@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from mergexo.config import RepoConfig, RuntimeConfig
+from mergexo.shell import run
+
+
+@dataclass(frozen=True)
+class RepoLayout:
+    mirror_path: Path
+    checkouts_root: Path
+
+
+class GitRepoManager:
+    def __init__(self, runtime: RuntimeConfig, repo: RepoConfig) -> None:
+        self.runtime = runtime
+        self.repo = repo
+        self.layout = RepoLayout(
+            mirror_path=runtime.base_dir / "repos" / repo.owner / f"{repo.name}.git",
+            checkouts_root=runtime.base_dir / "checkouts" / repo.owner / repo.name,
+        )
+
+    def ensure_layout(self) -> None:
+        self.layout.mirror_path.parent.mkdir(parents=True, exist_ok=True)
+        self.layout.checkouts_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_mirror()
+        for slot in range(self.runtime.worker_count):
+            self.ensure_checkout(slot)
+
+    def ensure_checkout(self, slot: int) -> Path:
+        checkout_path = self.slot_path(slot)
+        remote_url = self.repo.effective_remote_url
+        if not checkout_path.exists():
+            run(
+                [
+                    "git",
+                    "clone",
+                    "--reference-if-able",
+                    str(self.layout.mirror_path),
+                    remote_url,
+                    str(checkout_path),
+                ]
+            )
+        else:
+            run(["git", "-C", str(checkout_path), "remote", "set-url", "origin", remote_url])
+        return checkout_path
+
+    def slot_path(self, slot: int) -> Path:
+        return self.layout.checkouts_root / f"worker-{slot:02d}"
+
+    def prepare_checkout(self, checkout_path: Path) -> None:
+        run(["git", "-C", str(checkout_path), "fetch", "origin", "--prune", "--tags"])
+        run(
+            [
+                "git",
+                "-C",
+                str(checkout_path),
+                "checkout",
+                "-B",
+                self.repo.default_branch,
+                f"origin/{self.repo.default_branch}",
+            ]
+        )
+        run(
+            [
+                "git",
+                "-C",
+                str(checkout_path),
+                "reset",
+                "--hard",
+                f"origin/{self.repo.default_branch}",
+            ]
+        )
+        run(["git", "-C", str(checkout_path), "clean", "-ffdx"])
+
+    def create_or_reset_branch(self, checkout_path: Path, branch: str) -> None:
+        run(["git", "-C", str(checkout_path), "checkout", "-B", branch])
+
+    def commit_all(self, checkout_path: Path, message: str) -> None:
+        run(["git", "-C", str(checkout_path), "add", "-A"])
+        diff = run(["git", "-C", str(checkout_path), "diff", "--cached", "--name-only"]).strip()
+        if not diff:
+            raise RuntimeError("No staged changes to commit")
+        run(["git", "-C", str(checkout_path), "commit", "-m", message])
+
+    def push_branch(self, checkout_path: Path, branch: str) -> None:
+        run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
+
+    def cleanup_slot(self, checkout_path: Path) -> None:
+        self.prepare_checkout(checkout_path)
+
+    def _ensure_mirror(self) -> None:
+        remote_url = self.repo.effective_remote_url
+        source = self.repo.local_clone_source or remote_url
+        if not self.layout.mirror_path.exists():
+            run(["git", "clone", "--mirror", source, str(self.layout.mirror_path)])
+
+        run(
+            [
+                "git",
+                f"--git-dir={self.layout.mirror_path}",
+                "remote",
+                "set-url",
+                "origin",
+                remote_url,
+            ]
+        )
+        run(
+            [
+                "git",
+                f"--git-dir={self.layout.mirror_path}",
+                "fetch",
+                "origin",
+                "--prune",
+                "--tags",
+            ]
+        )
