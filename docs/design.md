@@ -289,9 +289,12 @@ Execution contract:
 
 Codex adapter approach:
 
-- Start Codex session per work item with deterministic system prompt + task context.
-- Feed review comments as incremental feedback events.
-- Convert Codex outputs into normalized actions.
+- Use turn-based interactions where ORCH sends a structured context package and Codex returns actions.
+- Keep Codex isolated from direct side effects (no direct GitHub writes).
+- Parse Codex output into normalized actions, then let ORCH validate/execute.
+- Support two operating modes behind the same adapter contract:
+  - Stateless one-shot turns (recommended MVP).
+  - Resumable session turns (optional later optimization).
 
 Future adapters (OpenAI direct API, other tools) implement the same interface.
 
@@ -382,6 +385,66 @@ Implementation session policy:
    - acceptance criteria,
    - touch-path/risk hints.
 3. Do not carry full design-phase chat history unless explicitly required.
+
+## 8.3 Codex interaction protocol
+
+Best initial integration for this project:
+
+1. Use a local Codex CLI adapter from Python (fits existing local auth on the Mac mini).
+2. Run Codex in non-interactive, turn-based mode from ORCH.
+3. Require machine-readable action output (JSON) every turn.
+
+Why this is the best starting point:
+
+1. Uses existing local authentication and workflow you already have.
+2. Keeps ORCH deterministic and easy to debug.
+3. Avoids brittle parsing of free-form assistant text.
+
+Turn input package (ORCH -> Codex):
+
+1. `task_context`: issue/PR metadata, branch, file paths, base SHA.
+2. `state_summary`: compact rolling summary for the current PR lifecycle.
+3. `new_events`: normalized deltas since last turn:
+   - review comments,
+   - PR comments,
+   - CI/check failures,
+   - merge/rebase/conflict signals.
+4. `allowed_actions`: explicit allowed action types for this turn.
+
+Turn output contract (Codex -> ORCH):
+
+```json
+{
+  "version": "1",
+  "work_item_id": "w_123",
+  "actions": [
+    {
+      "type": "post_github_comment",
+      "body": "I addressed this in commit abc123."
+    },
+    {
+      "type": "commit_and_push",
+      "message": "Fix retry backoff edge case"
+    }
+  ],
+  "state_delta": {
+    "decision_summary_append": "Adjusted retry jitter bounds per reviewer feedback."
+  }
+}
+```
+
+Validation and execution rules:
+
+1. ORCH validates output against a JSON schema.
+2. If output is invalid, ORCH requests a repair turn or marks session blocked.
+3. ORCH executes valid actions via `github_gateway` and git gateway only.
+4. ORCH records side effects and feeds resulting events back in the next turn.
+
+One-shot vs persistent session guidance:
+
+1. Not strictly one-shot forever, but one-shot turns are the safest MVP.
+2. Even with persistent provider sessions, keep the same structured turn protocol.
+3. Treat provider session memory as an optimization; ORCH state remains authoritative.
 
 ## 9. GitHub Integration Strategy
 
