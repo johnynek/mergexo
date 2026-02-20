@@ -4,4 +4,7 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
+.coverage
+*.egg-info/
 .DS_Store

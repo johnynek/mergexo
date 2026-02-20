@@ -2,14 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
-try:  # pragma: no cover - import resolution is runtime-version dependent.
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    try:
-        import tomli as tomllib  # type: ignore[no-redef]
-    except ModuleNotFoundError:  # pragma: no cover
-        tomllib = None  # type: ignore[assignment]
+import tomllib
+from typing import cast
 
 
 @dataclass(frozen=True)
@@ -61,9 +55,6 @@ class ConfigError(ValueError):
 
 
 def load_config(path: Path) -> AppConfig:
-    if tomllib is None:
-        raise ConfigError("No TOML parser available. Install tomli or use Python 3.11+.")
-
     with path.open("rb") as fh:
         data = tomllib.load(fh)
 
@@ -109,7 +100,9 @@ def _require_table(data: dict[str, object], key: str) -> dict[str, object]:
     value = data.get(key)
     if not isinstance(value, dict):
         raise ConfigError(f"[{key}] is required and must be a TOML table")
-    return value
+    if not all(isinstance(item, str) for item in value.keys()):
+        raise ConfigError(f"[{key}] must have string keys")
+    return cast(dict[str, object], value)
 
 
 def _require_str(data: dict[str, object], key: str) -> str:
@@ -144,6 +137,11 @@ def _bool_with_default(data: dict[str, object], key: str, default: bool) -> bool
 
 def _tuple_of_str(data: dict[str, object], key: str) -> tuple[str, ...]:
     value = data.get(key, [])
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+    if not isinstance(value, list):
         raise ConfigError(f"{key} must be a list of strings")
-    return tuple(value)
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigError(f"{key} must be a list of strings")
+        out.append(item)
+    return tuple(out)

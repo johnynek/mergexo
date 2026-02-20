@@ -12,7 +12,7 @@ This repository currently implements Phase 1 of the MVP:
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.11+
 - `uv`
 - `git`
 - `gh` authenticated for the target repository
