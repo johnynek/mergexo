@@ -113,8 +113,8 @@ def test_cmd_run_constructs_orchestrator(monkeypatch: pytest.MonkeyPatch, tmp_pa
     called: dict[str, object] = {}
 
     class FakeOrchestrator:
-        def __init__(self, config: AppConfig, *, state: object, github: object, git_manager: object, codex: object) -> None:
-            called["ctor"] = (config, state, github, git_manager, codex)
+        def __init__(self, config: AppConfig, *, state: object, github: object, git_manager: object, agent: object) -> None:
+            called["ctor"] = (config, state, github, git_manager, agent)
 
         def run(self, *, once: bool) -> None:
             called["run"] = once

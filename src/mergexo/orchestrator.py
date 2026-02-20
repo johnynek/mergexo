@@ -9,12 +9,11 @@ import re
 import threading
 import time
 
-from mergexo.codex_adapter import CodexAdapter
+from mergexo.agent_adapter import AgentAdapter
 from mergexo.config import AppConfig
 from mergexo.git_ops import GitRepoManager
 from mergexo.github_gateway import GitHubGateway
 from mergexo.models import GeneratedDesign, Issue, WorkResult
-from mergexo.prompts import build_design_prompt
 from mergexo.state import StateStore
 
 
@@ -48,13 +47,13 @@ class Phase1Orchestrator:
         state: StateStore,
         github: GitHubGateway,
         git_manager: GitRepoManager,
-        codex: CodexAdapter,
+        agent: AgentAdapter,
     ) -> None:
         self._config = config
         self._state = state
         self._github = github
         self._git = git_manager
-        self._codex = codex
+        self._agent = agent
         self._slot_pool = SlotPool(git_manager, config.runtime.worker_count)
         self._running: dict[int, Future[WorkResult]] = {}
         self._running_lock = threading.Lock()
@@ -128,13 +127,20 @@ class Phase1Orchestrator:
             self._git.create_or_reset_branch(lease.path, branch)
 
             design_relpath = f"{self._config.repo.design_docs_dir}/{issue.number}-{slug}.md"
-            prompt = build_design_prompt(
+            start_result = self._agent.start_design_from_issue(
                 issue=issue,
                 repo_full_name=self._config.repo.full_name,
                 design_doc_path=design_relpath,
                 default_branch=self._config.repo.default_branch,
+                cwd=lease.path,
             )
-            generated = self._codex.generate_design_doc(prompt=prompt, cwd=lease.path)
+            generated = start_result.design
+            if start_result.session:
+                self._state.save_agent_session(
+                    issue_number=issue.number,
+                    adapter=start_result.session.adapter,
+                    thread_id=start_result.session.thread_id,
+                )
 
             design_abs_path = lease.path / design_relpath
             design_abs_path.parent.mkdir(parents=True, exist_ok=True)

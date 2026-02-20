@@ -19,6 +19,40 @@ class PullRequest:
 
 
 @dataclass(frozen=True)
+class PullRequestSnapshot:
+    number: int
+    title: str
+    body: str
+    head_sha: str
+    base_sha: str
+    draft: bool
+
+
+@dataclass(frozen=True)
+class PullRequestReviewComment:
+    comment_id: int
+    body: str
+    path: str
+    line: int | None
+    side: str | None
+    in_reply_to_id: int | None
+    user_login: str
+    html_url: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class PullRequestIssueComment:
+    comment_id: int
+    body: str
+    user_login: str
+    html_url: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class GeneratedDesign:
     title: str
     design_doc_markdown: str

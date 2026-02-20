@@ -5,7 +5,13 @@ import json
 from typing import cast
 from urllib.parse import urlencode
 
-from mergexo.models import Issue, PullRequest
+from mergexo.models import (
+    Issue,
+    PullRequest,
+    PullRequestIssueComment,
+    PullRequestReviewComment,
+    PullRequestSnapshot,
+)
 from mergexo.shell import run
 
 
@@ -68,9 +74,106 @@ class GitHubGateway:
         html_url = _as_string(payload_obj.get("html_url"))
         return PullRequest(number=number, html_url=html_url)
 
+    def get_pull_request(self, pr_number: int) -> PullRequestSnapshot:
+        path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}"
+        payload = self._api_json("GET", path)
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for pull request")
+
+        head = _as_object_dict(payload_obj.get("head"))
+        base = _as_object_dict(payload_obj.get("base"))
+        if head is None or base is None:
+            raise RuntimeError("Unexpected GitHub response: missing pull request head/base")
+
+        return PullRequestSnapshot(
+            number=_as_int(payload_obj.get("number"), field="number"),
+            title=_as_string(payload_obj.get("title")),
+            body=_as_string(payload_obj.get("body")),
+            head_sha=_as_string(head.get("sha")),
+            base_sha=_as_string(base.get("sha")),
+            draft=_as_bool(payload_obj.get("draft")),
+        )
+
+    def list_pull_request_files(self, pr_number: int) -> tuple[str, ...]:
+        path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/files?per_page=100"
+        payload = self._api_json("GET", path)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected list of pull request files")
+
+        files: list[str] = []
+        for item in payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            filename = item_obj.get("filename")
+            if isinstance(filename, str) and filename:
+                files.append(filename)
+        return tuple(files)
+
+    def list_pull_request_review_comments(self, pr_number: int) -> list[PullRequestReviewComment]:
+        path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/comments?per_page=100"
+        payload = self._api_json("GET", path)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected list of review comments")
+
+        comments: list[PullRequestReviewComment] = []
+        for item in payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            user_obj = _as_object_dict(item_obj.get("user"))
+            comments.append(
+                PullRequestReviewComment(
+                    comment_id=_as_int(item_obj.get("id"), field="id"),
+                    body=_as_string(item_obj.get("body")),
+                    path=_as_string(item_obj.get("path")),
+                    line=_as_optional_int(item_obj.get("line")),
+                    side=_as_optional_str(item_obj.get("side")),
+                    in_reply_to_id=_as_optional_int(item_obj.get("in_reply_to_id")),
+                    user_login=_as_string(user_obj.get("login") if user_obj else None),
+                    html_url=_as_string(item_obj.get("html_url")),
+                    created_at=_as_string(item_obj.get("created_at")),
+                    updated_at=_as_string(item_obj.get("updated_at")),
+                )
+            )
+        return comments
+
+    def list_pull_request_issue_comments(self, pr_number: int) -> list[PullRequestIssueComment]:
+        path = f"/repos/{self.owner}/{self.name}/issues/{pr_number}/comments?per_page=100"
+        payload = self._api_json("GET", path)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected list of issue comments")
+
+        comments: list[PullRequestIssueComment] = []
+        for item in payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            user_obj = _as_object_dict(item_obj.get("user"))
+            comments.append(
+                PullRequestIssueComment(
+                    comment_id=_as_int(item_obj.get("id"), field="id"),
+                    body=_as_string(item_obj.get("body")),
+                    user_login=_as_string(user_obj.get("login") if user_obj else None),
+                    html_url=_as_string(item_obj.get("html_url")),
+                    created_at=_as_string(item_obj.get("created_at")),
+                    updated_at=_as_string(item_obj.get("updated_at")),
+                )
+            )
+        return comments
+
     def post_issue_comment(self, issue_number: int, body: str) -> None:
         path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}/comments"
         self._api_json("POST", path, payload={"body": body})
+
+    def post_review_comment_reply(self, pr_number: int, review_comment_id: int, body: str) -> None:
+        path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/comments"
+        self._api_json(
+            "POST",
+            path,
+            payload={"body": body, "in_reply_to": review_comment_id},
+        )
 
     def _api_json(self, method: str, path: str, payload: dict[str, object] | None = None) -> object:
         cmd = ["gh", "api", "--method", method, path]
@@ -98,6 +201,14 @@ def _as_string(value: object) -> str:
     return str(value)
 
 
+def _as_optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def _as_int(value: object, *, field: str) -> int:
     if isinstance(value, bool):
         raise RuntimeError(f"Unexpected GitHub response type for {field}")
@@ -109,3 +220,24 @@ def _as_int(value: object, *, field: str) -> int:
         except ValueError as exc:
             raise RuntimeError(f"Unexpected GitHub response value for {field}: {value}") from exc
     raise RuntimeError(f"Unexpected GitHub response type for {field}")
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise RuntimeError("Unexpected GitHub response type for optional int field")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"Unexpected GitHub response value for optional int field: {value}") from exc
+    raise RuntimeError("Unexpected GitHub response type for optional int field")
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise RuntimeError("Unexpected GitHub response type for bool field")

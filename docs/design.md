@@ -200,11 +200,14 @@ Status enums:
 1. Poller detects new review comments/comments.
 2. Comments are deduplicated by GitHub comment/review event id.
 3. Orchestrator routes feedback to the linked agent session.
-4. Agent responds:
+4. Canonical turn contract:
+   - start turn: `Issue -> (PR description, head commit SHA, agent session handle)`
+   - feedback turn: `(PR comments, review comments, changed files, head commit SHA, agent session handle) -> (comment replies, optional top-level PR comment, optional commit intent, updated session handle)`
+5. Agent responds:
    - emits actions to orchestrator (comment reply, patch, commit/push).
    - orchestrator executes GitHub/git side effects via gateways and records resulting runtime events.
-5. Loop repeats until PR merged or closed.
-6. On merge:
+6. Loop repeats until PR merged or closed.
+7. On merge:
    - Mark design work item `merged`.
    - Create implementation candidate (`ready`) if doc not yet implemented.
 
@@ -265,27 +268,37 @@ estimated_size: M
 Use a normalized adapter interface:
 
 ```python
-class AgentAdapter(Protocol):
-    def start_task(self, task: TaskContext) -> AgentSession: ...
-    def handle_feedback(self, session: AgentSession, feedback: FeedbackEvent) -> AgentActionBatch: ...
-    def poll(self, session: AgentSession) -> AgentActionBatch: ...
-    def stop(self, session: AgentSession) -> None: ...
+@dataclass(frozen=True)
+class AgentSession:
+    adapter: str
+    thread_id: str | None
+
+@dataclass(frozen=True)
+class FeedbackTurn:
+    issue: Issue
+    pull_request: PullRequestSnapshot
+    review_comments: tuple[PullRequestReviewComment, ...]
+    issue_comments: tuple[PullRequestIssueComment, ...]
+    changed_files: tuple[str, ...]
+
+@dataclass(frozen=True)
+class FeedbackResult:
+    session: AgentSession
+    review_replies: tuple[ReviewReply, ...]
+    general_comment: str | None
+    commit_message: str | None
+
+class AgentAdapter(ABC):
+    def start_design_from_issue(...) -> DesignStartResult: ...
+    def respond_to_feedback(...) -> FeedbackResult: ...
 ```
-
-`AgentActionBatch` supports:
-
-- `post_github_comment`
-- `apply_patch` (or write files)
-- `commit_and_push`
-- `request_human_input`
-- `mark_blocked` / `mark_failed`
 
 Execution contract:
 
-1. Adapters emit normalized actions only.
-2. Orchestrator validates, deduplicates, and executes actions.
-3. Any action that touches GitHub (`post_github_comment`, PR updates) must flow through `github_gateway`.
-4. Resulting side effects are written back as runtime events to keep recovery/idempotency deterministic.
+1. Adapters operate on typed turn data (`FeedbackTurn`) instead of raw GitHub payloads.
+2. Adapter outputs are typed and machine-validated (`FeedbackResult`).
+3. Only ORCH calls GitHub APIs and performs git side effects.
+4. Agent sessions are persisted in SQLite (`adapter`, provider `thread_id`) and resumed on each PR turn.
 
 Codex adapter approach:
 
@@ -371,9 +384,9 @@ Persist per agent session:
 Event handling loop:
 
 1. ORCH ingests and deduplicates GitHub + CI + runtime events.
-2. ORCH builds a delta package and calls adapter `handle_feedback`.
-3. Agent returns normalized actions.
-4. ORCH validates/executes actions and records side-effect events.
+2. ORCH builds a `FeedbackTurn` package and calls adapter `respond_to_feedback`.
+3. Agent returns `FeedbackResult` (reply intents + optional commit intent + updated session handle).
+4. ORCH validates/executes side effects and records resulting runtime events.
 
 Implementation session policy:
 
@@ -415,21 +428,14 @@ Turn output contract (Codex -> ORCH):
 
 ```json
 {
-  "version": "1",
-  "work_item_id": "w_123",
-  "actions": [
+  "review_replies": [
     {
-      "type": "post_github_comment",
-      "body": "I addressed this in commit abc123."
-    },
-    {
-      "type": "commit_and_push",
-      "message": "Fix retry backoff edge case"
+      "review_comment_id": 123,
+      "body": "Addressed in latest push; updated naming and tests."
     }
   ],
-  "state_delta": {
-    "decision_summary_append": "Adjusted retry jitter bounds per reviewer feedback."
-  }
+  "general_comment": "Applied requested changes and pushed a follow-up commit.",
+  "commit_message": "refactor: rename scheduler queue field"
 }
 ```
 
@@ -437,8 +443,10 @@ Validation and execution rules:
 
 1. ORCH validates output against a JSON schema.
 2. If output is invalid, ORCH requests a repair turn or marks session blocked.
-3. ORCH executes valid actions via `github_gateway` and git gateway only.
-4. ORCH records side effects and feeds resulting events back in the next turn.
+3. ORCH posts `review_replies` as threaded replies using `in_reply_to` IDs.
+4. ORCH posts `general_comment` only if present/non-empty.
+5. ORCH handles `commit_message` as a signal that local changes should be committed/pushed before posting status.
+6. ORCH records side effects and feeds resulting events back in the next turn.
 
 One-shot vs persistent session guidance:
 
@@ -457,6 +465,53 @@ For local-machine simplicity:
 2. Use `git` CLI for branch operations/commits/push/rebase.
    - Run git commands inside worker checkout directories backed by local bare mirrors.
 3. Use polling initially (for example every 20-60s); webhooks can be added later.
+
+## 9.1 PR comment schemas used by ORCH
+
+Line-level review comments (`GET /repos/{owner}/{repo}/pulls/{pr}/comments`):
+
+```json
+{
+  "id": 12345,
+  "body": "Please rename this variable.",
+  "path": "src/mergexo/scheduler.py",
+  "line": 88,
+  "side": "RIGHT",
+  "in_reply_to_id": null,
+  "user": { "login": "reviewer" },
+  "html_url": "https://...",
+  "created_at": "2026-02-20T10:00:00Z",
+  "updated_at": "2026-02-20T10:01:00Z"
+}
+```
+
+PR issue comments (`GET /repos/{owner}/{repo}/issues/{pr}/comments`):
+
+```json
+{
+  "id": 67890,
+  "body": "Can you summarize tradeoffs?",
+  "user": { "login": "reviewer" },
+  "html_url": "https://...",
+  "created_at": "2026-02-20T10:05:00Z",
+  "updated_at": "2026-02-20T10:05:00Z"
+}
+```
+
+Reply posting for line comments (`POST /repos/{owner}/{repo}/pulls/{pr}/comments`):
+
+```json
+{
+  "body": "Done in commit abc123.",
+  "in_reply_to": 12345
+}
+```
+
+Normalization rule:
+
+1. ORCH immediately maps raw payloads into typed internal models (`PullRequestReviewComment`, `PullRequestIssueComment`, `PullRequestSnapshot`) before prompting agents.
+2. Agents never consume raw GitHub JSON directly.
+3. This keeps adapters stable even if GitHub adds fields later.
 
 Idempotency rules:
 

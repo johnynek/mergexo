@@ -43,6 +43,16 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    issue_number INTEGER PRIMARY KEY,
+                    adapter TEXT NOT NULL,
+                    thread_id TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                )
+                """
+            )
 
     def can_enqueue(self, issue_number: int) -> bool:
         with self._lock, self._connect() as conn:
@@ -95,3 +105,32 @@ class StateStore:
                 """,
                 (issue_number, error),
             )
+
+    def save_agent_session(self, *, issue_number: int, adapter: str, thread_id: str | None) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_sessions(issue_number, adapter, thread_id)
+                VALUES(?, ?, ?)
+                ON CONFLICT(issue_number) DO UPDATE SET
+                    adapter=excluded.adapter,
+                    thread_id=excluded.thread_id,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (issue_number, adapter, thread_id),
+            )
+
+    def get_agent_session(self, issue_number: int) -> tuple[str, str | None] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT adapter, thread_id FROM agent_sessions WHERE issue_number = ?",
+                (issue_number,),
+            ).fetchone()
+        if row is None:
+            return None
+        adapter, thread_id = row
+        if not isinstance(adapter, str):
+            raise RuntimeError("Invalid adapter value stored in agent_sessions")
+        if thread_id is not None and not isinstance(thread_id, str):
+            raise RuntimeError("Invalid thread_id value stored in agent_sessions")
+        return adapter, thread_id

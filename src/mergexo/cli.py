@@ -57,14 +57,14 @@ def _cmd_run(config: AppConfig, *, once: bool) -> None:
     state = StateStore(_state_db_path(config))
     github = GitHubGateway(config.repo.owner, config.repo.name)
     git_manager = GitRepoManager(config.runtime, config.repo)
-    codex = CodexAdapter(config.codex)
+    agent = CodexAdapter(config.codex)
 
     orchestrator = Phase1Orchestrator(
         config,
         state=state,
         github=github,
         git_manager=git_manager,
-        codex=codex,
+        agent=agent,
     )
     orchestrator.run(once=once)
 

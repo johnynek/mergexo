@@ -9,6 +9,7 @@ import time
 from hypothesis import given, strategies as st
 import pytest
 
+from mergexo.agent_adapter import AgentSession, DesignStartResult, FeedbackResult
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.models import GeneratedDesign, Issue, PullRequest, WorkResult
 from mergexo.orchestrator import Phase1Orchestrator, SlotPool, _render_design_doc, _slugify
@@ -74,7 +75,7 @@ class FakeGitHub:
         self.comments.append((issue_number, body))
 
 
-class FakeCodex:
+class FakeAgent:
     def __init__(self, generated: GeneratedDesign | None = None, fail: bool = False) -> None:
         self.generated = generated or GeneratedDesign(
             title="Design Title",
@@ -83,13 +84,34 @@ class FakeCodex:
             design_doc_markdown="## Body\n\nDetails",
         )
         self.fail = fail
-        self.calls: list[tuple[str, Path]] = []
+        self.calls: list[tuple[Issue, Path]] = []
 
-    def generate_design_doc(self, *, prompt: str, cwd: Path) -> GeneratedDesign:
-        self.calls.append((prompt, cwd))
+    def start_design_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        design_doc_path: str,
+        default_branch: str,
+        cwd: Path,
+    ) -> DesignStartResult:
+        _ = repo_full_name, design_doc_path, default_branch
+        self.calls.append((issue, cwd))
         if self.fail:
             raise RuntimeError("codex failed")
-        return self.generated
+        return DesignStartResult(
+            design=self.generated,
+            session=AgentSession(adapter="codex", thread_id="thread-123"),
+        )
+
+    def respond_to_feedback(self, *, session: AgentSession, turn: object, cwd: Path) -> FeedbackResult:
+        _ = session, turn, cwd
+        return FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-123"),
+            review_replies=(),
+            general_comment=None,
+            commit_message=None,
+        )
 
 
 class FakeState:
@@ -98,6 +120,7 @@ class FakeState:
         self.running: list[int] = []
         self.completed: list[WorkResult] = []
         self.failed: list[tuple[int, str]] = []
+        self.saved_sessions: list[tuple[int, str, str | None]] = []
 
     def can_enqueue(self, issue_number: int) -> bool:
         return issue_number in self.allowed
@@ -112,6 +135,15 @@ class FakeState:
 
     def mark_failed(self, *, issue_number: int, error: str) -> None:
         self.failed.append((issue_number, error))
+
+    def save_agent_session(self, *, issue_number: int, adapter: str, thread_id: str | None) -> None:
+        self.saved_sessions.append((issue_number, adapter, thread_id))
+
+    def get_agent_session(self, issue_number: int) -> tuple[str, str | None] | None:
+        for num, adapter, thread_id in self.saved_sessions:
+            if num == issue_number:
+                return adapter, thread_id
+        return None
 
 
 def _config(tmp_path: Path, *, worker_count: int = 1) -> AppConfig:
@@ -176,10 +208,10 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub(issues=[])
-    codex = FakeCodex()
+    agent = FakeAgent()
     state = FakeState()
 
-    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, codex=codex)
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     result = orch._process_issue(_issue())
 
     assert result.issue_number == 7
@@ -196,19 +228,20 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     generated_path = git.branch_calls[0][0] / f"docs/design/7-{_slugify('Add worker scheduler')}.md"
     assert generated_path.exists()
     contents = generated_path.read_text(encoding="utf-8")
-    assert f"# {codex.generated.title}" in contents
+    assert f"# {agent.generated.title}" in contents
     assert "touch_paths" in contents
     assert branch.startswith("agent/design/7-")
+    assert state.saved_sessions == [(7, "codex", "thread-123")]
 
 
 def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub(issues=[])
-    codex = FakeCodex(fail=True)
+    agent = FakeAgent(fail=True)
     state = FakeState()
 
-    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, codex=codex)
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     with pytest.raises(RuntimeError, match="codex failed"):
         orch._process_issue(_issue())
@@ -225,10 +258,10 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
     issue1 = _issue(1, "One")
     issue2 = _issue(2, "Two")
     github = FakeGitHub([issue1, issue2])
-    codex = FakeCodex()
+    agent = FakeAgent()
     state = FakeState(allowed={1})
 
-    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, codex=codex)
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     class FakePool:
         def __init__(self) -> None:
@@ -269,10 +302,10 @@ def test_reap_finished_marks_success_and_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
-    codex = FakeCodex()
+    agent = FakeAgent()
     state = FakeState()
 
-    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, codex=codex)
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     ok: Future[WorkResult] = Future()
     ok.set_result(WorkResult(issue_number=1, branch="b", pr_number=2, pr_url="u"))
@@ -291,9 +324,9 @@ def test_wait_for_all_calls_sleep_when_needed(tmp_path: Path, monkeypatch: pytes
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
-    codex = FakeCodex()
+    agent = FakeAgent()
     state = FakeState()
-    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, codex=codex)
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     fut: Future[WorkResult] = Future()
     orch._running = {1: fut}
@@ -320,9 +353,9 @@ def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.Monke
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
-    codex = FakeCodex()
+    agent = FakeAgent()
     state = FakeState()
-    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, codex=codex)
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     once_calls = {"enqueue": 0, "wait": 0}
 

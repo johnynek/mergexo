@@ -53,6 +53,10 @@ def test_state_store_transitions(tmp_path: Path) -> None:
     assert pr_url == "https://example/pr/9"
     assert error is None
 
+    store.save_agent_session(issue_number=42, adapter="codex", thread_id="thread-1")
+    assert store.get_agent_session(42) == ("codex", "thread-1")
+    assert store.get_agent_session(999) is None
+
 
 def test_state_store_connection_rolls_back_on_error(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
@@ -65,3 +69,39 @@ def test_state_store_connection_rolls_back_on_error(tmp_path: Path) -> None:
 
     # Connection remains usable after rollback path.
     assert store.can_enqueue(999) is True
+
+
+def test_get_agent_session_rejects_invalid_adapter_type(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO agent_sessions(issue_number, adapter, thread_id) VALUES(?, ?, ?)",
+            (1, sqlite3.Binary(b"\x01"), None),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="Invalid adapter"):
+        store.get_agent_session(1)
+
+
+def test_get_agent_session_rejects_invalid_thread_id_type(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO agent_sessions(issue_number, adapter, thread_id) VALUES(?, ?, ?)",
+            (2, "codex", sqlite3.Binary(b"\x02")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="Invalid thread_id"):
+        store.get_agent_session(2)
