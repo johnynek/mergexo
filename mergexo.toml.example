@@ -1,0 +1,23 @@
+[runtime]
+base_dir = "~/.local/share/mergexo"
+worker_count = 2
+poll_interval_seconds = 60
+
+[repo]
+owner = "johnynek"
+name = "target-repo"
+default_branch = "main"
+trigger_label = "agent:design"
+design_docs_dir = "docs/design"
+# Optional local source to seed the mirror (path to local repo or .git dir)
+# local_clone_source = "/Users/oscar/code/target-repo/.git"
+# Optional explicit remote URL. Defaults to git@github.com:<owner>/<name>.git
+# remote_url = "git@github.com:johnynek/target-repo.git"
+
+[codex]
+enabled = true
+# model = "gpt-5-codex"
+# sandbox = "workspace-write"
+# profile = "default"
+# Example: ["--full-auto"]
+extra_args = []

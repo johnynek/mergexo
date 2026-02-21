@@ -25,6 +25,8 @@
    - integration boundaries,
    - user-visible scenarios.
 3. For state machines and schedulers, define invariants first, then encode them as properties.
+4. Every PR must run coverage checks.
+5. Required threshold is 100% line coverage for merged code.
 
 Example invariants:
 
@@ -56,11 +58,12 @@ Example invariants:
    - `ty`
    - `ruff`
    - `pytest`
+   - `pytest-cov`
 
 ## 7. Development workflow
 
 1. Add/update dependencies with `uv`.
 2. Format code with `uv run ruff format`.
-3. Run tests with `uv run pytest`.
+3. Run tests with coverage: `uv run pytest --cov=src --cov-report=term-missing --cov-fail-under=100`.
 4. Run type checks with `uv run ty`.
-5. Only merge when formatter, tests, and type checks pass.
+5. Only merge when formatter, tests, coverage, and type checks pass.

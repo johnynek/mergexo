@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+from pathlib import Path
+import re
+
+import pytest
+
+from mergexo import config
+from mergexo.config import AppConfig, ConfigError
+
+
+def _write(path: Path, content: str) -> Path:
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_load_config_happy_path(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "mergexo.toml",
+        """
+[runtime]
+base_dir = "~/tmp/mergexo"
+worker_count = 2
+poll_interval_seconds = 60
+
+[repo]
+owner = "johnynek"
+name = "repo"
+default_branch = "main"
+trigger_label = "agent:design"
+design_docs_dir = "docs/design"
+local_clone_source = "/tmp/local.git"
+
+[codex]
+enabled = true
+model = "gpt"
+sandbox = "workspace-write"
+profile = "default"
+extra_args = ["--full-auto"]
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+
+    assert isinstance(loaded, AppConfig)
+    assert loaded.runtime.worker_count == 2
+    assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
+    assert loaded.repo.full_name == "johnynek/repo"
+    assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
+    assert loaded.codex.extra_args == ("--full-auto",)
+
+
+def test_load_config_uses_explicit_remote(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "mergexo.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+remote_url = "git@github.com:example/custom.git"
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+    assert loaded.repo.effective_remote_url == "git@github.com:example/custom.git"
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        ("[repo]\nname='x'", "[runtime] is required"),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 0
+poll_interval_seconds = 60
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+""".strip(),
+            "worker_count",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 1
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+""".strip(),
+            "poll_interval_seconds",
+        ),
+        (
+            """
+codex = []
+
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+""".strip(),
+            "[codex] must be a TOML table",
+        ),
+    ],
+)
+def test_load_config_errors(tmp_path: Path, content: str, expected: str) -> None:
+    cfg_path = _write(tmp_path / "bad.toml", content)
+    with pytest.raises(ConfigError, match=re.escape(expected)):
+        config.load_config(cfg_path)
+
+
+def test_helper_require_table_and_strings() -> None:
+    assert config._require_table({"x": {}}, "x") == {}
+
+    with pytest.raises(ConfigError, match="required and must be a TOML table"):
+        config._require_table({"x": 3}, "x")
+
+    with pytest.raises(ConfigError, match="must have string keys"):
+        config._require_table({"x": {1: "v"}}, "x")
+
+    assert config._require_str({"k": "v"}, "k") == "v"
+    with pytest.raises(ConfigError, match="required and must be a non-empty string"):
+        config._require_str({"k": ""}, "k")
+
+    assert config._optional_str({}, "k") is None
+    assert config._optional_str({"k": "v"}, "k") == "v"
+    with pytest.raises(ConfigError, match="non-empty string"):
+        config._optional_str({"k": ""}, "k")
+
+
+def test_helper_numeric_bool_and_tuple() -> None:
+    assert config._require_int({"k": 3}, "k") == 3
+    with pytest.raises(ConfigError, match="must be an integer"):
+        config._require_int({"k": "3"}, "k")
+
+    assert config._bool_with_default({}, "k", True) is True
+    assert config._bool_with_default({"k": False}, "k", True) is False
+    with pytest.raises(ConfigError, match="must be a boolean"):
+        config._bool_with_default({"k": "yes"}, "k", True)
+
+    assert config._tuple_of_str({}, "k") == ()
+    assert config._tuple_of_str({"k": ["a", "b"]}, "k") == ("a", "b")
+    with pytest.raises(ConfigError, match="list of strings"):
+        config._tuple_of_str({"k": "oops"}, "k")
+    with pytest.raises(ConfigError, match="list of strings"):
+        config._tuple_of_str({"k": ["ok", 3]}, "k")
