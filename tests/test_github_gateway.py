@@ -103,13 +103,21 @@ def test_get_issue_parses_object(monkeypatch: pytest.MonkeyPatch) -> None:
             "title": "Issue title",
             "body": "Issue body",
             "html_url": "https://example/issue/9",
-            "labels": [{"name": "agent:design"}],
+            "labels": [{"name": "agent:design"}, "skip"],
         }
 
     monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
     issue = gateway.get_issue(9)
     assert issue.number == 9
     assert issue.labels == ("agent:design",)
+
+
+def test_get_issue_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+
+    with pytest.raises(RuntimeError, match="expected object for issue"):
+        gateway.get_issue(1)
 
 
 def test_create_pull_request_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:

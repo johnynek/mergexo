@@ -27,7 +27,13 @@ from mergexo.models import (
     PullRequestSnapshot,
     WorkResult,
 )
-from mergexo.orchestrator import Phase1Orchestrator, SlotPool, _render_design_doc, _slugify
+from mergexo.orchestrator import (
+    Phase1Orchestrator,
+    SlotPool,
+    _FeedbackFuture,
+    _render_design_doc,
+    _slugify,
+)
 from mergexo.state import StateStore, TrackedPullRequestState
 
 
@@ -569,6 +575,17 @@ def _tracked_state_from_store(store: StateStore) -> TrackedPullRequestState:
     return tracked[0]
 
 
+def _issue_comment(comment_id: int = 22) -> PullRequestIssueComment:
+    return PullRequestIssueComment(
+        comment_id=comment_id,
+        body="General feedback",
+        user_login="reviewer",
+        html_url=f"https://example/issue-comment/{comment_id}",
+        created_at="2026-02-21T00:00:00Z",
+        updated_at="2026-02-21T00:00:00Z",
+    )
+
+
 def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_feedback_loop=True)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -746,3 +763,382 @@ def test_feedback_turn_marks_closed_pr_and_stops_tracking(tmp_path: Path) -> Non
         assert row[0] == "closed"
     finally:
         conn.close()
+
+
+def test_run_once_invokes_feedback_enqueue_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    calls = {"feedback": 0}
+    monkeypatch.setattr(orch, "_enqueue_new_work", lambda pool: None)
+    monkeypatch.setattr(
+        orch, "_enqueue_feedback_work", lambda pool: calls.__setitem__("feedback", 1)
+    )
+    monkeypatch.setattr(orch, "_wait_for_all", lambda pool: None)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+
+    orch.run(once=True)
+    assert calls["feedback"] == 1
+
+
+def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=3, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    state.tracked = [
+        TrackedPullRequestState(
+            pr_number=101,
+            issue_number=7,
+            branch="agent/design/7",
+            status="awaiting_feedback",
+            last_seen_head_sha=None,
+        ),
+        TrackedPullRequestState(
+            pr_number=102,
+            issue_number=8,
+            branch="agent/design/8",
+            status="awaiting_feedback",
+            last_seen_head_sha=None,
+        ),
+    ]
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.submitted: list[int] = []
+
+        def submit(self, fn, tracked):  # type: ignore[no-untyped-def]
+            _ = fn
+            fut: Future[None] = Future()
+            self.submitted.append(tracked.pr_number)
+            return fut
+
+    pool = FakePool()
+    orch._enqueue_feedback_work(pool)
+    assert pool.submitted == [101, 102]
+
+    # Duplicate entry should be skipped when already running.
+    duplicate_future: Future[None] = Future()
+    orch._running_feedback = {101: _FeedbackFuture(issue_number=7, future=duplicate_future)}
+    pool.submitted.clear()
+    state.tracked = [state.tracked[0]]
+    orch._enqueue_feedback_work(pool)
+    assert pool.submitted == []
+
+    # Capacity guard should short-circuit before submitting.
+    full_future: Future[WorkResult] = Future()
+    orch._running = {1: full_future, 2: full_future, 3: full_future}
+    pool.submitted.clear()
+    orch._enqueue_feedback_work(pool)
+    assert pool.submitted == []
+
+
+def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    bad_feedback: Future[None] = Future()
+    bad_feedback.set_exception(RuntimeError("feedback boom"))
+    orch._running_feedback = {101: _FeedbackFuture(issue_number=7, future=bad_feedback)}
+
+    orch._reap_finished()
+    assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
+
+
+def test_feedback_turn_marks_merged_pr_and_stops_tracking(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=True,
+    )
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    assert state.list_tracked_pull_requests() == ()
+
+
+def test_feedback_turn_blocks_when_session_missing(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+    github.issue_comments = [_issue_comment()]
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert state.list_tracked_pull_requests() == ()
+    assert any("blocked" in body.lower() for _, body in github.comments)
+
+
+def test_feedback_turn_commit_no_staged_changes_is_ignored(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-456"),
+        review_replies=(),
+        general_comment=None,
+        commit_message="chore: noop",
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    def raise_no_staged(checkout_path: Path, message: str) -> None:
+        _ = checkout_path, message
+        raise RuntimeError("No staged changes to commit")
+
+    git.commit_all = raise_no_staged  # type: ignore[method-assign]
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    assert state.list_pending_feedback_events(101) == ()
+
+
+def test_feedback_turn_commit_unexpected_error_propagates(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-456"),
+        review_replies=(),
+        general_comment=None,
+        commit_message="chore: broken",
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    def raise_other(checkout_path: Path, message: str) -> None:
+        _ = checkout_path, message
+        raise RuntimeError("boom")
+
+    git.commit_all = raise_other  # type: ignore[method-assign]
+
+    tracked = _tracked_state_from_store(state)
+    with pytest.raises(RuntimeError, match="boom"):
+        orch._process_feedback_turn(tracked)
+
+
+def test_feedback_turn_commit_push_marks_closed(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-456"),
+        review_replies=(),
+        general_comment=None,
+        commit_message="feat: update",
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    original_push = git.push_branch
+
+    def push_and_close(checkout_path: Path, branch: str) -> None:
+        original_push(checkout_path, branch)
+        github.pr_snapshot = PullRequestSnapshot(
+            number=101,
+            title="Design PR",
+            body="Body",
+            head_sha="head-2",
+            base_sha="base-1",
+            draft=False,
+            state="closed",
+            merged=False,
+        )
+
+    git.push_branch = push_and_close  # type: ignore[method-assign]
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    assert state.list_tracked_pull_requests() == ()
+
+
+def test_feedback_turn_commit_push_marks_merged(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-456"),
+        review_replies=(),
+        general_comment=None,
+        commit_message="feat: update",
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    original_push = git.push_branch
+
+    def push_and_merge(checkout_path: Path, branch: str) -> None:
+        original_push(checkout_path, branch)
+        github.pr_snapshot = PullRequestSnapshot(
+            number=101,
+            title="Design PR",
+            body="Body",
+            head_sha="head-2",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=True,
+        )
+
+    git.push_branch = push_and_merge  # type: ignore[method-assign]
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    assert state.list_tracked_pull_requests() == ()
+
+
+def test_feedback_turn_returns_when_expected_tokens_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-456"),
+        review_replies=(ReviewReply(review_comment_id=11, body="Done"),),
+        general_comment=None,
+        commit_message=None,
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    monkeypatch.setattr(orch, "_fetch_remote_action_tokens", lambda pr_number: set())
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(github.review_replies) == 1
+    assert len(state.list_pending_feedback_events(101)) == 1
+
+
+def test_normalize_filters_tokenized_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    marker = "<!-- mergexo-action:" + ("a" * 64) + " -->"
+    review = PullRequestReviewComment(
+        comment_id=1,
+        body=f"done\n\n{marker}",
+        path="src/a.py",
+        line=1,
+        side="RIGHT",
+        in_reply_to_id=None,
+        user_login="reviewer",
+        html_url="u",
+        created_at="t1",
+        updated_at="t1",
+    )
+    issue = PullRequestIssueComment(
+        comment_id=2,
+        body="regular issue feedback",
+        user_login="reviewer",
+        html_url="u2",
+        created_at="t2",
+        updated_at="t2",
+    )
+    tokenized_issue = PullRequestIssueComment(
+        comment_id=3,
+        body=marker,
+        user_login="reviewer",
+        html_url="u3",
+        created_at="t3",
+        updated_at="t3",
+    )
+
+    normalized_review = orch._normalize_review_events(
+        pr_number=10, issue_number=20, comments=[review]
+    )
+    normalized_issue = orch._normalize_issue_events(
+        pr_number=10, issue_number=20, comments=[issue, tokenized_issue]
+    )
+
+    assert normalized_review == []
+    assert len(normalized_issue) == 1
+    assert normalized_issue[0][0].kind == "issue"

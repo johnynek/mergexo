@@ -125,6 +125,23 @@ def test_restore_feedback_branch_retries_once_on_head_mismatch(
     assert seen_rev_parse == 2
 
 
+def test_restore_feedback_branch_returns_true_on_first_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return "goodsha\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+    assert manager.restore_feedback_branch(checkout, "feature", "goodsha") is True
+
+
 def test_commit_all_raises_when_no_diff(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime, repo = _config(tmp_path, worker_count=1)
     manager = GitRepoManager(runtime, repo)

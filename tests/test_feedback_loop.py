@@ -42,6 +42,10 @@ def test_action_token_helpers() -> None:
     body2 = append_action_token(body=body, token=reply_token)
     assert body2 == body
 
+    # Empty body should still emit a valid marker.
+    marker_only = append_action_token(body="   ", token=general_token)
+    assert marker_only == f"<!-- mergexo-action:{general_token} -->"
+
 
 def test_bot_detection() -> None:
     assert is_bot_login("github-actions[bot]") is True
