@@ -19,7 +19,12 @@ from mergexo.codex_adapter import (
     _require_str_list,
 )
 from mergexo.config import CodexConfig
-from mergexo.models import Issue, PullRequestIssueComment, PullRequestReviewComment, PullRequestSnapshot
+from mergexo.models import (
+    Issue,
+    PullRequestIssueComment,
+    PullRequestReviewComment,
+    PullRequestSnapshot,
+)
 
 
 def _enabled_config() -> CodexConfig:
@@ -34,6 +39,7 @@ def _enabled_config() -> CodexConfig:
 
 def _feedback_turn() -> FeedbackTurn:
     return FeedbackTurn(
+        turn_key="turn-abc",
         issue=Issue(number=1, title="Issue", body="Body", html_url="u", labels=("x",)),
         pull_request=PullRequestSnapshot(
             number=8,
@@ -42,6 +48,8 @@ def _feedback_turn() -> FeedbackTurn:
             head_sha="headsha",
             base_sha="basesha",
             draft=False,
+            state="open",
+            merged=False,
         ),
         review_comments=(
             PullRequestReviewComment(
@@ -71,10 +79,18 @@ def _feedback_turn() -> FeedbackTurn:
     )
 
 
-def test_start_design_from_issue_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_start_design_from_issue_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     calls: list[list[str]] = []
 
-    def fake_run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None, check: bool = True) -> str:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
         assert cwd == tmp_path
         assert check is True
         assert input_text is not None
@@ -121,8 +137,16 @@ def test_start_design_from_issue_happy_path(monkeypatch: pytest.MonkeyPatch, tmp
     assert "--full-auto" in cmd
 
 
-def test_start_design_from_issue_returns_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fake_run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None, check: bool = True) -> str:
+def test_start_design_from_issue_returns_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
         _ = cwd, input_text, check
         idx = cmd.index("--output-last-message")
         Path(cmd[idx + 1]).write_text(
@@ -155,7 +179,13 @@ def test_start_design_from_issue_returns_session(monkeypatch: pytest.MonkeyPatch
 
 
 def test_respond_to_feedback_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fake_run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None, check: bool = True) -> str:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
         _ = cwd, input_text, check
         assert cmd[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
         message_payload = json.dumps(
@@ -216,7 +246,7 @@ def test_start_design_from_issue_rejects_disabled(tmp_path: Path) -> None:
 
 
 def test_parse_json_payload_variants_and_errors() -> None:
-    fenced = "```json\n{\"title\":\"x\"}\n```"
+    fenced = '```json\n{"title":"x"}\n```'
     assert _parse_json_payload(fenced) == {"title": "x"}
 
     with pytest.raises(RuntimeError, match="JSON object"):

@@ -26,6 +26,8 @@ class PullRequestSnapshot:
     head_sha: str
     base_sha: str
     draft: bool
+    state: str
+    merged: bool
 
 
 @dataclass(frozen=True)

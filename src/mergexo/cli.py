@@ -15,12 +15,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mergexo")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help="Initialize state DB, mirror, and worker checkouts")
+    init_parser = subparsers.add_parser(
+        "init", help="Initialize state DB, mirror, and worker checkouts"
+    )
     init_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
 
-    run_parser = subparsers.add_parser("run", help="Run phase-1 issue polling and design PR generation")
+    run_parser = subparsers.add_parser(
+        "run", help="Run phase-1 issue polling and design PR generation"
+    )
     run_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
-    run_parser.add_argument("--once", action="store_true", help="Poll once and wait for active workers")
+    run_parser.add_argument(
+        "--once", action="store_true", help="Poll once and wait for active workers"
+    )
 
     return parser
 

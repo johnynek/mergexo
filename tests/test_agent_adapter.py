@@ -59,6 +59,7 @@ class DummyAdapter(AgentAdapter):
 def test_agent_adapter_data_model() -> None:
     issue = Issue(number=1, title="t", body="b", html_url="u", labels=("x",))
     turn = FeedbackTurn(
+        turn_key="turn-1",
         issue=issue,
         pull_request=PullRequestSnapshot(
             number=2,
@@ -67,6 +68,8 @@ def test_agent_adapter_data_model() -> None:
             head_sha="h",
             base_sha="b",
             draft=False,
+            state="open",
+            merged=False,
         ),
         review_comments=(
             PullRequestReviewComment(

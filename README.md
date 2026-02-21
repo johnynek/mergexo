@@ -54,6 +54,8 @@ uv run mergexo run --config mergexo.toml
 
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
 
+The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `false`) until rollout is complete.
+
 ## Generated design doc contract
 
 The Codex prompt requires reporting likely implementation files in `touch_paths`, which are written into the design doc frontmatter.

@@ -4,7 +4,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
-from mergexo.models import GeneratedDesign, Issue, PullRequestIssueComment, PullRequestReviewComment, PullRequestSnapshot
+from mergexo.models import (
+    GeneratedDesign,
+    Issue,
+    PullRequestIssueComment,
+    PullRequestReviewComment,
+    PullRequestSnapshot,
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,7 @@ class FeedbackResult:
 
 @dataclass(frozen=True)
 class FeedbackTurn:
+    turn_key: str
     issue: Issue
     pull_request: PullRequestSnapshot
     review_comments: tuple[PullRequestReviewComment, ...]

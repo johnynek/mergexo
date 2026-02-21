@@ -24,6 +24,8 @@ def test_model_dataclasses_and_version() -> None:
         head_sha="h",
         base_sha="b",
         draft=False,
+        state="open",
+        merged=False,
     )
     review_comment = PullRequestReviewComment(
         comment_id=1,
@@ -45,7 +47,9 @@ def test_model_dataclasses_and_version() -> None:
         created_at="t1",
         updated_at="t2",
     )
-    gen = GeneratedDesign(title="Title", design_doc_markdown="# Doc", touch_paths=("a.py",), summary="sum")
+    gen = GeneratedDesign(
+        title="Title", design_doc_markdown="# Doc", touch_paths=("a.py",), summary="sum"
+    )
     result = WorkResult(issue_number=1, branch="b", pr_number=2, pr_url="u")
 
     assert __version__ == "0.1.0"
@@ -82,6 +86,7 @@ def test_build_design_prompt_contains_required_contract() -> None:
 
 def test_build_feedback_prompt_contains_structured_sections() -> None:
     turn = FeedbackTurn(
+        turn_key="turn-key-1",
         issue=Issue(number=9, title="t", body="b", html_url="u", labels=("x",)),
         pull_request=PullRequestSnapshot(
             number=5,
@@ -90,6 +95,8 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
             head_sha="head",
             base_sha="base",
             draft=False,
+            state="open",
+            merged=False,
         ),
         review_comments=(
             PullRequestReviewComment(
@@ -123,3 +130,4 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "review_comment_id" in prompt
     assert "issue comments on the pr" in prompt.lower()
     assert "src/a.py" in prompt
+    assert "turn_key" in prompt

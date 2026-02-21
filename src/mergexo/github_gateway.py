@@ -74,6 +74,30 @@ class GitHubGateway:
         html_url = _as_string(payload_obj.get("html_url"))
         return PullRequest(number=number, html_url=html_url)
 
+    def get_issue(self, issue_number: int) -> Issue:
+        path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}"
+        payload = self._api_json("GET", path)
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for issue")
+        number = _as_int(payload_obj.get("number"), field="number")
+        title = _as_string(payload_obj.get("title"))
+        body = _as_string(payload_obj.get("body"))
+        html_url = _as_string(payload_obj.get("html_url"))
+        labels_obj = payload_obj.get("labels")
+        label_names: list[str] = []
+        if isinstance(labels_obj, list):
+            for entry in labels_obj:
+                entry_obj = _as_object_dict(entry)
+                if entry_obj is None:
+                    continue
+                label = entry_obj.get("name")
+                if isinstance(label, str):
+                    label_names.append(label)
+        return Issue(
+            number=number, title=title, body=body, html_url=html_url, labels=tuple(label_names)
+        )
+
     def get_pull_request(self, pr_number: int) -> PullRequestSnapshot:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}"
         payload = self._api_json("GET", path)
@@ -93,6 +117,8 @@ class GitHubGateway:
             head_sha=_as_string(head.get("sha")),
             base_sha=_as_string(base.get("sha")),
             draft=_as_bool(payload_obj.get("draft")),
+            state=_as_string(payload_obj.get("state")),
+            merged=_as_bool(payload_obj.get("merged")),
         )
 
     def list_pull_request_files(self, pr_number: int) -> tuple[str, ...]:
@@ -233,7 +259,9 @@ def _as_optional_int(value: object) -> int | None:
         try:
             return int(value)
         except ValueError as exc:
-            raise RuntimeError(f"Unexpected GitHub response value for optional int field: {value}") from exc
+            raise RuntimeError(
+                f"Unexpected GitHub response value for optional int field: {value}"
+            ) from exc
     raise RuntimeError("Unexpected GitHub response type for optional int field")
 
 

@@ -67,7 +67,9 @@ def build_feedback_prompt(*, turn: FeedbackTurn) -> str:
         }
         for comment in turn.issue_comments
     ]
-    changed_files = "\n".join(f"- {path}" for path in turn.changed_files) or "- (no changed files reported)"
+    changed_files = (
+        "\n".join(f"- {path}" for path in turn.changed_files) or "- (no changed files reported)"
+    )
 
     return f"""
 You are the PR-feedback agent for repository issue #{turn.issue.number}.
@@ -77,6 +79,7 @@ Pull request:
 - title: {turn.pull_request.title}
 - head_sha: {turn.pull_request.head_sha}
 - base_sha: {turn.pull_request.base_sha}
+- turn_key: {turn.turn_key}
 
 Changed files:
 {changed_files}
