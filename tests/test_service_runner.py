@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 from mergexo.agent_adapter import AgentAdapter
-from mergexo.config import AppConfig, AuthConfig, CodexConfig, RepoConfig, RuntimeConfig
+from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import append_action_token, compute_operator_command_token
 from mergexo.github_gateway import GitHubGateway
 from mergexo.git_ops import GitRepoManager
@@ -39,23 +39,47 @@ def _app_config(
             git_checkout_root=tmp_path,
             service_python=service_python,
         ),
-        repo=RepoConfig(
-            owner="johnynek",
-            name="mergexo",
-            default_branch="main",
-            trigger_label="agent:design",
-            bugfix_label="agent:bugfix",
-            small_job_label="agent:small-job",
-            coding_guidelines_path="docs/python_style.md",
-            design_docs_dir="docs/design",
-            local_clone_source=None,
-            remote_url=None,
-            operations_issue_number=77,
-            operator_logins=("alice",),
+        repos=(
+            RepoConfig(
+                repo_id="mergexo",
+                owner="johnynek",
+                name="mergexo",
+                default_branch="main",
+                trigger_label="agent:design",
+                bugfix_label="agent:bugfix",
+                small_job_label="agent:small-job",
+                coding_guidelines_path="docs/python_style.md",
+                design_docs_dir="docs/design",
+                allowed_users=frozenset({"alice"}),
+                local_clone_source=None,
+                remote_url=None,
+                operations_issue_number=77,
+                operator_logins=("alice",),
+            ),
         ),
         codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
-        auth=AuthConfig(allowed_users=frozenset({"alice"})),
     )
+
+
+def _multi_repo_config(tmp_path: Path) -> AppConfig:
+    base = _app_config(tmp_path)
+    second = RepoConfig(
+        repo_id="bosatsu",
+        owner="johnynek",
+        name="bosatsu",
+        default_branch="main",
+        trigger_label="agent:design",
+        bugfix_label="agent:bugfix",
+        small_job_label="agent:small-job",
+        coding_guidelines_path="docs/python_style.md",
+        design_docs_dir="docs/design",
+        allowed_users=frozenset({"alice"}),
+        local_clone_source=None,
+        remote_url=None,
+        operations_issue_number=78,
+        operator_logins=("alice",),
+    )
+    return AppConfig(runtime=base.runtime, repos=(base.repo, second), codex=base.codex)
 
 
 @dataclass
@@ -104,11 +128,13 @@ def _seed_restart_command(state: StateStore, *, command_key: str) -> None:
         ),
         status="applied",
         result="pending",
+        repo_full_name="johnynek/mergexo",
     )
     state.request_runtime_restart(
         requested_by="alice",
         request_command_key=command_key,
         mode="git_checkout",
+        request_repo_full_name="johnynek/mergexo",
     )
 
 
@@ -139,6 +165,192 @@ def test_service_runner_returns_when_orchestrator_exits(
     )
     runner.run(once=False)
     assert called["runs"] == 1
+
+
+def test_service_runner_rejects_empty_repo_runtimes(tmp_path: Path) -> None:
+    cfg = AppConfig(
+        runtime=RuntimeConfig(
+            base_dir=tmp_path / "state",
+            worker_count=1,
+            poll_interval_seconds=60,
+            enable_feedback_loop=False,
+        ),
+        repos=(),
+        codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
+    )
+    runner = ServiceRunner(
+        config=cfg,
+        state=StateStore(tmp_path / "state.db"),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    with pytest.raises(RuntimeError, match="No repositories configured"):
+        runner.run(once=True)
+
+
+def test_service_runner_multi_repo_once_polls_each_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    runs: list[str] = []
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args
+            repo = cast(RepoConfig, kwargs["repo"])
+            self._repo_full_name = repo.full_name
+
+        def run(self, *, once: bool) -> None:
+            assert once is True
+            runs.append(self._repo_full_name)
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (
+                cfg.repos[0],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+            (
+                cfg.repos[1],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+        ),
+    )
+    runner.run(once=True)
+    assert runs == [cfg.repos[0].full_name, cfg.repos[1].full_name]
+
+
+def test_service_runner_multi_repo_non_once_sleeps_between_polls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    runs: list[str] = []
+    sleep_calls: list[int] = []
+
+    class StopLoop(Exception):
+        pass
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args
+            repo = cast(RepoConfig, kwargs["repo"])
+            self._repo_full_name = repo.full_name
+
+        def run(self, *, once: bool) -> None:
+            assert once is True
+            runs.append(self._repo_full_name)
+
+    def fake_sleep(seconds: int) -> None:
+        sleep_calls.append(seconds)
+        raise StopLoop()
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr("mergexo.service_runner.time.sleep", fake_sleep)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (
+                cfg.repos[0],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+            (
+                cfg.repos[1],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+        ),
+    )
+    with pytest.raises(StopLoop):
+        runner.run(once=False)
+    assert runs == [cfg.repos[0].full_name]
+    assert sleep_calls == [cfg.runtime.poll_interval_seconds]
+
+
+def test_service_runner_multi_repo_restart_returns_when_handled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+
+        def run(self, *, once: bool) -> None:
+            _ = once
+            raise RestartRequested(mode="git_checkout", command_key="k")
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (
+                cfg.repos[0],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+            (
+                cfg.repos[1],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+        ),
+    )
+    monkeypatch.setattr(ServiceRunner, "_handle_restart_requested", lambda self, requested: True)
+    runner.run(once=False)
+
+
+def test_service_runner_multi_repo_restart_returns_on_once_when_not_restarted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+
+        def run(self, *, once: bool) -> None:
+            _ = once
+            raise RestartRequested(mode="git_checkout", command_key="k")
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (
+                cfg.repos[0],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+            (
+                cfg.repos[1],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+        ),
+    )
+    monkeypatch.setattr(ServiceRunner, "_handle_restart_requested", lambda self, requested: False)
+    runner.run(once=True)
 
 
 def test_service_runner_restart_failure_marks_failed_and_posts_reply(
@@ -434,3 +646,34 @@ def test_run_service_wrapper_constructs_runner(
     assert calls["once"] is True
     kwargs = cast(dict[str, object], calls["kwargs"])
     assert kwargs["startup_argv"] == ("mergexo", "service")
+
+
+def test_effective_repo_runtimes_and_github_fallback_paths(tmp_path: Path) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    first_github = cast(GitHubGateway, FakeGitHub())
+    second_github = cast(GitHubGateway, FakeGitHub())
+
+    runner_with_supplied = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (cfg.repos[0], first_github, cast(GitRepoManager, object())),
+            (cfg.repos[1], second_github, cast(GitRepoManager, object())),
+        ),
+    )
+    supplied = runner_with_supplied._effective_repo_runtimes()
+    assert supplied[0][0].full_name == cfg.repos[0].full_name
+    assert runner_with_supplied._github_for_repo("missing/repo") is first_github
+
+    runner_with_factory = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    built = runner_with_factory._effective_repo_runtimes()
+    assert len(built) == 2
+    assert built[0][0].full_name == cfg.repos[0].full_name

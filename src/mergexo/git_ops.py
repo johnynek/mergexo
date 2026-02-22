@@ -31,8 +31,6 @@ class GitRepoManager:
         self.layout.mirror_path.parent.mkdir(parents=True, exist_ok=True)
         self.layout.checkouts_root.mkdir(parents=True, exist_ok=True)
         self._ensure_mirror()
-        for slot in range(self.runtime.worker_count):
-            self.ensure_checkout(slot)
 
     def ensure_checkout(self, slot: int) -> Path:
         checkout_path = self.slot_path(slot)

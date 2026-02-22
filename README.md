@@ -8,7 +8,7 @@ MergeXO is a local-first Python orchestrator that watches labeled issues and rou
 
 This repository currently implements Phase 1 of the MVP:
 
-- Configure one target repository, worker count `N`, base state directory, poll interval, and flow labels.
+- Configure one or more target repositories, worker count `N`, base state directory, poll interval, and flow labels.
 - Initialize a shared mirror plus `N` checkout slots.
 - Poll GitHub issues with configured trigger labels using `gh api`.
 - Farm each new issue to an available worker slot.
@@ -30,8 +30,9 @@ This repository currently implements Phase 1 of the MVP:
 cp mergexo.toml.example mergexo.toml
 ```
 
-Set `[auth].allowed_users` to the exact GitHub usernames that are allowed to trigger MergeXO.
-Startup fails closed when `[auth]` is missing or empty.
+Set allowlists per repo with `repo.allowed_users` (or use `[auth].allowed_users` only as a
+legacy single-repo fallback). In multi-repo configs, each `[repo.<id>]` can set its own
+allowlist; if omitted it defaults to `[owner]`.
 
 2. Sync environment:
 
@@ -77,6 +78,15 @@ The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `fals
 
 Use `--verbose` on `init`, `run`, or `service` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
 
+## State schema upgrade note
+
+Multi-repo support uses a repo-scoped state schema. Upgrading from older builds requires reinitializing the state DB:
+
+1. Stop MergeXO.
+2. Remove the previous `state.db`.
+3. Run `mergexo init`.
+4. Restart MergeXO.
+
 ## GitHub operator commands
 
 Enable GitHub operations with:
@@ -121,7 +131,7 @@ Unblock user story (`head_sha` override):
 
 ## Issue labels and precedence
 
-MergeXO reads three labels from `[repo]`:
+MergeXO reads these labels from each repo config (`[repo]` or `[repo.<id>]`):
 
 - `trigger_label` (default behavior, design-doc flow)
 - `bugfix_label` (direct bugfix flow)
@@ -146,8 +156,11 @@ Bugfix and small-job prompts require the agent to read and follow `coding_guidel
 
 ## Authentication allowlist
 
-`[auth].allowed_users` is required. MergeXO normalizes entries to lowercase at startup and
-matches case-insensitively at runtime.
+MergeXO normalizes allowlist entries to lowercase and matches case-insensitively at runtime.
+
+- Multi-repo (`[repo.<id>]`): use `allowed_users` in each repo table. If omitted, it defaults to `[owner]`.
+- Legacy single-repo (`[repo]`): `repo.allowed_users` is preferred; `[auth].allowed_users` is a compatibility fallback.
+- If neither is configured in legacy single-repo mode, allowlist defaults to `[owner]`.
 
 For users not in `allowed_users`, MergeXO fully ignores:
 

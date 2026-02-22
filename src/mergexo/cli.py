@@ -4,9 +4,10 @@ import argparse
 import json
 from pathlib import Path
 import re
+import time
 
 from mergexo.codex_adapter import CodexAdapter
-from mergexo.config import AppConfig, load_config
+from mergexo.config import AppConfig, RepoConfig, load_config
 from mergexo.git_ops import GitRepoManager
 from mergexo.github_gateway import GitHubGateway
 from mergexo.observability import configure_logging
@@ -119,6 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         help="Override last_seen_head_sha when resetting blocked PRs",
     )
+    blocked_reset_parser.add_argument(
+        "--repo",
+        type=str,
+        help="Optional repo filter (repo id or owner/name). Required with --pr in multi-repo mode.",
+    )
 
     return parser
 
@@ -149,42 +155,61 @@ def _cmd_init(config: AppConfig) -> None:
     state = StateStore(_state_db_path(config))
     _ = state
 
-    git_manager = GitRepoManager(config.runtime, config.repo)
-    git_manager.ensure_layout()
+    repo_managers: list[tuple[RepoConfig, GitRepoManager]] = []
+    for repo in config.repos:
+        git_manager = GitRepoManager(config.runtime, repo)
+        git_manager.ensure_layout()
+        repo_managers.append((repo, git_manager))
 
     print(f"Initialized MergeXO base dir: {config.runtime.base_dir}")
-    print(f"Mirror: {git_manager.layout.mirror_path}")
-    print(f"Checkouts: {git_manager.layout.checkouts_root}")
+    for repo, git_manager in repo_managers:
+        print(f"Repo: {repo.full_name}")
+        print(f"Mirror: {git_manager.layout.mirror_path}")
+        print(f"Checkouts: {git_manager.layout.checkouts_root}")
 
 
 def _cmd_run(config: AppConfig, *, once: bool) -> None:
     config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
     state = StateStore(_state_db_path(config))
-    github = GitHubGateway(config.repo.owner, config.repo.name)
-    git_manager = GitRepoManager(config.runtime, config.repo)
     agent = CodexAdapter(config.codex)
+    runtimes = _build_repo_runtimes(config)
+    github_by_repo_full_name = {repo.full_name: github for repo, github, _ in runtimes}
+    orchestrators = [
+        Phase1Orchestrator(
+            config,
+            state=state,
+            github=github,
+            git_manager=git_manager,
+            repo=repo,
+            github_by_repo_full_name=github_by_repo_full_name,
+            agent=agent,
+        )
+        for repo, github, git_manager in runtimes
+    ]
+    if len(orchestrators) == 1:
+        orchestrators[0].run(once=once)
+        return
+    if once:
+        for orchestrator in orchestrators:
+            orchestrator.run(once=True)
+        return
 
-    orchestrator = Phase1Orchestrator(
-        config,
-        state=state,
-        github=github,
-        git_manager=git_manager,
-        agent=agent,
-    )
-    orchestrator.run(once=once)
+    idx = 0
+    while True:
+        orchestrators[idx].run(once=True)
+        idx = (idx + 1) % len(orchestrators)
+        time.sleep(config.runtime.poll_interval_seconds)
 
 
 def _cmd_service(config: AppConfig, *, once: bool) -> None:
     config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
     state = StateStore(_state_db_path(config))
-    github = GitHubGateway(config.repo.owner, config.repo.name)
-    git_manager = GitRepoManager(config.runtime, config.repo)
     agent = CodexAdapter(config.codex)
+    runtimes = _build_repo_runtimes(config)
     run_service(
         config=config,
         state=state,
-        github=github,
-        git_manager=git_manager,
+        repo_runtimes=runtimes,
         agent=agent,
         once=once,
     )
@@ -193,23 +218,28 @@ def _cmd_service(config: AppConfig, *, once: bool) -> None:
 def _cmd_feedback(config: AppConfig, args: argparse.Namespace) -> None:
     state = StateStore(_state_db_path(config))
     if args.feedback_command == "blocked":
-        _cmd_feedback_blocked(state, args)
+        _cmd_feedback_blocked(config, state, args)
         return
     raise RuntimeError(f"Unknown feedback command: {args.feedback_command}")
 
 
-def _cmd_feedback_blocked(state: StateStore, args: argparse.Namespace) -> None:
+def _cmd_feedback_blocked(config: AppConfig, state: StateStore, args: argparse.Namespace) -> None:
     if args.blocked_command == "list":
         _cmd_feedback_blocked_list(state, as_json=bool(args.json))
         return
     if args.blocked_command == "reset":
+        repo_filter = (
+            _resolve_repo_filter(config, str(args.repo)) if args.repo is not None else None
+        )
         _cmd_feedback_blocked_reset(
             state,
+            configured_repos=config.repos,
             pr_numbers=tuple(args.pr or ()),
             reset_all=bool(args.all),
             yes=bool(args.yes),
             dry_run=bool(args.dry_run),
             head_sha_override=str(args.head_sha) if args.head_sha is not None else None,
+            repo_full_name_filter=repo_filter,
         )
         return
     raise RuntimeError(f"Unknown blocked command: {args.blocked_command}")
@@ -220,6 +250,7 @@ def _cmd_feedback_blocked_list(state: StateStore, *, as_json: bool) -> None:
     if as_json:
         payload = [
             {
+                "repo_full_name": item.repo_full_name,
                 "pr_number": item.pr_number,
                 "issue_number": item.issue_number,
                 "branch": item.branch,
@@ -239,7 +270,7 @@ def _cmd_feedback_blocked_list(state: StateStore, *, as_json: bool) -> None:
 
     for item in blocked:
         print(
-            f"pr_number={item.pr_number} issue_number={item.issue_number} "
+            f"repo={item.repo_full_name} pr_number={item.pr_number} issue_number={item.issue_number} "
             f"pending_events={item.pending_event_count} blocked_at={item.updated_at}"
         )
         print(f"branch={item.branch}")
@@ -250,14 +281,18 @@ def _cmd_feedback_blocked_list(state: StateStore, *, as_json: bool) -> None:
 def _cmd_feedback_blocked_reset(
     state: StateStore,
     *,
+    configured_repos: tuple[RepoConfig, ...],
     pr_numbers: tuple[int, ...],
     reset_all: bool,
     yes: bool,
     dry_run: bool,
     head_sha_override: str | None,
+    repo_full_name_filter: str | None,
 ) -> None:
     if reset_all and not (yes or dry_run):
         raise RuntimeError("--all requires --yes (or run with --dry-run)")
+    if pr_numbers and len(configured_repos) > 1 and repo_full_name_filter is None:
+        raise RuntimeError("--repo is required with --pr when multiple repos are configured")
     normalized_head_sha: str | None = None
     if head_sha_override is not None:
         candidate = head_sha_override.strip()
@@ -265,8 +300,10 @@ def _cmd_feedback_blocked_reset(
             raise RuntimeError("--head-sha must be a hex git commit SHA (7-64 chars)")
         normalized_head_sha = candidate.lower()
 
-    blocked = state.list_blocked_pull_requests()
-    blocked_by_pr = {item.pr_number: item for item in blocked}
+    blocked = state.list_blocked_pull_requests(repo_full_name=repo_full_name_filter)
+    blocked_by_pr: dict[int, list[str]] = {}
+    for item in blocked:
+        blocked_by_pr.setdefault(item.pr_number, []).append(item.repo_full_name)
     if reset_all:
         selected_pr_numbers = tuple(item.pr_number for item in blocked)
     else:
@@ -275,14 +312,19 @@ def _cmd_feedback_blocked_reset(
     matched_pr_numbers = tuple(
         pr_number for pr_number in selected_pr_numbers if pr_number in blocked_by_pr
     )
-    if not matched_pr_numbers:
+    if not matched_pr_numbers and not reset_all:
         print("No blocked pull requests matched.")
         return
 
     if dry_run:
-        summary = "Would reset blocked pull requests: " + ", ".join(
-            str(pr_number) for pr_number in matched_pr_numbers
-        )
+        if reset_all:
+            summary = "Would reset all blocked pull requests"
+        else:
+            summary = "Would reset blocked pull requests: " + ", ".join(
+                str(pr_number) for pr_number in matched_pr_numbers
+            )
+        if repo_full_name_filter is not None:
+            summary += f" (repo={repo_full_name_filter})"
         if normalized_head_sha is not None:
             summary += f" (override last_seen_head_sha={normalized_head_sha})"
         print(summary)
@@ -291,8 +333,35 @@ def _cmd_feedback_blocked_reset(
     reset_count = state.reset_blocked_pull_requests(
         pr_numbers=None if reset_all else matched_pr_numbers,
         last_seen_head_sha_override=normalized_head_sha,
+        repo_full_name=repo_full_name_filter,
     )
     print(f"Reset {reset_count} blocked pull request(s).")
+
+
+def _build_repo_runtimes(
+    config: AppConfig,
+) -> tuple[tuple[RepoConfig, GitHubGateway, GitRepoManager], ...]:
+    runtimes: list[tuple[RepoConfig, GitHubGateway, GitRepoManager]] = []
+    for repo in config.repos:
+        runtimes.append(
+            (
+                repo,
+                GitHubGateway(repo.owner, repo.name),
+                GitRepoManager(config.runtime, repo),
+            )
+        )
+    return tuple(runtimes)
+
+
+def _resolve_repo_filter(config: AppConfig, raw_repo_filter: str) -> str:
+    candidate = raw_repo_filter.strip()
+    if not candidate:
+        raise RuntimeError("--repo must be non-empty")
+    for repo in config.repos:
+        if candidate == repo.repo_id or candidate == repo.full_name:
+            return repo.full_name
+    available = ", ".join(sorted(repo.full_name for repo in config.repos))
+    raise RuntimeError(f"Unknown --repo value {candidate!r}. Expected one of: {available}")
 
 
 def _summarize_block_reason(error: str | None) -> str:

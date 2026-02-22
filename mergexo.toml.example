@@ -15,19 +15,17 @@ restart_supported_modes = ["git_checkout"]
 # Required for pypi mode.
 # service_python = "/usr/bin/python3"
 
-[repo]
+[repo.mergexo]
 owner = "johnynek"
-name = "target-repo"
+# name omitted => "mergexo"
 default_branch = "main"
-# Design-doc intake label (existing behavior)
 trigger_label = "agent:design"
-# Direct bugfix flow label
 bugfix_label = "agent:bugfix"
-# Direct small scoped job flow label
 small_job_label = "agent:small-job"
-# Path (repo-relative) to coding + testing guidelines agents should follow
+# Required path (repo-relative) to coding + testing guidelines agents should follow
 coding_guidelines_path = "docs/python_style.md"
 design_docs_dir = "docs/design"
+allowed_users = ["maintainer1", "maintainer2"]
 # Optional issue used for global operator commands (restart and cross-PR unblock).
 # operations_issue_number = 123
 # GitHub logins allowed to run /mergexo commands.
@@ -37,10 +35,19 @@ operator_logins = []
 # Optional explicit remote URL. Defaults to git@github.com:<owner>/<name>.git
 # remote_url = "git@github.com:johnynek/target-repo.git"
 
-[auth]
-# Required allowlist of GitHub usernames. Only these users can trigger issue intake
-# and feedback-loop processing. Matching is case-insensitive.
-allowed_users = ["maintainer1", "maintainer2"]
+[repo.bosatsu]
+owner = "johnynek"
+name = "bosatsu"
+coding_guidelines_path = "docs/python_style.md"
+# allowed_users omitted => defaults to ["johnynek"]
+
+# Legacy single-repo compatibility:
+# [repo]
+# owner = "johnynek"
+# name = "target-repo"
+# coding_guidelines_path = "docs/python_style.md"
+# [auth]
+# allowed_users = ["maintainer1", "maintainer2"]
 
 [codex]
 enabled = true

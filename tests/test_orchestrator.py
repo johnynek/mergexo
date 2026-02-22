@@ -21,7 +21,7 @@ from mergexo.agent_adapter import (
     GitOpRequest,
     ReviewReply,
 )
-from mergexo.config import AppConfig, AuthConfig, CodexConfig, RepoConfig, RuntimeConfig
+from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import ParsedOperatorCommand, parse_operator_command
 from mergexo.github_gateway import GitHubGateway
 from mergexo.models import (
@@ -389,40 +389,129 @@ class FakeState:
         self.implementation_candidates: list[ImplementationCandidateState] = []
         self.status_updates: list[tuple[int, int, str, str | None, str | None]] = []
 
-    def can_enqueue(self, issue_number: int) -> bool:
+    def can_enqueue(self, issue_number: int, *, repo_full_name: str | None = None) -> bool:
+        _ = repo_full_name
         return issue_number in self.allowed
 
-    def mark_running(self, issue_number: int) -> None:
+    def mark_running(self, issue_number: int, *, repo_full_name: str | None = None) -> None:
+        _ = repo_full_name
         self.running.append(issue_number)
 
     def mark_completed(
-        self, *, issue_number: int, branch: str, pr_number: int, pr_url: str
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        pr_number: int,
+        pr_url: str,
+        repo_full_name: str | None = None,
     ) -> None:
+        _ = repo_full_name
         self.completed.append(
             WorkResult(issue_number=issue_number, branch=branch, pr_number=pr_number, pr_url=pr_url)
         )
 
-    def mark_failed(self, *, issue_number: int, error: str) -> None:
+    def mark_failed(
+        self, *, issue_number: int, error: str, repo_full_name: str | None = None
+    ) -> None:
+        _ = repo_full_name
         self.failed.append((issue_number, error))
 
-    def save_agent_session(self, *, issue_number: int, adapter: str, thread_id: str | None) -> None:
+    def save_agent_session(
+        self,
+        *,
+        issue_number: int,
+        adapter: str,
+        thread_id: str | None,
+        repo_full_name: str | None = None,
+    ) -> None:
+        _ = repo_full_name
         self.saved_sessions.append((issue_number, adapter, thread_id))
 
-    def get_agent_session(self, issue_number: int) -> tuple[str, str | None] | None:
+    def get_agent_session(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> tuple[str, str | None] | None:
+        _ = repo_full_name
         for num, adapter, thread_id in self.saved_sessions:
             if num == issue_number:
                 return adapter, thread_id
         return None
 
-    def list_tracked_pull_requests(self) -> tuple[TrackedPullRequestState, ...]:
+    def list_tracked_pull_requests(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[TrackedPullRequestState, ...]:
+        _ = repo_full_name
         return tuple(self.tracked)
 
-    def list_implementation_candidates(self) -> tuple[ImplementationCandidateState, ...]:
+    def list_implementation_candidates(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[ImplementationCandidateState, ...]:
+        _ = repo_full_name
         return tuple(self.implementation_candidates)
 
     def get_runtime_operation(self, op_name: str):  # type: ignore[no-untyped-def]
         _ = op_name
         return None
+
+    def list_blocked_pull_requests(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[object, ...]:
+        _ = repo_full_name
+        return ()
+
+    def get_operator_command(self, command_key: str, *, repo_full_name: str | None = None):  # type: ignore[no-untyped-def]
+        _ = command_key, repo_full_name
+        return None
+
+    def record_operator_command(self, **kwargs):  # type: ignore[no-untyped-def]
+        return OperatorCommandRecord(
+            command_key=str(kwargs.get("command_key", "k")),
+            issue_number=int(kwargs.get("issue_number", 0)),
+            pr_number=kwargs.get("pr_number"),
+            comment_id=int(kwargs.get("comment_id", 0)),
+            author_login=str(kwargs.get("author_login", "alice")),
+            command=cast(str, kwargs.get("command", "help")),
+            args_json=str(kwargs.get("args_json", "{}")),
+            status=cast(str, kwargs.get("status", "applied")),
+            result=str(kwargs.get("result", "")),
+            created_at="now",
+            updated_at="now",
+            repo_full_name=str(kwargs.get("repo_full_name", "")),
+        )
+
+    def update_operator_command_result(self, **kwargs):  # type: ignore[no-untyped-def]
+        _ = kwargs
+        return None
+
+    def request_runtime_restart(self, **kwargs):  # type: ignore[no-untyped-def]
+        repo_full_name = str(kwargs.get("request_repo_full_name", ""))
+        return (
+            cast(
+                object,
+                type(
+                    "RuntimeOp",
+                    (),
+                    {
+                        "op_name": "restart",
+                        "status": "pending",
+                        "requested_by": str(kwargs.get("requested_by", "alice")),
+                        "request_command_key": str(kwargs.get("request_command_key", "k")),
+                        "request_repo_full_name": repo_full_name,
+                        "mode": kwargs.get("mode", "git_checkout"),
+                        "detail": None,
+                    },
+                )(),
+            ),
+            True,
+        )
+
+    def set_runtime_operation_status(self, **kwargs):  # type: ignore[no-untyped-def]
+        _ = kwargs
+        return None
+
+    def reset_blocked_pull_requests(self, **kwargs):  # type: ignore[no-untyped-def]
+        _ = kwargs
+        return 0
 
     def mark_pr_status(
         self,
@@ -432,14 +521,18 @@ class FakeState:
         status: str,
         last_seen_head_sha: str | None = None,
         error: str | None = None,
+        repo_full_name: str | None = None,
     ) -> None:
+        _ = repo_full_name
         self.status_updates.append((pr_number, issue_number, status, last_seen_head_sha, error))
 
-    def ingest_feedback_events(self, events: object) -> None:
-        _ = events
+    def ingest_feedback_events(self, events: object, *, repo_full_name: str | None = None) -> None:
+        _ = events, repo_full_name
 
-    def list_pending_feedback_events(self, pr_number: int) -> tuple[object, ...]:
-        _ = pr_number
+    def list_pending_feedback_events(
+        self, pr_number: int, *, repo_full_name: str | None = None
+    ) -> tuple[object, ...]:
+        _ = pr_number, repo_full_name
         return ()
 
     def finalize_feedback_turn(
@@ -450,8 +543,9 @@ class FakeState:
         processed_event_keys: tuple[str, ...],
         session: AgentSession,
         head_sha: str,
+        repo_full_name: str | None = None,
     ) -> None:
-        _ = pr_number, issue_number, processed_event_keys, session, head_sha
+        _ = pr_number, issue_number, processed_event_keys, session, head_sha, repo_full_name
 
 
 def _config(
@@ -478,22 +572,25 @@ def _config(
             restart_default_mode=cast(RestartMode, restart_default_mode),
             restart_supported_modes=cast(tuple[RestartMode, ...], restart_supported_modes),
         ),
-        repo=RepoConfig(
-            owner="johnynek",
-            name="mergexo",
-            default_branch="main",
-            trigger_label="agent:design",
-            bugfix_label="agent:bugfix",
-            small_job_label="agent:small-job",
-            coding_guidelines_path="docs/python_style.md",
-            design_docs_dir="docs/design",
-            local_clone_source=None,
-            remote_url=None,
-            operations_issue_number=operations_issue_number,
-            operator_logins=operator_logins,
+        repos=(
+            RepoConfig(
+                repo_id="mergexo",
+                owner="johnynek",
+                name="mergexo",
+                default_branch="main",
+                trigger_label="agent:design",
+                bugfix_label="agent:bugfix",
+                small_job_label="agent:small-job",
+                coding_guidelines_path="docs/python_style.md",
+                design_docs_dir="docs/design",
+                allowed_users=frozenset(login.lower() for login in allowed_users),
+                local_clone_source=None,
+                remote_url=None,
+                operations_issue_number=operations_issue_number,
+                operator_logins=operator_logins,
+            ),
         ),
         codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
-        auth=AuthConfig(allowed_users=frozenset(login.lower() for login in allowed_users)),
     )
 
 
@@ -535,6 +632,7 @@ def test_slugify_is_safe(text: str) -> None:
 
 def test_flow_helpers() -> None:
     cfg = RepoConfig(
+        repo_id="r",
         owner="o",
         name="r",
         default_branch="main",
@@ -543,6 +641,7 @@ def test_flow_helpers() -> None:
         small_job_label="agent:small-job",
         coding_guidelines_path="docs/python_style.md",
         design_docs_dir="docs/design",
+        allowed_users=frozenset({"o"}),
         local_clone_source=None,
         remote_url=None,
     )
@@ -645,7 +744,7 @@ def test_process_issue_rejects_unauthorized_author_before_side_effects(tmp_path:
 
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
-    with pytest.raises(RuntimeError, match="not allowed by auth.allowed_users"):
+    with pytest.raises(RuntimeError, match="not allowed by repo.allowed_users"):
         orch._process_issue(_issue(author_login="outsider"), "design_doc")
 
     assert git.ensure_checkout_calls == []
@@ -765,7 +864,7 @@ def test_process_implementation_candidate_rejects_unauthorized_author(tmp_path: 
     state = FakeState()
 
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
-    with pytest.raises(RuntimeError, match="not allowed by auth.allowed_users"):
+    with pytest.raises(RuntimeError, match="not allowed by repo.allowed_users"):
         orch._process_implementation_candidate(
             ImplementationCandidateState(
                 issue_number=7,
@@ -1298,9 +1397,18 @@ def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
 
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     tracked = _tracked_state_from_store(state)
@@ -1337,9 +1445,18 @@ def test_feedback_turn_blocks_legacy_tracked_pr_when_issue_author_unauthorized(
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
 
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     tracked = _tracked_state_from_store(state)
@@ -1387,9 +1504,18 @@ def test_feedback_turn_retry_after_crash_does_not_duplicate_replies(
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     original_finalize = state.finalize_feedback_turn
@@ -1445,9 +1571,18 @@ def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     configure_logging(verbose=True)
 
@@ -1491,13 +1626,18 @@ def test_feedback_turn_blocks_on_cross_cycle_history_rewrite_and_is_comment_idem
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
     state.mark_pr_status(
         pr_number=101,
         issue_number=issue.number,
         status="awaiting_feedback",
         last_seen_head_sha="head-old",
+        repo_full_name=cfg.repo.full_name,
     )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
@@ -1544,14 +1684,24 @@ def test_feedback_turn_allows_cross_cycle_fast_forward_drift(tmp_path: Path) -> 
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     state.mark_pr_status(
         pr_number=101,
         issue_number=issue.number,
         status="awaiting_feedback",
         last_seen_head_sha="head-old",
+        repo_full_name=cfg.repo.full_name,
     )
 
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
@@ -1598,9 +1748,18 @@ def test_feedback_turn_blocks_when_agent_rewrites_local_history(tmp_path: Path) 
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -1644,9 +1803,18 @@ def test_feedback_turn_marks_closed_pr_and_stops_tracking(tmp_path: Path) -> Non
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -1792,9 +1960,18 @@ def test_feedback_turn_marks_merged_pr_and_stops_tracking(tmp_path: Path) -> Non
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -1813,7 +1990,11 @@ def test_feedback_turn_blocks_when_session_missing(tmp_path: Path) -> None:
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
@@ -1844,9 +2025,18 @@ def test_feedback_turn_commit_no_staged_changes_blocks_and_keeps_event_pending(
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     def raise_no_staged(checkout_path: Path, message: str) -> None:
@@ -1928,9 +2118,18 @@ def test_feedback_turn_blocks_on_pre_finalize_remote_history_rewrite(tmp_path: P
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -1982,9 +2181,18 @@ def test_feedback_turn_marks_merged_when_pr_merges_before_finalize(tmp_path: Pat
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -2043,9 +2251,18 @@ def test_feedback_turn_marks_closed_when_pr_closes_before_finalize(tmp_path: Pat
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -2083,9 +2300,18 @@ def test_feedback_turn_commit_unexpected_error_propagates(tmp_path: Path) -> Non
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     def raise_other(checkout_path: Path, message: str) -> None:
@@ -2117,9 +2343,18 @@ def test_feedback_turn_commit_push_marks_closed(tmp_path: Path) -> None:
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     original_push = git.push_branch
@@ -2162,9 +2397,18 @@ def test_feedback_turn_commit_push_marks_merged(tmp_path: Path) -> None:
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     original_push = git.push_branch
@@ -2209,9 +2453,18 @@ def test_feedback_turn_returns_when_expected_tokens_missing(
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     monkeypatch.setattr(orch, "_fetch_remote_action_tokens", lambda pr_number: set())
 
@@ -2361,9 +2614,18 @@ def test_feedback_turn_processes_only_authorized_comments(tmp_path: Path) -> Non
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -2419,9 +2681,18 @@ def test_feedback_turn_ignores_all_unauthorized_comments(tmp_path: Path) -> None
     agent = FakeAgent()
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -2809,9 +3080,18 @@ def test_feedback_turn_returns_when_git_op_loop_blocks(tmp_path: Path) -> None:
 
     state = StateStore(tmp_path / "state.db")
     state.mark_completed(
-        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
     )
-    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     tracked = _tracked_state_from_store(state)
@@ -2870,13 +3150,16 @@ def test_operator_unblock_command_resets_blocked_pr_and_is_idempotent(tmp_path: 
     )
     git = FakeGitManager(tmp_path / "checkouts")
     state = StateStore(tmp_path / "state.db")
-    state.mark_completed(7, "agent/design/7-worker", 101, "https://example/pr/101")
+    state.mark_completed(
+        7, "agent/design/7-worker", 101, "https://example/pr/101", repo_full_name=cfg.repo.full_name
+    )
     state.mark_pr_status(
         pr_number=101,
         issue_number=7,
         status="blocked",
         last_seen_head_sha="head-old",
         error="blocked for test",
+        repo_full_name=cfg.repo.full_name,
     )
     github = OperatorGitHub(
         {
@@ -2924,13 +3207,16 @@ def test_operator_unblock_without_pr_fails_on_operations_issue(tmp_path: Path) -
     )
     git = FakeGitManager(tmp_path / "checkouts")
     state = StateStore(tmp_path / "state.db")
-    state.mark_completed(7, "agent/design/7-worker", 101, "https://example/pr/101")
+    state.mark_completed(
+        7, "agent/design/7-worker", 101, "https://example/pr/101", repo_full_name=cfg.repo.full_name
+    )
     state.mark_pr_status(
         pr_number=101,
         issue_number=7,
         status="blocked",
         last_seen_head_sha="head-old",
         error="blocked for test",
+        repo_full_name=cfg.repo.full_name,
     )
     github = OperatorGitHub(
         {
@@ -3171,13 +3457,16 @@ def test_operator_scan_skips_non_commands_bots_and_reconciles_existing(tmp_path:
     )
     git = FakeGitManager(tmp_path / "checkouts")
     state = StateStore(tmp_path / "state.db")
-    state.mark_completed(7, "agent/design/7-worker", 101, "https://example/pr/101")
+    state.mark_completed(
+        7, "agent/design/7-worker", 101, "https://example/pr/101", repo_full_name=cfg.repo.full_name
+    )
     state.mark_pr_status(
         pr_number=101,
         issue_number=7,
         status="blocked",
         last_seen_head_sha="head-1",
         error="blocked",
+        repo_full_name=cfg.repo.full_name,
     )
     existing_key = "101:30:2026-02-22T12:10:00Z"
     state.record_operator_command(

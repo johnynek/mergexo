@@ -9,12 +9,14 @@ from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
 from mergexo.state import (
     StateStore,
+    _normalize_repo_full_name,
     _parse_operator_command_name,
     _parse_operator_command_row,
     _parse_operator_command_status,
     _parse_restart_mode,
     _parse_runtime_operation_row,
     _parse_runtime_operation_status,
+    _table_columns,
 )
 
 
@@ -162,6 +164,43 @@ def test_list_implementation_candidates_reads_merged_design_runs(tmp_path: Path)
     assert candidate.design_branch == "agent/design/8-foo"
     assert candidate.design_pr_number == 101
     assert candidate.design_pr_url == "https://example/pr/101"
+
+
+def test_list_implementation_candidates_repo_filter(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(
+        8,
+        "agent/design/8-foo",
+        101,
+        "https://example/pr/101",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_pr_status(
+        pr_number=101,
+        issue_number=8,
+        status="merged",
+        last_seen_head_sha="head1",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_completed(
+        9,
+        "agent/design/9-bar",
+        102,
+        "https://example/pr/102",
+        repo_full_name="o/repo-b",
+    )
+    store.mark_pr_status(
+        pr_number=102,
+        issue_number=9,
+        status="merged",
+        last_seen_head_sha="head2",
+        repo_full_name="o/repo-b",
+    )
+
+    repo_a = store.list_implementation_candidates(repo_full_name="o/repo-a")
+    assert len(repo_a) == 1
+    assert repo_a[0].repo_full_name == "o/repo-a"
 
 
 def test_list_blocked_and_reset_pull_requests(tmp_path: Path) -> None:
@@ -320,8 +359,8 @@ def test_get_agent_session_rejects_invalid_adapter_type(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO agent_sessions(issue_number, adapter, thread_id) VALUES(?, ?, ?)",
-            (1, sqlite3.Binary(b"\x01"), None),
+            "INSERT INTO agent_sessions(repo_full_name, issue_number, adapter, thread_id) VALUES(?, ?, ?, ?)",
+            ("__single_repo__", 1, sqlite3.Binary(b"\x01"), None),
         )
         conn.commit()
     finally:
@@ -338,8 +377,8 @@ def test_get_agent_session_rejects_invalid_thread_id_type(tmp_path: Path) -> Non
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO agent_sessions(issue_number, adapter, thread_id) VALUES(?, ?, ?)",
-            (2, "codex", sqlite3.Binary(b"\x02")),
+            "INSERT INTO agent_sessions(repo_full_name, issue_number, adapter, thread_id) VALUES(?, ?, ?, ?)",
+            ("__single_repo__", 2, "codex", sqlite3.Binary(b"\x02")),
         )
         conn.commit()
     finally:
@@ -347,6 +386,18 @@ def test_get_agent_session_rejects_invalid_thread_id_type(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="Invalid thread_id"):
         store.get_agent_session(2)
+
+
+def test_get_agent_session_requires_repo_when_issue_number_collides(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.save_agent_session(
+        issue_number=5, adapter="codex", thread_id="thread-a", repo_full_name="o/a"
+    )
+    store.save_agent_session(
+        issue_number=5, adapter="codex", thread_id="thread-b", repo_full_name="o/b"
+    )
+    with pytest.raises(RuntimeError, match="specify repo_full_name"):
+        store.get_agent_session(5)
 
 
 def test_operator_commands_and_runtime_operations(tmp_path: Path) -> None:
@@ -394,6 +445,7 @@ def test_operator_commands_and_runtime_operations(tmp_path: Path) -> None:
     assert op.status == "pending"
     assert op.mode == "git_checkout"
     assert op.request_command_key == "99:100:2026-02-22T10:00:00Z"
+    assert op.request_repo_full_name == "__single_repo__"
 
     op_again, created_again = store.request_runtime_restart(
         requested_by="bob",
@@ -455,12 +507,13 @@ def test_operator_and_runtime_row_validation(tmp_path: Path) -> None:
         conn.execute(
             """
             INSERT INTO operator_commands(
-                command_key, issue_number, pr_number, comment_id, author_login,
+                repo_full_name, command_key, issue_number, pr_number, comment_id, author_login,
                 command, args_json, status, result
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                "__single_repo__",
                 "k",
                 1,
                 None,
@@ -474,10 +527,18 @@ def test_operator_and_runtime_row_validation(tmp_path: Path) -> None:
         )
         conn.execute(
             """
-            INSERT INTO runtime_operations(op_name, status, requested_by, request_command_key, mode, detail)
-            VALUES(?, ?, ?, ?, ?, ?)
+            INSERT INTO runtime_operations(
+                op_name,
+                status,
+                requested_by,
+                request_command_key,
+                request_repo_full_name,
+                mode,
+                detail
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
-            ("bad-op", "pending", "alice", "k", "bad-mode", None),
+            ("bad-op", "pending", "alice", "k", "__single_repo__", "bad-mode", None),
         )
         conn.commit()
     finally:
@@ -557,6 +618,33 @@ def test_runtime_operation_none_and_disappearing_rows(
         )
 
 
+def test_update_operator_command_result_returns_none_when_row_removed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = StateStore(tmp_path / "state.db")
+
+    row = (
+        "__single_repo__",
+        "k",
+        1,
+        None,
+        2,
+        "alice",
+        "help",
+        "{}",
+        "applied",
+        "ok",
+        "t1",
+        "t2",
+    )
+    monkeypatch.setattr(
+        "mergexo.state._select_operator_command_row",
+        lambda **kwargs: row,  # type: ignore[no-untyped-def]
+    )
+    updated = store.update_operator_command_result(command_key="k", status="failed", result="nope")
+    assert updated is None
+
+
 def test_parse_operator_command_row_validations() -> None:
     valid = ("k", 1, None, 2, "alice", "help", "{}", "applied", "ok", "t1", "t2")
 
@@ -621,6 +709,12 @@ def test_parse_operator_command_row_validations() -> None:
                 10,
             )
         )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="Invalid operator_commands row width"):
+        _parse_operator_command_row(())
+    with pytest.raises(RuntimeError, match="Invalid repo_full_name"):
+        _parse_operator_command_row(
+            (1, "k", 1, None, 2, "alice", "help", "{}", "applied", "ok", "t1", "t2")
+        )
 
 
 def test_parse_runtime_operation_row_validations() -> None:
@@ -644,6 +738,12 @@ def test_parse_runtime_operation_row_validations() -> None:
         _parse_runtime_operation_row(
             (valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], valid[6], 6)
         )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="Invalid runtime_operations row width"):
+        _parse_runtime_operation_row(())
+    with pytest.raises(RuntimeError, match="Invalid request_repo_full_name"):
+        _parse_runtime_operation_row(
+            ("restart", "pending", "alice", "k", 1, "git_checkout", None, "t1", "t2")
+        )
 
 
 def test_parse_enum_helpers_validate_types_and_values() -> None:
@@ -666,3 +766,118 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
         _parse_restart_mode(1)
     with pytest.raises(RuntimeError, match="Unknown mode value"):
         _parse_restart_mode("other")
+
+
+def test_state_store_repo_scoped_isolation(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_running(7, repo_full_name="o/repo-a")
+    store.mark_running(7, repo_full_name="o/repo-b")
+    assert store.can_enqueue(7, repo_full_name="o/repo-a") is False
+    assert store.can_enqueue(7, repo_full_name="o/repo-b") is False
+
+    store.mark_completed(
+        7, "agent/design/7-a", 101, "https://example/pr/101", repo_full_name="o/repo-a"
+    )
+    store.mark_completed(
+        7, "agent/design/7-b", 101, "https://example/pr/101", repo_full_name="o/repo-b"
+    )
+
+    tracked_a = store.list_tracked_pull_requests(repo_full_name="o/repo-a")
+    tracked_b = store.list_tracked_pull_requests(repo_full_name="o/repo-b")
+    assert tracked_a[0].repo_full_name == "o/repo-a"
+    assert tracked_b[0].repo_full_name == "o/repo-b"
+
+
+def test_get_operator_command_requires_repo_when_command_key_collides(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.record_operator_command(
+        command_key="k",
+        issue_number=1,
+        pr_number=None,
+        comment_id=10,
+        author_login="alice",
+        command="help",
+        args_json="{}",
+        status="applied",
+        result="ok",
+        repo_full_name="o/a",
+    )
+    store.record_operator_command(
+        command_key="k",
+        issue_number=2,
+        pr_number=None,
+        comment_id=11,
+        author_login="bob",
+        command="help",
+        args_json="{}",
+        status="applied",
+        result="ok",
+        repo_full_name="o/b",
+    )
+    with pytest.raises(RuntimeError, match="specify repo_full_name"):
+        store.get_operator_command("k")
+
+
+def test_state_store_rejects_legacy_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE issue_runs (
+                issue_number INTEGER PRIMARY KEY,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="legacy state schema"):
+        StateStore(db_path)
+
+
+def test_state_store_rejects_legacy_runtime_operation_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE runtime_operations (
+                op_name TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                request_command_key TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                detail TEXT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="legacy state schema"):
+        StateStore(db_path)
+
+
+def test_table_columns_skips_short_rows() -> None:
+    class FakeCursor:
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return [(0,), (0, "col_a"), (0, 3), (0, "col_b")]
+
+    class FakeConn:
+        def execute(self, sql: str) -> FakeCursor:
+            assert "PRAGMA table_info" in sql
+            return FakeCursor()
+
+    columns = _table_columns(FakeConn(), "x")  # type: ignore[arg-type]
+    assert columns == ("col_a", "col_b")
+
+
+def test_normalize_repo_full_name_blank_defaults_to_single_repo() -> None:
+    assert _normalize_repo_full_name(None) == "__single_repo__"
+    assert _normalize_repo_full_name("   ") == "__single_repo__"
