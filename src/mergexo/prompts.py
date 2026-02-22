@@ -100,9 +100,15 @@ Return JSON only with this object shape:
 }}
 
 Rules:
+- Primary objective: resolve review feedback by editing repository files, then provide commit_message.
+- For comments on design docs (for example `docs/design/*.md`), prefer updating the doc directly over explanatory discussion-only replies.
+- If a comment can be addressed by a concrete file change, make that change in this turn.
 - Reply to specific review comments using their exact review_comment_id.
 - Do not invent IDs.
+- Use review_replies to summarize what changed and where.
 - If you provide commit_message, you MUST have edited repository files for this turn.
+- Only skip file edits when blocked by genuine ambiguity or missing requirements; in that case, set commit_message to null and ask a precise clarifying question in the review reply.
 - Do not claim you pushed or updated files unless you actually edited them in this turn.
-- Use null or empty values only when no action is needed.
+- Do not post "proposed fix" text when you can implement the change directly.
+- Use null or empty values only when no action is needed or genuinely blocked.
 """.strip()
