@@ -3,12 +3,14 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import logging
 import queue
 import re
 import threading
 import time
+from typing import cast
 
 from mergexo.agent_adapter import (
     AgentAdapter,
@@ -20,15 +22,20 @@ from mergexo.agent_adapter import (
 from mergexo.config import AppConfig, RepoConfig
 from mergexo.feedback_loop import (
     FeedbackEventRecord,
+    ParsedOperatorCommand,
     append_action_token,
     compute_general_comment_token,
     compute_history_rewrite_token,
+    compute_operator_command_token,
     compute_review_reply_token,
     compute_turn_key,
     event_key,
     extract_action_tokens,
     has_action_token,
     is_bot_login,
+    operator_command_key,
+    operator_commands_help,
+    parse_operator_command,
 )
 from mergexo.git_ops import GitRepoManager
 from mergexo.github_gateway import CompareCommitsStatus, GitHubGateway
@@ -36,6 +43,10 @@ from mergexo.models import (
     GeneratedDesign,
     Issue,
     IssueFlow,
+    OperatorCommandRecord,
+    OperatorCommandStatus,
+    OperatorReplyStatus,
+    RestartMode,
     PullRequestIssueComment,
     PullRequestSnapshot,
     PullRequestReviewComment,
@@ -53,6 +64,8 @@ LOGGER = logging.getLogger("mergexo.orchestrator")
 _MAX_FEEDBACK_GIT_OP_ROUNDS = 3
 _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
 _ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
+_RESTART_OPERATION_NAME = "restart"
+_RESTART_PENDING_STATUSES = {"pending", "running"}
 
 
 @dataclass(frozen=True)
@@ -86,6 +99,15 @@ class DirectFlowValidationError(DirectFlowError):
     """Direct-flow output failed deterministic policy checks."""
 
 
+@dataclass(frozen=True)
+class RestartRequested(RuntimeError):
+    mode: RestartMode
+    command_key: str
+
+    def __str__(self) -> str:
+        return f"Restart requested in mode={self.mode} via command_key={self.command_key}"
+
+
 class SlotPool:
     def __init__(self, manager: GitRepoManager, worker_count: int) -> None:
         self._manager = manager
@@ -113,16 +135,22 @@ class Phase1Orchestrator:
         github: GitHubGateway,
         git_manager: GitRepoManager,
         agent: AgentAdapter,
+        allow_runtime_restart: bool = False,
     ) -> None:
         self._config = config
         self._state = state
         self._github = github
         self._git = git_manager
         self._agent = agent
+        self._allow_runtime_restart = allow_runtime_restart
         self._slot_pool = SlotPool(git_manager, config.runtime.worker_count)
         self._running: dict[int, Future[WorkResult]] = {}
         self._running_feedback: dict[int, _FeedbackFuture] = {}
         self._running_lock = threading.Lock()
+        self._restart_drain_started_at_monotonic: float | None = None
+        self._authorized_operator_logins = {
+            login.strip().lower() for login in self._config.repo.operator_logins if login.strip()
+        }
 
     def run(self, *, once: bool) -> None:
         self._git.ensure_layout()
@@ -134,21 +162,34 @@ class Phase1Orchestrator:
                     "poll_started",
                     once=once,
                     feedback_loop_enabled=self._config.runtime.enable_feedback_loop,
+                    github_operations_enabled=self._config.runtime.enable_github_operations,
                 )
                 self._reap_finished()
-                self._enqueue_new_work(pool)
-                self._enqueue_implementation_work(pool)
-                if self._config.runtime.enable_feedback_loop:
-                    self._enqueue_feedback_work(pool)
+
+                if self._config.runtime.enable_github_operations:
+                    self._scan_operator_commands()
+                draining_for_restart = self._drain_for_pending_restart_if_needed()
+
+                if not draining_for_restart:
+                    self._enqueue_new_work(pool)
+                    self._enqueue_implementation_work(pool)
+                    if self._config.runtime.enable_feedback_loop:
+                        self._enqueue_feedback_work(pool)
+
                 log_event(
                     LOGGER,
                     "poll_completed",
                     running_issue_count=len(self._running),
                     running_feedback_count=len(self._running_feedback),
+                    draining_for_restart=draining_for_restart,
                 )
 
                 if once:
                     self._wait_for_all(pool)
+                    self._reap_finished()
+                    if self._config.runtime.enable_github_operations:
+                        self._scan_operator_commands()
+                    self._drain_for_pending_restart_if_needed()
                     break
 
                 time.sleep(self._config.runtime.poll_interval_seconds)
@@ -276,6 +317,483 @@ class Phase1Orchestrator:
     def _has_capacity_locked(self) -> bool:
         active = len(self._running) + len(self._running_feedback)
         return active < self._config.runtime.worker_count
+
+    def _active_worker_count(self) -> int:
+        with self._running_lock:
+            return len(self._running) + len(self._running_feedback)
+
+    def _scan_operator_commands(self) -> None:
+        issue_numbers = self._operator_issue_numbers_to_scan()
+        if not issue_numbers:
+            return
+
+        for issue_number in issue_numbers:
+            comments = self._github.list_issue_comments(issue_number)
+            for comment in comments:
+                parsed = parse_operator_command(comment.body)
+                if parsed is None:
+                    continue
+                if is_bot_login(comment.user_login):
+                    continue
+
+                command_key = operator_command_key(
+                    issue_number=issue_number,
+                    comment_id=comment.comment_id,
+                    updated_at=comment.updated_at,
+                )
+                existing = self._state.get_operator_command(command_key)
+                if existing is not None:
+                    self._reconcile_operator_command(existing)
+                    continue
+
+                log_event(
+                    LOGGER,
+                    "operator_command_seen",
+                    command_key=command_key,
+                    actor=comment.user_login,
+                    issue_number=issue_number,
+                    command=parsed.command,
+                )
+
+                args_json = self._encode_operator_command_args(
+                    parsed=parsed,
+                    comment_url=comment.html_url,
+                )
+
+                if not self._is_authorized_operator(comment.user_login):
+                    detail = f"@{comment.user_login} is not in repo.operator_logins, so this command was rejected."
+                    record = self._state.record_operator_command(
+                        command_key=command_key,
+                        issue_number=issue_number,
+                        pr_number=None,
+                        comment_id=comment.comment_id,
+                        author_login=comment.user_login,
+                        command=parsed.command,
+                        args_json=args_json,
+                        status="rejected",
+                        result=detail,
+                    )
+                    self._post_operator_command_result(
+                        record, reply_status="rejected", detail=detail
+                    )
+                    log_event(
+                        LOGGER,
+                        "operator_command_rejected",
+                        command_key=command_key,
+                        actor=comment.user_login,
+                        issue_number=issue_number,
+                        command=parsed.command,
+                    )
+                    continue
+
+                if parsed.parse_error is not None:
+                    detail = f"{parsed.parse_error}\n\n{operator_commands_help()}"
+                    record = self._state.record_operator_command(
+                        command_key=command_key,
+                        issue_number=issue_number,
+                        pr_number=None,
+                        comment_id=comment.comment_id,
+                        author_login=comment.user_login,
+                        command="invalid",
+                        args_json=args_json,
+                        status="failed",
+                        result=detail,
+                    )
+                    self._post_operator_command_result(record, reply_status="failed", detail=detail)
+                    log_event(
+                        LOGGER,
+                        "operator_command_failed",
+                        command_key=command_key,
+                        actor=comment.user_login,
+                        issue_number=issue_number,
+                        command="invalid",
+                        reason="parse_error",
+                    )
+                    continue
+
+                if parsed.command == "help":
+                    detail = operator_commands_help()
+                    record = self._state.record_operator_command(
+                        command_key=command_key,
+                        issue_number=issue_number,
+                        pr_number=None,
+                        comment_id=comment.comment_id,
+                        author_login=comment.user_login,
+                        command="help",
+                        args_json=args_json,
+                        status="applied",
+                        result=detail,
+                    )
+                    self._post_operator_command_result(record, reply_status="help", detail=detail)
+                    log_event(
+                        LOGGER,
+                        "operator_command_applied",
+                        command_key=command_key,
+                        actor=comment.user_login,
+                        issue_number=issue_number,
+                        command="help",
+                    )
+                    continue
+
+                if parsed.command == "unblock":
+                    unblock_status, unblock_detail, target_pr_number = self._apply_unblock_command(
+                        source_issue_number=issue_number,
+                        parsed=parsed,
+                    )
+                    record = self._state.record_operator_command(
+                        command_key=command_key,
+                        issue_number=issue_number,
+                        pr_number=target_pr_number,
+                        comment_id=comment.comment_id,
+                        author_login=comment.user_login,
+                        command="unblock",
+                        args_json=args_json,
+                        status=unblock_status,
+                        result=unblock_detail,
+                    )
+                    reply_status = cast(OperatorReplyStatus, unblock_status)
+                    self._post_operator_command_result(
+                        record,
+                        reply_status=reply_status,
+                        detail=unblock_detail,
+                        issue_number_override=target_pr_number,
+                    )
+                    log_event(
+                        LOGGER,
+                        "operator_command_applied"
+                        if unblock_status == "applied"
+                        else "operator_command_failed",
+                        command_key=command_key,
+                        actor=comment.user_login,
+                        issue_number=issue_number,
+                        command="unblock",
+                        target_pr_number=target_pr_number,
+                    )
+                    continue
+
+                if parsed.command == "restart":
+                    requested_mode = cast(
+                        RestartMode,
+                        parsed.get_arg("mode") or self._config.runtime.restart_default_mode,
+                    )
+                    if requested_mode not in self._config.runtime.restart_supported_modes:
+                        detail = (
+                            f"Requested mode={requested_mode} is not enabled in "
+                            "runtime.restart_supported_modes."
+                        )
+                        record = self._state.record_operator_command(
+                            command_key=command_key,
+                            issue_number=issue_number,
+                            pr_number=None,
+                            comment_id=comment.comment_id,
+                            author_login=comment.user_login,
+                            command="restart",
+                            args_json=args_json,
+                            status="failed",
+                            result=detail,
+                        )
+                        self._post_operator_command_result(
+                            record, reply_status="failed", detail=detail
+                        )
+                        log_event(
+                            LOGGER,
+                            "operator_command_failed",
+                            command_key=command_key,
+                            actor=comment.user_login,
+                            issue_number=issue_number,
+                            command="restart",
+                            reason="unsupported_mode",
+                            mode=requested_mode,
+                        )
+                        continue
+
+                    if not self._allow_runtime_restart:
+                        detail = (
+                            "Automatic restart is only supported when MergeXO is launched via "
+                            "`mergexo service`."
+                        )
+                        record = self._state.record_operator_command(
+                            command_key=command_key,
+                            issue_number=issue_number,
+                            pr_number=None,
+                            comment_id=comment.comment_id,
+                            author_login=comment.user_login,
+                            command="restart",
+                            args_json=args_json,
+                            status="failed",
+                            result=detail,
+                        )
+                        self._post_operator_command_result(
+                            record, reply_status="failed", detail=detail
+                        )
+                        log_event(
+                            LOGGER,
+                            "operator_command_failed",
+                            command_key=command_key,
+                            actor=comment.user_login,
+                            issue_number=issue_number,
+                            command="restart",
+                            reason="service_mode_required",
+                        )
+                        continue
+
+                    operation, created = self._state.request_runtime_restart(
+                        requested_by=comment.user_login,
+                        request_command_key=command_key,
+                        mode=requested_mode,
+                    )
+                    if created:
+                        detail = (
+                            f"Restart requested in mode={requested_mode}. "
+                            "MergeXO is draining active workers before update and restart."
+                        )
+                        self._state.record_operator_command(
+                            command_key=command_key,
+                            issue_number=issue_number,
+                            pr_number=None,
+                            comment_id=comment.comment_id,
+                            author_login=comment.user_login,
+                            command="restart",
+                            args_json=args_json,
+                            status="applied",
+                            result=detail,
+                        )
+                        log_event(
+                            LOGGER,
+                            "restart_requested",
+                            command_key=command_key,
+                            actor=comment.user_login,
+                            issue_number=issue_number,
+                            mode=requested_mode,
+                        )
+                        log_event(
+                            LOGGER,
+                            "operator_command_applied",
+                            command_key=command_key,
+                            actor=comment.user_login,
+                            issue_number=issue_number,
+                            command="restart",
+                            mode=requested_mode,
+                        )
+                    else:
+                        detail = (
+                            "Restart already in progress; this command was collapsed into "
+                            f"the pending request {operation.request_command_key}."
+                        )
+                        record = self._state.record_operator_command(
+                            command_key=command_key,
+                            issue_number=issue_number,
+                            pr_number=None,
+                            comment_id=comment.comment_id,
+                            author_login=comment.user_login,
+                            command="restart",
+                            args_json=args_json,
+                            status="applied",
+                            result=detail,
+                        )
+                        self._post_operator_command_result(
+                            record, reply_status="applied", detail=detail
+                        )
+                        log_event(
+                            LOGGER,
+                            "operator_command_applied",
+                            command_key=command_key,
+                            actor=comment.user_login,
+                            issue_number=issue_number,
+                            command="restart",
+                            collapsed_into=operation.request_command_key,
+                        )
+                    continue
+
+    def _operator_issue_numbers_to_scan(self) -> tuple[int, ...]:
+        issue_numbers = {blocked.pr_number for blocked in self._state.list_blocked_pull_requests()}
+        if self._config.repo.operations_issue_number is not None:
+            issue_numbers.add(self._config.repo.operations_issue_number)
+        return tuple(sorted(issue_numbers))
+
+    def _reconcile_operator_command(self, command: OperatorCommandRecord) -> None:
+        if command.command == "restart":
+            runtime_op = self._state.get_runtime_operation(_RESTART_OPERATION_NAME)
+            if (
+                runtime_op is not None
+                and runtime_op.request_command_key == command.command_key
+                and runtime_op.status in _RESTART_PENDING_STATUSES
+            ):
+                return
+        reply_status = _operator_reply_status_for_record(command)
+        self._post_operator_command_result(
+            command,
+            reply_status=reply_status,
+            detail=command.result,
+        )
+
+    def _drain_for_pending_restart_if_needed(self) -> bool:
+        operation = self._state.get_runtime_operation(_RESTART_OPERATION_NAME)
+        if operation is None or operation.status not in _RESTART_PENDING_STATUSES:
+            self._restart_drain_started_at_monotonic = None
+            return False
+
+        if not self._allow_runtime_restart:
+            detail = (
+                "Restart command was received, but this process was not started via "
+                "`mergexo service`."
+            )
+            self._state.set_runtime_operation_status(
+                op_name=_RESTART_OPERATION_NAME,
+                status="failed",
+                detail=detail,
+            )
+            command = self._state.update_operator_command_result(
+                command_key=operation.request_command_key,
+                status="failed",
+                result=detail,
+            )
+            if command is not None:
+                self._post_operator_command_result(command, reply_status="failed", detail=detail)
+            log_event(
+                LOGGER,
+                "operator_command_failed",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                command="restart",
+                reason="service_mode_required",
+            )
+            return False
+
+        now = time.monotonic()
+        if self._restart_drain_started_at_monotonic is None:
+            self._restart_drain_started_at_monotonic = now
+            log_event(
+                LOGGER,
+                "restart_drain_started",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                mode=operation.mode,
+            )
+
+        active_workers = self._active_worker_count()
+        if active_workers == 0:
+            self._state.set_runtime_operation_status(
+                op_name=_RESTART_OPERATION_NAME,
+                status="running",
+                detail="workers drained; supervisor update running",
+            )
+            log_event(
+                LOGGER,
+                "restart_drain_completed",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                mode=operation.mode,
+            )
+            raise RestartRequested(mode=operation.mode, command_key=operation.request_command_key)
+
+        drain_timeout = self._config.runtime.restart_drain_timeout_seconds
+        elapsed = now - self._restart_drain_started_at_monotonic
+        if elapsed >= drain_timeout:
+            detail = (
+                f"Restart drain timed out after {drain_timeout} seconds with "
+                f"{active_workers} active worker(s)."
+            )
+            self._state.set_runtime_operation_status(
+                op_name=_RESTART_OPERATION_NAME,
+                status="failed",
+                detail=detail,
+            )
+            command = self._state.update_operator_command_result(
+                command_key=operation.request_command_key,
+                status="failed",
+                result=detail,
+            )
+            if command is not None:
+                self._post_operator_command_result(command, reply_status="failed", detail=detail)
+            self._restart_drain_started_at_monotonic = None
+            log_event(
+                LOGGER,
+                "operator_command_failed",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                command="restart",
+                reason="drain_timeout",
+                active_workers=active_workers,
+                timeout_seconds=drain_timeout,
+            )
+            return False
+
+        return True
+
+    def _apply_unblock_command(
+        self,
+        *,
+        source_issue_number: int,
+        parsed: ParsedOperatorCommand,
+    ) -> tuple[OperatorCommandStatus, str, int]:
+        target_pr_number = int(parsed.get_arg("pr") or source_issue_number)
+        head_sha = parsed.get_arg("head_sha")
+
+        reset_count = self._state.reset_blocked_pull_requests(
+            pr_numbers=(target_pr_number,),
+            last_seen_head_sha_override=head_sha,
+        )
+        if reset_count == 0:
+            return "failed", f"PR #{target_pr_number} is not currently blocked.", target_pr_number
+
+        detail = f"Reset blocked state for PR #{target_pr_number}."
+        if head_sha is not None:
+            detail += f" Set last_seen_head_sha override to `{head_sha}`."
+        return "applied", detail, target_pr_number
+
+    def _encode_operator_command_args(
+        self,
+        *,
+        parsed: ParsedOperatorCommand,
+        comment_url: str,
+    ) -> str:
+        payload = {
+            "normalized_command": parsed.normalized_command,
+            "args": dict(parsed.args),
+            "parse_error": parsed.parse_error,
+            "comment_url": comment_url,
+        }
+        return json.dumps(payload, sort_keys=True)
+
+    def _is_authorized_operator(self, login: str) -> bool:
+        normalized = login.strip().lower()
+        if not normalized:
+            return False
+        return normalized in self._authorized_operator_logins
+
+    def _post_operator_command_result(
+        self,
+        command: OperatorCommandRecord,
+        *,
+        reply_status: OperatorReplyStatus,
+        detail: str,
+        issue_number_override: int | None = None,
+    ) -> None:
+        issue_number = issue_number_override or _operator_reply_issue_number(command)
+        token = compute_operator_command_token(command_key=command.command_key)
+        if self._issue_has_action_token(issue_number=issue_number, token=token):
+            return
+        body = _render_operator_command_result(
+            normalized_command=_operator_normalized_command(command),
+            status=reply_status,
+            detail=detail,
+            source_comment_url=_operator_source_comment_url(
+                command=command,
+                repo_full_name=self._config.repo.full_name,
+            ),
+        )
+        self._github.post_issue_comment(
+            issue_number=issue_number,
+            body=append_action_token(body=body, token=token),
+        )
+
+    def _issue_has_action_token(self, *, issue_number: int, token: str) -> bool:
+        issue_comments = self._github.list_issue_comments(issue_number)
+        for comment in issue_comments:
+            if token in extract_action_tokens(comment.body):
+                return True
+        return False
 
     def _reap_finished(self) -> None:
         finished_issue_numbers: list[int] = []
@@ -1471,6 +1989,69 @@ def _summarize_git_error(raw_error: str) -> str:
     if len(normalized) > 240:
         return normalized[:237] + "..."
     return normalized
+
+
+def _operator_args_payload(command: OperatorCommandRecord) -> dict[str, object]:
+    try:
+        parsed = json.loads(command.args_json)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    if not all(isinstance(key, str) for key in parsed.keys()):
+        return {}
+    return cast(dict[str, object], parsed)
+
+
+def _operator_normalized_command(command: OperatorCommandRecord) -> str:
+    payload = _operator_args_payload(command)
+    normalized = payload.get("normalized_command")
+    if isinstance(normalized, str) and normalized.strip():
+        return normalized.strip()
+    return f"/mergexo {command.command}"
+
+
+def _operator_source_comment_url(*, command: OperatorCommandRecord, repo_full_name: str) -> str:
+    payload = _operator_args_payload(command)
+    source_url = payload.get("comment_url")
+    if isinstance(source_url, str) and source_url.strip():
+        return source_url.strip()
+    return (
+        f"https://github.com/{repo_full_name}/issues/{command.issue_number}"
+        f"#issuecomment-{command.comment_id}"
+    )
+
+
+def _operator_reply_issue_number(command: OperatorCommandRecord) -> int:
+    if command.command == "unblock" and command.pr_number is not None:
+        return command.pr_number
+    return command.issue_number
+
+
+def _operator_reply_status_for_record(command: OperatorCommandRecord) -> OperatorReplyStatus:
+    if command.command == "help":
+        return "help"
+    if command.status == "rejected":
+        return "rejected"
+    if command.status == "failed":
+        return "failed"
+    return "applied"
+
+
+def _render_operator_command_result(
+    *,
+    normalized_command: str,
+    status: OperatorReplyStatus,
+    detail: str,
+    source_comment_url: str,
+) -> str:
+    return (
+        "MergeXO operator command result:\n"
+        f"- command: `{normalized_command}`\n"
+        f"- status: `{status}`\n"
+        f"- detail: {detail}\n\n"
+        f"Source command: {source_comment_url}"
+    )
 
 
 def _design_doc_url(*, repo_full_name: str, default_branch: str, design_doc_path: str) -> str:

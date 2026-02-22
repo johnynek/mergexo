@@ -5,10 +5,12 @@ from mergexo import __version__
 from mergexo.models import (
     GeneratedDesign,
     Issue,
+    OperatorCommandRecord,
     PullRequest,
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    RuntimeOperationRecord,
     WorkResult,
 )
 from mergexo.prompts import (
@@ -57,6 +59,29 @@ def test_model_dataclasses_and_version() -> None:
         title="Title", design_doc_markdown="# Doc", touch_paths=("a.py",), summary="sum"
     )
     result = WorkResult(issue_number=1, branch="b", pr_number=2, pr_url="u")
+    operator_command = OperatorCommandRecord(
+        command_key="77:1:2026-02-22T00:00:00Z",
+        issue_number=77,
+        pr_number=None,
+        comment_id=1,
+        author_login="alice",
+        command="restart",
+        args_json="{}",
+        status="applied",
+        result="ok",
+        created_at="t1",
+        updated_at="t2",
+    )
+    runtime_op = RuntimeOperationRecord(
+        op_name="restart",
+        status="pending",
+        requested_by="alice",
+        request_command_key="77:1:2026-02-22T00:00:00Z",
+        mode="git_checkout",
+        detail=None,
+        created_at="t1",
+        updated_at="t2",
+    )
 
     assert __version__ == "0.1.0"
     assert issue.labels == ("x",)
@@ -66,6 +91,8 @@ def test_model_dataclasses_and_version() -> None:
     assert issue_comment.body == "note"
     assert gen.touch_paths == ("a.py",)
     assert result.branch == "b"
+    assert operator_command.command == "restart"
+    assert runtime_op.mode == "git_checkout"
 
 
 def test_build_design_prompt_contains_required_contract() -> None:

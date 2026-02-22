@@ -5,6 +5,8 @@ from pathlib import Path
 import tomllib
 from typing import cast
 
+from mergexo.models import RestartMode
+
 
 @dataclass(frozen=True)
 class RuntimeConfig:
@@ -12,6 +14,12 @@ class RuntimeConfig:
     worker_count: int
     poll_interval_seconds: int
     enable_feedback_loop: bool
+    enable_github_operations: bool = False
+    restart_drain_timeout_seconds: int = 900
+    restart_default_mode: RestartMode = "git_checkout"
+    restart_supported_modes: tuple[RestartMode, ...] = ("git_checkout",)
+    git_checkout_root: Path | None = None
+    service_python: str | None = None
 
 
 @dataclass(frozen=True)
@@ -26,6 +34,8 @@ class RepoConfig:
     design_docs_dir: str
     local_clone_source: str | None
     remote_url: str | None
+    operations_issue_number: int | None = None
+    operator_logins: tuple[str, ...] = ()
 
     @property
     def full_name(self) -> str:
@@ -73,12 +83,32 @@ def load_config(path: Path) -> AppConfig:
         worker_count=_require_int(runtime_data, "worker_count"),
         poll_interval_seconds=_require_int(runtime_data, "poll_interval_seconds"),
         enable_feedback_loop=_bool_with_default(runtime_data, "enable_feedback_loop", False),
+        enable_github_operations=_bool_with_default(
+            runtime_data, "enable_github_operations", False
+        ),
+        restart_drain_timeout_seconds=_int_with_default(
+            runtime_data, "restart_drain_timeout_seconds", 900
+        ),
+        restart_default_mode=_restart_mode_with_default(
+            runtime_data, "restart_default_mode", "git_checkout"
+        ),
+        restart_supported_modes=_restart_modes_with_default(
+            runtime_data, "restart_supported_modes", ("git_checkout",)
+        ),
+        git_checkout_root=_optional_path(runtime_data, "git_checkout_root"),
+        service_python=_optional_str(runtime_data, "service_python"),
     )
 
     if runtime.worker_count < 1:
         raise ConfigError("runtime.worker_count must be >= 1")
     if runtime.poll_interval_seconds < 5:
         raise ConfigError("runtime.poll_interval_seconds must be >= 5")
+    if runtime.restart_drain_timeout_seconds < 1:
+        raise ConfigError("runtime.restart_drain_timeout_seconds must be >= 1")
+    if runtime.restart_default_mode not in runtime.restart_supported_modes:
+        raise ConfigError(
+            "runtime.restart_default_mode must be included in runtime.restart_supported_modes"
+        )
 
     repo = RepoConfig(
         owner=_require_str(repo_data, "owner"),
@@ -93,6 +123,8 @@ def load_config(path: Path) -> AppConfig:
         design_docs_dir=_require_str(repo_data, "design_docs_dir"),
         local_clone_source=_optional_str(repo_data, "local_clone_source"),
         remote_url=_optional_str(repo_data, "remote_url"),
+        operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
+        operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
     )
 
     codex = CodexConfig(
@@ -138,6 +170,13 @@ def _require_int(data: dict[str, object], key: str) -> int:
     return value
 
 
+def _int_with_default(data: dict[str, object], key: str, default: int) -> int:
+    value = data.get(key, default)
+    if not isinstance(value, int):
+        raise ConfigError(f"{key} must be an integer")
+    return value
+
+
 def _bool_with_default(data: dict[str, object], key: str, default: bool) -> bool:
     value = data.get(key, default)
     if not isinstance(value, bool):
@@ -162,3 +201,69 @@ def _tuple_of_str(data: dict[str, object], key: str) -> tuple[str, ...]:
             raise ConfigError(f"{key} must be a list of strings")
         out.append(item)
     return tuple(out)
+
+
+def _optional_positive_int(data: dict[str, object], key: str) -> int | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or value < 1:
+        raise ConfigError(f"{key} must be an integer >= 1 if provided")
+    return value
+
+
+def _optional_path(data: dict[str, object], key: str) -> Path | None:
+    value = _optional_str(data, key)
+    if value is None:
+        return None
+    return Path(value).expanduser()
+
+
+def _restart_modes_with_default(
+    data: dict[str, object], key: str, default: tuple[RestartMode, ...]
+) -> tuple[RestartMode, ...]:
+    value = data.get(key, list(default))
+    if not isinstance(value, list):
+        raise ConfigError(f"{key} must be a list of restart modes")
+    if not value:
+        raise ConfigError(f"{key} must contain at least one restart mode")
+    parsed: list[RestartMode] = []
+    for item in value:
+        parsed_mode = _parse_restart_mode(item, key=key)
+        if parsed_mode not in parsed:
+            parsed.append(parsed_mode)
+    return tuple(parsed)
+
+
+def _restart_mode_with_default(
+    data: dict[str, object], key: str, default: RestartMode
+) -> RestartMode:
+    value = data.get(key, default)
+    return _parse_restart_mode(value, key=key)
+
+
+def _parse_restart_mode(value: object, *, key: str) -> RestartMode:
+    if not isinstance(value, str):
+        raise ConfigError(f"{key} must be one of: git_checkout, pypi")
+    normalized = value.strip().lower()
+    if normalized not in {"git_checkout", "pypi"}:
+        raise ConfigError(f"{key} must be one of: git_checkout, pypi")
+    return cast(RestartMode, normalized)
+
+
+def _operator_logins_with_default(
+    data: dict[str, object], key: str, default: tuple[str, ...]
+) -> tuple[str, ...]:
+    value = data.get(key, list(default))
+    if not isinstance(value, list):
+        raise ConfigError(f"{key} must be a list of strings")
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigError(f"{key} must be a list of strings")
+        login = item.strip().lower()
+        if not login:
+            raise ConfigError(f"{key} entries must be non-empty strings")
+        if login not in normalized:
+            normalized.append(login)
+    return tuple(normalized)

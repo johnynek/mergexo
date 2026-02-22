@@ -213,6 +213,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     files = gateway.list_pull_request_files(9)
     review_comments = gateway.list_pull_request_review_comments(9)
     issue_comments = gateway.list_pull_request_issue_comments(9)
+    issue_comments_direct = gateway.list_issue_comments(9)
 
     assert pr.number == 9
     assert pr.head_sha == "headsha"
@@ -222,6 +223,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert review_comments[0].comment_id == 11
     assert review_comments[0].user_login == "reviewer"
     assert issue_comments[0].comment_id == 22
+    assert issue_comments_direct[0].comment_id == 22
 
 
 def test_get_pull_request_requires_head_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -296,6 +298,7 @@ def test_compare_commits_rejects_bad_payload_and_status(monkeypatch: pytest.Monk
         ("list_pull_request_files", {}, "expected list"),
         ("list_pull_request_review_comments", {}, "expected list"),
         ("list_pull_request_issue_comments", {}, "expected list"),
+        ("list_issue_comments", {}, "expected list"),
     ],
 )
 def test_pull_request_related_fetch_errors(
@@ -374,6 +377,7 @@ def test_gateway_emits_read_and_write_logs(
     gateway.list_pull_request_files(9)
     gateway.list_pull_request_review_comments(9)
     gateway.list_pull_request_issue_comments(9)
+    gateway.list_issue_comments(9)
     gateway.compare_commits("base", "head")
     gateway.create_pull_request("t", "h", "b", "body")
     gateway.post_issue_comment(9, "hello")
@@ -381,6 +385,7 @@ def test_gateway_emits_read_and_write_logs(
 
     text = capsys.readouterr().err
     assert "event=github_read count=1 endpoint=issues" in text
+    assert "endpoint=issue_comments" in text
     assert "endpoint=compare_commits" in text
     assert "event=github_pr_created" in text
     assert "event=github_issue_comment_posted issue_number=9" in text

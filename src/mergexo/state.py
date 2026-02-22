@@ -6,9 +6,18 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import threading
+from typing import cast
 
 from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
+from mergexo.models import (
+    OperatorCommandName,
+    OperatorCommandRecord,
+    OperatorCommandStatus,
+    RestartMode,
+    RuntimeOperationRecord,
+    RuntimeOperationStatus,
+)
 
 
 @dataclass(frozen=True)
@@ -119,6 +128,37 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operator_commands (
+                    command_key TEXT PRIMARY KEY,
+                    issue_number INTEGER NOT NULL,
+                    pr_number INTEGER NULL,
+                    comment_id INTEGER NOT NULL,
+                    author_login TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    args_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_operations (
+                    op_name TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    request_command_key TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    detail TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                )
+                """
+            )
 
     def can_enqueue(self, issue_number: int) -> bool:
         with self._lock, self._connect() as conn:
@@ -213,6 +253,280 @@ class StateStore:
         if thread_id is not None and not isinstance(thread_id, str):
             raise RuntimeError("Invalid thread_id value stored in agent_sessions")
         return adapter, thread_id
+
+    def get_operator_command(self, command_key: str) -> OperatorCommandRecord | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    command_key,
+                    issue_number,
+                    pr_number,
+                    comment_id,
+                    author_login,
+                    command,
+                    args_json,
+                    status,
+                    result,
+                    created_at,
+                    updated_at
+                FROM operator_commands
+                WHERE command_key = ?
+                """,
+                (command_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_operator_command_row(row)
+
+    def record_operator_command(
+        self,
+        *,
+        command_key: str,
+        issue_number: int,
+        pr_number: int | None,
+        comment_id: int,
+        author_login: str,
+        command: OperatorCommandName,
+        args_json: str,
+        status: OperatorCommandStatus,
+        result: str,
+    ) -> OperatorCommandRecord:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO operator_commands(
+                    command_key,
+                    issue_number,
+                    pr_number,
+                    comment_id,
+                    author_login,
+                    command,
+                    args_json,
+                    status,
+                    result
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(command_key) DO UPDATE SET
+                    issue_number=excluded.issue_number,
+                    pr_number=excluded.pr_number,
+                    comment_id=excluded.comment_id,
+                    author_login=excluded.author_login,
+                    command=excluded.command,
+                    args_json=excluded.args_json,
+                    status=excluded.status,
+                    result=excluded.result,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (
+                    command_key,
+                    issue_number,
+                    pr_number,
+                    comment_id,
+                    author_login,
+                    command,
+                    args_json,
+                    status,
+                    result,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                    command_key,
+                    issue_number,
+                    pr_number,
+                    comment_id,
+                    author_login,
+                    command,
+                    args_json,
+                    status,
+                    result,
+                    created_at,
+                    updated_at
+                FROM operator_commands
+                WHERE command_key = ?
+                """,
+                (command_key,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("operator_commands row disappeared after upsert")
+        return _parse_operator_command_row(row)
+
+    def update_operator_command_result(
+        self,
+        *,
+        command_key: str,
+        status: OperatorCommandStatus,
+        result: str,
+    ) -> OperatorCommandRecord | None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE operator_commands
+                SET status = ?,
+                    result = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE command_key = ?
+                """,
+                (status, result, command_key),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                    command_key,
+                    issue_number,
+                    pr_number,
+                    comment_id,
+                    author_login,
+                    command,
+                    args_json,
+                    status,
+                    result,
+                    created_at,
+                    updated_at
+                FROM operator_commands
+                WHERE command_key = ?
+                """,
+                (command_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_operator_command_row(row)
+
+    def get_runtime_operation(self, op_name: str) -> RuntimeOperationRecord | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    op_name,
+                    status,
+                    requested_by,
+                    request_command_key,
+                    mode,
+                    detail,
+                    created_at,
+                    updated_at
+                FROM runtime_operations
+                WHERE op_name = ?
+                """,
+                (op_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_runtime_operation_row(row)
+
+    def request_runtime_restart(
+        self,
+        *,
+        requested_by: str,
+        request_command_key: str,
+        mode: RestartMode,
+    ) -> tuple[RuntimeOperationRecord, bool]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    op_name,
+                    status,
+                    requested_by,
+                    request_command_key,
+                    mode,
+                    detail,
+                    created_at,
+                    updated_at
+                FROM runtime_operations
+                WHERE op_name = 'restart'
+                """
+            ).fetchone()
+            if row is not None:
+                existing = _parse_runtime_operation_row(row)
+                if existing.status in {"pending", "running"}:
+                    return existing, False
+                conn.execute(
+                    """
+                    UPDATE runtime_operations
+                    SET status = 'pending',
+                        requested_by = ?,
+                        request_command_key = ?,
+                        mode = ?,
+                        detail = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE op_name = 'restart'
+                    """,
+                    (requested_by, request_command_key, mode),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO runtime_operations(
+                        op_name,
+                        status,
+                        requested_by,
+                        request_command_key,
+                        mode,
+                        detail
+                    )
+                    VALUES('restart', 'pending', ?, ?, ?, NULL)
+                    """,
+                    (requested_by, request_command_key, mode),
+                )
+            updated = conn.execute(
+                """
+                SELECT
+                    op_name,
+                    status,
+                    requested_by,
+                    request_command_key,
+                    mode,
+                    detail,
+                    created_at,
+                    updated_at
+                FROM runtime_operations
+                WHERE op_name = 'restart'
+                """
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("runtime restart row disappeared after upsert")
+        return _parse_runtime_operation_row(updated), True
+
+    def set_runtime_operation_status(
+        self,
+        *,
+        op_name: str,
+        status: RuntimeOperationStatus,
+        detail: str | None,
+    ) -> RuntimeOperationRecord | None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE runtime_operations
+                SET status = ?,
+                    detail = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE op_name = ?
+                """,
+                (status, detail, op_name),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                    op_name,
+                    status,
+                    requested_by,
+                    request_command_key,
+                    mode,
+                    detail,
+                    created_at,
+                    updated_at
+                FROM runtime_operations
+                WHERE op_name = ?
+                """,
+                (op_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_runtime_operation_row(row)
 
     def list_tracked_pull_requests(self) -> tuple[TrackedPullRequestState, ...]:
         with self._lock, self._connect() as conn:
@@ -519,3 +833,119 @@ class StateStore:
                 """,
                 (issue_number,),
             )
+
+
+def _parse_operator_command_row(row: tuple[object, ...]) -> OperatorCommandRecord:
+    (
+        command_key,
+        issue_number,
+        pr_number,
+        comment_id,
+        author_login,
+        command,
+        args_json,
+        status,
+        result,
+        created_at,
+        updated_at,
+    ) = row
+    if not isinstance(command_key, str):
+        raise RuntimeError("Invalid command_key value stored in operator_commands")
+    if not isinstance(issue_number, int):
+        raise RuntimeError("Invalid issue_number value stored in operator_commands")
+    if pr_number is not None and not isinstance(pr_number, int):
+        raise RuntimeError("Invalid pr_number value stored in operator_commands")
+    if not isinstance(comment_id, int):
+        raise RuntimeError("Invalid comment_id value stored in operator_commands")
+    if not isinstance(author_login, str):
+        raise RuntimeError("Invalid author_login value stored in operator_commands")
+    if not isinstance(args_json, str):
+        raise RuntimeError("Invalid args_json value stored in operator_commands")
+    if not isinstance(result, str):
+        raise RuntimeError("Invalid result value stored in operator_commands")
+    if not isinstance(created_at, str):
+        raise RuntimeError("Invalid created_at value stored in operator_commands")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in operator_commands")
+
+    return OperatorCommandRecord(
+        command_key=command_key,
+        issue_number=issue_number,
+        pr_number=pr_number,
+        comment_id=comment_id,
+        author_login=author_login,
+        command=_parse_operator_command_name(command),
+        args_json=args_json,
+        status=_parse_operator_command_status(status),
+        result=result,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _parse_runtime_operation_row(row: tuple[object, ...]) -> RuntimeOperationRecord:
+    (
+        op_name,
+        status,
+        requested_by,
+        request_command_key,
+        mode,
+        detail,
+        created_at,
+        updated_at,
+    ) = row
+    if not isinstance(op_name, str):
+        raise RuntimeError("Invalid op_name value stored in runtime_operations")
+    if not isinstance(requested_by, str):
+        raise RuntimeError("Invalid requested_by value stored in runtime_operations")
+    if not isinstance(request_command_key, str):
+        raise RuntimeError("Invalid request_command_key value stored in runtime_operations")
+    if detail is not None and not isinstance(detail, str):
+        raise RuntimeError("Invalid detail value stored in runtime_operations")
+    if not isinstance(created_at, str):
+        raise RuntimeError("Invalid created_at value stored in runtime_operations")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in runtime_operations")
+
+    return RuntimeOperationRecord(
+        op_name=op_name,
+        status=_parse_runtime_operation_status(status),
+        requested_by=requested_by,
+        request_command_key=request_command_key,
+        mode=_parse_restart_mode(mode),
+        detail=detail,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _parse_operator_command_name(value: object) -> OperatorCommandName:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid command value stored in operator_commands")
+    if value not in {"unblock", "restart", "help", "invalid"}:
+        raise RuntimeError(f"Unknown command value stored in operator_commands: {value}")
+    return cast(OperatorCommandName, value)
+
+
+def _parse_operator_command_status(value: object) -> OperatorCommandStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in operator_commands")
+    if value not in {"applied", "rejected", "failed"}:
+        raise RuntimeError(f"Unknown status value stored in operator_commands: {value}")
+    return cast(OperatorCommandStatus, value)
+
+
+def _parse_runtime_operation_status(value: object) -> RuntimeOperationStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in runtime_operations")
+    if value not in {"pending", "running", "failed", "completed"}:
+        raise RuntimeError(f"Unknown status value stored in runtime_operations: {value}")
+    return cast(RuntimeOperationStatus, value)
+
+
+def _parse_restart_mode(value: object) -> RestartMode:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid mode value stored in runtime_operations")
+    if value not in {"git_checkout", "pypi"}:
+        raise RuntimeError(f"Unknown mode value stored in runtime_operations: {value}")
+    return cast(RestartMode, value)

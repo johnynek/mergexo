@@ -23,6 +23,12 @@ base_dir = "~/tmp/mergexo"
 worker_count = 2
 poll_interval_seconds = 60
 enable_feedback_loop = true
+enable_github_operations = true
+restart_drain_timeout_seconds = 120
+restart_default_mode = "git_checkout"
+restart_supported_modes = ["git_checkout", "pypi"]
+git_checkout_root = "~/code/mergexo"
+service_python = "/usr/bin/python3"
 
 [repo]
 owner = "johnynek"
@@ -34,6 +40,8 @@ small_job_label = "agent:small-custom"
 coding_guidelines_path = "docs/guidelines.md"
 design_docs_dir = "docs/design"
 local_clone_source = "/tmp/local.git"
+operations_issue_number = 99
+operator_logins = ["Alice", "bob"]
 
 [codex]
 enabled = true
@@ -50,11 +58,20 @@ extra_args = ["--full-auto"]
     assert loaded.runtime.worker_count == 2
     assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
     assert loaded.runtime.enable_feedback_loop is True
+    assert loaded.runtime.enable_github_operations is True
+    assert loaded.runtime.restart_drain_timeout_seconds == 120
+    assert loaded.runtime.restart_default_mode == "git_checkout"
+    assert loaded.runtime.restart_supported_modes == ("git_checkout", "pypi")
+    assert loaded.runtime.git_checkout_root is not None
+    assert loaded.runtime.git_checkout_root.as_posix().endswith("/code/mergexo")
+    assert loaded.runtime.service_python == "/usr/bin/python3"
     assert loaded.repo.full_name == "johnynek/repo"
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.repo.bugfix_label == "agent:bugfix-custom"
     assert loaded.repo.small_job_label == "agent:small-custom"
     assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
+    assert loaded.repo.operations_issue_number == 99
+    assert loaded.repo.operator_logins == ("alice", "bob")
     assert loaded.codex.extra_args == ("--full-auto",)
 
 
@@ -83,6 +100,12 @@ remote_url = "git@github.com:example/custom.git"
     assert loaded.repo.small_job_label == "agent:small-job"
     assert loaded.repo.coding_guidelines_path == "docs/python_style.md"
     assert loaded.runtime.enable_feedback_loop is False
+    assert loaded.runtime.enable_github_operations is False
+    assert loaded.runtime.restart_default_mode == "git_checkout"
+    assert loaded.runtime.restart_supported_modes == ("git_checkout",)
+    assert loaded.runtime.git_checkout_root is None
+    assert loaded.repo.operations_issue_number is None
+    assert loaded.repo.operator_logins == ()
 
 
 @pytest.mark.parametrize(
@@ -139,6 +162,41 @@ design_docs_dir = "docs/design"
 """.strip(),
             "[codex] must be a TOML table",
         ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+restart_drain_timeout_seconds = 0
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+""".strip(),
+            "restart_drain_timeout_seconds",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+restart_default_mode = "pypi"
+restart_supported_modes = ["git_checkout"]
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+""".strip(),
+            "restart_default_mode",
+        ),
     ],
 )
 def test_load_config_errors(tmp_path: Path, content: str, expected: str) -> None:
@@ -170,6 +228,9 @@ def test_helper_numeric_bool_and_tuple() -> None:
     assert config._require_int({"k": 3}, "k") == 3
     with pytest.raises(ConfigError, match="must be an integer"):
         config._require_int({"k": "3"}, "k")
+    assert config._int_with_default({}, "k", 7) == 7
+    with pytest.raises(ConfigError, match="must be an integer"):
+        config._int_with_default({"k": "x"}, "k", 7)
 
     assert config._bool_with_default({}, "k", True) is True
     assert config._bool_with_default({"k": False}, "k", True) is False
@@ -186,3 +247,34 @@ def test_helper_numeric_bool_and_tuple() -> None:
         config._tuple_of_str({"k": "oops"}, "k")
     with pytest.raises(ConfigError, match="list of strings"):
         config._tuple_of_str({"k": ["ok", 3]}, "k")
+
+    assert config._optional_positive_int({}, "k") is None
+    assert config._optional_positive_int({"k": 2}, "k") == 2
+    with pytest.raises(ConfigError, match="integer >= 1"):
+        config._optional_positive_int({"k": 0}, "k")
+
+    assert config._optional_path({}, "k") is None
+    assert config._optional_path({"k": "~/tmp"}, "k") is not None
+
+    assert config._restart_mode_with_default({}, "k", "git_checkout") == "git_checkout"
+    assert config._restart_modes_with_default({}, "k", ("git_checkout",)) == ("git_checkout",)
+    assert config._restart_modes_with_default(
+        {"k": ["git_checkout", "pypi"]}, "k", ("git_checkout",)
+    ) == ("git_checkout", "pypi")
+    with pytest.raises(ConfigError, match="at least one"):
+        config._restart_modes_with_default({"k": []}, "k", ("git_checkout",))
+    with pytest.raises(ConfigError, match="list of restart modes"):
+        config._restart_modes_with_default({"k": "git_checkout"}, "k", ("git_checkout",))
+    with pytest.raises(ConfigError, match="one of"):
+        config._parse_restart_mode("bad", key="k")
+    with pytest.raises(ConfigError, match="one of"):
+        config._parse_restart_mode(1, key="k")
+
+    assert config._operator_logins_with_default({}, "k", ()) == ()
+    assert config._operator_logins_with_default({"k": ["A", "a", "b"]}, "k", ()) == ("a", "b")
+    with pytest.raises(ConfigError, match="list of strings"):
+        config._operator_logins_with_default({"k": "alice"}, "k", ())
+    with pytest.raises(ConfigError, match="list of strings"):
+        config._operator_logins_with_default({"k": ["alice", 7]}, "k", ())
+    with pytest.raises(ConfigError, match="non-empty"):
+        config._operator_logins_with_default({"k": [""]}, "k", ())

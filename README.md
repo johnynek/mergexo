@@ -60,13 +60,44 @@ uv run mergexo run --config mergexo.toml --once --verbose
 uv run mergexo run --config mergexo.toml
 ```
 
+For GitHub-operated restart/update workflows, run supervisor mode instead:
+
+```bash
+uv run mergexo service --config mergexo.toml
+```
+
 ## Notes on polling
 
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
 
 The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `false`) until rollout is complete.
 
-Use `--verbose` on `init` or `run` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
+Use `--verbose` on `init`, `run`, or `service` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
+
+## GitHub operator commands
+
+Enable GitHub operations with:
+
+- `runtime.enable_github_operations = true`
+- `repo.operator_logins = ["<maintainer-login>", ...]`
+- optional `repo.operations_issue_number = <issue-number>` for global commands
+
+Supported comment commands:
+
+- `/mergexo unblock`
+- `/mergexo unblock head_sha=<sha>`
+- `/mergexo unblock pr=<number> [head_sha=<sha>]`
+- `/mergexo restart`
+- `/mergexo restart mode=git_checkout|pypi`
+- `/mergexo help`
+
+Behavior notes:
+
+- Operator commands are processed only from blocked PR threads and the optional operations issue.
+- Every `/mergexo ...` command receives one deterministic reply comment with status and detail.
+- Restart automation requires `mergexo service`; `mergexo run` rejects restart commands.
+- `git_checkout` restart mode runs `git pull --ff-only` + `uv sync` before re-exec.
+- `pypi` mode is available only when configured (`restart_supported_modes` + `service_python`).
 
 ## Issue labels and precedence
 
