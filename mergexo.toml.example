@@ -1,8 +1,8 @@
 [runtime]
 base_dir = "~/.local/share/mergexo"
 worker_count = 2
-poll_interval_seconds = 60
-enable_feedback_loop = false
+poll_interval_seconds = 600
+enable_feedback_loop = true
 
 [repo]
 owner = "johnynek"
