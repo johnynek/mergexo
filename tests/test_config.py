@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+from typing import cast
 
 import pytest
 
@@ -14,7 +15,7 @@ def _write(path: Path, content: str) -> Path:
     return path
 
 
-def test_load_config_happy_path(tmp_path: Path) -> None:
+def test_load_config_legacy_single_repo_normalizes_and_applies_defaults(tmp_path: Path) -> None:
     cfg_path = _write(
         tmp_path / "mergexo.toml",
         """
@@ -33,12 +34,7 @@ service_python = "/usr/bin/python3"
 [repo]
 owner = "johnynek"
 name = "repo"
-default_branch = "main"
-trigger_label = "agent:design"
-bugfix_label = "agent:bugfix-custom"
-small_job_label = "agent:small-custom"
 coding_guidelines_path = "docs/guidelines.md"
-design_docs_dir = "docs/design"
 local_clone_source = "/tmp/local.git"
 operations_issue_number = 99
 operator_logins = ["Alice", "bob"]
@@ -58,6 +54,7 @@ extra_args = ["--full-auto"]
     loaded = config.load_config(cfg_path)
 
     assert isinstance(loaded, AppConfig)
+    assert len(loaded.repos) == 1
     assert loaded.runtime.worker_count == 2
     assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
     assert loaded.runtime.enable_feedback_loop is True
@@ -68,22 +65,60 @@ extra_args = ["--full-auto"]
     assert loaded.runtime.git_checkout_root is not None
     assert loaded.runtime.git_checkout_root.as_posix().endswith("/code/mergexo")
     assert loaded.runtime.service_python == "/usr/bin/python3"
+    assert loaded.repo.repo_id == "repo"
     assert loaded.repo.full_name == "johnynek/repo"
+    assert loaded.repo.default_branch == "main"
+    assert loaded.repo.trigger_label == "agent:design"
+    assert loaded.repo.bugfix_label == "agent:bugfix"
+    assert loaded.repo.small_job_label == "agent:small-job"
+    assert loaded.repo.design_docs_dir == "docs/design"
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
-    assert loaded.repo.bugfix_label == "agent:bugfix-custom"
-    assert loaded.repo.small_job_label == "agent:small-custom"
     assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
     assert loaded.repo.operations_issue_number == 99
     assert loaded.repo.operator_logins == ("alice", "bob")
+    assert loaded.repo.allowed_users == frozenset({"alice", "bob"})
+    assert loaded.repo.allows(" ALICE ")
     assert loaded.codex.extra_args == ("--full-auto",)
+    # Single-repo compatibility shim:
     assert loaded.auth.allowed_users == frozenset({"alice", "bob"})
-    assert loaded.auth.allows("ALICE")
-    assert loaded.auth.allows(" bob ")
-    assert loaded.auth.allows("carol") is False
-    assert loaded.auth.allows("   ") is False
 
 
-def test_load_config_uses_explicit_remote(tmp_path: Path) -> None:
+def test_load_config_multi_repo_keyed_tables_and_name_inference(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "mergexo.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo.mergexo]
+owner = "johnynek"
+coding_guidelines_path = "docs/python_style.md"
+allowed_users = ["Alice", "bob", "alice"]
+
+[repo.bosatsu]
+owner = "johnynek"
+name = "bosatsu"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+    assert len(loaded.repos) == 2
+
+    by_id = {repo.repo_id: repo for repo in loaded.repos}
+    assert by_id["mergexo"].name == "mergexo"
+    assert by_id["mergexo"].full_name == "johnynek/mergexo"
+    assert by_id["mergexo"].allowed_users == frozenset({"alice", "bob"})
+
+    assert by_id["bosatsu"].name == "bosatsu"
+    assert by_id["bosatsu"].full_name == "johnynek/bosatsu"
+    # owner default when allowed_users omitted in multi-repo mode
+    assert by_id["bosatsu"].allowed_users == frozenset({"johnynek"})
+
+
+def test_load_config_legacy_defaults_owner_when_no_allowlists(tmp_path: Path) -> None:
     cfg_path = _write(
         tmp_path / "mergexo.toml",
         """
@@ -93,31 +128,101 @@ worker_count = 1
 poll_interval_seconds = 5
 
 [repo]
-owner = "o"
-name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-remote_url = "git@github.com:example/custom.git"
-
-[auth]
-allowed_users = ["o"]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
 """.strip(),
     )
-
     loaded = config.load_config(cfg_path)
-    assert loaded.repo.effective_remote_url == "git@github.com:example/custom.git"
-    assert loaded.repo.bugfix_label == "agent:bugfix"
-    assert loaded.repo.small_job_label == "agent:small-job"
-    assert loaded.repo.coding_guidelines_path == "docs/python_style.md"
-    assert loaded.runtime.enable_feedback_loop is False
-    assert loaded.runtime.enable_github_operations is False
-    assert loaded.runtime.restart_default_mode == "git_checkout"
-    assert loaded.runtime.restart_supported_modes == ("git_checkout",)
-    assert loaded.runtime.git_checkout_root is None
-    assert loaded.repo.operations_issue_number is None
-    assert loaded.repo.operator_logins == ()
-    assert loaded.auth.allowed_users == frozenset({"o"})
+    assert loaded.repo.allowed_users == frozenset({"owner"})
+
+
+def test_load_config_legacy_repo_allowed_users_overrides_auth(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "mergexo.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+allowed_users = ["repo-user"]
+
+[auth]
+allowed_users = ["auth-user"]
+""".strip(),
+    )
+    loaded = config.load_config(cfg_path)
+    assert loaded.repo.allowed_users == frozenset({"repo-user"})
+
+
+def test_load_config_rejects_missing_coding_guidelines(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match=re.escape("coding_guidelines_path is required")):
+        config.load_config(cfg_path)
+
+
+def test_load_config_rejects_mixed_repo_shapes(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+
+[repo.other]
+owner = "o"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match="Cannot mix legacy"):
+        config.load_config(cfg_path)
+
+
+def test_load_config_rejects_duplicate_repo_full_names(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo.a]
+owner = "o"
+name = "same"
+coding_guidelines_path = "docs/python_style.md"
+
+[repo.b]
+owner = "o"
+name = "same"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match="Duplicate repo full_name"):
+        config.load_config(cfg_path)
 
 
 @pytest.mark.parametrize(
@@ -134,12 +239,7 @@ poll_interval_seconds = 60
 [repo]
 owner = "o"
 name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-
-[auth]
-allowed_users = ["o"]
+coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "worker_count",
         ),
@@ -153,12 +253,7 @@ poll_interval_seconds = 1
 [repo]
 owner = "o"
 name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-
-[auth]
-allowed_users = ["o"]
+coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "poll_interval_seconds",
         ),
@@ -174,12 +269,7 @@ poll_interval_seconds = 5
 [repo]
 owner = "o"
 name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-
-[auth]
-allowed_users = ["o"]
+coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "[codex] must be a TOML table",
         ),
@@ -194,12 +284,7 @@ restart_drain_timeout_seconds = 0
 [repo]
 owner = "o"
 name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-
-[auth]
-allowed_users = ["o"]
+coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "restart_drain_timeout_seconds",
         ),
@@ -215,18 +300,13 @@ restart_supported_modes = ["git_checkout"]
 [repo]
 owner = "o"
 name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-
-[auth]
-allowed_users = ["o"]
+coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "restart_default_mode",
         ),
     ],
 )
-def test_load_config_errors(tmp_path: Path, content: str, expected: str) -> None:
+def test_load_config_runtime_and_shape_errors(tmp_path: Path, content: str, expected: str) -> None:
     cfg_path = _write(tmp_path / "bad.toml", content)
     with pytest.raises(ConfigError, match=re.escape(expected)):
         config.load_config(cfg_path)
@@ -249,6 +329,18 @@ def test_helper_require_table_and_strings() -> None:
     assert config._optional_str({"k": "v"}, "k") == "v"
     with pytest.raises(ConfigError, match="non-empty string"):
         config._optional_str({"k": ""}, "k")
+
+    assert config._optional_table({}, "x") is None
+    assert config._optional_table({"x": {}}, "x") == {}
+    with pytest.raises(ConfigError, match="must be a TOML table"):
+        config._optional_table({"x": 1}, "x")
+    with pytest.raises(ConfigError, match="must have string keys"):
+        config._optional_table({"x": cast(dict[str, object], {1: "v"})}, "x")
+
+    with pytest.raises(ConfigError, match="must be a TOML table"):
+        config._require_repo_table(1, table_name="[repo.bad]")
+    with pytest.raises(ConfigError, match="must have string keys"):
+        config._require_repo_table(cast(object, {1: "v"}), table_name="[repo.bad]")
 
 
 def test_helper_numeric_bool_and_tuple() -> None:
@@ -297,6 +389,58 @@ def test_helper_numeric_bool_and_tuple() -> None:
     with pytest.raises(ConfigError, match="one of"):
         config._parse_restart_mode(1, key="k")
 
+
+def test_repo_auth_and_app_config_helpers() -> None:
+    repo = config.RepoConfig(
+        repo_id="id",
+        owner="owner",
+        name="repo",
+        default_branch="main",
+        trigger_label="agent:design",
+        bugfix_label="agent:bugfix",
+        small_job_label="agent:small-job",
+        coding_guidelines_path="docs/python_style.md",
+        design_docs_dir="docs/design",
+        allowed_users=frozenset({"alice"}),
+        local_clone_source=None,
+        remote_url="https://example.invalid/repo.git",
+    )
+    assert repo.effective_remote_url == "https://example.invalid/repo.git"
+    assert repo.allows("") is False
+    assert repo.allows(" alice ")
+
+    auth = config.AuthConfig(allowed_users=frozenset({"bob"}))
+    assert auth.allows("") is False
+    assert auth.allows(" BOB ")
+
+    app = config.AppConfig(
+        runtime=config.RuntimeConfig(
+            base_dir=Path("/tmp"),
+            worker_count=1,
+            poll_interval_seconds=60,
+            enable_feedback_loop=False,
+        ),
+        repos=(),
+        codex=config.CodexConfig(
+            enabled=True,
+            model=None,
+            sandbox=None,
+            profile=None,
+            extra_args=(),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="AppConfig.repos is empty"):
+        _ = app.repo
+
+
+def test_load_repo_configs_rejects_empty_and_non_string_keys() -> None:
+    with pytest.raises(ConfigError, match=r"\[repo\] must define one repo configuration"):
+        config._load_repo_configs(repo_data={}, auth_data=None)
+
+    bad_repo_data = cast(dict[str, object], {1: {"owner": "o", "coding_guidelines_path": "p"}})
+    with pytest.raises(ConfigError, match=r"\[repo\] must have string keys"):
+        config._load_repo_configs(repo_data=bad_repo_data, auth_data=None)
+
     assert config._operator_logins_with_default({}, "k", ()) == ()
     assert config._operator_logins_with_default({"k": ["A", "a", "b"]}, "k", ()) == ("a", "b")
     with pytest.raises(ConfigError, match="list of strings"):
@@ -307,75 +451,12 @@ def test_helper_numeric_bool_and_tuple() -> None:
         config._operator_logins_with_default({"k": [""]}, "k", ())
 
 
-@pytest.mark.parametrize(
-    "content, expected",
-    [
-        (
-            """
-[runtime]
-base_dir = "/tmp/x"
-worker_count = 1
-poll_interval_seconds = 5
-
-[repo]
-owner = "o"
-name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-""".strip(),
-            "[auth] is required and must be a TOML table",
-        ),
-        (
-            """
-[runtime]
-base_dir = "/tmp/x"
-worker_count = 1
-poll_interval_seconds = 5
-
-[repo]
-owner = "o"
-name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-
-[auth]
-allowed_users = []
-""".strip(),
-            "allowed_users is required and must be a non-empty list of strings",
-        ),
-        (
-            """
-[runtime]
-base_dir = "/tmp/x"
-worker_count = 1
-poll_interval_seconds = 5
-
-[repo]
-owner = "o"
-name = "n"
-default_branch = "main"
-trigger_label = "l"
-design_docs_dir = "docs/design"
-
-[auth]
-allowed_users = ["ok", "   "]
-""".strip(),
-            "allowed_users is required and must be a non-empty list of strings",
-        ),
-    ],
-)
-def test_load_config_auth_errors(tmp_path: Path, content: str, expected: str) -> None:
-    cfg_path = _write(tmp_path / "bad-auth.toml", content)
-    with pytest.raises(ConfigError, match=re.escape(expected)):
-        config.load_config(cfg_path)
-
-
-def test_helper_require_allowed_users() -> None:
+def test_helper_allowed_user_parsing() -> None:
     assert config._require_allowed_users({"users": [" Alice ", "BOB"]}, "users") == frozenset(
         {"alice", "bob"}
     )
+    assert config._optional_allowed_users({}, "users") is None
+    assert config._default_allowed_users(owner="Owner") == frozenset({"owner"})
     with pytest.raises(ConfigError, match="non-empty list of strings"):
         config._require_allowed_users({"users": []}, "users")
     with pytest.raises(ConfigError, match="non-empty list of strings"):

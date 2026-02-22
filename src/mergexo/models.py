@@ -78,6 +78,7 @@ class WorkResult:
     branch: str
     pr_number: int
     pr_url: str
+    repo_full_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ class OperatorCommandRecord:
     result: str
     created_at: str
     updated_at: str
+    repo_full_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -105,3 +107,4 @@ class RuntimeOperationRecord:
     detail: str | None
     created_at: str
     updated_at: str
+    request_repo_full_name: str = ""

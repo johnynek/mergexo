@@ -18,6 +18,7 @@ def _config(tmp_path: Path, *, worker_count: int = 2) -> tuple[RuntimeConfig, Re
         enable_feedback_loop=False,
     )
     repo = RepoConfig(
+        repo_id="mergexo",
         owner="johnynek",
         name="mergexo",
         default_branch="main",
@@ -26,6 +27,7 @@ def _config(tmp_path: Path, *, worker_count: int = 2) -> tuple[RuntimeConfig, Re
         small_job_label="agent:small-job",
         coding_guidelines_path="docs/python_style.md",
         design_docs_dir="docs/design",
+        allowed_users=frozenset({"johnynek"}),
         local_clone_source=None,
         remote_url=None,
     )
@@ -53,7 +55,7 @@ def test_ensure_layout_initializes_mirror_and_slots(
     assert manager.layout.checkouts_root.exists()
     assert any(cmd[:3] == ["git", "clone", "--mirror"] for cmd in calls)
     clone_calls = [cmd for cmd in calls if cmd[:2] == ["git", "clone"] and "--mirror" not in cmd]
-    assert len(clone_calls) == 2
+    assert clone_calls == []
 
 
 def test_ensure_checkout_existing_slot_sets_remote(

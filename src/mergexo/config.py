@@ -24,6 +24,7 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class RepoConfig:
+    repo_id: str
     owner: str
     name: str
     default_branch: str
@@ -32,6 +33,7 @@ class RepoConfig:
     small_job_label: str
     coding_guidelines_path: str
     design_docs_dir: str
+    allowed_users: frozenset[str]
     local_clone_source: str | None
     remote_url: str | None
     operations_issue_number: int | None = None
@@ -46,6 +48,12 @@ class RepoConfig:
         if self.remote_url:
             return self.remote_url
         return f"git@github.com:{self.owner}/{self.name}.git"
+
+    def allows(self, login: str) -> bool:
+        normalized = login.strip().lower()
+        if not normalized:
+            return False
+        return normalized in self.allowed_users
 
 
 @dataclass(frozen=True)
@@ -71,9 +79,19 @@ class AuthConfig:
 @dataclass(frozen=True)
 class AppConfig:
     runtime: RuntimeConfig
-    repo: RepoConfig
+    repos: tuple[RepoConfig, ...]
     codex: CodexConfig
-    auth: AuthConfig
+
+    @property
+    def repo(self) -> RepoConfig:
+        if not self.repos:
+            raise RuntimeError("AppConfig.repos is empty")
+        return self.repos[0]
+
+    @property
+    def auth(self) -> AuthConfig:
+        # Single-repo compatibility shim for existing code/tests.
+        return AuthConfig(allowed_users=self.repo.allowed_users)
 
 
 class ConfigError(ValueError):
@@ -86,10 +104,10 @@ def load_config(path: Path) -> AppConfig:
 
     runtime_data = _require_table(data, "runtime")
     repo_data = _require_table(data, "repo")
-    auth_data = _require_table(data, "auth")
     codex_data = data.get("codex", {})
     if not isinstance(codex_data, dict):
         raise ConfigError("[codex] must be a TOML table")
+    auth_data = _optional_table(data, "auth")
 
     runtime = RuntimeConfig(
         base_dir=Path(_require_str(runtime_data, "base_dir")).expanduser(),
@@ -123,22 +141,7 @@ def load_config(path: Path) -> AppConfig:
             "runtime.restart_default_mode must be included in runtime.restart_supported_modes"
         )
 
-    repo = RepoConfig(
-        owner=_require_str(repo_data, "owner"),
-        name=_require_str(repo_data, "name"),
-        default_branch=_require_str(repo_data, "default_branch"),
-        trigger_label=_require_str(repo_data, "trigger_label"),
-        bugfix_label=_str_with_default(repo_data, "bugfix_label", "agent:bugfix"),
-        small_job_label=_str_with_default(repo_data, "small_job_label", "agent:small-job"),
-        coding_guidelines_path=_str_with_default(
-            repo_data, "coding_guidelines_path", "docs/python_style.md"
-        ),
-        design_docs_dir=_require_str(repo_data, "design_docs_dir"),
-        local_clone_source=_optional_str(repo_data, "local_clone_source"),
-        remote_url=_optional_str(repo_data, "remote_url"),
-        operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
-        operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
-    )
+    repos = _load_repo_configs(repo_data=repo_data, auth_data=auth_data)
 
     codex = CodexConfig(
         enabled=_bool_with_default(codex_data, "enabled", True),
@@ -148,9 +151,94 @@ def load_config(path: Path) -> AppConfig:
         extra_args=_tuple_of_str(codex_data, "extra_args"),
     )
 
-    auth = AuthConfig(allowed_users=_require_allowed_users(auth_data, "allowed_users"))
+    return AppConfig(runtime=runtime, repos=repos, codex=codex)
 
-    return AppConfig(runtime=runtime, repo=repo, codex=codex, auth=auth)
+
+def _load_repo_configs(
+    *, repo_data: dict[str, object], auth_data: dict[str, object] | None
+) -> tuple[RepoConfig, ...]:
+    if not repo_data:
+        raise ConfigError("[repo] must define one repo configuration")
+
+    keyed_items = [(key, value) for key, value in repo_data.items() if isinstance(value, dict)]
+    scalar_items = [(key, value) for key, value in repo_data.items() if not isinstance(value, dict)]
+
+    if keyed_items and scalar_items:
+        raise ConfigError("Cannot mix legacy [repo] fields with [repo.<id>] tables")
+
+    if scalar_items:
+        return (_parse_legacy_repo_config(repo_data=repo_data, auth_data=auth_data),)
+
+    repos: list[RepoConfig] = []
+    for repo_id, raw_value in sorted(keyed_items):
+        if not isinstance(repo_id, str):
+            raise ConfigError("[repo] must have string keys")
+        repo_table = _require_repo_table(raw_value, table_name=f"[repo.{repo_id}]")
+        repos.append(_parse_keyed_repo_config(repo_id=repo_id, repo_data=repo_table))
+    _ensure_unique_full_names(repos)
+    return tuple(repos)
+
+
+def _parse_legacy_repo_config(
+    *, repo_data: dict[str, object], auth_data: dict[str, object] | None
+) -> RepoConfig:
+    owner = _require_str(repo_data, "owner")
+    name = _require_str(repo_data, "name")
+    repo_allowed_users = _optional_allowed_users(repo_data, "allowed_users")
+    if repo_allowed_users is not None:
+        allowed_users = repo_allowed_users
+    elif auth_data is not None and "allowed_users" in auth_data:
+        allowed_users = _require_allowed_users(auth_data, "allowed_users")
+    else:
+        allowed_users = _default_allowed_users(owner=owner)
+    return _parse_repo_config(
+        repo_id=name,
+        repo_data=repo_data,
+        owner=owner,
+        name=name,
+        allowed_users=allowed_users,
+    )
+
+
+def _parse_keyed_repo_config(*, repo_id: str, repo_data: dict[str, object]) -> RepoConfig:
+    owner = _require_str(repo_data, "owner")
+    name = _str_with_default(repo_data, "name", repo_id)
+    allowed_users = _optional_allowed_users(repo_data, "allowed_users")
+    if allowed_users is None:
+        allowed_users = _default_allowed_users(owner=owner)
+    return _parse_repo_config(
+        repo_id=repo_id,
+        repo_data=repo_data,
+        owner=owner,
+        name=name,
+        allowed_users=allowed_users,
+    )
+
+
+def _parse_repo_config(
+    *,
+    repo_id: str,
+    repo_data: dict[str, object],
+    owner: str,
+    name: str,
+    allowed_users: frozenset[str],
+) -> RepoConfig:
+    return RepoConfig(
+        repo_id=repo_id,
+        owner=owner,
+        name=name,
+        default_branch=_str_with_default(repo_data, "default_branch", "main"),
+        trigger_label=_str_with_default(repo_data, "trigger_label", "agent:design"),
+        bugfix_label=_str_with_default(repo_data, "bugfix_label", "agent:bugfix"),
+        small_job_label=_str_with_default(repo_data, "small_job_label", "agent:small-job"),
+        coding_guidelines_path=_require_str(repo_data, "coding_guidelines_path"),
+        design_docs_dir=_str_with_default(repo_data, "design_docs_dir", "docs/design"),
+        allowed_users=allowed_users,
+        local_clone_source=_optional_str(repo_data, "local_clone_source"),
+        remote_url=_optional_str(repo_data, "remote_url"),
+        operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
+        operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
+    )
 
 
 def _require_table(data: dict[str, object], key: str) -> dict[str, object]:
@@ -159,6 +247,25 @@ def _require_table(data: dict[str, object], key: str) -> dict[str, object]:
         raise ConfigError(f"[{key}] is required and must be a TOML table")
     if not all(isinstance(item, str) for item in value.keys()):
         raise ConfigError(f"[{key}] must have string keys")
+    return cast(dict[str, object], value)
+
+
+def _optional_table(data: dict[str, object], key: str) -> dict[str, object] | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError(f"[{key}] must be a TOML table when provided")
+    if not all(isinstance(item, str) for item in value.keys()):
+        raise ConfigError(f"[{key}] must have string keys")
+    return cast(dict[str, object], value)
+
+
+def _require_repo_table(value: object, *, table_name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{table_name} must be a TOML table")
+    if not all(isinstance(item, str) for item in value.keys()):
+        raise ConfigError(f"{table_name} must have string keys")
     return cast(dict[str, object], value)
 
 
@@ -284,6 +391,16 @@ def _operator_logins_with_default(
     return tuple(normalized)
 
 
+def _optional_allowed_users(data: dict[str, object], key: str) -> frozenset[str] | None:
+    if key not in data:
+        return None
+    return _require_allowed_users(data, key)
+
+
+def _default_allowed_users(*, owner: str) -> frozenset[str]:
+    return frozenset({owner.strip().lower()})
+
+
 def _require_allowed_users(data: dict[str, object], key: str) -> frozenset[str]:
     value = data.get(key)
     if not isinstance(value, list) or not value:
@@ -298,3 +415,15 @@ def _require_allowed_users(data: dict[str, object], key: str) -> frozenset[str]:
             raise ConfigError(f"{key} is required and must be a non-empty list of strings")
         out.add(normalized)
     return frozenset(out)
+
+
+def _ensure_unique_full_names(repos: list[RepoConfig]) -> None:
+    seen: dict[str, str] = {}
+    for repo in repos:
+        existing_id = seen.get(repo.full_name)
+        if existing_id is not None:
+            raise ConfigError(
+                f"Duplicate repo full_name {repo.full_name!r} across repo ids "
+                f"{existing_id!r} and {repo.repo_id!r}"
+            )
+        seen[repo.full_name] = repo.repo_id

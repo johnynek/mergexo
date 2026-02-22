@@ -103,9 +103,13 @@ class DirectFlowValidationError(DirectFlowError):
 class RestartRequested(RuntimeError):
     mode: RestartMode
     command_key: str
+    repo_full_name: str = ""
 
     def __str__(self) -> str:
-        return f"Restart requested in mode={self.mode} via command_key={self.command_key}"
+        return (
+            f"Restart requested in mode={self.mode} via command_key={self.command_key} "
+            f"(repo={self.repo_full_name})"
+        )
 
 
 class SlotPool:
@@ -115,9 +119,10 @@ class SlotPool:
         for slot in range(worker_count):
             self._slots.put(slot)
 
-    def acquire(self) -> _SlotLease:
+    def acquire(self, *, manager: GitRepoManager | None = None) -> _SlotLease:
         slot = self._slots.get(block=True)
-        path = self._manager.ensure_checkout(slot)
+        active_manager = manager if manager is not None else self._manager
+        path = active_manager.ensure_checkout(slot)
         log_event(LOGGER, "slot_acquired", slot=slot)
         return _SlotLease(slot=slot, path=path)
 
@@ -134,6 +139,8 @@ class Phase1Orchestrator:
         state: StateStore,
         github: GitHubGateway,
         git_manager: GitRepoManager,
+        repo: RepoConfig | None = None,
+        github_by_repo_full_name: dict[str, GitHubGateway] | None = None,
         agent: AgentAdapter,
         allow_runtime_restart: bool = False,
     ) -> None:
@@ -141,6 +148,9 @@ class Phase1Orchestrator:
         self._state = state
         self._github = github
         self._git = git_manager
+        self._repo = repo if repo is not None else config.repo
+        self._github_by_repo_full_name = dict(github_by_repo_full_name or {})
+        self._github_by_repo_full_name.setdefault(self._repo.full_name, github)
         self._agent = agent
         self._allow_runtime_restart = allow_runtime_restart
         self._slot_pool = SlotPool(git_manager, config.runtime.worker_count)
@@ -149,7 +159,7 @@ class Phase1Orchestrator:
         self._running_lock = threading.Lock()
         self._restart_drain_started_at_monotonic: float | None = None
         self._authorized_operator_logins = {
-            login.strip().lower() for login in self._config.repo.operator_logins if login.strip()
+            login.strip().lower() for login in self._repo.operator_logins if login.strip()
         }
 
     def run(self, *, once: bool) -> None:
@@ -195,7 +205,7 @@ class Phase1Orchestrator:
                 time.sleep(self._config.runtime.poll_interval_seconds)
 
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
-        labels = _trigger_labels(self._config.repo)
+        labels = _trigger_labels(self._repo)
         issues = self._github.list_open_issues_with_any_labels(labels)
         log_event(LOGGER, "issues_fetched", issue_count=len(issues), label_count=len(labels))
         for issue in issues:
@@ -214,9 +224,9 @@ class Phase1Orchestrator:
 
             flow = _resolve_issue_flow(
                 issue=issue,
-                design_label=self._config.repo.trigger_label,
-                bugfix_label=self._config.repo.bugfix_label,
-                small_job_label=self._config.repo.small_job_label,
+                design_label=self._repo.trigger_label,
+                bugfix_label=self._repo.bugfix_label,
+                small_job_label=self._repo.small_job_label,
             )
             if flow is None:
                 log_event(
@@ -245,7 +255,9 @@ class Phase1Orchestrator:
                     )
                     continue
 
-            if not self._state.can_enqueue(issue.number):
+            if not self._state.can_enqueue(
+                issue.number, repo_full_name=self._state_repo_full_name()
+            ):
                 log_event(
                     LOGGER,
                     "issue_skipped",
@@ -254,14 +266,16 @@ class Phase1Orchestrator:
                 )
                 continue
 
-            self._state.mark_running(issue.number)
+            self._state.mark_running(issue.number, repo_full_name=self._state_repo_full_name())
             fut = pool.submit(self._process_issue, issue, flow)
             with self._running_lock:
                 self._running[issue.number] = fut
             log_event(LOGGER, "issue_enqueued", issue_number=issue.number, flow=flow)
 
     def _enqueue_implementation_work(self, pool: ThreadPoolExecutor) -> None:
-        candidates = self._state.list_implementation_candidates()
+        candidates = self._state.list_implementation_candidates(
+            repo_full_name=self._state_repo_full_name()
+        )
         log_event(
             LOGGER,
             "implementation_candidates_fetched",
@@ -286,7 +300,9 @@ class Phase1Orchestrator:
                     )
                     continue
 
-            self._state.mark_running(candidate.issue_number)
+            self._state.mark_running(
+                candidate.issue_number, repo_full_name=self._state_repo_full_name()
+            )
             fut = pool.submit(self._process_implementation_candidate, candidate)
             with self._running_lock:
                 self._running[candidate.issue_number] = fut
@@ -298,7 +314,9 @@ class Phase1Orchestrator:
             )
 
     def _enqueue_feedback_work(self, pool: ThreadPoolExecutor) -> None:
-        tracked_prs = self._state.list_tracked_pull_requests()
+        tracked_prs = self._state.list_tracked_pull_requests(
+            repo_full_name=self._state_repo_full_name()
+        )
         log_event(LOGGER, "feedback_scan_started", tracked_pr_count=len(tracked_prs))
         for tracked in tracked_prs:
             with self._running_lock:
@@ -340,7 +358,10 @@ class Phase1Orchestrator:
         if not issue_numbers:
             return
         blocked_pr_numbers = {
-            blocked.pr_number for blocked in self._state.list_blocked_pull_requests()
+            blocked.pr_number
+            for blocked in self._state.list_blocked_pull_requests(
+                repo_full_name=self._state_repo_full_name()
+            )
         }
 
         for issue_number in issue_numbers:
@@ -358,7 +379,10 @@ class Phase1Orchestrator:
                     comment_id=comment.comment_id,
                     updated_at=comment.updated_at,
                 )
-                existing = self._state.get_operator_command(command_key)
+                existing = self._state.get_operator_command(
+                    command_key,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 if existing is not None:
                     self._reconcile_operator_command(existing)
                     continue
@@ -389,6 +413,7 @@ class Phase1Orchestrator:
                         args_json=args_json,
                         status="rejected",
                         result=detail,
+                        repo_full_name=self._state_repo_full_name(),
                     )
                     self._post_operator_command_result(
                         record, reply_status="rejected", detail=detail
@@ -415,6 +440,7 @@ class Phase1Orchestrator:
                         args_json=args_json,
                         status="failed",
                         result=detail,
+                        repo_full_name=self._state_repo_full_name(),
                     )
                     self._post_operator_command_result(record, reply_status="failed", detail=detail)
                     log_event(
@@ -440,6 +466,7 @@ class Phase1Orchestrator:
                         args_json=args_json,
                         status="applied",
                         result=detail,
+                        repo_full_name=self._state_repo_full_name(),
                     )
                     self._post_operator_command_result(record, reply_status="help", detail=detail)
                     log_event(
@@ -468,6 +495,7 @@ class Phase1Orchestrator:
                         args_json=args_json,
                         status=unblock_status,
                         result=unblock_detail,
+                        repo_full_name=self._state_repo_full_name(),
                     )
                     reply_status = cast(OperatorReplyStatus, unblock_status)
                     self._post_operator_command_result(
@@ -509,6 +537,7 @@ class Phase1Orchestrator:
                             args_json=args_json,
                             status="failed",
                             result=detail,
+                            repo_full_name=self._state_repo_full_name(),
                         )
                         self._post_operator_command_result(
                             record, reply_status="failed", detail=detail
@@ -540,6 +569,7 @@ class Phase1Orchestrator:
                             args_json=args_json,
                             status="failed",
                             result=detail,
+                            repo_full_name=self._state_repo_full_name(),
                         )
                         self._post_operator_command_result(
                             record, reply_status="failed", detail=detail
@@ -559,6 +589,7 @@ class Phase1Orchestrator:
                         requested_by=comment.user_login,
                         request_command_key=command_key,
                         mode=requested_mode,
+                        request_repo_full_name=self._state_repo_full_name(),
                     )
                     if created:
                         detail = (
@@ -575,6 +606,7 @@ class Phase1Orchestrator:
                             args_json=args_json,
                             status="applied",
                             result=detail,
+                            repo_full_name=self._state_repo_full_name(),
                         )
                         log_event(
                             LOGGER,
@@ -608,6 +640,7 @@ class Phase1Orchestrator:
                             args_json=args_json,
                             status="applied",
                             result=detail,
+                            repo_full_name=self._state_repo_full_name(),
                         )
                         self._post_operator_command_result(
                             record, reply_status="applied", detail=detail
@@ -624,9 +657,14 @@ class Phase1Orchestrator:
                     continue
 
     def _operator_issue_numbers_to_scan(self) -> tuple[int, ...]:
-        issue_numbers = {blocked.pr_number for blocked in self._state.list_blocked_pull_requests()}
-        if self._config.repo.operations_issue_number is not None:
-            issue_numbers.add(self._config.repo.operations_issue_number)
+        issue_numbers = {
+            blocked.pr_number
+            for blocked in self._state.list_blocked_pull_requests(
+                repo_full_name=self._state_repo_full_name()
+            )
+        }
+        if self._repo.operations_issue_number is not None:
+            issue_numbers.add(self._repo.operations_issue_number)
         return tuple(sorted(issue_numbers))
 
     def _reconcile_operator_command(self, command: OperatorCommandRecord) -> None:
@@ -665,6 +703,7 @@ class Phase1Orchestrator:
                 command_key=operation.request_command_key,
                 status="failed",
                 result=detail,
+                repo_full_name=operation.request_repo_full_name,
             )
             if command is not None:
                 self._post_operator_command_result(command, reply_status="failed", detail=detail)
@@ -703,7 +742,11 @@ class Phase1Orchestrator:
                 actor=operation.requested_by,
                 mode=operation.mode,
             )
-            raise RestartRequested(mode=operation.mode, command_key=operation.request_command_key)
+            raise RestartRequested(
+                mode=operation.mode,
+                command_key=operation.request_command_key,
+                repo_full_name=operation.request_repo_full_name,
+            )
 
         drain_timeout = self._config.runtime.restart_drain_timeout_seconds
         elapsed = now - self._restart_drain_started_at_monotonic
@@ -721,6 +764,7 @@ class Phase1Orchestrator:
                 command_key=operation.request_command_key,
                 status="failed",
                 result=detail,
+                repo_full_name=operation.request_repo_full_name,
             )
             if command is not None:
                 self._post_operator_command_result(command, reply_status="failed", detail=detail)
@@ -762,6 +806,7 @@ class Phase1Orchestrator:
         reset_count = self._state.reset_blocked_pull_requests(
             pr_numbers=(target_pr_number,),
             last_seen_head_sha_override=head_sha,
+            repo_full_name=self._state_repo_full_name(),
         )
         if reset_count == 0:
             return "failed", f"PR #{target_pr_number} is not currently blocked.", target_pr_number
@@ -799,9 +844,10 @@ class Phase1Orchestrator:
         detail: str,
         issue_number_override: int | None = None,
     ) -> None:
+        github = self._github_for_repo(command.repo_full_name)
         issue_number = issue_number_override or _operator_reply_issue_number(command)
         token = compute_operator_command_token(command_key=command.command_key)
-        if self._issue_has_action_token(issue_number=issue_number, token=token):
+        if self._issue_has_action_token(github=github, issue_number=issue_number, token=token):
             return
         body = _render_operator_command_result(
             normalized_command=_operator_normalized_command(command),
@@ -809,20 +855,31 @@ class Phase1Orchestrator:
             detail=detail,
             source_comment_url=_operator_source_comment_url(
                 command=command,
-                repo_full_name=self._config.repo.full_name,
+                repo_full_name=command.repo_full_name or self._repo.full_name,
             ),
         )
-        self._github.post_issue_comment(
+        github.post_issue_comment(
             issue_number=issue_number,
             body=append_action_token(body=body, token=token),
         )
 
-    def _issue_has_action_token(self, *, issue_number: int, token: str) -> bool:
-        issue_comments = self._github.list_issue_comments(issue_number)
+    def _issue_has_action_token(
+        self, *, github: GitHubGateway, issue_number: int, token: str
+    ) -> bool:
+        issue_comments = github.list_issue_comments(issue_number)
         for comment in issue_comments:
             if token in extract_action_tokens(comment.body):
                 return True
         return False
+
+    def _github_for_repo(self, repo_full_name: str) -> GitHubGateway:
+        normalized = repo_full_name.strip()
+        if normalized and normalized in self._github_by_repo_full_name:
+            return self._github_by_repo_full_name[normalized]
+        return self._github
+
+    def _state_repo_full_name(self) -> str:
+        return self._repo.full_name
 
     def _reap_finished(self) -> None:
         finished_issue_numbers: list[int] = []
@@ -845,6 +902,7 @@ class Phase1Orchestrator:
                         branch=result.branch,
                         pr_number=result.pr_number,
                         pr_url=result.pr_url,
+                        repo_full_name=result.repo_full_name or self._repo.full_name,
                     )
                     log_event(
                         LOGGER,
@@ -854,7 +912,11 @@ class Phase1Orchestrator:
                         branch=result.branch,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    self._state.mark_failed(issue_number=issue_number, error=str(exc))
+                    self._state.mark_failed(
+                        issue_number=issue_number,
+                        error=str(exc),
+                        repo_full_name=self._state_repo_full_name(),
+                    )
                     log_event(
                         LOGGER,
                         "issue_processing_failed",
@@ -878,6 +940,7 @@ class Phase1Orchestrator:
                         issue_number=handle.issue_number,
                         status="blocked",
                         error=str(exc),
+                        repo_full_name=self._state_repo_full_name(),
                     )
                     log_event(
                         LOGGER,
@@ -902,7 +965,7 @@ class Phase1Orchestrator:
             reason="unauthorized_issue_author_defensive",
         ):
             raise DirectFlowValidationError(
-                f"Issue #{issue.number} author is not allowed by auth.allowed_users"
+                f"Issue #{issue.number} author is not allowed by repo.allowed_users"
             )
 
         lease = self._slot_pool.acquire()
@@ -940,7 +1003,7 @@ class Phase1Orchestrator:
         branch = _issue_branch(flow="design_doc", issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
 
-        design_relpath = f"{self._config.repo.design_docs_dir}/{issue.number}-{slug}.md"
+        design_relpath = f"{self._repo.design_docs_dir}/{issue.number}-{slug}.md"
         log_event(
             LOGGER,
             "design_turn_started",
@@ -949,9 +1012,9 @@ class Phase1Orchestrator:
         )
         start_result = self._agent.start_design_from_issue(
             issue=issue,
-            repo_full_name=self._config.repo.full_name,
+            repo_full_name=self._state_repo_full_name(),
             design_doc_path=design_relpath,
-            default_branch=self._config.repo.default_branch,
+            default_branch=self._repo.default_branch,
             cwd=checkout_path,
         )
         log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
@@ -961,6 +1024,7 @@ class Phase1Orchestrator:
                 issue_number=issue.number,
                 adapter=start_result.session.adapter,
                 thread_id=start_result.session.thread_id,
+                repo_full_name=self._state_repo_full_name(),
             )
 
         design_abs_path = checkout_path / design_relpath
@@ -976,7 +1040,7 @@ class Phase1Orchestrator:
         pr = self._github.create_pull_request(
             title=f"Design doc for #{issue.number}: {generated.title}",
             head=branch,
-            base=self._config.repo.default_branch,
+            base=self._repo.default_branch,
             body=(
                 f"Design doc for issue #{issue.number}.\n\n"
                 f"Refs #{issue.number}\n\n"
@@ -1002,6 +1066,7 @@ class Phase1Orchestrator:
             branch=branch,
             pr_number=pr.number,
             pr_url=pr.html_url,
+            repo_full_name=self._state_repo_full_name(),
         )
 
     def _process_direct_issue(
@@ -1018,18 +1083,18 @@ class Phase1Orchestrator:
         if flow == "bugfix":
             start_result = self._agent.start_bugfix_from_issue(
                 issue=issue,
-                repo_full_name=self._config.repo.full_name,
-                default_branch=self._config.repo.default_branch,
-                coding_guidelines_path=self._config.repo.coding_guidelines_path,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                coding_guidelines_path=self._repo.coding_guidelines_path,
                 cwd=checkout_path,
             )
             flow_label = "bugfix"
         elif flow == "small_job":
             start_result = self._agent.start_small_job_from_issue(
                 issue=issue,
-                repo_full_name=self._config.repo.full_name,
-                default_branch=self._config.repo.default_branch,
-                coding_guidelines_path=self._config.repo.coding_guidelines_path,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                coding_guidelines_path=self._repo.coding_guidelines_path,
                 cwd=checkout_path,
             )
             flow_label = "small-job"
@@ -1041,6 +1106,7 @@ class Phase1Orchestrator:
                 issue_number=issue.number,
                 adapter=start_result.session.adapter,
                 thread_id=start_result.session.thread_id,
+                repo_full_name=self._state_repo_full_name(),
             )
 
         if start_result.blocked_reason:
@@ -1078,7 +1144,7 @@ class Phase1Orchestrator:
         pr = self._github.create_pull_request(
             title=start_result.pr_title,
             head=branch,
-            base=self._config.repo.default_branch,
+            base=self._repo.default_branch,
             body=(
                 f"{start_result.pr_summary}\n\n"
                 f"Fixes #{issue.number}\n\n"
@@ -1103,6 +1169,7 @@ class Phase1Orchestrator:
             branch=branch,
             pr_number=pr.number,
             pr_url=pr.html_url,
+            repo_full_name=self._state_repo_full_name(),
         )
 
     def _process_implementation_candidate(
@@ -1116,7 +1183,7 @@ class Phase1Orchestrator:
             reason="unauthorized_issue_author_defensive",
         ):
             raise DirectFlowValidationError(
-                f"Issue #{issue.number} author is not allowed by auth.allowed_users"
+                f"Issue #{issue.number} author is not allowed by repo.allowed_users"
             )
 
         lease = self._slot_pool.acquire()
@@ -1138,7 +1205,7 @@ class Phase1Orchestrator:
             branch = f"agent/impl/{slug}"
             self._git.create_or_reset_branch(lease.path, branch)
 
-            design_relpath = f"{self._config.repo.design_docs_dir}/{slug}.md"
+            design_relpath = f"{self._repo.design_docs_dir}/{slug}.md"
             design_abs_path = lease.path / design_relpath
             if not design_abs_path.exists():
                 detail = (
@@ -1150,7 +1217,7 @@ class Phase1Orchestrator:
                     issue_number=issue.number,
                     body=(
                         "MergeXO implementation flow requires a merged design doc at "
-                        f"`{design_relpath}` on `{self._config.repo.default_branch}`.{detail}"
+                        f"`{design_relpath}` on `{self._repo.default_branch}`.{detail}"
                     ),
                 )
                 raise DirectFlowValidationError(
@@ -1160,9 +1227,9 @@ class Phase1Orchestrator:
 
             start_result = self._agent.start_implementation_from_design(
                 issue=issue,
-                repo_full_name=self._config.repo.full_name,
-                default_branch=self._config.repo.default_branch,
-                coding_guidelines_path=self._config.repo.coding_guidelines_path,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                coding_guidelines_path=self._repo.coding_guidelines_path,
                 design_doc_path=design_relpath,
                 design_doc_markdown=design_doc_markdown,
                 design_pr_number=candidate.design_pr_number,
@@ -1174,6 +1241,7 @@ class Phase1Orchestrator:
                     issue_number=issue.number,
                     adapter=start_result.session.adapter,
                     thread_id=start_result.session.thread_id,
+                    repo_full_name=self._state_repo_full_name(),
                 )
 
             if start_result.blocked_reason:
@@ -1195,8 +1263,8 @@ class Phase1Orchestrator:
             self._git.push_branch(lease.path, branch)
 
             design_doc_url = _design_doc_url(
-                repo_full_name=self._config.repo.full_name,
-                default_branch=self._config.repo.default_branch,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
                 design_doc_path=design_relpath,
             )
             design_pr_line = (
@@ -1207,7 +1275,7 @@ class Phase1Orchestrator:
             pr = self._github.create_pull_request(
                 title=start_result.pr_title,
                 head=branch,
-                base=self._config.repo.default_branch,
+                base=self._repo.default_branch,
                 body=(
                     f"{start_result.pr_summary}\n\n"
                     f"Fixes #{issue.number}\n\n"
@@ -1234,6 +1302,7 @@ class Phase1Orchestrator:
                 branch=branch,
                 pr_number=pr.number,
                 pr_url=pr.html_url,
+                repo_full_name=self._state_repo_full_name(),
             )
         except Exception as exc:  # noqa: BLE001
             log_event(
@@ -1268,6 +1337,7 @@ class Phase1Orchestrator:
                     issue_number=tracked.issue_number,
                     status="merged",
                     last_seen_head_sha=pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1283,6 +1353,7 @@ class Phase1Orchestrator:
                     issue_number=tracked.issue_number,
                     status="closed",
                     last_seen_head_sha=pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1294,15 +1365,16 @@ class Phase1Orchestrator:
                 return
 
             issue = self._github.get_issue(tracked.issue_number)
-            if not self._config.auth.allows(issue.author_login):
+            if not self._repo.allows(issue.author_login):
                 reason = "unauthorized_issue_author"
-                error = "feedback ignored because issue author is not allowed by auth.allowed_users"
+                error = "feedback ignored because issue author is not allowed by repo.allowed_users"
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
                     status="blocked",
                     last_seen_head_sha=pr.head_sha,
                     error=error,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1340,7 +1412,10 @@ class Phase1Orchestrator:
             issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
             changed_files = self._github.list_pull_request_files(tracked.pr_number)
 
-            previous_pending = self._state.list_pending_feedback_events(tracked.pr_number)
+            previous_pending = self._state.list_pending_feedback_events(
+                tracked.pr_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
             normalized_review = self._normalize_review_events(
                 pr_number=tracked.pr_number,
                 issue_number=tracked.issue_number,
@@ -1351,10 +1426,19 @@ class Phase1Orchestrator:
                 issue_number=tracked.issue_number,
                 comments=issue_comments,
             )
-            self._state.ingest_feedback_events([event for event, _ in normalized_review])
-            self._state.ingest_feedback_events([event for event, _ in normalized_issue])
+            self._state.ingest_feedback_events(
+                [event for event, _ in normalized_review],
+                repo_full_name=self._state_repo_full_name(),
+            )
+            self._state.ingest_feedback_events(
+                [event for event, _ in normalized_issue],
+                repo_full_name=self._state_repo_full_name(),
+            )
 
-            pending_events = self._state.list_pending_feedback_events(tracked.pr_number)
+            pending_events = self._state.list_pending_feedback_events(
+                tracked.pr_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
             log_event(
                 LOGGER,
                 "feedback_events_pending",
@@ -1385,7 +1469,10 @@ class Phase1Orchestrator:
                 if normalized_event.event_key in pending_event_key_set
             )
 
-            session_row = self._state.get_agent_session(tracked.issue_number)
+            session_row = self._state.get_agent_session(
+                tracked.issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
             if session_row is None:
                 self._github.post_issue_comment(
                     issue_number=tracked.pr_number,
@@ -1400,6 +1487,7 @@ class Phase1Orchestrator:
                     status="blocked",
                     last_seen_head_sha=pr.head_sha,
                     error="missing saved agent session",
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1429,6 +1517,7 @@ class Phase1Orchestrator:
                 issue_number=tracked.issue_number,
                 status="awaiting_feedback",
                 last_seen_head_sha=turn_head_sha,
+                repo_full_name=self._state_repo_full_name(),
             )
             turn_key = compute_turn_key(
                 pr_number=tracked.pr_number,
@@ -1483,6 +1572,7 @@ class Phase1Orchestrator:
                             status="blocked",
                             last_seen_head_sha=pr.head_sha,
                             error=error,
+                            repo_full_name=self._state_repo_full_name(),
                         )
                         log_event(
                             LOGGER,
@@ -1502,6 +1592,7 @@ class Phase1Orchestrator:
                             issue_number=tracked.issue_number,
                             status="merged",
                             last_seen_head_sha=pr.head_sha,
+                            repo_full_name=self._state_repo_full_name(),
                         )
                         log_event(
                             LOGGER,
@@ -1517,6 +1608,7 @@ class Phase1Orchestrator:
                             issue_number=tracked.issue_number,
                             status="closed",
                             last_seen_head_sha=pr.head_sha,
+                            repo_full_name=self._state_repo_full_name(),
                         )
                         log_event(
                             LOGGER,
@@ -1534,6 +1626,7 @@ class Phase1Orchestrator:
                     issue_number=tracked.issue_number,
                     status="merged",
                     last_seen_head_sha=refreshed_pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1549,6 +1642,7 @@ class Phase1Orchestrator:
                     issue_number=tracked.issue_number,
                     status="closed",
                     last_seen_head_sha=refreshed_pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1618,6 +1712,7 @@ class Phase1Orchestrator:
                 processed_event_keys=pending_event_keys,
                 session=result.session,
                 head_sha=pr.head_sha,
+                repo_full_name=self._state_repo_full_name(),
             )
             log_event(
                 LOGGER,
@@ -1685,6 +1780,7 @@ class Phase1Orchestrator:
                     status="blocked",
                     last_seen_head_sha=current_pr.head_sha,
                     error=error,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1707,6 +1803,7 @@ class Phase1Orchestrator:
                     status="blocked",
                     last_seen_head_sha=current_pr.head_sha,
                     error=error,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1730,6 +1827,7 @@ class Phase1Orchestrator:
                     issue_number=tracked.issue_number,
                     status="merged",
                     last_seen_head_sha=current_pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1745,6 +1843,7 @@ class Phase1Orchestrator:
                     issue_number=tracked.issue_number,
                     status="closed",
                     last_seen_head_sha=current_pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
                 )
                 log_event(
                     LOGGER,
@@ -1839,7 +1938,7 @@ class Phase1Orchestrator:
         for comment in comments:
             if is_bot_login(comment.user_login):
                 continue
-            if not self._config.auth.allows(comment.user_login):
+            if not self._repo.allows(comment.user_login):
                 log_event(
                     LOGGER,
                     "auth_feedback_ignored",
@@ -1882,7 +1981,7 @@ class Phase1Orchestrator:
         for comment in comments:
             if is_bot_login(comment.user_login):
                 continue
-            if not self._config.auth.allows(comment.user_login):
+            if not self._repo.allows(comment.user_login):
                 log_event(
                     LOGGER,
                     "auth_feedback_ignored",
@@ -1964,6 +2063,7 @@ class Phase1Orchestrator:
             status="blocked",
             last_seen_head_sha=state_head_sha if state_head_sha is not None else observed_head_sha,
             error=error,
+            repo_full_name=self._state_repo_full_name(),
         )
         log_event(
             LOGGER,
@@ -2001,7 +2101,7 @@ class Phase1Orchestrator:
     def _is_issue_author_allowed(
         self, *, issue_number: int, author_login: str, reason: str
     ) -> bool:
-        if self._config.auth.allows(author_login):
+        if self._repo.allows(author_login):
             return True
         log_event(
             LOGGER,
