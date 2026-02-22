@@ -65,7 +65,7 @@ Update `src/mergexo/config.py` to normalize all config inputs into one internal 
 - In `[repo.<id>]`, when `name` is omitted, use `<id>` as GitHub repo name.
 - When `name` is set, `<id>` remains only a local config identifier.
 5. `allowed_users` placement:
-- In multi-repo mode, `allowed_users` is required inside each `[repo.<id>]` section.
+- In multi-repo mode, `allowed_users` is optional per repo and defaults to `[owner]` when omitted.
 - Global `[auth]` is not used in multi-repo mode.
 - In legacy single-repo mode, `[auth].allowed_users` can be read as a compatibility fallback and translated into the single normalized repo entry.
 6. Default values:
@@ -73,13 +73,13 @@ Update `src/mergexo/config.py` to normalize all config inputs into one internal 
 - `trigger_label` defaults to `"agent:design"`.
 - `bugfix_label` defaults to `"agent:bugfix"`.
 - `small_job_label` defaults to `"agent:small-job"`.
-- `coding_guidelines_path` defaults to `"docs/python_style.md"`.
+- `coding_guidelines_path` is required (no default).
 - `design_docs_dir` defaults to `"docs/design"`.
 - `operator_logins` defaults to an empty list.
 - `operations_issue_number` defaults to unset.
 - `allowed_users` rules:
-  - Multi-repo mode: required in each repo section (no implicit default).
-  - Legacy single-repo mode: if `repo.allowed_users` and `[auth].allowed_users` are both absent, default to `[owner]` for single-developer setups.
+  - Multi-repo mode: if omitted in a repo section, default to `[owner]`.
+  - Legacy single-repo mode: if `repo.allowed_users` and `[auth].allowed_users` are both absent, default to `[owner]`.
 
 Example multi-repo config shape:
 
@@ -91,6 +91,7 @@ owner = "johnynek"
 # trigger_label defaults to "agent:design"
 # bugfix_label defaults to "agent:bugfix"
 # small_job_label defaults to "agent:small-job"
+# coding_guidelines_path is required
 # design_docs_dir defaults to "docs/design"
 allowed_users = ["alice", "bob"]
 
@@ -99,8 +100,9 @@ owner = "johnynek"
 name = "bosatsu"
 # default_branch defaults to "main"
 # trigger_label defaults to "agent:design"
+# coding_guidelines_path is required
 # design_docs_dir defaults to "docs/design"
-allowed_users = ["alice"]
+# allowed_users omitted => defaults to ["johnynek"]
 ```
 
 ### 2. Repo runtime contexts
@@ -184,8 +186,9 @@ Global behavior:
 
 1. Config parsing:
 - legacy `[repo]` config normalizes to a single `AppConfig.repos` entry.
-- `[repo.<id>]` config supports omitted/explicit `name` and required per-repo `allowed_users`.
+- `[repo.<id>]` config supports omitted/explicit `name` and owner-defaulted `allowed_users`.
 - documented defaults resolve correctly when optional repo keys are omitted.
+- `coding_guidelines_path` is rejected when omitted.
 - single-repo mode falls back to `[owner]` for `allowed_users` when no allowlist is explicitly configured.
 - invalid mixed/duplicate repo definitions fail with clear errors.
 
@@ -210,19 +213,20 @@ Global behavior:
 ## Acceptance Criteria
 
 1. A config with two `[repo.<id>]` entries runs one process that polls both repos.
-2. For multi-repo configs, `allowed_users` is configured in each repo section and enforced per repo.
+2. For multi-repo configs, `allowed_users` is enforced per repo and defaults to `[owner]` when omitted.
 3. Legacy single-repo config input is normalized into one internal repo entry after parsing.
 4. Omitted repo fields resolve to documented defaults (`default_branch=main`, `trigger_label=agent:design`, `bugfix_label=agent:bugfix`, `small_job_label=agent:small-job`, `design_docs_dir=docs/design`).
-5. In legacy single-repo mode, when no allowlist is provided, `allowed_users` defaults to `[owner]`.
-6. The same issue number in two repos can run concurrently without state collisions.
-7. The same PR number in two repos can be tracked independently in feedback state.
-8. With `poll_interval_seconds = P` and `R` repos, each repo is polled every `P * R` seconds.
-9. `init` and startup do not eagerly clone all worker slots for all repos.
-10. First use of an unused `(repo, slot)` performs a lazy clone from that repo mirror.
-11. `feedback blocked list` clearly identifies repo for each row.
-12. `feedback blocked reset --pr` in multi-repo mode requires repo disambiguation and only mutates that repo’s rows.
-13. `/mergexo restart` remains global single-flight and posts result in the originating repo thread.
-14. Upgrading to this version requires state reinit; documented operator steps work end-to-end.
+5. `coding_guidelines_path` is required and startup fails when it is missing.
+6. In legacy single-repo mode, when no allowlist is provided, `allowed_users` defaults to `[owner]`.
+7. The same issue number in two repos can run concurrently without state collisions.
+8. The same PR number in two repos can be tracked independently in feedback state.
+9. With `poll_interval_seconds = P` and `R` repos, each repo is polled every `P * R` seconds.
+10. `init` and startup do not eagerly clone all worker slots for all repos.
+11. First use of an unused `(repo, slot)` performs a lazy clone from that repo mirror.
+12. `feedback blocked list` clearly identifies repo for each row.
+13. `feedback blocked reset --pr` in multi-repo mode requires repo disambiguation and only mutates that repo’s rows.
+14. `/mergexo restart` remains global single-flight and posts result in the originating repo thread.
+15. Upgrading to this version requires state reinit; documented operator steps work end-to-end.
 
 ## Risks and Mitigations
 
