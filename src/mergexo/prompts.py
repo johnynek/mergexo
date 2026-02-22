@@ -102,5 +102,7 @@ Return JSON only with this object shape:
 Rules:
 - Reply to specific review comments using their exact review_comment_id.
 - Do not invent IDs.
+- If you provide commit_message, you MUST have edited repository files for this turn.
+- Do not claim you pushed or updated files unless you actually edited them in this turn.
 - Use null or empty values only when no action is needed.
 """.strip()
