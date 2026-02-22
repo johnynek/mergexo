@@ -100,6 +100,36 @@ On rewrite detection:
 3. Reuse action-token pattern (`src/mergexo/feedback_loop.py`) for violation comments to avoid duplicate spam on retry/crash windows.
 4. Leave pending feedback events unprocessed so manual recovery can replay context if unblocked later.
 
+### 2.5 Manual recovery and unblocking playbook
+When a rewrite violation blocks a PR, operators need a deterministic recovery path.
+
+How operators know action is required:
+1. MergeXO posts an explicit PR comment that automation is blocked due to a non-fast-forward transition.
+2. `pr_feedback_state.status` becomes `blocked` for the PR.
+3. `issue_runs.status` becomes `blocked` with a concrete `error` reason.
+4. Verbose logs include an explicit event (for example `history_rewrite_blocked`) with `issue_number`, `pr_number`, `expected_head_sha`, and `observed_head_sha`.
+
+Why this does not leak worker capacity:
+1. `_process_feedback_turn` already releases slot leases in a `finally` block.
+2. Slot cleanup still runs before release, so no checkout slot remains stuck.
+3. A blocked PR is skipped by normal scheduling (`list_tracked_pull_requests` only returns `awaiting_feedback`), so failed retries do not monopolize workers.
+
+Exact operator recovery steps:
+1. Choose canonical branch state:
+   - Option A: restore prior linear history on the PR branch.
+   - Option B: accept the rewritten remote head as the new baseline.
+2. Verify the current PR head SHA on GitHub.
+3. Update local runtime state to resume from that baseline:
+   - `UPDATE pr_feedback_state SET status='awaiting_feedback', last_seen_head_sha='<current_pr_head_sha>', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE pr_number=<pr_number>;`
+   - `UPDATE issue_runs SET status='awaiting_feedback', error=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE issue_number=<issue_number>;`
+4. Do not delete rows from `feedback_events`; pending events should replay idempotently on next turn.
+5. Run one verification cycle:
+   - `uv run mergexo run --config mergexo.toml --once --verbose`
+6. Confirm recovery succeeded:
+   - PR is no longer marked blocked in state.
+   - Worker slot count is unchanged and new work can still start.
+   - Feedback events for the PR progress (or remain pending only for normal retry reasons).
+
 ## Implementation plan
 1. Add git ancestry helper methods in `src/mergexo/git_ops.py` and unit tests in `tests/test_git_ops.py`.
 2. Add GitHub compare wrapper in `src/mergexo/github_gateway.py` and parsing tests in `tests/test_github_gateway.py`.
@@ -129,6 +159,7 @@ On rewrite detection:
 5. Violation comments are idempotent and not duplicated across retries/crashes.
 6. Feedback prompt explicitly instructs agents to avoid history-rewrite commands.
 7. Existing non-feedback issue-to-design flow remains unchanged.
+8. Operators have documented, executable steps to unblock a PR safely without deleting feedback events or leaking worker slots.
 
 ## Risks and mitigations
 1. Risk: false positives from transient API/git inconsistency.
