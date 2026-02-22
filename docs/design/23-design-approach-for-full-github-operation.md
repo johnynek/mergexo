@@ -30,7 +30,7 @@ _Issue: #23 (https://github.com/johnynek/mergexo/issues/23)_
 
 ## Summary
 
-Add a GitHub-driven operator control plane so maintainers can unblock blocked PRs and request MergeXO restarts from comments, backed by durable command state, idempotent acknowledgements, and a supervisor-based restart/update path that supports both git-checkout installs now and PyPI installs later.
+Add a GitHub-driven operator control plane so maintainers can unblock blocked PRs and request MergeXO restarts from comments, backed by durable command state, idempotent acknowledgements, and a supervisor-based restart/update path that is explicit about today's supported `uv`-from-checkout deployment while keeping a clear extension point for future PyPI installs.
 
 ## Context
 MergeXO currently needs local shell access for two operational actions:
@@ -42,9 +42,11 @@ Issue #23 asks for full GitHub operation for both actions. The near-term environ
 ## Goals
 1. Allow maintainers to unblock blocked PRs from GitHub comments without SSH/shell access.
 2. Allow maintainers to request a safe MergeXO restart from GitHub.
-3. Make restart flow compatible with both install modes: `git_checkout` now and `pypi` later.
-4. Keep command handling idempotent across retries/crashes.
-5. Keep an auditable state trail of who requested what and when.
+3. Add a `/mergexo help` command that returns the current command set and a README link.
+4. Ensure every `/mergexo ...` command receives a deterministic success/failure/rejection reply.
+5. Make restart flow explicit for today's supported `uv` checkout runtime, with a future-compatible `pypi` mode.
+6. Keep command handling idempotent across retries/crashes.
+7. Keep an auditable state trail of who requested what and when.
 
 ## Non-goals
 1. Arbitrary remote command execution from GitHub comments.
@@ -61,12 +63,20 @@ Introduce a narrow command grammar in issue comments:
 3. `/mergexo unblock pr=<number> [head_sha=<sha>]`
 4. `/mergexo restart`
 5. `/mergexo restart mode=git_checkout|pypi`
+6. `/mergexo help`
 
 Command sources:
 1. Blocked PR threads: primary place for `unblock`.
 2. A configured operations issue (`repo.operations_issue_number`): place for global ops (`restart`, cross-PR `unblock pr=...`).
 
 Command key for dedupe: `issue_number:comment_id:updated_at`.
+
+Command reply contract:
+1. Every recognized `/mergexo ...` command produces exactly one idempotent result comment in the same issue/PR conversation.
+2. Result comment includes: normalized command, status (`applied`, `rejected`, `failed`, or `help`), and brief detail.
+3. `/mergexo help` always responds with the supported commands and a link to `README.md#github-operator-commands`.
+4. Parse failures (unknown subcommand or bad args) also receive a usage reply so operators are never silent-failed.
+5. Each result comment includes a reference to the originating command comment URL so the response is traceable as a thread-level reply.
 
 ### 2. Authorization Model
 1. Add explicit operator allowlist in config: `repo.operator_logins`.
@@ -117,25 +127,31 @@ Key detail: this scan is independent of `_enqueue_feedback_work`, so blocked PRs
 3. When drained, orchestrator raises a typed restart signal (`RestartRequested`) with requested mode.
 4. A new supervisor runtime (`mergexo service`) catches that signal and performs update+restart.
 
-If update fails, supervisor marks operation `failed`, posts a failure comment to the operations issue, and keeps the current process running.
+If update fails, supervisor marks operation `failed`, posts a failure comment reply to the originating command thread, and keeps the current process running.
 
-### 6. Update Strategy Abstraction
+### 6. UV-First Update and Restart Strategy
 Add updater modes in config:
-1. `git_checkout` mode (default for current deployments):
-- run configured update command in checkout root (default `git pull --ff-only`)
-- run configured sync command (default `uv sync`)
-- restart process
+1. `git_checkout` mode (supported now, default):
+- Assume MergeXO is launched from the mergexo repository checkout root.
+- Service launch command is explicitly:
+  `uv run mergexo service --config <path-to-mergexo.toml>`
+- Update commands are explicitly:
+  `git -C <checkout_root> pull --ff-only origin <default_branch>`
+  `uv sync`
+- Restart is explicit re-exec of the same service command and args used at boot (for example, `uv run mergexo service --config <path-to-mergexo.toml>` plus flags such as `--verbose` when present).
 
 2. `pypi` mode (future deployments):
-- run configured upgrade command (default `python -m pip install --upgrade mergexo`)
-- restart process
+- Not enabled in the first rollout, but reserved in the command grammar and state model.
+- When enabled, use a configured interpreter path and upgrade without assuming system-wide install, for example:
+  `uv pip install --python <service_python> --upgrade mergexo`
+- Restart still re-execs the same recorded service command line.
 
 The command-level `mode=` argument can override default mode per restart request, but only to supported configured modes.
 
 ### 7. CLI and Process Model
 1. Keep `mergexo run` for direct local execution.
 2. Add `mergexo service` as the production entrypoint for GitHub-operated restarts.
-3. `service` wraps orchestrator lifecycle, performs update strategy, and re-execs itself on successful restart operation.
+3. `service` wraps orchestrator lifecycle, performs update strategy, and re-execs itself on successful restart operation using the exact startup command line captured at process boot.
 4. Document that GitHub restart commands require `service` mode for fully automatic update+restart behavior.
 
 ### 8. Observability and Audit
@@ -175,9 +191,11 @@ All events include command key, actor, issue/PR target, and operation mode when 
 7. During restart drain, no new issue/design/implementation/feedback work is enqueued.
 8. After all active workers finish, supervisor executes configured update commands and restarts MergeXO.
 9. In `git_checkout` mode, restart path runs configured checkout update/sync commands before re-exec.
-10. In `pypi` mode, restart path runs configured package upgrade command before re-exec.
-11. If update command fails, restart operation is marked failed, a GitHub result comment is posted, and current process continues.
-12. Existing issue intake and feedback behavior is unchanged when GitHub operations are disabled.
+10. `/mergexo help` returns the supported command list and `README.md#github-operator-commands`.
+11. Every `/mergexo` command (including parse failures and unauthorized requests) receives one deterministic result reply in the same issue/PR conversation.
+12. In future `pypi` mode, restart path runs configured package upgrade command through `uv` against a configured interpreter before re-exec.
+13. If update command fails, restart operation is marked failed, a GitHub result reply is posted for that command, and current process continues.
+14. Existing issue intake and feedback behavior is unchanged when GitHub operations are disabled.
 
 ## Risks and Mitigations
 1. Risk: command abuse from public comments.
@@ -200,6 +218,6 @@ Mitigation: only scan blocked PRs plus one operations issue; cap fetched comment
 2. Canary unblock-only first on one repository and one or two operator accounts.
 3. Validate idempotency by forcing process restarts mid-command handling.
 4. Enable restart in `git_checkout` mode after unblock is stable.
-5. Move production launch instructions to `mergexo service` for GitHub-operated instances.
+5. Add a README section `github-operator-commands` and move production launch instructions to `mergexo service` for GitHub-operated instances.
 6. Add `pypi` mode only after package publishing pipeline is stable.
 7. Keep local CLI unblock command as break-glass fallback during rollout.
