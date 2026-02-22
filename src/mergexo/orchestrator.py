@@ -270,7 +270,15 @@ class Phase1Orchestrator:
             fut = pool.submit(self._process_issue, issue, flow)
             with self._running_lock:
                 self._running[issue.number] = fut
-            log_event(LOGGER, "issue_enqueued", issue_number=issue.number, flow=flow)
+            log_event(
+                LOGGER,
+                "issue_enqueued",
+                issue_number=issue.number,
+                flow=flow,
+                repo_full_name=self._state_repo_full_name(),
+                trigger_label=_flow_trigger_label(flow=flow, repo=self._repo),
+                issue_url=issue.html_url,
+            )
 
     def _enqueue_implementation_work(self, pool: ThreadPoolExecutor) -> None:
         candidates = self._state.list_implementation_candidates(
@@ -308,7 +316,7 @@ class Phase1Orchestrator:
                 self._running[candidate.issue_number] = fut
             log_event(
                 LOGGER,
-                "issue_enqueued",
+                "implementation_enqueued",
                 issue_number=candidate.issue_number,
                 flow="implementation",
             )
@@ -1950,6 +1958,16 @@ class Phase1Orchestrator:
                 continue
             if has_action_token(comment.body):
                 continue
+            log_event(
+                LOGGER,
+                "monitored_comment_detected",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue_number,
+                pr_number=pr_number,
+                comment_kind="review",
+                comment_id=comment.comment_id,
+                comment_url=comment.html_url,
+            )
             normalized.append(
                 (
                     FeedbackEventRecord(
@@ -1993,6 +2011,16 @@ class Phase1Orchestrator:
                 continue
             if has_action_token(comment.body):
                 continue
+            log_event(
+                LOGGER,
+                "monitored_comment_detected",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue_number,
+                pr_number=pr_number,
+                comment_kind="issue",
+                comment_id=comment.comment_id,
+                comment_url=comment.html_url,
+            )
             normalized.append(
                 (
                     FeedbackEventRecord(
@@ -2153,6 +2181,14 @@ def _resolve_issue_flow(
     if design_label in issue_labels:
         return "design_doc"
     return None
+
+
+def _flow_trigger_label(*, flow: IssueFlow, repo: RepoConfig) -> str:
+    if flow == "design_doc":
+        return repo.trigger_label
+    if flow == "bugfix":
+        return repo.bugfix_label
+    return repo.small_job_label
 
 
 def _issue_branch(*, flow: IssueFlow, issue_number: int, slug: str) -> str:

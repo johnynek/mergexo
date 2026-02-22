@@ -106,20 +106,33 @@ class GitHubGateway:
 
     def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
         path = f"/repos/{self.owner}/{self.name}/pulls"
-        payload = self._api_json(
-            "POST",
-            path,
-            payload={"title": title, "head": head, "base": base, "body": body},
-        )
-        payload_obj = _as_object_dict(payload)
-        if payload_obj is None:
-            raise RuntimeError("Unexpected GitHub response: expected object for PR")
-        number = _as_int(payload_obj.get("number"), field="number")
-        html_url = _as_string(payload_obj.get("html_url"))
+        try:
+            payload = self._api_json(
+                "POST",
+                path,
+                payload={"title": title, "head": head, "base": base, "body": body},
+            )
+            payload_obj = _as_object_dict(payload)
+            if payload_obj is None:
+                raise RuntimeError("Unexpected GitHub response: expected object for PR")
+            number = _as_int(payload_obj.get("number"), field="number")
+            html_url = _as_string(payload_obj.get("html_url"))
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "github_pr_create_failed",
+                repo_full_name=f"{self.owner}/{self.name}",
+                base=base,
+                head=head,
+                error_type=type(exc).__name__,
+            )
+            raise
         log_event(
             LOGGER,
             "github_pr_created",
+            repo_full_name=f"{self.owner}/{self.name}",
             pr_number=number,
+            pr_url=html_url,
             base=base,
             head=head,
         )
@@ -316,16 +329,37 @@ class GitHubGateway:
 
     def post_issue_comment(self, issue_number: int, body: str) -> None:
         path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}/comments"
-        self._api_json("POST", path, payload={"body": body})
+        try:
+            self._api_json("POST", path, payload={"body": body})
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "github_issue_comment_failed",
+                repo_full_name=f"{self.owner}/{self.name}",
+                issue_number=issue_number,
+                error_type=type(exc).__name__,
+            )
+            raise
         log_event(LOGGER, "github_issue_comment_posted", issue_number=issue_number)
 
     def post_review_comment_reply(self, pr_number: int, review_comment_id: int, body: str) -> None:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/comments"
-        self._api_json(
-            "POST",
-            path,
-            payload={"body": body, "in_reply_to": review_comment_id},
-        )
+        try:
+            self._api_json(
+                "POST",
+                path,
+                payload={"body": body, "in_reply_to": review_comment_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "github_review_reply_failed",
+                repo_full_name=f"{self.owner}/{self.name}",
+                pr_number=pr_number,
+                review_comment_id=review_comment_id,
+                error_type=type(exc).__name__,
+            )
+            raise
         log_event(
             LOGGER,
             "github_review_reply_posted",

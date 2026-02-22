@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import logging
 import tempfile
+import time
 from typing import cast
 
 from mergexo.agent_adapter import (
@@ -74,25 +75,55 @@ class CodexAdapter(AgentAdapter):
         default_branch: str,
         cwd: Path,
     ) -> DesignStartResult:
+        started_at = time.monotonic()
+        log_event(
+            LOGGER,
+            "codex_invocation_started",
+            mode="writing_doc",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+        )
         log_event(
             LOGGER,
             "design_turn_started",
             issue_number=issue.number,
             design_doc_path=design_doc_path,
         )
-        prompt = build_design_prompt(
-            issue=issue,
-            repo_full_name=repo_full_name,
-            design_doc_path=design_doc_path,
-            default_branch=default_branch,
-        )
-        design, thread_id = self._run_design_turn(prompt=prompt, cwd=cwd)
+        try:
+            prompt = build_design_prompt(
+                issue=issue,
+                repo_full_name=repo_full_name,
+                design_doc_path=design_doc_path,
+                default_branch=default_branch,
+            )
+            design, thread_id = self._run_design_turn(prompt=prompt, cwd=cwd)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "codex_invocation_finished",
+                mode="writing_doc",
+                repo_full_name=repo_full_name,
+                issue_number=issue.number,
+                status="fault",
+                duration_seconds=_elapsed_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
         log_event(
             LOGGER,
             "design_turn_completed",
             issue_number=issue.number,
             thread_id=thread_id or "<none>",
             touch_path_count=len(design.touch_paths),
+        )
+        log_event(
+            LOGGER,
+            "codex_invocation_finished",
+            mode="writing_doc",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+            status="success",
+            duration_seconds=_elapsed_seconds(started_at),
         )
         return DesignStartResult(
             design=design, session=AgentSession(adapter="codex", thread_id=thread_id)
@@ -113,7 +144,13 @@ class CodexAdapter(AgentAdapter):
             default_branch=default_branch,
             coding_guidelines_path=coding_guidelines_path,
         )
-        return self._start_direct_turn(issue=issue, flow_name="bugfix", prompt=prompt, cwd=cwd)
+        return self._start_direct_turn(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            flow_name="bugfix",
+            prompt=prompt,
+            cwd=cwd,
+        )
 
     def start_small_job_from_issue(
         self,
@@ -130,7 +167,13 @@ class CodexAdapter(AgentAdapter):
             default_branch=default_branch,
             coding_guidelines_path=coding_guidelines_path,
         )
-        return self._start_direct_turn(issue=issue, flow_name="small_job", prompt=prompt, cwd=cwd)
+        return self._start_direct_turn(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            flow_name="small_job",
+            prompt=prompt,
+            cwd=cwd,
+        )
 
     def start_implementation_from_design(
         self,
@@ -157,6 +200,7 @@ class CodexAdapter(AgentAdapter):
         )
         return self._start_direct_turn(
             issue=issue,
+            repo_full_name=repo_full_name,
             flow_name="implementation",
             prompt=prompt,
             cwd=cwd,
@@ -172,6 +216,14 @@ class CodexAdapter(AgentAdapter):
         if session.thread_id is None:
             raise RuntimeError("Cannot resume Codex feedback turn without a thread_id")
 
+        started_at = time.monotonic()
+        log_event(
+            LOGGER,
+            "codex_invocation_started",
+            mode="respond_to_review",
+            issue_number=turn.issue.number,
+            pr_number=turn.pull_request.number,
+        )
         log_event(
             LOGGER,
             "feedback_agent_call_started",
@@ -180,27 +232,40 @@ class CodexAdapter(AgentAdapter):
             thread_id=session.thread_id,
             turn_key=turn.turn_key,
         )
-        prompt = build_feedback_prompt(turn=turn)
-        cmd = [
-            "codex",
-            "exec",
-            "resume",
-            "--json",
-            "--skip-git-repo-check",
-        ]
-        self._append_resume_options(cmd)
-        cmd.extend([session.thread_id, "-"])
+        try:
+            prompt = build_feedback_prompt(turn=turn)
+            cmd = [
+                "codex",
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+            ]
+            self._append_resume_options(cmd)
+            cmd.extend([session.thread_id, "-"])
 
-        raw_events = run(cmd, cwd=cwd, input_text=prompt)
-        message = _extract_final_agent_message(raw_events)
-        payload = _parse_json_payload(message)
+            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+            message = _extract_final_agent_message(raw_events)
+            payload = _parse_json_payload(message)
 
-        replies = _parse_review_replies(payload.get("review_replies"))
-        general_comment = _optional_output_text(payload.get("general_comment"))
-        commit_message = _optional_output_text(payload.get("commit_message"))
-        git_ops = _parse_git_ops(payload.get("git_ops"))
+            replies = _parse_review_replies(payload.get("review_replies"))
+            general_comment = _optional_output_text(payload.get("general_comment"))
+            commit_message = _optional_output_text(payload.get("commit_message"))
+            git_ops = _parse_git_ops(payload.get("git_ops"))
 
-        resumed_thread_id = _extract_thread_id(raw_events) or session.thread_id
+            resumed_thread_id = _extract_thread_id(raw_events) or session.thread_id
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "codex_invocation_finished",
+                mode="respond_to_review",
+                issue_number=turn.issue.number,
+                pr_number=turn.pull_request.number,
+                status="fault",
+                duration_seconds=_elapsed_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
 
         log_event(
             LOGGER,
@@ -211,6 +276,15 @@ class CodexAdapter(AgentAdapter):
             review_reply_count=len(replies),
             has_general_comment=general_comment is not None,
             has_commit_message=commit_message is not None,
+        )
+        log_event(
+            LOGGER,
+            "codex_invocation_finished",
+            mode="respond_to_review",
+            issue_number=turn.issue.number,
+            pr_number=turn.pull_request.number,
+            status="success",
+            duration_seconds=_elapsed_seconds(started_at),
         )
         return FeedbackResult(
             session=AgentSession(adapter="codex", thread_id=resumed_thread_id),
@@ -267,17 +341,40 @@ class CodexAdapter(AgentAdapter):
         self,
         *,
         issue: Issue,
+        repo_full_name: str,
         flow_name: str,
         prompt: str,
         cwd: Path,
     ) -> DirectStartResult:
+        started_at = time.monotonic()
+        invocation_mode = _direct_invocation_mode(flow_name)
+        log_event(
+            LOGGER,
+            "codex_invocation_started",
+            mode=invocation_mode,
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+        )
         log_event(
             LOGGER,
             "direct_turn_started",
             issue_number=issue.number,
             flow=flow_name,
         )
-        result, thread_id = self._run_direct_turn(prompt=prompt, cwd=cwd)
+        try:
+            result, thread_id = self._run_direct_turn(prompt=prompt, cwd=cwd)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "codex_invocation_finished",
+                mode=invocation_mode,
+                repo_full_name=repo_full_name,
+                issue_number=issue.number,
+                status="fault",
+                duration_seconds=_elapsed_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
         log_event(
             LOGGER,
             "direct_turn_completed",
@@ -285,6 +382,15 @@ class CodexAdapter(AgentAdapter):
             flow=flow_name,
             thread_id=thread_id or "<none>",
             blocked=result.blocked_reason is not None,
+        )
+        log_event(
+            LOGGER,
+            "codex_invocation_finished",
+            mode=invocation_mode,
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+            status="success",
+            duration_seconds=_elapsed_seconds(started_at),
         )
         return DirectStartResult(
             pr_title=result.pr_title,
@@ -523,3 +629,14 @@ def _filter_resume_extra_args(extra_args: tuple[str, ...]) -> list[str]:
         filtered.append(arg)
         idx += 1
     return filtered
+
+
+def _direct_invocation_mode(flow_name: str) -> str:
+    if flow_name == "small_job":
+        return "small-job"
+    return flow_name
+
+
+def _elapsed_seconds(started_at: float) -> float:
+    elapsed = time.monotonic() - started_at
+    return round(elapsed, 3)

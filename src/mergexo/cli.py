@@ -24,12 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
         "init", help="Initialize state DB, mirror, and worker checkouts"
     )
     init_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
-    init_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose runtime logging to stderr",
-    )
+    _add_verbose_argument(init_parser)
 
     run_parser = subparsers.add_parser(
         "run", help="Run phase-1 issue polling and design PR generation"
@@ -38,12 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--once", action="store_true", help="Poll once and wait for active workers"
     )
-    run_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose runtime logging to stderr",
-    )
+    _add_verbose_argument(run_parser)
 
     service_parser = subparsers.add_parser(
         "service",
@@ -53,24 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
     service_parser.add_argument(
         "--once", action="store_true", help="Poll once and wait for active workers"
     )
-    service_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose runtime logging to stderr",
-    )
+    _add_verbose_argument(service_parser)
 
     feedback_parser = subparsers.add_parser(
         "feedback",
         help="Inspect and manage feedback-loop state",
     )
     feedback_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
-    feedback_parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose runtime logging to stderr",
-    )
+    _add_verbose_argument(feedback_parser)
     feedback_subparsers = feedback_parser.add_subparsers(dest="feedback_command", required=True)
 
     blocked_parser = feedback_subparsers.add_parser(
@@ -129,10 +109,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_verbose_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        nargs="?",
+        choices=("low", "high"),
+        const="low",
+        default=None,
+        metavar="MODE",
+        help=(
+            "Enable runtime logging (`low` for key lifecycle events, `high` for full event stream)"
+        ),
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
-    configure_logging(bool(getattr(args, "verbose", False)))
     config = load_config(args.config)
+    configure_logging(getattr(args, "verbose", None), state_dir=config.runtime.base_dir)
 
     if args.command == "init":
         _cmd_init(config)

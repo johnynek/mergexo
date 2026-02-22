@@ -130,7 +130,17 @@ class GitRepoManager:
             checkout_path=str(checkout_path),
             branch=branch,
         )
-        run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
+        try:
+            run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "git_push_failed",
+                checkout_path=str(checkout_path),
+                branch=branch,
+                error_type=type(exc).__name__,
+            )
+            raise
 
     def fetch_origin(self, checkout_path: Path) -> None:
         log_event(
