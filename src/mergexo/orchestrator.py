@@ -339,8 +339,12 @@ class Phase1Orchestrator:
         issue_numbers = self._operator_issue_numbers_to_scan()
         if not issue_numbers:
             return
+        blocked_pr_numbers = {
+            blocked.pr_number for blocked in self._state.list_blocked_pull_requests()
+        }
 
         for issue_number in issue_numbers:
+            source_pr_number = issue_number if issue_number in blocked_pr_numbers else None
             comments = self._github.list_issue_comments(issue_number)
             for comment in comments:
                 parsed = parse_operator_command(comment.body)
@@ -451,6 +455,7 @@ class Phase1Orchestrator:
                 if parsed.command == "unblock":
                     unblock_status, unblock_detail, target_pr_number = self._apply_unblock_command(
                         source_issue_number=issue_number,
+                        source_pr_number=source_pr_number,
                         parsed=parsed,
                     )
                     record = self._state.record_operator_command(
@@ -738,9 +743,20 @@ class Phase1Orchestrator:
         self,
         *,
         source_issue_number: int,
+        source_pr_number: int | None,
         parsed: ParsedOperatorCommand,
-    ) -> tuple[OperatorCommandStatus, str, int]:
-        target_pr_number = int(parsed.get_arg("pr") or source_issue_number)
+    ) -> tuple[OperatorCommandStatus, str, int | None]:
+        pr_arg = parsed.get_arg("pr")
+        if pr_arg is not None:
+            target_pr_number = int(pr_arg)
+        elif source_pr_number is not None:
+            target_pr_number = source_pr_number
+        else:
+            detail = (
+                "No target PR was provided. On the operations issue, use "
+                "`/mergexo unblock pr=<number>`."
+            )
+            return "failed", detail, None
         head_sha = parsed.get_arg("head_sha")
 
         reset_count = self._state.reset_blocked_pull_requests(

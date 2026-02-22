@@ -2907,9 +2907,66 @@ def test_operator_unblock_command_resets_blocked_pr_and_is_idempotent(tmp_path: 
     assert len(github.posted_comments) == 1
     assert github.posted_comments[0][0] == 101
     assert "status: `applied`" in github.posted_comments[0][1]
+    command = state.get_operator_command("101:10:2026-02-22T12:00:00Z")
+    assert command is not None
+    assert command.pr_number == 101
 
     orch._scan_operator_commands()
     assert len(github.posted_comments) == 1
+
+
+def test_operator_unblock_without_pr_fails_on_operations_issue(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(7, "agent/design/7-worker", 101, "https://example/pr/101")
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        last_seen_head_sha="head-old",
+        error="blocked for test",
+    )
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=18,
+                    body="/mergexo unblock",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:08:00Z",
+                    issue_number=77,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    still_blocked = state.list_blocked_pull_requests()
+    assert len(still_blocked) == 1
+    assert still_blocked[0].pr_number == 101
+    record = state.get_operator_command("77:18:2026-02-22T12:08:00Z")
+    assert record is not None
+    assert record.status == "failed"
+    assert record.pr_number is None
+    assert "No target PR was provided" in record.result
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 77
+    assert "status: `failed`" in github.posted_comments[0][1]
+    assert "unblock pr=<number>" in github.posted_comments[0][1]
 
 
 def test_operator_commands_reject_unauthorized_and_parse_failures(tmp_path: Path) -> None:
@@ -3098,6 +3155,7 @@ def test_apply_unblock_command_fails_when_target_not_blocked(tmp_path: Path) -> 
     assert isinstance(parsed, ParsedOperatorCommand)
     status, detail, pr_number = orch._apply_unblock_command(
         source_issue_number=77,
+        source_pr_number=None,
         parsed=parsed,
     )
     assert status == "failed"
