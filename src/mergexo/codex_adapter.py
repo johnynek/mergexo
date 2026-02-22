@@ -104,7 +104,7 @@ class CodexAdapter(AgentAdapter):
             "--json",
             "--skip-git-repo-check",
         ]
-        self._append_common_options(cmd)
+        self._append_resume_options(cmd)
         cmd.extend([session.thread_id, "-"])
 
         raw_events = run(cmd, cwd=cwd, input_text=prompt)
@@ -186,6 +186,14 @@ class CodexAdapter(AgentAdapter):
             cmd.extend(["--profile", self._config.profile])
         if self._config.extra_args:
             cmd.extend(self._config.extra_args)
+
+    def _append_resume_options(self, cmd: list[str]) -> None:
+        # `codex exec resume` does not accept `--sandbox` or `--profile`.
+        # Keep model/extra args, while stripping known unsupported options.
+        if self._config.model:
+            cmd.extend(["--model", self._config.model])
+        if self._config.extra_args:
+            cmd.extend(_filter_resume_extra_args(self._config.extra_args))
 
 
 def _parse_json_payload(raw: str) -> dict[str, object]:
@@ -311,3 +319,24 @@ def _as_object_dict(value: object) -> dict[str, object] | None:
     if not all(isinstance(key, str) for key in value.keys()):
         return None
     return cast(dict[str, object], value)
+
+
+def _filter_resume_extra_args(extra_args: tuple[str, ...]) -> list[str]:
+    filtered: list[str] = []
+    idx = 0
+    while idx < len(extra_args):
+        arg = extra_args[idx]
+        if arg in {"--sandbox", "--profile", "-s", "-p"}:
+            idx += 2
+            continue
+        if (
+            arg.startswith("--sandbox=")
+            or arg.startswith("--profile=")
+            or arg.startswith("-s=")
+            or arg.startswith("-p=")
+        ):
+            idx += 1
+            continue
+        filtered.append(arg)
+        idx += 1
+    return filtered
