@@ -35,6 +35,8 @@ from mergexo.orchestrator import (
     Phase1Orchestrator,
     SlotPool,
     _FeedbackFuture,
+    _design_branch_slug,
+    _design_doc_url,
     _default_commit_message,
     _has_regression_test_changes,
     _issue_branch,
@@ -45,7 +47,7 @@ from mergexo.orchestrator import (
     _trigger_labels,
 )
 from mergexo.observability import configure_logging
-from mergexo.state import StateStore, TrackedPullRequestState
+from mergexo.state import ImplementationCandidateState, StateStore, TrackedPullRequestState
 
 
 @dataclass
@@ -224,6 +226,7 @@ class FakeAgent:
         self.calls: list[tuple[Issue, Path]] = []
         self.bugfix_calls: list[tuple[Issue, Path]] = []
         self.small_job_calls: list[tuple[Issue, Path]] = []
+        self.implementation_calls: list[tuple[Issue, Path, str]] = []
         self.feedback_calls: list[tuple[AgentSession, FeedbackTurn, Path]] = []
         self.bugfix_result = DirectStartResult(
             pr_title="Fix bug",
@@ -236,6 +239,13 @@ class FakeAgent:
             pr_title="Implement small job",
             pr_summary="Applies scoped change.",
             commit_message="feat: complete small job",
+            blocked_reason=None,
+            session=AgentSession(adapter="codex", thread_id="thread-123"),
+        )
+        self.implementation_result = DirectStartResult(
+            pr_title="Implement merged design",
+            pr_summary="Implements the merged design document.",
+            commit_message="feat: implement merged design",
             blocked_reason=None,
             session=AgentSession(adapter="codex", thread_id="thread-123"),
         )
@@ -304,6 +314,32 @@ class FakeAgent:
             raise RuntimeError("codex failed")
         return self.small_job_result
 
+    def start_implementation_from_design(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        design_doc_path: str,
+        design_doc_markdown: str,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> DirectStartResult:
+        _ = (
+            repo_full_name,
+            default_branch,
+            coding_guidelines_path,
+            design_doc_markdown,
+            design_pr_number,
+            design_pr_url,
+        )
+        self.implementation_calls.append((issue, cwd, design_doc_path))
+        if self.fail:
+            raise RuntimeError("codex failed")
+        return self.implementation_result
+
 
 class FakeState:
     def __init__(self, *, allowed: set[int] | None = None) -> None:
@@ -313,6 +349,7 @@ class FakeState:
         self.failed: list[tuple[int, str]] = []
         self.saved_sessions: list[tuple[int, str, str | None]] = []
         self.tracked: list[TrackedPullRequestState] = []
+        self.implementation_candidates: list[ImplementationCandidateState] = []
         self.status_updates: list[tuple[int, int, str, str | None, str | None]] = []
 
     def can_enqueue(self, issue_number: int) -> bool:
@@ -342,6 +379,9 @@ class FakeState:
 
     def list_tracked_pull_requests(self) -> tuple[TrackedPullRequestState, ...]:
         return tuple(self.tracked)
+
+    def list_implementation_candidates(self) -> tuple[ImplementationCandidateState, ...]:
+        return tuple(self.implementation_candidates)
 
     def mark_pr_status(
         self,
@@ -474,6 +514,17 @@ def test_flow_helpers() -> None:
     )
     assert _has_regression_test_changes(("tests/test_a.py", "src/a.py")) is True
     assert _has_regression_test_changes(("src/a.py",)) is False
+    assert _design_branch_slug("agent/design/7-x") == "7-x"
+    assert _design_branch_slug("agent/small/7-x") is None
+    assert _design_branch_slug("agent/design/   ") is None
+    assert (
+        _design_doc_url(
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            design_doc_path="docs/design/7-x.md",
+        )
+        == "https://github.com/johnynek/mergexo/blob/main/docs/design/7-x.md"
+    )
 
 
 def test_render_design_doc_includes_frontmatter_and_summary() -> None:
@@ -589,6 +640,118 @@ def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
     assert any(
         "requires at least one staged regression test" in body for _, body in github.comments
     )
+
+
+def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+
+    checkout_path = git.ensure_checkout(0)
+    design_doc = checkout_path / "docs/design/7-add-worker-scheduler.md"
+    design_doc.parent.mkdir(parents=True, exist_ok=True)
+    design_doc.write_text("# Design\n\nImplement queue scheduler.", encoding="utf-8")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    result = orch._process_implementation_candidate(
+        ImplementationCandidateState(
+            issue_number=7,
+            design_branch="agent/design/7-add-worker-scheduler",
+            design_pr_number=44,
+            design_pr_url="https://example/pr/44",
+        )
+    )
+
+    assert result.branch == "agent/impl/7-add-worker-scheduler"
+    assert len(agent.implementation_calls) == 1
+    assert agent.implementation_calls[0][2] == "docs/design/7-add-worker-scheduler.md"
+    assert github.created_prs[0][0] == "Implement merged design"
+    assert "Fixes #7" in github.created_prs[0][3]
+    assert (
+        "Implements design doc: [docs/design/7-add-worker-scheduler.md]"
+        "(https://github.com/johnynek/mergexo/blob/main/docs/design/7-add-worker-scheduler.md)"
+        in github.created_prs[0][3]
+    )
+    assert "Design source PR: https://example/pr/44" in github.created_prs[0][3]
+    assert github.comments == [(7, "Opened implementation PR: https://example/pr/101")]
+
+
+def test_process_implementation_candidate_requires_design_doc(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    with pytest.raises(RuntimeError, match="merged design doc"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            )
+        )
+
+    assert github.created_prs == []
+    assert len(agent.implementation_calls) == 0
+    assert any("requires a merged design doc" in body for _, body in github.comments)
+
+
+def test_process_implementation_candidate_rejects_invalid_design_branch(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    with pytest.raises(RuntimeError, match="valid design branch suffix"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/small/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            )
+        )
+
+
+def test_process_implementation_candidate_blocked_posts_comment(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent()
+    agent.implementation_result = DirectStartResult(
+        pr_title="N/A",
+        pr_summary="N/A",
+        commit_message=None,
+        blocked_reason="Need migration strategy from humans.",
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    state = FakeState()
+
+    checkout_path = git.ensure_checkout(0)
+    design_doc = checkout_path / "docs/design/7-add-worker-scheduler.md"
+    design_doc.parent.mkdir(parents=True, exist_ok=True)
+    design_doc.write_text("# Design\n\nImplement queue scheduler.", encoding="utf-8")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    with pytest.raises(RuntimeError, match="blocked"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            )
+        )
+
+    assert github.created_prs == []
+    assert any("Need migration strategy from humans." in body for _, body in github.comments)
 
 
 def test_process_issue_direct_flow_blocked_posts_comment(tmp_path: Path) -> None:
@@ -722,6 +885,70 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
     running_future: Future[WorkResult] = Future()
     orch._running = {99: running_future, 100: running_future}
     orch._enqueue_new_work(pool)
+
+
+def test_enqueue_implementation_work_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=2)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    state.implementation_candidates = [
+        ImplementationCandidateState(
+            issue_number=7,
+            design_branch="agent/design/7-a",
+            design_pr_number=41,
+            design_pr_url="https://example/pr/41",
+        ),
+        ImplementationCandidateState(
+            issue_number=8,
+            design_branch="agent/design/8-b",
+            design_pr_number=42,
+            design_pr_url="https://example/pr/42",
+        ),
+    ]
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.submitted: list[int] = []
+
+        def submit(self, fn, candidate):  # type: ignore[no-untyped-def]
+            _ = fn
+            fut: Future[WorkResult] = Future()
+            fut.set_result(
+                WorkResult(
+                    issue_number=candidate.issue_number,
+                    branch="agent/impl/x",
+                    pr_number=9,
+                    pr_url="u",
+                )
+            )
+            self.submitted.append(candidate.issue_number)
+            return fut
+
+    pool = FakePool()
+    orch._enqueue_implementation_work(pool)
+    assert state.running == [7, 8]
+    assert pool.submitted == [7, 8]
+
+    # Already-running path: skip candidate issue number currently in-flight.
+    running_future: Future[WorkResult] = Future()
+    orch._running = {7: running_future}
+    state.running.clear()
+    pool.submitted.clear()
+    state.implementation_candidates = [state.implementation_candidates[0]]
+    orch._enqueue_implementation_work(pool)
+    assert state.running == []
+    assert pool.submitted == []
+
+    # Capacity guard should short-circuit before submitting.
+    orch._running = {1: running_future, 2: running_future}
+    state.running.clear()
+    pool.submitted.clear()
+    orch._enqueue_implementation_work(pool)
+    assert state.running == []
+    assert pool.submitted == []
 
 
 def test_enqueue_new_work_uses_flow_precedence(tmp_path: Path) -> None:

@@ -106,6 +106,22 @@ class AgentAdapter(ABC):
         """Start a direct small-job PR flow from an issue."""
 
     @abstractmethod
+    def start_implementation_from_design(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        design_doc_path: str,
+        design_doc_markdown: str,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> DirectStartResult:
+        """Start an implementation PR flow from a merged design doc."""
+
+    @abstractmethod
     def respond_to_feedback(
         self,
         *,

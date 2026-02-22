@@ -41,7 +41,11 @@ from mergexo.models import (
     WorkResult,
 )
 from mergexo.observability import log_event
-from mergexo.state import StateStore, TrackedPullRequestState
+from mergexo.state import (
+    ImplementationCandidateState,
+    StateStore,
+    TrackedPullRequestState,
+)
 
 
 LOGGER = logging.getLogger("mergexo.orchestrator")
@@ -131,6 +135,7 @@ class Phase1Orchestrator:
                 )
                 self._reap_finished()
                 self._enqueue_new_work(pool)
+                self._enqueue_implementation_work(pool)
                 if self._config.runtime.enable_feedback_loop:
                     self._enqueue_feedback_work(pool)
                 log_event(
@@ -198,6 +203,43 @@ class Phase1Orchestrator:
             with self._running_lock:
                 self._running[issue.number] = fut
             log_event(LOGGER, "issue_enqueued", issue_number=issue.number, flow=flow)
+
+    def _enqueue_implementation_work(self, pool: ThreadPoolExecutor) -> None:
+        candidates = self._state.list_implementation_candidates()
+        log_event(
+            LOGGER,
+            "implementation_candidates_fetched",
+            candidate_count=len(candidates),
+        )
+        for candidate in candidates:
+            with self._running_lock:
+                if not self._has_capacity_locked():
+                    log_event(
+                        LOGGER,
+                        "implementation_skipped",
+                        issue_number=candidate.issue_number,
+                        reason="worker_capacity_full",
+                    )
+                    return
+                if candidate.issue_number in self._running:
+                    log_event(
+                        LOGGER,
+                        "implementation_skipped",
+                        issue_number=candidate.issue_number,
+                        reason="already_running",
+                    )
+                    continue
+
+            self._state.mark_running(candidate.issue_number)
+            fut = pool.submit(self._process_implementation_candidate, candidate)
+            with self._running_lock:
+                self._running[candidate.issue_number] = fut
+            log_event(
+                LOGGER,
+                "issue_enqueued",
+                issue_number=candidate.issue_number,
+                flow="implementation",
+            )
 
     def _enqueue_feedback_work(self, pool: ThreadPoolExecutor) -> None:
         tracked_prs = self._state.list_tracked_pull_requests()
@@ -504,6 +546,143 @@ class Phase1Orchestrator:
             pr_number=pr.number,
             pr_url=pr.html_url,
         )
+
+    def _process_implementation_candidate(
+        self,
+        candidate: ImplementationCandidateState,
+    ) -> WorkResult:
+        lease = self._slot_pool.acquire()
+        try:
+            log_event(
+                LOGGER,
+                "issue_processing_started",
+                issue_number=candidate.issue_number,
+                slot=lease.slot,
+                flow="implementation",
+            )
+            self._git.prepare_checkout(lease.path)
+
+            issue = self._github.get_issue(candidate.issue_number)
+            slug = _design_branch_slug(candidate.design_branch)
+            if slug is None:
+                raise DirectFlowValidationError(
+                    "Implementation candidate is missing a valid design branch suffix"
+                )
+
+            branch = f"agent/impl/{slug}"
+            self._git.create_or_reset_branch(lease.path, branch)
+
+            design_relpath = f"{self._config.repo.design_docs_dir}/{slug}.md"
+            design_abs_path = lease.path / design_relpath
+            if not design_abs_path.exists():
+                detail = (
+                    f" Design PR: {candidate.design_pr_url}"
+                    if candidate.design_pr_url is not None
+                    else ""
+                )
+                self._github.post_issue_comment(
+                    issue_number=issue.number,
+                    body=(
+                        "MergeXO implementation flow requires a merged design doc at "
+                        f"`{design_relpath}` on `{self._config.repo.default_branch}`.{detail}"
+                    ),
+                )
+                raise DirectFlowValidationError(
+                    f"Implementation flow requires merged design doc at {design_relpath}"
+                )
+            design_doc_markdown = design_abs_path.read_text(encoding="utf-8")
+
+            start_result = self._agent.start_implementation_from_design(
+                issue=issue,
+                repo_full_name=self._config.repo.full_name,
+                default_branch=self._config.repo.default_branch,
+                coding_guidelines_path=self._config.repo.coding_guidelines_path,
+                design_doc_path=design_relpath,
+                design_doc_markdown=design_doc_markdown,
+                design_pr_number=candidate.design_pr_number,
+                design_pr_url=candidate.design_pr_url,
+                cwd=lease.path,
+            )
+            if start_result.session:
+                self._state.save_agent_session(
+                    issue_number=issue.number,
+                    adapter=start_result.session.adapter,
+                    thread_id=start_result.session.thread_id,
+                )
+
+            if start_result.blocked_reason:
+                self._github.post_issue_comment(
+                    issue_number=issue.number,
+                    body=(
+                        f"MergeXO implementation flow was blocked for issue #{issue.number}: "
+                        f"{start_result.blocked_reason}"
+                    ),
+                )
+                raise DirectFlowBlockedError(
+                    f"implementation flow blocked: {start_result.blocked_reason}"
+                )
+
+            commit_message = start_result.commit_message or _default_commit_message(
+                flow="small_job", issue_number=issue.number
+            )
+            self._git.commit_all(lease.path, commit_message)
+            self._git.push_branch(lease.path, branch)
+
+            design_doc_url = _design_doc_url(
+                repo_full_name=self._config.repo.full_name,
+                default_branch=self._config.repo.default_branch,
+                design_doc_path=design_relpath,
+            )
+            design_pr_line = (
+                f"Design source PR: {candidate.design_pr_url}\n\n"
+                if candidate.design_pr_url
+                else ""
+            )
+            pr = self._github.create_pull_request(
+                title=start_result.pr_title,
+                head=branch,
+                base=self._config.repo.default_branch,
+                body=(
+                    f"{start_result.pr_summary}\n\n"
+                    f"Fixes #{issue.number}\n\n"
+                    f"Implements design doc: [{design_relpath}]({design_doc_url})\n\n"
+                    f"{design_pr_line}"
+                    f"Source issue: {issue.html_url}"
+                ),
+            )
+
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=f"Opened implementation PR: {pr.html_url}",
+            )
+            log_event(
+                LOGGER,
+                "issue_processing_completed",
+                issue_number=issue.number,
+                pr_number=pr.number,
+                branch=branch,
+                flow="implementation",
+            )
+            return WorkResult(
+                issue_number=issue.number,
+                branch=branch,
+                pr_number=pr.number,
+                pr_url=pr.html_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "issue_processing_failed",
+                issue_number=candidate.issue_number,
+                flow="implementation",
+                error_type=type(exc).__name__,
+            )
+            raise
+        finally:
+            try:
+                self._git.cleanup_slot(lease.path)
+            finally:
+                self._slot_pool.release(lease)
 
     def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> None:
         lease = self._slot_pool.acquire()
@@ -1066,6 +1245,16 @@ def _slugify(value: str) -> str:
     return slug or "issue"
 
 
+def _design_branch_slug(branch: str) -> str | None:
+    prefix = "agent/design/"
+    if not branch.startswith(prefix):
+        return None
+    slug = branch[len(prefix) :].strip()
+    if not slug:
+        return None
+    return slug
+
+
 def _trigger_labels(repo: RepoConfig) -> tuple[str, ...]:
     # Operators may intentionally configure overlapping labels across flows; dedupe avoids
     # repeated GitHub queries while preserving first-occurrence precedence semantics.
@@ -1134,6 +1323,10 @@ def _summarize_git_error(raw_error: str) -> str:
     if len(normalized) > 240:
         return normalized[:237] + "..."
     return normalized
+
+
+def _design_doc_url(*, repo_full_name: str, default_branch: str, design_doc_path: str) -> str:
+    return f"https://github.com/{repo_full_name}/blob/{default_branch}/{design_doc_path}"
 
 
 def _render_design_doc(*, issue: Issue, design: GeneratedDesign) -> str:

@@ -137,6 +137,25 @@ def test_mark_pr_status_updates_run_and_tracking_rows(tmp_path: Path) -> None:
     assert status == "merged"
 
 
+def test_list_implementation_candidates_reads_merged_design_runs(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(8, "agent/design/8-foo", 101, "https://example/pr/101")
+    store.mark_pr_status(pr_number=101, issue_number=8, status="merged", last_seen_head_sha="head1")
+
+    # Non-design merged runs should not be considered implementation candidates.
+    store.mark_completed(9, "agent/bugfix/9-bar", 102, "https://example/pr/102")
+    store.mark_pr_status(pr_number=102, issue_number=9, status="merged", last_seen_head_sha="head2")
+
+    candidates = store.list_implementation_candidates()
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.issue_number == 8
+    assert candidate.design_branch == "agent/design/8-foo"
+    assert candidate.design_pr_number == 101
+    assert candidate.design_pr_url == "https://example/pr/101"
+
+
 def test_list_blocked_and_reset_pull_requests(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)

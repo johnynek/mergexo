@@ -94,6 +94,38 @@ class DummyAdapter(AgentAdapter):
             session=AgentSession(adapter="dummy", thread_id="th"),
         )
 
+    def start_implementation_from_design(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        design_doc_path: str,
+        design_doc_markdown: str,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> DirectStartResult:
+        _ = (
+            issue,
+            repo_full_name,
+            default_branch,
+            coding_guidelines_path,
+            design_doc_path,
+            design_doc_markdown,
+            design_pr_number,
+            design_pr_url,
+            cwd,
+        )
+        return DirectStartResult(
+            pr_title="Implement design",
+            pr_summary="Summary",
+            commit_message="feat: implementation",
+            blocked_reason=None,
+            session=AgentSession(adapter="dummy", thread_id="th"),
+        )
+
 
 def test_agent_adapter_data_model() -> None:
     issue = Issue(number=1, title="t", body="b", html_url="u", labels=("x",))
@@ -159,6 +191,17 @@ def test_agent_adapter_data_model() -> None:
         coding_guidelines_path="docs/python_style.md",
         cwd=Path("."),
     )
+    implementation = adapter.start_implementation_from_design(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        design_doc_path="docs/design/1-t.md",
+        design_doc_markdown="# Design",
+        design_pr_number=44,
+        design_pr_url="https://example/pr/44",
+        cwd=Path("."),
+    )
     feedback = adapter.respond_to_feedback(
         session=AgentSession(adapter="dummy", thread_id="th"),
         turn=turn,
@@ -169,5 +212,6 @@ def test_agent_adapter_data_model() -> None:
     assert start.session.thread_id == "th"
     assert bugfix.pr_title == "Fix bug"
     assert small_job.pr_title == "Small job"
+    assert implementation.pr_title == "Implement design"
     assert feedback.review_replies[0].review_comment_id == 1
     assert feedback.git_ops[0].op == "fetch_origin"

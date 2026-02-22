@@ -119,6 +119,57 @@ Issue body:
 """.strip()
 
 
+def build_implementation_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    coding_guidelines_path: str,
+    design_doc_path: str,
+    design_doc_markdown: str,
+    design_pr_number: int | None,
+    design_pr_url: str | None,
+) -> str:
+    design_pr_line = (
+        f"- Source design PR: #{design_pr_number} ({design_pr_url})"
+        if design_pr_number is not None and design_pr_url
+        else "- Source design PR: unavailable in local state"
+    )
+    return f"""
+You are the implementation agent for repository {repo_full_name}.
+
+Task:
+- Implement issue #{issue.number} by following the merged design doc.
+- Base branch is: {default_branch}
+- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
+- Design doc path on base branch: {design_doc_path}
+{design_pr_line}
+
+Output requirements:
+- Implement the accepted design in repository code and tests.
+- Keep changes aligned to the design doc scope unless explicitly blocked by missing requirements.
+- Return PR metadata with a clear summary of what changed.
+- If you cannot proceed safely, return a blocked_reason.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Issue title:
+{issue.title}
+
+Issue URL:
+{issue.html_url}
+
+Issue body:
+{issue.body}
+
+Merged design doc markdown ({design_doc_path}):
+{design_doc_markdown}
+""".strip()
+
+
 def build_feedback_prompt(*, turn: FeedbackTurn) -> str:
     review_comments = [
         {

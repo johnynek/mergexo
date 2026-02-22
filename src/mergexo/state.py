@@ -39,6 +39,14 @@ class BlockedPullRequestState:
     pending_event_count: int
 
 
+@dataclass(frozen=True)
+class ImplementationCandidateState:
+    issue_number: int
+    design_branch: str
+    design_pr_number: int | None
+    design_pr_url: str | None
+
+
 class StateStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,6 +287,27 @@ class StateStore:
                 updated_at,
                 pending_event_count,
             ) in rows
+        )
+
+    def list_implementation_candidates(self) -> tuple[ImplementationCandidateState, ...]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT issue_number, branch, pr_number, pr_url
+                FROM issue_runs
+                WHERE status = 'merged'
+                  AND branch LIKE 'agent/design/%'
+                ORDER BY updated_at ASC, issue_number ASC
+                """
+            ).fetchall()
+        return tuple(
+            ImplementationCandidateState(
+                issue_number=int(issue_number),
+                design_branch=str(branch),
+                design_pr_number=int(pr_number) if isinstance(pr_number, int) else None,
+                design_pr_url=str(pr_url) if isinstance(pr_url, str) else None,
+            )
+            for issue_number, branch, pr_number, pr_url in rows
         )
 
     def reset_blocked_pull_requests(self, *, pr_numbers: tuple[int, ...] | None = None) -> int:

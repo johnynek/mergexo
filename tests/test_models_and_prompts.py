@@ -15,6 +15,7 @@ from mergexo.prompts import (
     build_bugfix_prompt,
     build_design_prompt,
     build_feedback_prompt,
+    build_implementation_prompt,
     build_small_job_prompt,
 )
 
@@ -184,3 +185,31 @@ def test_build_small_job_prompt_is_scoped() -> None:
     assert "docs/python_style.md" in prompt
     assert "blocked_reason" in prompt
     assert "Keep scope tight" in prompt
+
+
+def test_build_implementation_prompt_links_design_context() -> None:
+    issue = Issue(
+        number=23,
+        title="Ship worker pool scheduling",
+        body="Implement the accepted design and rollout checks.",
+        html_url="https://example/issue/23",
+        labels=("agent:design",),
+    )
+
+    prompt = build_implementation_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        design_doc_path="docs/design/23-ship-worker-pool.md",
+        design_doc_markdown="# Design\n\nDo the thing.",
+        design_pr_number=144,
+        design_pr_url="https://example/pr/144",
+    )
+
+    assert "implementation agent" in prompt
+    assert "docs/python_style.md" in prompt
+    assert "docs/design/23-ship-worker-pool.md" in prompt
+    assert "Source design PR: #144 (https://example/pr/144)" in prompt
+    assert "blocked_reason" in prompt
+    assert "Merged design doc markdown" in prompt
