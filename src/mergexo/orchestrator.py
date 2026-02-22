@@ -10,7 +10,7 @@ import queue
 import re
 import threading
 import time
-from typing import cast
+from typing import Literal, cast
 
 from mergexo.agent_adapter import (
     AgentAdapter,
@@ -977,6 +977,10 @@ class Phase1Orchestrator:
                 slot=lease.slot,
                 flow=flow,
             )
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=_render_issue_start_comment(issue_number=issue.number, flow=flow),
+            )
             self._git.prepare_checkout(lease.path)
             if flow == "design_doc":
                 return self._process_design_issue(issue=issue, checkout_path=lease.path)
@@ -1194,6 +1198,13 @@ class Phase1Orchestrator:
                 issue_number=candidate.issue_number,
                 slot=lease.slot,
                 flow="implementation",
+            )
+            self._github.post_issue_comment(
+                issue_number=candidate.issue_number,
+                body=_render_issue_start_comment(
+                    issue_number=candidate.issue_number,
+                    flow="implementation",
+                ),
             )
             self._git.prepare_checkout(lease.path)
             slug = _design_branch_slug(candidate.design_branch)
@@ -2167,6 +2178,20 @@ def _default_commit_message(*, flow: IssueFlow, issue_number: int) -> str:
     if flow == "bugfix":
         return f"fix: resolve issue #{issue_number}"
     return f"feat: implement issue #{issue_number}"
+
+
+def _render_issue_start_comment(
+    *, issue_number: int, flow: IssueFlow | Literal["implementation"]
+) -> str:
+    if flow == "design_doc":
+        action = "design work"
+    elif flow == "bugfix":
+        action = "bugfix PR work"
+    elif flow == "small_job":
+        action = "small-job PR work"
+    else:
+        action = "implementation PR work"
+    return f"MergeXO assigned an agent and started {action} for issue #{issue_number}."
 
 
 def _has_regression_test_changes(paths: tuple[str, ...]) -> bool:

@@ -718,7 +718,10 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     assert result.pr_number == 101
     assert github.created_prs
     assert "Refs #7" in github.created_prs[0][3]
-    assert github.comments == [(7, "Opened design PR: https://example/pr/101")]
+    assert github.comments == [
+        (7, "MergeXO assigned an agent and started design work for issue #7."),
+        (7, "Opened design PR: https://example/pr/101"),
+    ]
     assert git.prepare_calls
     assert git.branch_calls
     assert git.commit_calls
@@ -772,7 +775,10 @@ def test_process_issue_bugfix_flow_happy_path(tmp_path: Path) -> None:
     assert github.created_prs[0][0] == "Fix bug"
     assert "Fixes #7" in github.created_prs[0][3]
     assert f"Source issue: {issue.html_url}" in github.created_prs[0][3]
-    assert github.comments == [(7, "Opened bugfix PR: https://example/pr/101")]
+    assert github.comments == [
+        (7, "MergeXO assigned an agent and started bugfix PR work for issue #7."),
+        (7, "Opened bugfix PR: https://example/pr/101"),
+    ]
 
 
 def test_process_issue_small_job_flow_uses_default_commit_message(tmp_path: Path) -> None:
@@ -797,7 +803,10 @@ def test_process_issue_small_job_flow_uses_default_commit_message(tmp_path: Path
     assert len(agent.small_job_calls) == 1
     assert git.commit_calls[-1][1] == "feat: implement issue #7"
     assert "Fixes #7" in github.created_prs[0][3]
-    assert github.comments == [(7, "Opened small-job PR: https://example/pr/101")]
+    assert github.comments == [
+        (7, "MergeXO assigned an agent and started small-job PR work for issue #7."),
+        (7, "Opened small-job PR: https://example/pr/101"),
+    ]
 
 
 def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
@@ -853,7 +862,10 @@ def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
         in github.created_prs[0][3]
     )
     assert "Design source PR: https://example/pr/44" in github.created_prs[0][3]
-    assert github.comments == [(7, "Opened implementation PR: https://example/pr/101")]
+    assert github.comments == [
+        (7, "MergeXO assigned an agent and started implementation PR work for issue #7."),
+        (7, "Opened implementation PR: https://example/pr/101"),
+    ]
 
 
 def test_process_implementation_candidate_rejects_unauthorized_author(tmp_path: Path) -> None:
