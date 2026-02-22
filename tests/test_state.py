@@ -7,7 +7,15 @@ import pytest
 
 from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
-from mergexo.state import StateStore
+from mergexo.state import (
+    StateStore,
+    _parse_operator_command_name,
+    _parse_operator_command_row,
+    _parse_operator_command_status,
+    _parse_restart_mode,
+    _parse_runtime_operation_row,
+    _parse_runtime_operation_status,
+)
 
 
 def _get_row(
@@ -339,3 +347,322 @@ def test_get_agent_session_rejects_invalid_thread_id_type(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="Invalid thread_id"):
         store.get_agent_session(2)
+
+
+def test_operator_commands_and_runtime_operations(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    command = store.record_operator_command(
+        command_key="99:100:2026-02-22T10:00:00Z",
+        issue_number=99,
+        pr_number=101,
+        comment_id=100,
+        author_login="alice",
+        command="unblock",
+        args_json='{"normalized_command":"/mergexo unblock"}',
+        status="applied",
+        result="ok",
+    )
+    assert command.command_key == "99:100:2026-02-22T10:00:00Z"
+    assert command.pr_number == 101
+    assert command.command == "unblock"
+
+    fetched = store.get_operator_command("99:100:2026-02-22T10:00:00Z")
+    assert fetched is not None
+    assert fetched.result == "ok"
+
+    updated = store.update_operator_command_result(
+        command_key="99:100:2026-02-22T10:00:00Z",
+        status="failed",
+        result="nope",
+    )
+    assert updated is not None
+    assert updated.status == "failed"
+    assert updated.result == "nope"
+    assert (
+        store.update_operator_command_result(command_key="missing", status="failed", result="x")
+        is None
+    )
+
+    op, created = store.request_runtime_restart(
+        requested_by="alice",
+        request_command_key="99:100:2026-02-22T10:00:00Z",
+        mode="git_checkout",
+    )
+    assert created is True
+    assert op.status == "pending"
+    assert op.mode == "git_checkout"
+    assert op.request_command_key == "99:100:2026-02-22T10:00:00Z"
+
+    op_again, created_again = store.request_runtime_restart(
+        requested_by="bob",
+        request_command_key="99:101:2026-02-22T10:01:00Z",
+        mode="pypi",
+    )
+    assert created_again is False
+    assert op_again.requested_by == "alice"
+    assert op_again.mode == "git_checkout"
+
+    running = store.set_runtime_operation_status(
+        op_name="restart",
+        status="running",
+        detail="draining done",
+    )
+    assert running is not None
+    assert running.status == "running"
+    assert running.detail == "draining done"
+
+    fetched_running = store.get_runtime_operation("restart")
+    assert fetched_running is not None
+    assert fetched_running.status == "running"
+
+    assert (
+        store.set_runtime_operation_status(op_name="missing", status="failed", detail="x") is None
+    )
+
+    completed, created_completed = store.request_runtime_restart(
+        requested_by="carol",
+        request_command_key="99:102:2026-02-22T10:02:00Z",
+        mode="pypi",
+    )
+    # running restarts are single-flight and collapse.
+    assert created_completed is False
+    assert completed.status == "running"
+
+    store.set_runtime_operation_status(
+        op_name="restart",
+        status="completed",
+        detail="done",
+    )
+    refreshed, created_refreshed = store.request_runtime_restart(
+        requested_by="dana",
+        request_command_key="99:103:2026-02-22T10:03:00Z",
+        mode="pypi",
+    )
+    assert created_refreshed is True
+    assert refreshed.status == "pending"
+    assert refreshed.mode == "pypi"
+    assert refreshed.requested_by == "dana"
+
+
+def test_operator_and_runtime_row_validation(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO operator_commands(
+                command_key, issue_number, pr_number, comment_id, author_login,
+                command, args_json, status, result
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "k",
+                1,
+                None,
+                2,
+                "alice",
+                "bad-command",
+                "{}",
+                "applied",
+                "ok",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO runtime_operations(op_name, status, requested_by, request_command_key, mode, detail)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            ("bad-op", "pending", "alice", "k", "bad-mode", None),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="Unknown command value"):
+        store.get_operator_command("k")
+
+    with pytest.raises(RuntimeError, match="Unknown mode value"):
+        store.get_runtime_operation("bad-op")
+
+
+def test_runtime_operation_none_and_disappearing_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    assert store.get_runtime_operation("restart") is None
+
+    class FakeCursor:
+        def __init__(self, row: object) -> None:
+            self._row = row
+
+        def fetchone(self) -> object:
+            return self._row
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.select_count = 0
+
+        def execute(self, sql: str, params: tuple[object, ...] = ()) -> FakeCursor:
+            _ = params
+            if "FROM operator_commands" in sql and "SELECT" in sql:
+                return FakeCursor(None)
+            if "FROM runtime_operations" in sql and "SELECT" in sql:
+                self.select_count += 1
+                if self.select_count == 1:
+                    return FakeCursor(None)
+                return FakeCursor(None)
+            return FakeCursor(None)
+
+        def commit(self) -> None:
+            return None
+
+        def rollback(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_connect():  # type: ignore[no-untyped-def]
+        yield FakeConn()
+
+    monkeypatch.setattr(store, "_connect", fake_connect)
+
+    with pytest.raises(RuntimeError, match="operator_commands row disappeared"):
+        store.record_operator_command(
+            command_key="k",
+            issue_number=1,
+            pr_number=None,
+            comment_id=1,
+            author_login="alice",
+            command="help",
+            args_json="{}",
+            status="applied",
+            result="ok",
+        )
+
+    with pytest.raises(RuntimeError, match="runtime restart row disappeared"):
+        store.request_runtime_restart(
+            requested_by="alice",
+            request_command_key="k",
+            mode="git_checkout",
+        )
+
+
+def test_parse_operator_command_row_validations() -> None:
+    valid = ("k", 1, None, 2, "alice", "help", "{}", "applied", "ok", "t1", "t2")
+
+    with pytest.raises(RuntimeError, match="command_key"):
+        _parse_operator_command_row((1, *valid[1:]))
+    with pytest.raises(RuntimeError, match="issue_number"):
+        _parse_operator_command_row((valid[0], "1", *valid[2:]))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="pr_number"):
+        _parse_operator_command_row((valid[0], valid[1], "bad", *valid[3:]))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="comment_id"):
+        _parse_operator_command_row((valid[0], valid[1], valid[2], "x", *valid[4:]))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="author_login"):
+        _parse_operator_command_row((valid[0], valid[1], valid[2], valid[3], 4, *valid[5:]))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="args_json"):
+        _parse_operator_command_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], 7, *valid[7:])
+        )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="result"):
+        _parse_operator_command_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                8,
+                *valid[9:],
+            )
+        )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="created_at"):
+        _parse_operator_command_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                valid[8],
+                9,
+                valid[10],
+            )
+        )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="updated_at"):
+        _parse_operator_command_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                valid[8],
+                valid[9],
+                10,
+            )
+        )  # type: ignore[arg-type]
+
+
+def test_parse_runtime_operation_row_validations() -> None:
+    valid = ("restart", "pending", "alice", "k", "git_checkout", None, "t1", "t2")
+
+    with pytest.raises(RuntimeError, match="op_name"):
+        _parse_runtime_operation_row((1, *valid[1:]))
+    with pytest.raises(RuntimeError, match="requested_by"):
+        _parse_runtime_operation_row((valid[0], valid[1], 2, *valid[3:]))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="request_command_key"):
+        _parse_runtime_operation_row((valid[0], valid[1], valid[2], 3, *valid[4:]))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="detail"):
+        _parse_runtime_operation_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], 4, *valid[6:])
+        )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="created_at"):
+        _parse_runtime_operation_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], 5, valid[7])
+        )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="updated_at"):
+        _parse_runtime_operation_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], valid[6], 6)
+        )  # type: ignore[arg-type]
+
+
+def test_parse_enum_helpers_validate_types_and_values() -> None:
+    with pytest.raises(RuntimeError, match="Invalid command value"):
+        _parse_operator_command_name(1)
+    with pytest.raises(RuntimeError, match="Unknown command value"):
+        _parse_operator_command_name("other")
+
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        _parse_operator_command_status(1)
+    with pytest.raises(RuntimeError, match="Unknown status value"):
+        _parse_operator_command_status("other")
+
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        _parse_runtime_operation_status(1)
+    with pytest.raises(RuntimeError, match="Unknown status value"):
+        _parse_runtime_operation_status("other")
+
+    with pytest.raises(RuntimeError, match="Invalid mode value"):
+        _parse_restart_mode(1)
+    with pytest.raises(RuntimeError, match="Unknown mode value"):
+        _parse_restart_mode("other")

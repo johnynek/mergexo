@@ -5,6 +5,11 @@ from typing import Literal
 
 
 IssueFlow = Literal["design_doc", "bugfix", "small_job"]
+OperatorCommandName = Literal["unblock", "restart", "help", "invalid"]
+OperatorCommandStatus = Literal["applied", "rejected", "failed"]
+OperatorReplyStatus = Literal["applied", "rejected", "failed", "help"]
+RestartMode = Literal["git_checkout", "pypi"]
+RuntimeOperationStatus = Literal["pending", "running", "failed", "completed"]
 
 
 @dataclass(frozen=True)
@@ -73,3 +78,30 @@ class WorkResult:
     branch: str
     pr_number: int
     pr_url: str
+
+
+@dataclass(frozen=True)
+class OperatorCommandRecord:
+    command_key: str
+    issue_number: int
+    pr_number: int | None
+    comment_id: int
+    author_login: str
+    command: OperatorCommandName
+    args_json: str
+    status: OperatorCommandStatus
+    result: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class RuntimeOperationRecord:
+    op_name: str
+    status: RuntimeOperationStatus
+    requested_by: str
+    request_command_key: str
+    mode: RestartMode
+    detail: str | None
+    created_at: str
+    updated_at: str

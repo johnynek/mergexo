@@ -63,13 +63,61 @@ uv run mergexo run --config mergexo.toml --once --verbose
 uv run mergexo run --config mergexo.toml
 ```
 
+For GitHub-operated restart/update workflows, run supervisor mode instead:
+
+```bash
+uv run mergexo service --config mergexo.toml
+```
+
 ## Notes on polling
 
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
 
 The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `false`) until rollout is complete.
 
-Use `--verbose` on `init` or `run` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
+Use `--verbose` on `init`, `run`, or `service` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
+
+## GitHub operator commands
+
+Enable GitHub operations with:
+
+- `runtime.enable_github_operations = true`
+- `repo.operator_logins = ["<maintainer-login>", ...]`
+- optional `repo.operations_issue_number = <issue-number>` for global commands
+  (the issue does not need to stay open; MergeXO scans comments by issue number
+  and reads comments from open or closed issues)
+
+Supported comment commands:
+
+- `/mergexo unblock` (target PR defaults from a blocked PR thread)
+- `/mergexo unblock head_sha=<sha>` (same target resolution as above)
+- `/mergexo unblock pr=<number> [head_sha=<sha>]`
+- `/mergexo restart`
+- `/mergexo restart mode=git_checkout|pypi`
+- `/mergexo help`
+
+Behavior notes:
+
+- Operator commands are processed only from blocked PR threads and the optional operations issue.
+- `pr=` is optional on PR threads: `/mergexo unblock` and `/mergexo unblock head_sha=...` target that PR.
+- `pr=` is required on the operations issue: `/mergexo unblock` without `pr=<number>` is rejected.
+- Every `/mergexo ...` command receives one deterministic reply comment with status and detail.
+- Restart automation requires `mergexo service`; `mergexo run` rejects restart commands.
+- `git_checkout` restart mode runs `git pull --ff-only` + `uv sync` before re-exec.
+- `pypi` mode is available only when configured (`restart_supported_modes` + `service_python`).
+
+Unblock user story (`head_sha` override):
+
+1. PR `#101` is in `blocked` status because MergeXO detected a non-fast-forward head change, for example:
+   - previous expected head: `abc1234`
+   - current observed head after force-push/rewrite: `def5678`
+2. MergeXO will not continue feedback automation while the PR remains blocked.
+3. A maintainer verifies the canonical head to resume from:
+   - if no override is needed, comment `/mergexo unblock` on the blocked PR thread;
+   - if canonical head should be explicit, comment `/mergexo unblock head_sha=def5678` on the blocked PR thread;
+   - from the operations issue, use `/mergexo unblock pr=101` or `/mergexo unblock pr=101 head_sha=def5678`.
+4. MergeXO transitions the PR from `blocked` back to `awaiting_feedback`.
+5. If `head_sha` is supplied, MergeXO also updates the stored `last_seen_head_sha` to that value before resuming.
 
 ## Issue labels and precedence
 

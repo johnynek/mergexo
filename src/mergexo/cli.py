@@ -11,6 +11,7 @@ from mergexo.git_ops import GitRepoManager
 from mergexo.github_gateway import GitHubGateway
 from mergexo.observability import configure_logging
 from mergexo.orchestrator import Phase1Orchestrator
+from mergexo.service_runner import run_service
 from mergexo.state import StateStore
 
 
@@ -37,6 +38,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--once", action="store_true", help="Poll once and wait for active workers"
     )
     run_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose runtime logging to stderr",
+    )
+
+    service_parser = subparsers.add_parser(
+        "service",
+        help="Run orchestrator under supervisor mode with GitHub-driven restart support",
+    )
+    service_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
+    service_parser.add_argument(
+        "--once", action="store_true", help="Poll once and wait for active workers"
+    )
+    service_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -118,6 +134,9 @@ def main() -> None:
     if args.command == "run":
         _cmd_run(config, once=bool(args.once))
         return
+    if args.command == "service":
+        _cmd_service(config, once=bool(args.once))
+        return
     if args.command == "feedback":
         _cmd_feedback(config, args)
         return
@@ -153,6 +172,22 @@ def _cmd_run(config: AppConfig, *, once: bool) -> None:
         agent=agent,
     )
     orchestrator.run(once=once)
+
+
+def _cmd_service(config: AppConfig, *, once: bool) -> None:
+    config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
+    state = StateStore(_state_db_path(config))
+    github = GitHubGateway(config.repo.owner, config.repo.name)
+    git_manager = GitRepoManager(config.runtime, config.repo)
+    agent = CodexAdapter(config.codex)
+    run_service(
+        config=config,
+        state=state,
+        github=github,
+        git_manager=git_manager,
+        agent=agent,
+        once=once,
+    )
 
 
 def _cmd_feedback(config: AppConfig, args: argparse.Namespace) -> None:

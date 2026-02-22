@@ -273,7 +273,18 @@ class GitHubGateway:
         return comments
 
     def list_pull_request_issue_comments(self, pr_number: int) -> list[PullRequestIssueComment]:
-        path = f"/repos/{self.owner}/{self.name}/issues/{pr_number}/comments?per_page=100"
+        comments = self.list_issue_comments(pr_number)
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="pull_request_issue_comments",
+            pr_number=pr_number,
+            count=len(comments),
+        )
+        return comments
+
+    def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
+        path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}/comments?per_page=100"
         payload = self._api_json("GET", path)
         if not isinstance(payload, list):
             raise RuntimeError("Unexpected GitHub response: expected list of issue comments")
@@ -297,8 +308,8 @@ class GitHubGateway:
         log_event(
             LOGGER,
             "github_read",
-            endpoint="pull_request_issue_comments",
-            pr_number=pr_number,
+            endpoint="issue_comments",
+            issue_number=issue_number,
             count=len(comments),
         )
         return comments

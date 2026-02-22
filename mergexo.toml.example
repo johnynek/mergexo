@@ -3,6 +3,17 @@ base_dir = "~/.local/share/mergexo"
 worker_count = 2
 poll_interval_seconds = 600
 enable_feedback_loop = true
+enable_github_operations = false
+# Restart drain timeout before pending restart is marked failed.
+restart_drain_timeout_seconds = 900
+# Default restart mode when /mergexo restart omits mode=...
+restart_default_mode = "git_checkout"
+# Allowed restart modes for this deployment.
+restart_supported_modes = ["git_checkout"]
+# Required for git_checkout mode; defaults to current working directory if omitted.
+# git_checkout_root = "/Users/oscar/code/mergexo"
+# Required for pypi mode.
+# service_python = "/usr/bin/python3"
 
 [repo]
 owner = "johnynek"
@@ -17,6 +28,10 @@ small_job_label = "agent:small-job"
 # Path (repo-relative) to coding + testing guidelines agents should follow
 coding_guidelines_path = "docs/python_style.md"
 design_docs_dir = "docs/design"
+# Optional issue used for global operator commands (restart and cross-PR unblock).
+# operations_issue_number = 123
+# GitHub logins allowed to run /mergexo commands.
+operator_logins = []
 # Optional local source to seed the mirror (path to local repo or .git dir)
 # local_clone_source = "/Users/oscar/code/target-repo/.git"
 # Optional explicit remote URL. Defaults to git@github.com:<owner>/<name>.git

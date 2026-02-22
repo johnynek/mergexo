@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import re
 import sqlite3
 import time
@@ -20,20 +21,24 @@ from mergexo.agent_adapter import (
     GitOpRequest,
     ReviewReply,
 )
-from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
-from mergexo.config import AuthConfig
+from mergexo.config import AppConfig, AuthConfig, CodexConfig, RepoConfig, RuntimeConfig
+from mergexo.feedback_loop import ParsedOperatorCommand, parse_operator_command
+from mergexo.github_gateway import GitHubGateway
 from mergexo.models import (
     GeneratedDesign,
     Issue,
     IssueFlow,
+    OperatorCommandRecord,
     PullRequest,
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    RestartMode,
     WorkResult,
 )
 from mergexo.orchestrator import (
     Phase1Orchestrator,
+    RestartRequested,
     SlotPool,
     _FeedbackFuture,
     _design_branch_slug,
@@ -42,8 +47,14 @@ from mergexo.orchestrator import (
     _has_regression_test_changes,
     _issue_branch,
     _render_design_doc,
+    _render_operator_command_result,
     _resolve_issue_flow,
     _summarize_git_error,
+    _operator_args_payload,
+    _operator_normalized_command,
+    _operator_reply_issue_number,
+    _operator_reply_status_for_record,
+    _operator_source_comment_url,
     _slugify,
     _trigger_labels,
 )
@@ -409,6 +420,10 @@ class FakeState:
     def list_implementation_candidates(self) -> tuple[ImplementationCandidateState, ...]:
         return tuple(self.implementation_candidates)
 
+    def get_runtime_operation(self, op_name: str):  # type: ignore[no-untyped-def]
+        _ = op_name
+        return None
+
     def mark_pr_status(
         self,
         *,
@@ -444,6 +459,12 @@ def _config(
     *,
     worker_count: int = 1,
     enable_feedback_loop: bool = False,
+    enable_github_operations: bool = False,
+    restart_drain_timeout_seconds: int = 900,
+    restart_default_mode: str = "git_checkout",
+    restart_supported_modes: tuple[str, ...] = ("git_checkout",),
+    operations_issue_number: int | None = None,
+    operator_logins: tuple[str, ...] = (),
     allowed_users: tuple[str, ...] = ("issue-author", "reviewer"),
 ) -> AppConfig:
     return AppConfig(
@@ -452,6 +473,10 @@ def _config(
             worker_count=worker_count,
             poll_interval_seconds=1,
             enable_feedback_loop=enable_feedback_loop,
+            enable_github_operations=enable_github_operations,
+            restart_drain_timeout_seconds=restart_drain_timeout_seconds,
+            restart_default_mode=cast(RestartMode, restart_default_mode),
+            restart_supported_modes=cast(tuple[RestartMode, ...], restart_supported_modes),
         ),
         repo=RepoConfig(
             owner="johnynek",
@@ -464,6 +489,8 @@ def _config(
             design_docs_dir="docs/design",
             local_clone_source=None,
             remote_url=None,
+            operations_issue_number=operations_issue_number,
+            operator_logins=operator_logins,
         ),
         codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
         auth=AuthConfig(allowed_users=frozenset(login.lower() for login in allowed_users)),
@@ -1183,6 +1210,37 @@ def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.Monke
 
     with pytest.raises(StopLoop):
         orch.run(once=False)
+
+
+def test_run_once_with_github_ops_scans_commands_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True, enable_github_operations=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    calls = {"scan": 0, "drain": 0, "feedback": 0}
+
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(orch, "_enqueue_new_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_implementation_work", lambda pool: None)
+    monkeypatch.setattr(
+        orch, "_enqueue_feedback_work", lambda pool: calls.__setitem__("feedback", 1)
+    )
+    monkeypatch.setattr(
+        orch, "_scan_operator_commands", lambda: calls.__setitem__("scan", calls["scan"] + 1)
+    )
+    monkeypatch.setattr(
+        orch,
+        "_drain_for_pending_restart_if_needed",
+        lambda: calls.__setitem__("drain", calls["drain"] + 1) or False,
+    )
+    monkeypatch.setattr(orch, "_wait_for_all", lambda pool: None)
+
+    orch.run(once=True)
+    assert calls == {"scan": 2, "drain": 2, "feedback": 1}
 
 
 def _review_comment(
@@ -2760,3 +2818,700 @@ def test_feedback_turn_returns_when_git_op_loop_blocks(tmp_path: Path) -> None:
     orch._process_feedback_turn(tracked)
 
     assert len(state.list_pending_feedback_events(101)) == 1
+
+
+def _operator_issue_comment(
+    *,
+    comment_id: int,
+    body: str,
+    user_login: str,
+    updated_at: str,
+    issue_number: int,
+) -> PullRequestIssueComment:
+    return PullRequestIssueComment(
+        comment_id=comment_id,
+        body=body,
+        user_login=user_login,
+        html_url=f"https://github.com/johnynek/mergexo/issues/{issue_number}#issuecomment-{comment_id}",
+        created_at=updated_at,
+        updated_at=updated_at,
+    )
+
+
+class OperatorGitHub:
+    def __init__(self, threads: dict[int, list[PullRequestIssueComment]]) -> None:
+        self._threads = {issue_number: list(items) for issue_number, items in threads.items()}
+        self.posted_comments: list[tuple[int, str]] = []
+        self._next_comment_id = 5000
+
+    def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
+        return list(self._threads.get(issue_number, []))
+
+    def post_issue_comment(self, issue_number: int, body: str) -> None:
+        self.posted_comments.append((issue_number, body))
+        self._next_comment_id += 1
+        self._threads.setdefault(issue_number, []).append(
+            PullRequestIssueComment(
+                comment_id=self._next_comment_id,
+                body=body,
+                user_login="mergexo[bot]",
+                html_url=f"https://example/issues/{issue_number}#issuecomment-{self._next_comment_id}",
+                created_at="now",
+                updated_at="now",
+            )
+        )
+
+
+def test_operator_unblock_command_resets_blocked_pr_and_is_idempotent(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(7, "agent/design/7-worker", 101, "https://example/pr/101")
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        last_seen_head_sha="head-old",
+        error="blocked for test",
+    )
+    github = OperatorGitHub(
+        {
+            101: [
+                _operator_issue_comment(
+                    comment_id=10,
+                    body="/mergexo unblock head_sha=ABC1234",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:00:00Z",
+                    issue_number=101,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+    assert state.list_blocked_pull_requests() == ()
+    tracked = state.list_tracked_pull_requests()
+    assert len(tracked) == 1
+    assert tracked[0].last_seen_head_sha == "abc1234"
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 101
+    assert "status: `applied`" in github.posted_comments[0][1]
+    command = state.get_operator_command("101:10:2026-02-22T12:00:00Z")
+    assert command is not None
+    assert command.pr_number == 101
+
+    orch._scan_operator_commands()
+    assert len(github.posted_comments) == 1
+
+
+def test_operator_unblock_without_pr_fails_on_operations_issue(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(7, "agent/design/7-worker", 101, "https://example/pr/101")
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        last_seen_head_sha="head-old",
+        error="blocked for test",
+    )
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=18,
+                    body="/mergexo unblock",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:08:00Z",
+                    issue_number=77,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    still_blocked = state.list_blocked_pull_requests()
+    assert len(still_blocked) == 1
+    assert still_blocked[0].pr_number == 101
+    record = state.get_operator_command("77:18:2026-02-22T12:08:00Z")
+    assert record is not None
+    assert record.status == "failed"
+    assert record.pr_number is None
+    assert "No target PR was provided" in record.result
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 77
+    assert "status: `failed`" in github.posted_comments[0][1]
+    assert "unblock pr=<number>" in github.posted_comments[0][1]
+
+
+def test_operator_commands_reject_unauthorized_and_parse_failures(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=11,
+                    body="/mergexo unblock",
+                    user_login="mallory",
+                    updated_at="2026-02-22T12:01:00Z",
+                    issue_number=77,
+                ),
+                _operator_issue_comment(
+                    comment_id=12,
+                    body="/mergexo restart mode=rolling",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:02:00Z",
+                    issue_number=77,
+                ),
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    rejected_key = "77:11:2026-02-22T12:01:00Z"
+    rejected = state.get_operator_command(rejected_key)
+    assert rejected is not None
+    assert rejected.status == "rejected"
+
+    failed_key = "77:12:2026-02-22T12:02:00Z"
+    failed = state.get_operator_command(failed_key)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert len(github.posted_comments) == 2
+    assert "status: `rejected`" in github.posted_comments[0][1]
+    assert "status: `failed`" in github.posted_comments[1][1]
+    assert "README.md#github-operator-commands" in github.posted_comments[1][1]
+
+
+def test_operator_restart_request_drains_and_raises_signal(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice", "carol"),
+        operations_issue_number=77,
+        restart_supported_modes=("git_checkout", "pypi"),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=13,
+                    body="/mergexo restart mode=git_checkout",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:03:00Z",
+                    issue_number=77,
+                ),
+                _operator_issue_comment(
+                    comment_id=14,
+                    body="/mergexo restart",
+                    user_login="carol",
+                    updated_at="2026-02-22T12:04:00Z",
+                    issue_number=77,
+                ),
+            ]
+        }
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+        allow_runtime_restart=True,
+    )
+
+    orch._scan_operator_commands()
+    op = state.get_runtime_operation("restart")
+    assert op is not None
+    assert op.status == "pending"
+    assert op.request_command_key == "77:13:2026-02-22T12:03:00Z"
+    assert op.mode == "git_checkout"
+
+    collapsed = state.get_operator_command("77:14:2026-02-22T12:04:00Z")
+    assert collapsed is not None
+    assert collapsed.status == "applied"
+    assert len(github.posted_comments) == 1
+    assert "collapsed" in github.posted_comments[0][1]
+
+    with pytest.raises(RestartRequested, match="mode=git_checkout"):
+        orch._drain_for_pending_restart_if_needed()
+    running = state.get_runtime_operation("restart")
+    assert running is not None
+    assert running.status == "running"
+
+
+def test_restart_drain_timeout_marks_operation_failed(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+        restart_drain_timeout_seconds=1,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    command_key = "77:15:2026-02-22T12:05:00Z"
+    state.record_operator_command(
+        command_key=command_key,
+        issue_number=77,
+        pr_number=None,
+        comment_id=15,
+        author_login="alice",
+        command="restart",
+        args_json=json.dumps(
+            {
+                "normalized_command": "/mergexo restart",
+                "args": {},
+                "comment_url": "https://example/command/15",
+            }
+        ),
+        status="applied",
+        result="pending",
+    )
+    state.request_runtime_restart(
+        requested_by="alice",
+        request_command_key=command_key,
+        mode="git_checkout",
+    )
+    github = OperatorGitHub({77: []})
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+        allow_runtime_restart=True,
+    )
+    pending: Future[WorkResult] = Future()
+    orch._running = {1: pending}
+    orch._restart_drain_started_at_monotonic = time.monotonic() - 2.0
+
+    assert orch._drain_for_pending_restart_if_needed() is False
+    op = state.get_runtime_operation("restart")
+    assert op is not None
+    assert op.status == "failed"
+    command = state.get_operator_command(command_key)
+    assert command is not None
+    assert command.status == "failed"
+    assert len(github.posted_comments) == 1
+    assert "timed out" in github.posted_comments[0][1]
+
+
+def test_apply_unblock_command_fails_when_target_not_blocked(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True, operator_logins=("alice",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub({})
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    parsed = parse_operator_command("/mergexo unblock pr=999")
+    assert isinstance(parsed, ParsedOperatorCommand)
+    status, detail, pr_number = orch._apply_unblock_command(
+        source_issue_number=77,
+        source_pr_number=None,
+        parsed=parsed,
+    )
+    assert status == "failed"
+    assert pr_number == 999
+    assert "not currently blocked" in detail
+
+
+def test_operator_scan_skips_non_commands_bots_and_reconciles_existing(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(7, "agent/design/7-worker", 101, "https://example/pr/101")
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        last_seen_head_sha="head-1",
+        error="blocked",
+    )
+    existing_key = "101:30:2026-02-22T12:10:00Z"
+    state.record_operator_command(
+        command_key=existing_key,
+        issue_number=101,
+        pr_number=None,
+        comment_id=30,
+        author_login="alice",
+        command="help",
+        args_json=json.dumps(
+            {
+                "normalized_command": "/mergexo help",
+                "args": {},
+                "comment_url": "https://example/issues/101#issuecomment-30",
+            }
+        ),
+        status="applied",
+        result="help text",
+    )
+    github = OperatorGitHub(
+        {
+            101: [
+                _operator_issue_comment(
+                    comment_id=28,
+                    body="regular discussion",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:08:00Z",
+                    issue_number=101,
+                ),
+                _operator_issue_comment(
+                    comment_id=29,
+                    body="/mergexo help",
+                    user_login="mergexo[bot]",
+                    updated_at="2026-02-22T12:09:00Z",
+                    issue_number=101,
+                ),
+                _operator_issue_comment(
+                    comment_id=30,
+                    body="/mergexo help",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:10:00Z",
+                    issue_number=101,
+                ),
+            ]
+        }
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+    assert len(github.posted_comments) == 1
+    assert "status: `help`" in github.posted_comments[0][1]
+    assert state.get_operator_command("101:29:2026-02-22T12:09:00Z") is None
+    orch._scan_operator_commands()
+    assert len(github.posted_comments) == 1
+
+
+def test_operator_help_and_restart_failure_paths(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+        restart_supported_modes=("git_checkout",),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=31,
+                    body="/mergexo help",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:11:00Z",
+                    issue_number=77,
+                ),
+                _operator_issue_comment(
+                    comment_id=32,
+                    body="/mergexo restart mode=pypi",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:12:00Z",
+                    issue_number=77,
+                ),
+                _operator_issue_comment(
+                    comment_id=33,
+                    body="/mergexo restart",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:13:00Z",
+                    issue_number=77,
+                ),
+            ]
+        }
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+        allow_runtime_restart=False,
+    )
+    orch._scan_operator_commands()
+
+    help_record = state.get_operator_command("77:31:2026-02-22T12:11:00Z")
+    assert help_record is not None
+    assert help_record.command == "help"
+    assert help_record.status == "applied"
+
+    unsupported = state.get_operator_command("77:32:2026-02-22T12:12:00Z")
+    assert unsupported is not None
+    assert unsupported.status == "failed"
+    assert "not enabled" in unsupported.result
+
+    service_required = state.get_operator_command("77:33:2026-02-22T12:13:00Z")
+    assert service_required is not None
+    assert service_required.status == "failed"
+    assert "mergexo service" in service_required.result
+    assert len(github.posted_comments) == 3
+
+
+def test_operator_reconcile_restart_skips_pending_then_posts_terminal(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True, operator_logins=("alice",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    key = "77:34:2026-02-22T12:14:00Z"
+    command = state.record_operator_command(
+        command_key=key,
+        issue_number=77,
+        pr_number=None,
+        comment_id=34,
+        author_login="alice",
+        command="restart",
+        args_json=json.dumps(
+            {
+                "normalized_command": "/mergexo restart",
+                "args": {},
+                "comment_url": "https://example/issues/77#issuecomment-34",
+            }
+        ),
+        status="applied",
+        result="pending",
+    )
+    state.request_runtime_restart(
+        requested_by="alice", request_command_key=key, mode="git_checkout"
+    )
+    github = OperatorGitHub({77: []})
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+        allow_runtime_restart=True,
+    )
+    orch._reconcile_operator_command(command)
+    assert github.posted_comments == []
+
+    state.set_runtime_operation_status(op_name="restart", status="failed", detail="failed")
+    updated = state.update_operator_command_result(
+        command_key=key, status="failed", result="failed"
+    )
+    assert updated is not None
+    orch._reconcile_operator_command(updated)
+    assert len(github.posted_comments) == 1
+    assert "status: `failed`" in github.posted_comments[0][1]
+
+
+def test_restart_drain_service_mode_required_and_in_progress(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        restart_drain_timeout_seconds=30,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    key = "77:35:2026-02-22T12:15:00Z"
+    state.record_operator_command(
+        command_key=key,
+        issue_number=77,
+        pr_number=None,
+        comment_id=35,
+        author_login="alice",
+        command="restart",
+        args_json='{"normalized_command":"/mergexo restart","args":{}}',
+        status="applied",
+        result="pending",
+    )
+    state.request_runtime_restart(
+        requested_by="alice", request_command_key=key, mode="git_checkout"
+    )
+    github = OperatorGitHub({77: []})
+    orch_no_service = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+        allow_runtime_restart=False,
+    )
+    assert orch_no_service._drain_for_pending_restart_if_needed() is False
+    op = state.get_runtime_operation("restart")
+    assert op is not None
+    assert op.status == "failed"
+
+    state.set_runtime_operation_status(op_name="restart", status="pending", detail=None)
+    orch_in_progress = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+        allow_runtime_restart=True,
+    )
+    pending: Future[WorkResult] = Future()
+    orch_in_progress._running = {1: pending}
+    orch_in_progress._restart_drain_started_at_monotonic = time.monotonic()
+    assert orch_in_progress._is_authorized_operator("") is False
+    assert orch_in_progress._is_authorized_operator("alice") is True
+    assert orch_in_progress._drain_for_pending_restart_if_needed() is True
+
+
+def test_operator_helper_functions_cover_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    command = OperatorCommandRecord(
+        command_key="k",
+        issue_number=77,
+        pr_number=101,
+        comment_id=9,
+        author_login="alice",
+        command="unblock",
+        args_json="{bad-json",
+        status="applied",
+        result="ok",
+        created_at="t1",
+        updated_at="t2",
+    )
+    assert _operator_args_payload(command) == {}
+    assert _operator_normalized_command(command) == "/mergexo unblock"
+    assert (
+        _operator_source_comment_url(command=command, repo_full_name="johnynek/mergexo")
+        == "https://github.com/johnynek/mergexo/issues/77#issuecomment-9"
+    )
+    assert _operator_reply_issue_number(command) == 101
+
+    as_list = OperatorCommandRecord(
+        command_key="k2",
+        issue_number=77,
+        pr_number=None,
+        comment_id=10,
+        author_login="alice",
+        command="help",
+        args_json="[]",
+        status="applied",
+        result="ok",
+        created_at="t1",
+        updated_at="t2",
+    )
+    assert _operator_args_payload(as_list) == {}
+    assert _operator_reply_issue_number(as_list) == 77
+
+    original_json_loads = json.loads
+    monkeypatch.setattr("mergexo.orchestrator.json.loads", lambda _: {1: "x"})
+    assert _operator_args_payload(as_list) == {}
+    monkeypatch.setattr("mergexo.orchestrator.json.loads", original_json_loads)
+
+    payload_command = OperatorCommandRecord(
+        command_key="k3",
+        issue_number=77,
+        pr_number=None,
+        comment_id=11,
+        author_login="alice",
+        command="restart",
+        args_json='{"normalized_command":" /mergexo restart ","comment_url":" https://x "}',
+        status="rejected",
+        result="no",
+        created_at="t1",
+        updated_at="t2",
+    )
+    assert _operator_normalized_command(payload_command) == "/mergexo restart"
+    assert (
+        _operator_source_comment_url(command=payload_command, repo_full_name="r/n") == "https://x"
+    )
+    assert _operator_reply_status_for_record(payload_command) == "rejected"
+    help_record = OperatorCommandRecord(
+        command_key="k4",
+        issue_number=77,
+        pr_number=None,
+        comment_id=12,
+        author_login="alice",
+        command="help",
+        args_json="{}",
+        status="applied",
+        result="ok",
+        created_at="t1",
+        updated_at="t2",
+    )
+    failed_record = OperatorCommandRecord(
+        command_key="k5",
+        issue_number=77,
+        pr_number=None,
+        comment_id=13,
+        author_login="alice",
+        command="restart",
+        args_json="{}",
+        status="failed",
+        result="bad",
+        created_at="t1",
+        updated_at="t2",
+    )
+    applied_record = OperatorCommandRecord(
+        command_key="k6",
+        issue_number=77,
+        pr_number=None,
+        comment_id=14,
+        author_login="alice",
+        command="restart",
+        args_json="{}",
+        status="applied",
+        result="good",
+        created_at="t1",
+        updated_at="t2",
+    )
+    assert _operator_reply_status_for_record(help_record) == "help"
+    assert _operator_reply_status_for_record(failed_record) == "failed"
+    assert _operator_reply_status_for_record(applied_record) == "applied"
+    rendered = _render_operator_command_result(
+        normalized_command="/mergexo restart",
+        status="applied",
+        detail="ok",
+        source_comment_url="https://x",
+    )
+    assert "Source command: https://x" in rendered

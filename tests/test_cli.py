@@ -41,6 +41,7 @@ def test_build_parser_supports_commands() -> None:
 
     parsed_init = parser.parse_args(["init", "--verbose"])
     parsed_run = parser.parse_args(["run", "--once", "--verbose"])
+    parsed_service = parser.parse_args(["service", "--once", "--verbose"])
     parsed_feedback_list = parser.parse_args(["feedback", "blocked", "list", "--json"])
     parsed_feedback_reset = parser.parse_args(
         [
@@ -62,6 +63,9 @@ def test_build_parser_supports_commands() -> None:
     assert parsed_run.command == "run"
     assert parsed_run.once is True
     assert parsed_run.verbose is True
+    assert parsed_service.command == "service"
+    assert parsed_service.once is True
+    assert parsed_service.verbose is True
     assert parsed_feedback_list.command == "feedback"
     assert parsed_feedback_list.feedback_command == "blocked"
     assert parsed_feedback_list.blocked_command == "list"
@@ -141,6 +145,33 @@ def test_main_dispatches_feedback(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert isinstance(feedback_call, tuple)
     assert feedback_call[0] == cfg
     assert feedback_call[1].blocked_command == "list"
+
+
+def test_main_dispatches_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+
+    class FakeParser:
+        def parse_args(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                command="service",
+                config=Path("cfg.toml"),
+                once=True,
+                verbose=True,
+            )
+
+    called: dict[str, object] = {}
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+    )
+    monkeypatch.setattr(
+        cli, "_cmd_service", lambda c, once: called.setdefault("service", (c, once))
+    )
+
+    cli.main()
+    assert called["verbose"] is True
+    assert called["service"] == (cfg, True)
 
 
 def test_main_unknown_command_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -235,6 +266,28 @@ def test_cmd_run_constructs_orchestrator(monkeypatch: pytest.MonkeyPatch, tmp_pa
     ctor = called["ctor"]
     assert isinstance(ctor, tuple)
     assert ctor[0] == cfg
+
+
+def test_cmd_service_constructs_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    called: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "StateStore", lambda p: f"state:{p}")
+    monkeypatch.setattr(cli, "GitHubGateway", lambda owner, name: f"gh:{owner}/{name}")
+    monkeypatch.setattr(cli, "GitRepoManager", lambda runtime, repo: f"git:{repo.full_name}")
+    monkeypatch.setattr(cli, "CodexAdapter", lambda codex: f"codex:{codex.enabled}")
+    monkeypatch.setattr(
+        cli,
+        "run_service",
+        lambda **kwargs: called.setdefault("service", kwargs),
+    )
+
+    cli._cmd_service(cfg, once=False)
+
+    service_call = called["service"]
+    assert isinstance(service_call, dict)
+    assert service_call["config"] == cfg
+    assert service_call["once"] is False
 
 
 def test_cmd_feedback_dispatches_blocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
