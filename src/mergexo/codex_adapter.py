@@ -23,6 +23,7 @@ from mergexo.prompts import (
     build_bugfix_prompt,
     build_design_prompt,
     build_feedback_prompt,
+    build_implementation_prompt,
     build_small_job_prompt,
 )
 from mergexo.shell import run
@@ -130,6 +131,36 @@ class CodexAdapter(AgentAdapter):
             coding_guidelines_path=coding_guidelines_path,
         )
         return self._start_direct_turn(issue=issue, flow_name="small_job", prompt=prompt, cwd=cwd)
+
+    def start_implementation_from_design(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        design_doc_path: str,
+        design_doc_markdown: str,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> DirectStartResult:
+        prompt = build_implementation_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+            design_doc_path=design_doc_path,
+            design_doc_markdown=design_doc_markdown,
+            design_pr_number=design_pr_number,
+            design_pr_url=design_pr_url,
+        )
+        return self._start_direct_turn(
+            issue=issue,
+            flow_name="implementation",
+            prompt=prompt,
+            cwd=cwd,
+        )
 
     def respond_to_feedback(
         self,

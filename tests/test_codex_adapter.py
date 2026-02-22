@@ -285,6 +285,59 @@ def test_start_small_job_from_issue_can_return_blocked_reason(
     assert result.session.thread_id == "thread-small"
 
 
+def test_start_implementation_from_design_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert "implementation agent" in input_text
+        assert "docs/design/1-issue.md" in input_text
+        assert "Source design PR: #77 (https://example/pr/77)" in input_text
+        assert "Re-read the full diff against main." in input_text
+        assert "Re-run formatting and CI-required checks from docs/python_style.md." in input_text
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "pr_title": "Implement scheduler design",
+                    "pr_summary": "Implements the merged design doc plan.",
+                    "commit_message": "feat: implement scheduler design",
+                    "blocked_reason": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-impl"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.start_implementation_from_design(
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        design_doc_path="docs/design/1-issue.md",
+        design_doc_markdown="# Design",
+        design_pr_number=77,
+        design_pr_url="https://example/pr/77",
+        cwd=tmp_path,
+    )
+
+    assert result.pr_title == "Implement scheduler design"
+    assert result.commit_message == "feat: implement scheduler design"
+    assert result.blocked_reason is None
+    assert result.session is not None
+    assert result.session.thread_id == "thread-impl"
+
+
 def test_respond_to_feedback_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

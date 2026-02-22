@@ -93,6 +93,22 @@ Direct-flow PR bodies include `Fixes #<issue_number>`. Design-doc PR bodies keep
 Bugfix flow enforces at least one staged file under `tests/` before opening a PR.
 Bugfix and small-job prompts require the agent to read and follow `coding_guidelines_path`.
 
+## Abandoning work (changing direction)
+
+Sometimes we discover a deeper problem late, or priorities change. That is expected. Use this playbook to abandon work safely:
+
+1. After design doc PR is opened (design phase):
+   - Close the design PR to stop active review-loop automation for that design.
+   - Optionally close the issue as well for project hygiene and visibility.
+   - Important: closing only the issue is not enough if the design PR remains open.
+
+2. After design doc is merged and implementation PR is opened:
+   - Close the implementation PR to stop active review-loop automation for implementation.
+   - Close the issue so it is clearly no longer in scope.
+   - The merged design doc will remain in `main`; if you want to remove or supersede it, open a follow-up doc/change PR.
+
+In short: closing the currently active PR is the key action to stop automation for that phase.
+
 ## Generated design doc contract
 
 The Codex prompt requires reporting likely implementation files in `touch_paths`, which are written into the design doc frontmatter.
