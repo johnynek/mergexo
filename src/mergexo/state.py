@@ -28,6 +28,17 @@ class PendingFeedbackEvent:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class BlockedPullRequestState:
+    pr_number: int
+    issue_number: int
+    branch: str
+    last_seen_head_sha: str | None
+    error: str | None
+    updated_at: str
+    pending_event_count: int
+
+
 class StateStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +228,109 @@ class StateStore:
             )
             for pr_number, issue_number, branch, status, last_seen_head_sha in rows
         )
+
+    def list_blocked_pull_requests(self) -> tuple[BlockedPullRequestState, ...]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    p.pr_number,
+                    p.issue_number,
+                    p.branch,
+                    p.last_seen_head_sha,
+                    r.error,
+                    p.updated_at,
+                    COUNT(e.event_key) AS pending_event_count
+                FROM pr_feedback_state AS p
+                LEFT JOIN issue_runs AS r
+                    ON r.issue_number = p.issue_number
+                LEFT JOIN feedback_events AS e
+                    ON e.pr_number = p.pr_number
+                   AND e.processed_at IS NULL
+                WHERE p.status = 'blocked'
+                GROUP BY
+                    p.pr_number,
+                    p.issue_number,
+                    p.branch,
+                    p.last_seen_head_sha,
+                    r.error,
+                    p.updated_at
+                ORDER BY p.updated_at ASC, p.pr_number ASC
+                """
+            ).fetchall()
+        return tuple(
+            BlockedPullRequestState(
+                pr_number=int(pr_number),
+                issue_number=int(issue_number),
+                branch=str(branch),
+                last_seen_head_sha=str(last_seen_head_sha)
+                if isinstance(last_seen_head_sha, str)
+                else None,
+                error=str(error) if isinstance(error, str) else None,
+                updated_at=str(updated_at),
+                pending_event_count=int(pending_event_count),
+            )
+            for (
+                pr_number,
+                issue_number,
+                branch,
+                last_seen_head_sha,
+                error,
+                updated_at,
+                pending_event_count,
+            ) in rows
+        )
+
+    def reset_blocked_pull_requests(self, *, pr_numbers: tuple[int, ...] | None = None) -> int:
+        if pr_numbers is not None and not pr_numbers:
+            return 0
+
+        with self._lock, self._connect() as conn:
+            where_clauses = ["status = 'blocked'"]
+            params: list[object] = []
+            if pr_numbers is not None:
+                placeholders = ",".join("?" for _ in pr_numbers)
+                where_clauses.append(f"pr_number IN ({placeholders})")
+                params.extend(pr_numbers)
+
+            rows = conn.execute(
+                f"""
+                SELECT pr_number, issue_number
+                FROM pr_feedback_state
+                WHERE {" AND ".join(where_clauses)}
+                """,
+                tuple(params),
+            ).fetchall()
+            if not rows:
+                return 0
+
+            blocked_pr_numbers = tuple(int(row[0]) for row in rows)
+            issue_numbers = tuple(sorted({int(row[1]) for row in rows}))
+
+            pr_placeholders = ",".join("?" for _ in blocked_pr_numbers)
+            conn.execute(
+                f"""
+                UPDATE pr_feedback_state
+                SET status = 'awaiting_feedback',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE pr_number IN ({pr_placeholders})
+                """,
+                blocked_pr_numbers,
+            )
+
+            conn.executemany(
+                """
+                INSERT INTO issue_runs(issue_number, status, error)
+                VALUES(?, 'awaiting_feedback', NULL)
+                ON CONFLICT(issue_number) DO UPDATE SET
+                    status='awaiting_feedback',
+                    error=NULL,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                [(issue_number,) for issue_number in issue_numbers],
+            )
+
+        return len(blocked_pr_numbers)
 
     def mark_pr_status(
         self,
