@@ -56,7 +56,9 @@ class CodexAdapter(AgentAdapter):
             default_branch=default_branch,
         )
         design, thread_id = self._run_design_turn(prompt=prompt, cwd=cwd)
-        return DesignStartResult(design=design, session=AgentSession(adapter="codex", thread_id=thread_id))
+        return DesignStartResult(
+            design=design, session=AgentSession(adapter="codex", thread_id=thread_id)
+        )
 
     def respond_to_feedback(
         self,

@@ -17,14 +17,22 @@ from mergexo.github_gateway import (
 
 def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = [
-        {"number": 1, "title": "Issue", "body": "Body", "html_url": "u", "labels": [{"name": "x"}, 9]},
+        {
+            "number": 1,
+            "title": "Issue",
+            "body": "Body",
+            "html_url": "u",
+            "labels": [{"name": "x"}, 9],
+        },
         {"pull_request": {"url": "pr"}, "number": 2},
         "skip",
     ]
 
     gateway = GitHubGateway("o", "r")
 
-    def fake_api(self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None) -> object:
+    def fake_api(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
         _ = self
         _ = payload
         assert method == "GET"
@@ -56,7 +64,9 @@ def test_create_pull_request_and_comment(monkeypatch: pytest.MonkeyPatch) -> Non
     gateway = GitHubGateway("o", "r")
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
-    def fake_api(self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None) -> object:
+    def fake_api(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
         _ = self
         calls.append((method, path, payload))
         if path.endswith("/pulls"):
@@ -75,6 +85,39 @@ def test_create_pull_request_and_comment(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls[1][1].endswith("/issues/7/comments")
     assert calls[2][1].endswith("/pulls/7/comments")
     assert calls[2][2] == {"body": "reply", "in_reply_to": 55}
+
+
+def test_get_issue_parses_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, method, payload
+        assert path.endswith("/issues/9")
+        return {
+            "number": 9,
+            "title": "Issue title",
+            "body": "Issue body",
+            "html_url": "https://example/issue/9",
+            "labels": [{"name": "agent:design"}, "skip"],
+        }
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    issue = gateway.get_issue(9)
+    assert issue.number == 9
+    assert issue.labels == ("agent:design",)
+
+
+def test_get_issue_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+
+    with pytest.raises(RuntimeError, match="expected object for issue"):
+        gateway.get_issue(1)
 
 
 def test_create_pull_request_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,6 +146,8 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
                 "head": {"sha": "headsha"},
                 "base": {"sha": "basesha"},
                 "draft": False,
+                "state": "open",
+                "merged": False,
             }
         if path.endswith("/pulls/9/files?per_page=100"):
             return ["skip", {"filename": "src/a.py"}, {"filename": "README.md"}]
@@ -120,7 +165,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
                     "html_url": "http://review",
                     "created_at": "t1",
                     "updated_at": "t2",
-                }
+                },
             ]
         if path.endswith("/issues/9/comments?per_page=100"):
             return [
@@ -132,7 +177,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
                     "html_url": "http://issue",
                     "created_at": "t3",
                     "updated_at": "t4",
-                }
+                },
             ]
         raise AssertionError(path)
 
@@ -145,6 +190,8 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert pr.number == 9
     assert pr.head_sha == "headsha"
+    assert pr.state == "open"
+    assert pr.merged is False
     assert files == ("src/a.py", "README.md")
     assert review_comments[0].comment_id == 11
     assert review_comments[0].user_login == "reviewer"
@@ -161,7 +208,14 @@ def test_get_pull_request_requires_head_and_base(monkeypatch: pytest.MonkeyPatch
         payload: dict[str, object] | None = None,
     ) -> object:
         _ = self, method, path, payload
-        return {"number": 1, "title": "t", "body": "b", "draft": False}
+        return {
+            "number": 1,
+            "title": "t",
+            "body": "b",
+            "draft": False,
+            "state": "open",
+            "merged": False,
+        }
 
     monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
 
@@ -185,7 +239,9 @@ def test_pull_request_related_fetch_errors(
     expected: str,
 ) -> None:
     gateway = GitHubGateway("o", "r")
-    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: bad_payload)
+    monkeypatch.setattr(
+        GitHubGateway, "_api_json", lambda self, method, path, payload=None: bad_payload
+    )
 
     method = getattr(gateway, method_name)
     with pytest.raises(RuntimeError, match=expected):
@@ -195,7 +251,9 @@ def test_pull_request_related_fetch_errors(
 def test_api_json_invokes_gh_api(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[list[str], str | None]] = []
 
-    def fake_run(cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True) -> str:
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
         _ = cwd, check
         calls.append((cmd, input_text))
         return json.dumps({"ok": True})

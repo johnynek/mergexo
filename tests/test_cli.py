@@ -11,7 +11,12 @@ from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 
 def _app_config(tmp_path: Path) -> AppConfig:
     return AppConfig(
-        runtime=RuntimeConfig(base_dir=tmp_path / "state", worker_count=1, poll_interval_seconds=60),
+        runtime=RuntimeConfig(
+            base_dir=tmp_path / "state",
+            worker_count=1,
+            poll_interval_seconds=60,
+            enable_feedback_loop=False,
+        ),
         repo=RepoConfig(
             owner="johnynek",
             name="mergexo",
@@ -113,7 +118,15 @@ def test_cmd_run_constructs_orchestrator(monkeypatch: pytest.MonkeyPatch, tmp_pa
     called: dict[str, object] = {}
 
     class FakeOrchestrator:
-        def __init__(self, config: AppConfig, *, state: object, github: object, git_manager: object, agent: object) -> None:
+        def __init__(
+            self,
+            config: AppConfig,
+            *,
+            state: object,
+            github: object,
+            git_manager: object,
+            agent: object,
+        ) -> None:
             called["ctor"] = (config, state, github, git_manager, agent)
 
         def run(self, *, once: bool) -> None:

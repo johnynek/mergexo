@@ -91,6 +91,26 @@ class GitRepoManager:
     def cleanup_slot(self, checkout_path: Path) -> None:
         self.prepare_checkout(checkout_path)
 
+    def restore_feedback_branch(
+        self, checkout_path: Path, branch: str, expected_head_sha: str
+    ) -> bool:
+        self.prepare_checkout(checkout_path)
+        self._checkout_remote_branch(checkout_path, branch)
+        if self.current_head_sha(checkout_path) == expected_head_sha:
+            return True
+
+        # Retry once after a fresh fetch to handle race windows on remote updates.
+        run(["git", "-C", str(checkout_path), "fetch", "origin", "--prune", "--tags"])
+        self._checkout_remote_branch(checkout_path, branch)
+        return self.current_head_sha(checkout_path) == expected_head_sha
+
+    def current_head_sha(self, checkout_path: Path) -> str:
+        return run(["git", "-C", str(checkout_path), "rev-parse", "HEAD"]).strip()
+
+    def _checkout_remote_branch(self, checkout_path: Path, branch: str) -> None:
+        run(["git", "-C", str(checkout_path), "checkout", "-B", branch, f"origin/{branch}"])
+        run(["git", "-C", str(checkout_path), "reset", "--hard", f"origin/{branch}"])
+
     def _ensure_mirror(self) -> None:
         remote_url = self.repo.effective_remote_url
         source = self.repo.local_clone_source or remote_url

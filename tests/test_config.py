@@ -22,6 +22,7 @@ def test_load_config_happy_path(tmp_path: Path) -> None:
 base_dir = "~/tmp/mergexo"
 worker_count = 2
 poll_interval_seconds = 60
+enable_feedback_loop = true
 
 [repo]
 owner = "johnynek"
@@ -45,6 +46,7 @@ extra_args = ["--full-auto"]
     assert isinstance(loaded, AppConfig)
     assert loaded.runtime.worker_count == 2
     assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
+    assert loaded.runtime.enable_feedback_loop is True
     assert loaded.repo.full_name == "johnynek/repo"
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.codex.extra_args == ("--full-auto",)
@@ -71,6 +73,7 @@ remote_url = "git@github.com:example/custom.git"
 
     loaded = config.load_config(cfg_path)
     assert loaded.repo.effective_remote_url == "git@github.com:example/custom.git"
+    assert loaded.runtime.enable_feedback_loop is False
 
 
 @pytest.mark.parametrize(
