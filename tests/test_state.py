@@ -137,6 +137,97 @@ def test_mark_pr_status_updates_run_and_tracking_rows(tmp_path: Path) -> None:
     assert status == "merged"
 
 
+def test_list_blocked_and_reset_pull_requests(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_completed(8, "agent/design/8", 101, "https://example/pr/101")
+    store.mark_pr_status(
+        pr_number=101,
+        issue_number=8,
+        status="blocked",
+        last_seen_head_sha="head-1",
+        error="resume failed",
+    )
+
+    store.mark_completed(9, "agent/design/9", 102, "https://example/pr/102")
+    store.mark_pr_status(
+        pr_number=102,
+        issue_number=9,
+        status="blocked",
+        last_seen_head_sha="head-2",
+        error="missing session",
+    )
+
+    store.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:review:1:2026-02-22T00:00:00Z",
+                pr_number=101,
+                issue_number=8,
+                kind="review",
+                comment_id=1,
+                updated_at="2026-02-22T00:00:00Z",
+            ),
+            FeedbackEventRecord(
+                event_key="101:issue:2:2026-02-22T00:01:00Z",
+                pr_number=101,
+                issue_number=8,
+                kind="issue",
+                comment_id=2,
+                updated_at="2026-02-22T00:01:00Z",
+            ),
+        )
+    )
+    store.finalize_feedback_turn(
+        pr_number=101,
+        issue_number=8,
+        processed_event_keys=("101:issue:2:2026-02-22T00:01:00Z",),
+        session=AgentSession(adapter="codex", thread_id="thread-1"),
+        head_sha="head-1",
+    )
+    store.mark_pr_status(
+        pr_number=101,
+        issue_number=8,
+        status="blocked",
+        last_seen_head_sha="head-1",
+        error="resume failed",
+    )
+
+    blocked = store.list_blocked_pull_requests()
+    blocked_by_pr = {item.pr_number: item for item in blocked}
+    assert set(blocked_by_pr) == {101, 102}
+    assert blocked_by_pr[101].error == "resume failed"
+    assert blocked_by_pr[101].pending_event_count == 1
+    assert blocked_by_pr[102].pending_event_count == 0
+
+    reset_count = store.reset_blocked_pull_requests(pr_numbers=(101, 999))
+    assert reset_count == 1
+
+    blocked_after_single_reset = store.list_blocked_pull_requests()
+    assert [item.pr_number for item in blocked_after_single_reset] == [102]
+
+    pending_after_reset = store.list_pending_feedback_events(101)
+    assert len(pending_after_reset) == 1
+    assert pending_after_reset[0].event_key == "101:review:1:2026-02-22T00:00:00Z"
+
+    status, *_rest, error = _get_row(db_path, 8)
+    assert status == "awaiting_feedback"
+    assert error is None
+
+    reset_all_count = store.reset_blocked_pull_requests()
+    assert reset_all_count == 1
+    assert store.list_blocked_pull_requests() == ()
+
+
+def test_reset_blocked_pull_requests_noop_paths(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    assert store.reset_blocked_pull_requests(pr_numbers=()) == 0
+    assert store.reset_blocked_pull_requests(pr_numbers=(999,)) == 0
+
+
 def test_state_store_connection_rolls_back_on_error(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)

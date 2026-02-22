@@ -23,6 +23,7 @@ def _config(tmp_path: Path, *, worker_count: int = 2) -> tuple[RuntimeConfig, Re
         trigger_label="agent:design",
         bugfix_label="agent:bugfix",
         small_job_label="agent:small-job",
+        coding_guidelines_path="docs/python_style.md",
         design_docs_dir="docs/design",
         local_clone_source=None,
         remote_url=None,
@@ -233,3 +234,28 @@ def test_ensure_mirror_skips_clone_if_existing(
     assert not any(cmd[:3] == ["git", "clone", "--mirror"] for cmd in calls)
     assert any(cmd[2:4] == ["remote", "set-url"] for cmd in calls)
     assert any(cmd[2:4] == ["fetch", "origin"] for cmd in calls)
+
+
+def test_fetch_origin_and_merge_default_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    manager.fetch_origin(checkout)
+    manager.merge_origin_default_branch(checkout)
+
+    assert calls == [
+        ["git", "-C", str(checkout), "fetch", "origin", "--prune", "--tags"],
+        ["git", "-C", str(checkout), "merge", "--no-edit", "origin/main"],
+    ]

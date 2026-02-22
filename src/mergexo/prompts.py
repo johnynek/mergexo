@@ -49,6 +49,7 @@ def build_bugfix_prompt(
     issue: Issue,
     repo_full_name: str,
     default_branch: str,
+    coding_guidelines_path: str,
 ) -> str:
     return f"""
 You are the bugfix agent for repository {repo_full_name}.
@@ -56,6 +57,7 @@ You are the bugfix agent for repository {repo_full_name}.
 Task:
 - Resolve issue #{issue.number} directly with code changes.
 - Base branch is: {default_branch}
+- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
 - Reproduce the issue behavior from the report details.
 - Add or update regression tests in tests/ that fail before the fix and pass after the fix.
 
@@ -85,6 +87,7 @@ def build_small_job_prompt(
     issue: Issue,
     repo_full_name: str,
     default_branch: str,
+    coding_guidelines_path: str,
 ) -> str:
     return f"""
 You are the small-job agent for repository {repo_full_name}.
@@ -92,6 +95,7 @@ You are the small-job agent for repository {repo_full_name}.
 Task:
 - Implement issue #{issue.number} directly with focused code changes.
 - Base branch is: {default_branch}
+- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
 - Keep scope tight to the requested job.
 
 Output requirements:
@@ -163,6 +167,10 @@ Issue comments on the PR:
 
 Return JSON only with this object shape:
 {{
+  "git_ops": [
+    {{"op": "fetch_origin"}},
+    {{"op": "merge_origin_default_branch"}}
+  ],
   "review_replies": [
     {{"review_comment_id": 123, "body": "reply body"}}
   ],
@@ -171,9 +179,18 @@ Return JSON only with this object shape:
 }}
 
 Rules:
+- Primary objective: resolve review feedback by editing repository files, then provide commit_message.
+- For comments on design docs (for example `docs/design/*.md`), prefer updating the doc directly over explanatory discussion-only replies.
+- If a comment can be addressed by a concrete file change, make that change in this turn.
 - Reply to specific review comments using their exact review_comment_id.
 - Do not invent IDs.
+- Use review_replies to summarize what changed and where.
+- Allowed git_ops are exactly: `fetch_origin`, `merge_origin_default_branch`.
+- If you need MergeXO to run one of those git operations (for example because of sandbox git metadata limits), request it via git_ops and set commit_message to null for that response.
+- When git_ops are requested, do not post proposal-only review replies yet; wait for the follow-up turn with operation results and then implement/finalize.
 - If you provide commit_message, you MUST have edited repository files for this turn.
+- Only skip file edits when blocked by genuine ambiguity or missing requirements; in that case, set commit_message to null and ask a precise clarifying question in the review reply.
 - Do not claim you pushed or updated files unless you actually edited them in this turn.
-- Use null or empty values only when no action is needed.
+- Do not post "proposed fix" text when you can implement the change directly.
+- Use null or empty values only when no action is needed or genuinely blocked.
 """.strip()

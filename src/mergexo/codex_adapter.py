@@ -13,6 +13,7 @@ from mergexo.agent_adapter import (
     DesignStartResult,
     FeedbackResult,
     FeedbackTurn,
+    GitOpRequest,
     ReviewReply,
 )
 from mergexo.config import CodexConfig
@@ -102,12 +103,14 @@ class CodexAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
+        coding_guidelines_path: str,
         cwd: Path,
     ) -> DirectStartResult:
         prompt = build_bugfix_prompt(
             issue=issue,
             repo_full_name=repo_full_name,
             default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
         )
         return self._start_direct_turn(issue=issue, flow_name="bugfix", prompt=prompt, cwd=cwd)
 
@@ -117,12 +120,14 @@ class CodexAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
+        coding_guidelines_path: str,
         cwd: Path,
     ) -> DirectStartResult:
         prompt = build_small_job_prompt(
             issue=issue,
             repo_full_name=repo_full_name,
             default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
         )
         return self._start_direct_turn(issue=issue, flow_name="small_job", prompt=prompt, cwd=cwd)
 
@@ -151,10 +156,9 @@ class CodexAdapter(AgentAdapter):
             "resume",
             "--json",
             "--skip-git-repo-check",
-            session.thread_id,
-            "-",
         ]
-        self._append_common_options(cmd)
+        self._append_resume_options(cmd)
+        cmd.extend([session.thread_id, "-"])
 
         raw_events = run(cmd, cwd=cwd, input_text=prompt)
         message = _extract_final_agent_message(raw_events)
@@ -163,6 +167,7 @@ class CodexAdapter(AgentAdapter):
         replies = _parse_review_replies(payload.get("review_replies"))
         general_comment = _optional_output_text(payload.get("general_comment"))
         commit_message = _optional_output_text(payload.get("commit_message"))
+        git_ops = _parse_git_ops(payload.get("git_ops"))
 
         resumed_thread_id = _extract_thread_id(raw_events) or session.thread_id
 
@@ -181,6 +186,7 @@ class CodexAdapter(AgentAdapter):
             review_replies=tuple(replies),
             general_comment=general_comment,
             commit_message=commit_message,
+            git_ops=tuple(git_ops),
         )
 
     def _run_design_turn(self, *, prompt: str, cwd: Path) -> tuple[GeneratedDesign, str | None]:
@@ -202,9 +208,9 @@ class CodexAdapter(AgentAdapter):
                 str(schema_path),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
             self._append_common_options(cmd)
+            cmd.append("-")
 
             raw_events = run(cmd, cwd=cwd, input_text=prompt)
 
@@ -310,6 +316,14 @@ class CodexAdapter(AgentAdapter):
             cmd.extend(["--profile", self._config.profile])
         if self._config.extra_args:
             cmd.extend(self._config.extra_args)
+
+    def _append_resume_options(self, cmd: list[str]) -> None:
+        # `codex exec resume` does not accept `--sandbox` or `--profile`.
+        # Keep model/extra args, while stripping known unsupported options.
+        if self._config.model:
+            cmd.extend(["--model", self._config.model])
+        if self._config.extra_args:
+            cmd.extend(_filter_resume_extra_args(self._config.extra_args))
 
 
 def _parse_json_payload(raw: str) -> dict[str, object]:
@@ -429,9 +443,52 @@ def _parse_review_replies(value: object) -> list[ReviewReply]:
     return replies
 
 
+def _parse_git_ops(value: object) -> list[GitOpRequest]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError("Codex response field git_ops must be a list")
+
+    requests: list[GitOpRequest] = []
+    for item in value:
+        item_obj = _as_object_dict(item)
+        if item_obj is None:
+            raise RuntimeError("Each git_ops entry must be an object")
+        op = item_obj.get("op")
+        if op == "fetch_origin":
+            requests.append(GitOpRequest(op="fetch_origin"))
+            continue
+        if op == "merge_origin_default_branch":
+            requests.append(GitOpRequest(op="merge_origin_default_branch"))
+            continue
+        raise RuntimeError("git_ops op must be one of: fetch_origin, merge_origin_default_branch")
+    return requests
+
+
 def _as_object_dict(value: object) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
     if not all(isinstance(key, str) for key in value.keys()):
         return None
     return cast(dict[str, object], value)
+
+
+def _filter_resume_extra_args(extra_args: tuple[str, ...]) -> list[str]:
+    filtered: list[str] = []
+    idx = 0
+    while idx < len(extra_args):
+        arg = extra_args[idx]
+        if arg in {"--sandbox", "--profile", "-s", "-p"}:
+            idx += 2
+            continue
+        if (
+            arg.startswith("--sandbox=")
+            or arg.startswith("--profile=")
+            or arg.startswith("-s=")
+            or arg.startswith("-p=")
+        ):
+            idx += 1
+            continue
+        filtered.append(arg)
+        idx += 1
+    return filtered

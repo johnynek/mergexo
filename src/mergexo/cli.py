@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from mergexo.codex_adapter import CodexAdapter
@@ -41,6 +42,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable verbose runtime logging to stderr",
     )
 
+    feedback_parser = subparsers.add_parser(
+        "feedback",
+        help="Inspect and manage feedback-loop state",
+    )
+    feedback_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
+    feedback_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose runtime logging to stderr",
+    )
+    feedback_subparsers = feedback_parser.add_subparsers(dest="feedback_command", required=True)
+
+    blocked_parser = feedback_subparsers.add_parser(
+        "blocked",
+        help="List and reset blocked pull requests",
+    )
+    blocked_subparsers = blocked_parser.add_subparsers(dest="blocked_command", required=True)
+
+    blocked_list_parser = blocked_subparsers.add_parser(
+        "list",
+        help="List blocked pull requests and reasons",
+    )
+    blocked_list_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print blocked pull requests as JSON",
+    )
+
+    blocked_reset_parser = blocked_subparsers.add_parser(
+        "reset",
+        help="Reset blocked pull requests back to awaiting_feedback",
+    )
+    reset_target = blocked_reset_parser.add_mutually_exclusive_group(required=True)
+    reset_target.add_argument(
+        "--pr",
+        type=int,
+        action="append",
+        help="Specific blocked pull request number to reset (repeatable)",
+    )
+    reset_target.add_argument(
+        "--all",
+        action="store_true",
+        help="Reset all blocked pull requests",
+    )
+    blocked_reset_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required with --all unless --dry-run is used",
+    )
+    blocked_reset_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be reset without mutating state",
+    )
+
     return parser
 
 
@@ -54,6 +111,9 @@ def main() -> None:
         return
     if args.command == "run":
         _cmd_run(config, once=bool(args.once))
+        return
+    if args.command == "feedback":
+        _cmd_feedback(config, args)
         return
 
     raise RuntimeError(f"Unknown command: {args.command}")
@@ -87,6 +147,111 @@ def _cmd_run(config: AppConfig, *, once: bool) -> None:
         agent=agent,
     )
     orchestrator.run(once=once)
+
+
+def _cmd_feedback(config: AppConfig, args: argparse.Namespace) -> None:
+    state = StateStore(_state_db_path(config))
+    if args.feedback_command == "blocked":
+        _cmd_feedback_blocked(state, args)
+        return
+    raise RuntimeError(f"Unknown feedback command: {args.feedback_command}")
+
+
+def _cmd_feedback_blocked(state: StateStore, args: argparse.Namespace) -> None:
+    if args.blocked_command == "list":
+        _cmd_feedback_blocked_list(state, as_json=bool(args.json))
+        return
+    if args.blocked_command == "reset":
+        _cmd_feedback_blocked_reset(
+            state,
+            pr_numbers=tuple(args.pr or ()),
+            reset_all=bool(args.all),
+            yes=bool(args.yes),
+            dry_run=bool(args.dry_run),
+        )
+        return
+    raise RuntimeError(f"Unknown blocked command: {args.blocked_command}")
+
+
+def _cmd_feedback_blocked_list(state: StateStore, *, as_json: bool) -> None:
+    blocked = state.list_blocked_pull_requests()
+    if as_json:
+        payload = [
+            {
+                "pr_number": item.pr_number,
+                "issue_number": item.issue_number,
+                "branch": item.branch,
+                "last_seen_head_sha": item.last_seen_head_sha,
+                "pending_event_count": item.pending_event_count,
+                "blocked_at": item.updated_at,
+                "reason": item.error,
+            }
+            for item in blocked
+        ]
+        print(json.dumps(payload, indent=2))
+        return
+
+    if not blocked:
+        print("No blocked pull requests.")
+        return
+
+    for item in blocked:
+        print(
+            f"pr_number={item.pr_number} issue_number={item.issue_number} "
+            f"pending_events={item.pending_event_count} blocked_at={item.updated_at}"
+        )
+        print(f"branch={item.branch}")
+        print(f"reason={_summarize_block_reason(item.error)}")
+        print()
+
+
+def _cmd_feedback_blocked_reset(
+    state: StateStore,
+    *,
+    pr_numbers: tuple[int, ...],
+    reset_all: bool,
+    yes: bool,
+    dry_run: bool,
+) -> None:
+    if reset_all and not (yes or dry_run):
+        raise RuntimeError("--all requires --yes (or run with --dry-run)")
+
+    blocked = state.list_blocked_pull_requests()
+    blocked_by_pr = {item.pr_number: item for item in blocked}
+    if reset_all:
+        selected_pr_numbers = tuple(item.pr_number for item in blocked)
+    else:
+        selected_pr_numbers = tuple(dict.fromkeys(pr_numbers))
+
+    matched_pr_numbers = tuple(
+        pr_number for pr_number in selected_pr_numbers if pr_number in blocked_by_pr
+    )
+    if not matched_pr_numbers:
+        print("No blocked pull requests matched.")
+        return
+
+    if dry_run:
+        print(
+            "Would reset blocked pull requests: "
+            + ", ".join(str(pr_number) for pr_number in matched_pr_numbers)
+        )
+        return
+
+    reset_count = state.reset_blocked_pull_requests(
+        pr_numbers=None if reset_all else matched_pr_numbers
+    )
+    print(f"Reset {reset_count} blocked pull request(s).")
+
+
+def _summarize_block_reason(error: str | None) -> str:
+    if error is None:
+        return "<none>"
+    first_line = error.strip().splitlines()[0] if error.strip() else ""
+    if not first_line:
+        return "<none>"
+    if len(first_line) <= 200:
+        return first_line
+    return f"{first_line[:197]}..."
 
 
 def _state_db_path(config: AppConfig) -> Path:

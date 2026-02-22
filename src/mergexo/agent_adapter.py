@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from mergexo.models import (
     GeneratedDesign,
@@ -40,12 +41,21 @@ class ReviewReply:
     body: str
 
 
+GitOpName = Literal["fetch_origin", "merge_origin_default_branch"]
+
+
+@dataclass(frozen=True)
+class GitOpRequest:
+    op: GitOpName
+
+
 @dataclass(frozen=True)
 class FeedbackResult:
     session: AgentSession
     review_replies: tuple[ReviewReply, ...]
     general_comment: str | None
     commit_message: str | None
+    git_ops: tuple[GitOpRequest, ...]
 
 
 @dataclass(frozen=True)
@@ -78,6 +88,7 @@ class AgentAdapter(ABC):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
+        coding_guidelines_path: str,
         cwd: Path,
     ) -> DirectStartResult:
         """Start a direct bugfix PR flow from an issue."""
@@ -89,6 +100,7 @@ class AgentAdapter(ABC):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
+        coding_guidelines_path: str,
         cwd: Path,
     ) -> DirectStartResult:
         """Start a direct small-job PR flow from an issue."""

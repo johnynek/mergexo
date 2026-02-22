@@ -11,6 +11,8 @@ from mergexo.codex_adapter import (
     _as_object_dict,
     _extract_final_agent_message,
     _extract_thread_id,
+    _filter_resume_extra_args,
+    _parse_git_ops,
     _optional_output_text,
     _parse_event_line,
     _parse_json_payload,
@@ -204,6 +206,7 @@ def test_start_bugfix_from_issue_happy_path(
         _ = cwd, check
         assert input_text is not None
         assert "regression tests in tests/" in input_text
+        assert "docs/python_style.md" in input_text
         idx = cmd.index("--output-last-message")
         Path(cmd[idx + 1]).write_text(
             json.dumps(
@@ -225,6 +228,7 @@ def test_start_bugfix_from_issue_happy_path(
         issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
         repo_full_name="johnynek/mergexo",
         default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
         cwd=tmp_path,
     )
 
@@ -248,6 +252,7 @@ def test_start_small_job_from_issue_can_return_blocked_reason(
         _ = cwd, check
         assert input_text is not None
         assert "small-job agent" in input_text
+        assert "docs/python_style.md" in input_text
         idx = cmd.index("--output-last-message")
         Path(cmd[idx + 1]).write_text(
             json.dumps(
@@ -269,6 +274,7 @@ def test_start_small_job_from_issue_can_return_blocked_reason(
         issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
         repo_full_name="johnynek/mergexo",
         default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
         cwd=tmp_path,
     )
 
@@ -293,6 +299,12 @@ def test_respond_to_feedback_happy_path(
     ) -> str:
         _ = cwd, input_text, check
         assert cmd[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+        thread_idx = cmd.index("thread-abc")
+        assert cmd[thread_idx + 1] == "-"
+        assert "--sandbox" not in cmd
+        assert "--profile" not in cmd
+        assert "--full-auto" in cmd
+        assert cmd.index("--model") < thread_idx
         message_payload = json.dumps(
             {
                 "review_replies": [{"review_comment_id": 101, "body": "Done"}],
@@ -325,6 +337,7 @@ def test_respond_to_feedback_happy_path(
     assert result.review_replies[0].review_comment_id == 101
     assert result.general_comment == "Updated"
     assert result.commit_message == "fix: update"
+    assert result.git_ops == ()
     stderr = capsys.readouterr().err
     assert "event=feedback_agent_call_started issue_number=1 pr_number=8" in stderr
     assert (
@@ -366,6 +379,7 @@ def test_start_bugfix_from_issue_rejects_disabled(tmp_path: Path) -> None:
             issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
             repo_full_name="johnynek/mergexo",
             default_branch="main",
+            coding_guidelines_path="docs/python_style.md",
             cwd=tmp_path,
         )
 
@@ -444,3 +458,36 @@ def test_parse_event_line_rejects_non_dict_json(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("mergexo.codex_adapter.json.loads", fake_loads)
     assert _parse_event_line("{}") is None
+
+
+def test_filter_resume_extra_args_strips_unsupported_options() -> None:
+    extra = (
+        "--sandbox",
+        "workspace-write",
+        "--profile",
+        "default",
+        "--full-auto",
+        "--sandbox=danger-full-access",
+        "--profile=alt",
+        "-s",
+        "read-only",
+        "-p",
+        "dev",
+        "--ephemeral",
+    )
+    assert _filter_resume_extra_args(extra) == ["--full-auto", "--ephemeral"]
+
+
+def test_parse_git_ops_validation() -> None:
+    assert _parse_git_ops(None) == []
+    assert [req.op for req in _parse_git_ops([{"op": "fetch_origin"}])] == ["fetch_origin"]
+    assert [req.op for req in _parse_git_ops([{"op": "merge_origin_default_branch"}])] == [
+        "merge_origin_default_branch"
+    ]
+
+    with pytest.raises(RuntimeError, match="must be a list"):
+        _parse_git_ops("bad")
+    with pytest.raises(RuntimeError, match="must be an object"):
+        _parse_git_ops(["bad"])
+    with pytest.raises(RuntimeError, match="must be one of"):
+        _parse_git_ops([{"op": "unknown"}])

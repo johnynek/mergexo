@@ -137,6 +137,9 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "src/a.py" in prompt
     assert "turn_key" in prompt
     assert "If you provide commit_message" in prompt
+    assert "Primary objective: resolve review feedback by editing repository files" in prompt
+    assert "For comments on design docs" in prompt
+    assert "Only skip file edits when blocked by genuine ambiguity" in prompt
 
 
 def test_build_bugfix_prompt_requires_regression_tests() -> None:
@@ -152,9 +155,11 @@ def test_build_bugfix_prompt_requires_regression_tests() -> None:
         issue=issue,
         repo_full_name="johnynek/mergexo",
         default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
     )
 
     assert "regression tests in tests/" in prompt
+    assert "docs/python_style.md" in prompt
     assert "blocked_reason" in prompt
     assert "issue #21" in prompt.lower()
 
@@ -172,8 +177,10 @@ def test_build_small_job_prompt_is_scoped() -> None:
         issue=issue,
         repo_full_name="johnynek/mergexo",
         default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
     )
 
     assert "small-job agent" in prompt
+    assert "docs/python_style.md" in prompt
     assert "blocked_reason" in prompt
     assert "Keep scope tight" in prompt

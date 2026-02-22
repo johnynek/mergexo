@@ -134,6 +134,32 @@ class GitRepoManager:
         )
         run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
 
+    def fetch_origin(self, checkout_path: Path) -> None:
+        log_event(
+            LOGGER,
+            "git_fetch_origin",
+            checkout_path=str(checkout_path),
+        )
+        run(["git", "-C", str(checkout_path), "fetch", "origin", "--prune", "--tags"])
+
+    def merge_origin_default_branch(self, checkout_path: Path) -> None:
+        log_event(
+            LOGGER,
+            "git_merge_origin_default_branch",
+            checkout_path=str(checkout_path),
+            default_branch=self.repo.default_branch,
+        )
+        run(
+            [
+                "git",
+                "-C",
+                str(checkout_path),
+                "merge",
+                "--no-edit",
+                f"origin/{self.repo.default_branch}",
+            ]
+        )
+
     def cleanup_slot(self, checkout_path: Path) -> None:
         self.prepare_checkout(checkout_path)
 

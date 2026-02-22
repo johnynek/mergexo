@@ -22,6 +22,7 @@ class RepoConfig:
     trigger_label: str
     bugfix_label: str
     small_job_label: str
+    coding_guidelines_path: str
     design_docs_dir: str
     local_clone_source: str | None
     remote_url: str | None
@@ -86,6 +87,9 @@ def load_config(path: Path) -> AppConfig:
         trigger_label=_require_str(repo_data, "trigger_label"),
         bugfix_label=_str_with_default(repo_data, "bugfix_label", "agent:bugfix"),
         small_job_label=_str_with_default(repo_data, "small_job_label", "agent:small-job"),
+        coding_guidelines_path=_str_with_default(
+            repo_data, "coding_guidelines_path", "docs/python_style.md"
+        ),
         design_docs_dir=_require_str(repo_data, "design_docs_dir"),
         local_clone_source=_optional_str(repo_data, "local_clone_source"),
         remote_url=_optional_str(repo_data, "remote_url"),

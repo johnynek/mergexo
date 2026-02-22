@@ -75,6 +75,7 @@ MergeXO reads three labels from `[repo]`:
 - `trigger_label` (default behavior, design-doc flow)
 - `bugfix_label` (direct bugfix flow)
 - `small_job_label` (direct small-job flow)
+- `coding_guidelines_path` (repo-relative file that defines coding style and required pre-PR tests for direct flows)
 
 When an issue has more than one trigger label, precedence is deterministic:
 
@@ -90,6 +91,7 @@ Example:
 
 Direct-flow PR bodies include `Fixes #<issue_number>`. Design-doc PR bodies keep `Refs #<issue_number>`.
 Bugfix flow enforces at least one staged file under `tests/` before opening a PR.
+Bugfix and small-job prompts require the agent to read and follow `coding_guidelines_path`.
 
 ## Generated design doc contract
 

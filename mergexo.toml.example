@@ -14,6 +14,8 @@ trigger_label = "agent:design"
 bugfix_label = "agent:bugfix"
 # Direct small scoped job flow label
 small_job_label = "agent:small-job"
+# Path (repo-relative) to coding + testing guidelines agents should follow
+coding_guidelines_path = "docs/python_style.md"
 design_docs_dir = "docs/design"
 # Optional local source to seed the mirror (path to local repo or .git dir)
 # local_clone_source = "/Users/oscar/code/target-repo/.git"

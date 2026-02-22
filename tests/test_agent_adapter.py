@@ -9,6 +9,7 @@ from mergexo.agent_adapter import (
     DesignStartResult,
     FeedbackResult,
     FeedbackTurn,
+    GitOpRequest,
     ReviewReply,
 )
 from mergexo.models import (
@@ -54,6 +55,7 @@ class DummyAdapter(AgentAdapter):
             review_replies=(ReviewReply(review_comment_id=1, body="ok"),),
             general_comment="done",
             commit_message="commit",
+            git_ops=(GitOpRequest(op="fetch_origin"),),
         )
 
     def start_bugfix_from_issue(
@@ -62,9 +64,10 @@ class DummyAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
+        coding_guidelines_path: str,
         cwd: Path,
     ) -> DirectStartResult:
-        _ = issue, repo_full_name, default_branch, cwd
+        _ = issue, repo_full_name, default_branch, coding_guidelines_path, cwd
         return DirectStartResult(
             pr_title="Fix bug",
             pr_summary="Summary",
@@ -79,9 +82,10 @@ class DummyAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
+        coding_guidelines_path: str,
         cwd: Path,
     ) -> DirectStartResult:
-        _ = issue, repo_full_name, default_branch, cwd
+        _ = issue, repo_full_name, default_branch, coding_guidelines_path, cwd
         return DirectStartResult(
             pr_title="Small job",
             pr_summary="Summary",
@@ -145,12 +149,14 @@ def test_agent_adapter_data_model() -> None:
         issue=issue,
         repo_full_name="johnynek/mergexo",
         default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
         cwd=Path("."),
     )
     small_job = adapter.start_small_job_from_issue(
         issue=issue,
         repo_full_name="johnynek/mergexo",
         default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
         cwd=Path("."),
     )
     feedback = adapter.respond_to_feedback(
@@ -164,3 +170,4 @@ def test_agent_adapter_data_model() -> None:
     assert bugfix.pr_title == "Fix bug"
     assert small_job.pr_title == "Small job"
     assert feedback.review_replies[0].review_comment_id == 1
+    assert feedback.git_ops[0].op == "fetch_origin"

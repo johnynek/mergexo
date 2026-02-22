@@ -31,6 +31,7 @@ default_branch = "main"
 trigger_label = "agent:design"
 bugfix_label = "agent:bugfix-custom"
 small_job_label = "agent:small-custom"
+coding_guidelines_path = "docs/guidelines.md"
 design_docs_dir = "docs/design"
 local_clone_source = "/tmp/local.git"
 
@@ -53,6 +54,7 @@ extra_args = ["--full-auto"]
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.repo.bugfix_label == "agent:bugfix-custom"
     assert loaded.repo.small_job_label == "agent:small-custom"
+    assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
     assert loaded.codex.extra_args == ("--full-auto",)
 
 
@@ -79,6 +81,7 @@ remote_url = "git@github.com:example/custom.git"
     assert loaded.repo.effective_remote_url == "git@github.com:example/custom.git"
     assert loaded.repo.bugfix_label == "agent:bugfix"
     assert loaded.repo.small_job_label == "agent:small-job"
+    assert loaded.repo.coding_guidelines_path == "docs/python_style.md"
     assert loaded.runtime.enable_feedback_loop is False
 
 
