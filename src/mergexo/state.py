@@ -291,6 +291,14 @@ class StateStore:
 
     def list_implementation_candidates(self) -> tuple[ImplementationCandidateState, ...]:
         with self._lock, self._connect() as conn:
+            # Lifecycle for a design doc promoted to implementation:
+            # 1) Design PR merge marks the issue row as status='merged' with branch='agent/design/...'.
+            # 2) Scheduler picks candidates from this exact state and marks status='running' when
+            #    implementation work starts.
+            # 3) Opening the implementation PR calls mark_completed(), transitioning to
+            #    status='awaiting_feedback' with branch='agent/impl/...'.
+            # 4) Feedback loop then transitions to terminal PR states like merged/closed/blocked.
+            # Because only step (1) is eligible, selecting merged design branches here is intentional.
             rows = conn.execute(
                 """
                 SELECT issue_number, branch, pr_number, pr_url
