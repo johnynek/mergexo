@@ -962,7 +962,9 @@ def test_feedback_turn_blocks_when_session_missing(tmp_path: Path) -> None:
     assert any("blocked" in body.lower() for _, body in github.comments)
 
 
-def test_feedback_turn_commit_no_staged_changes_is_ignored(tmp_path: Path) -> None:
+def test_feedback_turn_commit_no_staged_changes_blocks_and_keeps_event_pending(
+    tmp_path: Path,
+) -> None:
     cfg = _config(tmp_path, enable_feedback_loop=True)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
@@ -972,8 +974,8 @@ def test_feedback_turn_commit_no_staged_changes_is_ignored(tmp_path: Path) -> No
     agent = FakeAgent()
     agent.feedback_result = FeedbackResult(
         session=AgentSession(adapter="codex", thread_id="thread-456"),
-        review_replies=(),
-        general_comment=None,
+        review_replies=(ReviewReply(review_comment_id=11, body="Done"),),
+        general_comment="Updated in latest commit.",
         commit_message="chore: noop",
     )
 
@@ -992,7 +994,22 @@ def test_feedback_turn_commit_no_staged_changes_is_ignored(tmp_path: Path) -> No
 
     tracked = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked)
-    assert state.list_pending_feedback_events(101) == ()
+
+    assert len(state.list_pending_feedback_events(101)) == 1
+    assert state.list_tracked_pull_requests() == ()
+    assert github.review_replies == []
+    assert github.comments == []
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT status, error FROM issue_runs WHERE issue_number = ?", (issue.number,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "blocked"
+        assert "no staged changes" in str(row[1]).lower()
+    finally:
+        conn.close()
 
 
 def test_feedback_turn_commit_unexpected_error_propagates(tmp_path: Path) -> None:

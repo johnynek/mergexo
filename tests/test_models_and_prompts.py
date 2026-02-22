@@ -131,3 +131,4 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "issue comments on the pr" in prompt.lower()
     assert "src/a.py" in prompt
     assert "turn_key" in prompt
+    assert "If you provide commit_message" in prompt

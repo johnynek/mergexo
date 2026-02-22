@@ -529,8 +529,27 @@ class Phase1Orchestrator:
                 try:
                     self._git.commit_all(lease.path, result.commit_message)
                 except RuntimeError as exc:
-                    if "No staged changes to commit" not in str(exc):
-                        raise
+                    if _is_no_staged_changes_error(exc):
+                        error = (
+                            "agent returned commit_message but no staged changes were found; "
+                            "feedback turn requires repo edits before posting replies"
+                        )
+                        self._state.mark_pr_status(
+                            pr_number=tracked.pr_number,
+                            issue_number=tracked.issue_number,
+                            status="blocked",
+                            last_seen_head_sha=pr.head_sha,
+                            error=error,
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_blocked",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            reason="commit_message_without_changes",
+                        )
+                        return
+                    raise
                 else:
                     self._git.push_branch(lease.path, tracked.branch)
                     pr = self._github.get_pull_request(tracked.pr_number)
@@ -707,6 +726,10 @@ class Phase1Orchestrator:
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "issue"
+
+
+def _is_no_staged_changes_error(exc: RuntimeError) -> bool:
+    return "No staged changes to commit" in str(exc)
 
 
 def _render_design_doc(*, issue: Issue, design: GeneratedDesign) -> str:
