@@ -30,6 +30,9 @@ This repository currently implements Phase 1 of the MVP:
 cp mergexo.toml.example mergexo.toml
 ```
 
+Set `[auth].allowed_users` to the exact GitHub usernames that are allowed to trigger MergeXO.
+Startup fails closed when `[auth]` is missing or empty.
+
 2. Sync environment:
 
 ```bash
@@ -92,6 +95,20 @@ Example:
 Direct-flow PR bodies include `Fixes #<issue_number>`. Design-doc PR bodies keep `Refs #<issue_number>`.
 Bugfix flow enforces at least one staged file under `tests/` before opening a PR.
 Bugfix and small-job prompts require the agent to read and follow `coding_guidelines_path`.
+
+## Authentication allowlist
+
+`[auth].allowed_users` is required. MergeXO normalizes entries to lowercase at startup and
+matches case-insensitively at runtime.
+
+For users not in `allowed_users`, MergeXO fully ignores:
+
+- new issue intake (no branch/commit/PR/comment side effects),
+- PR review comments in feedback loop,
+- PR issue comments in feedback loop.
+
+If an already tracked PR is linked to an issue whose author is no longer allowlisted, MergeXO
+marks that PR feedback state as blocked internally and stays silent on GitHub.
 
 ## Abandoning work (changing direction)
 

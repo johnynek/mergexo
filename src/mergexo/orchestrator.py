@@ -158,6 +158,19 @@ class Phase1Orchestrator:
         issues = self._github.list_open_issues_with_any_labels(labels)
         log_event(LOGGER, "issues_fetched", issue_count=len(issues), label_count=len(labels))
         for issue in issues:
+            if not self._is_issue_author_allowed(
+                issue_number=issue.number,
+                author_login=issue.author_login,
+                reason="unauthorized_issue_author",
+            ):
+                log_event(
+                    LOGGER,
+                    "issue_skipped",
+                    issue_number=issue.number,
+                    reason="unauthorized_issue_author",
+                )
+                continue
+
             flow = _resolve_issue_flow(
                 issue=issue,
                 design_label=self._config.repo.trigger_label,
@@ -349,6 +362,15 @@ class Phase1Orchestrator:
             time.sleep(1.0)
 
     def _process_issue(self, issue: Issue, flow: IssueFlow) -> WorkResult:
+        if not self._is_issue_author_allowed(
+            issue_number=issue.number,
+            author_login=issue.author_login,
+            reason="unauthorized_issue_author_defensive",
+        ):
+            raise DirectFlowValidationError(
+                f"Issue #{issue.number} author is not allowed by auth.allowed_users"
+            )
+
         lease = self._slot_pool.acquire()
         try:
             log_event(
@@ -553,6 +575,16 @@ class Phase1Orchestrator:
         self,
         candidate: ImplementationCandidateState,
     ) -> WorkResult:
+        issue = self._github.get_issue(candidate.issue_number)
+        if not self._is_issue_author_allowed(
+            issue_number=issue.number,
+            author_login=issue.author_login,
+            reason="unauthorized_issue_author_defensive",
+        ):
+            raise DirectFlowValidationError(
+                f"Issue #{issue.number} author is not allowed by auth.allowed_users"
+            )
+
         lease = self._slot_pool.acquire()
         try:
             log_event(
@@ -563,8 +595,6 @@ class Phase1Orchestrator:
                 flow="implementation",
             )
             self._git.prepare_checkout(lease.path)
-
-            issue = self._github.get_issue(candidate.issue_number)
             slug = _design_branch_slug(candidate.design_branch)
             if slug is None:
                 raise DirectFlowValidationError(
@@ -729,6 +759,34 @@ class Phase1Orchestrator:
                 )
                 return
 
+            issue = self._github.get_issue(tracked.issue_number)
+            if not self._config.auth.allows(issue.author_login):
+                reason = "unauthorized_issue_author"
+                error = "feedback ignored because issue author is not allowed by auth.allowed_users"
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="blocked",
+                    last_seen_head_sha=pr.head_sha,
+                    error=error,
+                )
+                log_event(
+                    LOGGER,
+                    "auth_pr_blocked",
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    author_login=issue.author_login,
+                    reason=reason,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason=reason,
+                )
+                return
+
             if tracked.last_seen_head_sha and tracked.last_seen_head_sha != pr.head_sha:
                 transition_status = self._classify_remote_history_transition(
                     older_sha=tracked.last_seen_head_sha,
@@ -747,7 +805,6 @@ class Phase1Orchestrator:
             review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
             issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
             changed_files = self._github.list_pull_request_files(tracked.pr_number)
-            issue = self._github.get_issue(tracked.issue_number)
 
             previous_pending = self._state.list_pending_feedback_events(tracked.pr_number)
             normalized_review = self._normalize_review_events(
@@ -1248,6 +1305,16 @@ class Phase1Orchestrator:
         for comment in comments:
             if is_bot_login(comment.user_login):
                 continue
+            if not self._config.auth.allows(comment.user_login):
+                log_event(
+                    LOGGER,
+                    "auth_feedback_ignored",
+                    pr_number=pr_number,
+                    comment_id=comment.comment_id,
+                    kind="review",
+                    user_login=comment.user_login,
+                )
+                continue
             if has_action_token(comment.body):
                 continue
             normalized.append(
@@ -1280,6 +1347,16 @@ class Phase1Orchestrator:
         normalized: list[tuple[FeedbackEventRecord, PullRequestIssueComment]] = []
         for comment in comments:
             if is_bot_login(comment.user_login):
+                continue
+            if not self._config.auth.allows(comment.user_login):
+                log_event(
+                    LOGGER,
+                    "auth_feedback_ignored",
+                    pr_number=pr_number,
+                    comment_id=comment.comment_id,
+                    kind="issue",
+                    user_login=comment.user_login,
+                )
                 continue
             if has_action_token(comment.body):
                 continue
@@ -1386,6 +1463,20 @@ class Phase1Orchestrator:
         for comment in issue_comments:
             tokens.update(extract_action_tokens(comment.body))
         return tokens
+
+    def _is_issue_author_allowed(
+        self, *, issue_number: int, author_login: str, reason: str
+    ) -> bool:
+        if self._config.auth.allows(author_login):
+            return True
+        log_event(
+            LOGGER,
+            "auth_issue_ignored",
+            issue_number=issue_number,
+            author_login=author_login,
+            reason=reason,
+        )
+        return False
 
 
 def _slugify(value: str) -> str:
