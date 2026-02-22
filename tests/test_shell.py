@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from mergexo.observability import configure_logging
-from mergexo.shell import CommandError, run
+from mergexo.shell import CommandError, _preview, run
 
 
 def test_run_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -41,4 +41,12 @@ def test_run_failure_raises(
 
     with pytest.raises(CommandError, match="Command failed"):
         run(["bad"])
-    assert "event=command_failed command=bad exit_code=2" in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert "event=command_failed command=bad exit_code=2" in stderr
+    assert "stderr=err" in stderr
+    assert "stdout=out" in stderr
+
+
+def test_preview_handles_empty_and_truncation() -> None:
+    assert _preview("") == "<empty>"
+    assert _preview("x" * 10, limit=4) == "xxxx..."

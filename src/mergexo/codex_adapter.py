@@ -103,10 +103,9 @@ class CodexAdapter(AgentAdapter):
             "resume",
             "--json",
             "--skip-git-repo-check",
-            session.thread_id,
-            "-",
         ]
         self._append_common_options(cmd)
+        cmd.extend([session.thread_id, "-"])
 
         raw_events = run(cmd, cwd=cwd, input_text=prompt)
         message = _extract_final_agent_message(raw_events)
@@ -154,9 +153,9 @@ class CodexAdapter(AgentAdapter):
                 str(schema_path),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
             self._append_common_options(cmd)
+            cmd.append("-")
 
             raw_events = run(cmd, cwd=cwd, input_text=prompt)
 

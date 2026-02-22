@@ -205,6 +205,10 @@ def test_respond_to_feedback_happy_path(
     ) -> str:
         _ = cwd, input_text, check
         assert cmd[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+        thread_idx = cmd.index("thread-abc")
+        assert cmd[thread_idx + 1] == "-"
+        assert cmd.index("--sandbox") < thread_idx
+        assert cmd.index("--model") < thread_idx
         message_payload = json.dumps(
             {
                 "review_replies": [{"review_comment_id": 101, "body": "Done"}],
