@@ -2,17 +2,21 @@
 issue: 11
 priority: 3
 touch_paths:
+  - src/mergexo/cli.py
   - src/mergexo/orchestrator.py
   - src/mergexo/git_ops.py
   - src/mergexo/github_gateway.py
   - src/mergexo/feedback_loop.py
   - src/mergexo/prompts.py
+  - src/mergexo/state.py
+  - tests/test_cli.py
   - tests/test_orchestrator.py
   - tests/test_git_ops.py
   - tests/test_github_gateway.py
   - tests/test_feedback_loop.py
   - tests/test_models_and_prompts.py
-depends_on: []
+  - tests/test_state.py
+depends_on: [17]
 estimated_size: M
 generated_at: 2026-02-22T02:25:43Z
 ---
@@ -119,13 +123,22 @@ Exact operator recovery steps:
    - Option A: restore prior linear history on the PR branch.
    - Option B: accept the rewritten remote head as the new baseline.
 2. Verify the current PR head SHA on GitHub.
-3. Update local runtime state to resume from that baseline:
-   - `UPDATE pr_feedback_state SET status='awaiting_feedback', last_seen_head_sha='<current_pr_head_sha>', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE pr_number=<pr_number>;`
-   - `UPDATE issue_runs SET status='awaiting_feedback', error=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE issue_number=<issue_number>;`
-4. Do not delete rows from `feedback_events`; pending events should replay idempotently on next turn.
-5. Run one verification cycle:
+3. Use the existing admin command added on `main` for blocked-state reset:
+   - Inspect: `uv run mergexo feedback blocked list --config mergexo.toml --json`
+   - Reset one PR: `uv run mergexo feedback blocked reset --config mergexo.toml --pr <pr_number>`
+   - Reset all blocked PRs: `uv run mergexo feedback blocked reset --config mergexo.toml --all --yes`
+4. Current behavior of that command path (`StateStore.reset_blocked_pull_requests`):
+   - Sets `pr_feedback_state.status='awaiting_feedback'`.
+   - Clears `issue_runs.error` and sets `issue_runs.status='awaiting_feedback'`.
+   - Preserves pending rows in `feedback_events`.
+   - Does not currently override `last_seen_head_sha`.
+5. Required extension for Option B (accept rewritten head):
+   - Add an explicit override path (for example `--head-sha <sha>` on `feedback blocked reset`) that writes `pr_feedback_state.last_seen_head_sha=<sha>` during reset.
+   - Without this override, Option B can re-block on the next turn because the old `last_seen_head_sha` remains authoritative.
+6. Until that extension lands, use Option A for operator recovery in production (restore linear branch history, then run existing reset command).
+7. Run one verification cycle:
    - `uv run mergexo run --config mergexo.toml --once --verbose`
-6. Confirm recovery succeeded:
+8. Confirm recovery succeeded:
    - PR is no longer marked blocked in state.
    - Worker slot count is unchanged and new work can still start.
    - Feedback events for the PR progress (or remain pending only for normal retry reasons).
@@ -139,8 +152,12 @@ Exact operator recovery steps:
 2. Validate local post-agent lineage.
 3. Validate pre-finalize remote transition.
 4. Block and comment on violations.
-5. Update feedback prompt text in `src/mergexo/prompts.py` and assertions in `tests/test_models_and_prompts.py`.
-6. Expand orchestrator tests in `tests/test_orchestrator.py` for local rewrite, remote rewrite, and allowed fast-forward drift paths.
+5. Integrate with blocked-admin commands from `main`:
+1. Reuse `feedback blocked list/reset` as the canonical operator flow.
+2. Extend reset support to optionally override `last_seen_head_sha` for rewritten-head acceptance.
+6. Update feedback prompt text in `src/mergexo/prompts.py` and assertions in `tests/test_models_and_prompts.py`.
+7. Expand orchestrator tests in `tests/test_orchestrator.py` for local rewrite, remote rewrite, and allowed fast-forward drift paths.
+8. Add/extend CLI and state tests in `tests/test_cli.py` and `tests/test_state.py` for reset-with-head-override behavior.
 
 ## Testing plan
 1. `tests/test_git_ops.py`: ancestry helper returns true for ancestor/equal and false for non-ancestor.
@@ -150,6 +167,8 @@ Exact operator recovery steps:
 5. `tests/test_orchestrator.py`: allow `ahead` remote transition and continue/retry safely.
 6. `tests/test_orchestrator.py`: normal append-only feedback commit still commits, pushes, and finalizes.
 7. `tests/test_models_and_prompts.py`: feedback prompt includes explicit no-history-rewrite contract.
+8. `tests/test_cli.py`: blocked reset command validates and forwards optional head override arguments.
+9. `tests/test_state.py`: reset path updates `last_seen_head_sha` only when explicit override is provided, and keeps pending events intact.
 
 ## Acceptance criteria
 1. If an agent rebases/amends/resets so local post-turn `HEAD` no longer descends from PR head at turn start, MergeXO blocks the PR and performs no push.
@@ -160,6 +179,7 @@ Exact operator recovery steps:
 6. Feedback prompt explicitly instructs agents to avoid history-rewrite commands.
 7. Existing non-feedback issue-to-design flow remains unchanged.
 8. Operators have documented, executable steps to unblock a PR safely without deleting feedback events or leaking worker slots.
+9. Documented unblock steps are aligned with `feedback blocked reset` on `main`, including explicit behavior for `last_seen_head_sha`.
 
 ## Risks and mitigations
 1. Risk: false positives from transient API/git inconsistency.
