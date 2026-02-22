@@ -11,6 +11,7 @@ from mergexo.codex_adapter import (
     _as_object_dict,
     _extract_final_agent_message,
     _extract_thread_id,
+    _filter_resume_extra_args,
     _optional_output_text,
     _parse_event_line,
     _parse_json_payload,
@@ -207,7 +208,9 @@ def test_respond_to_feedback_happy_path(
         assert cmd[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
         thread_idx = cmd.index("thread-abc")
         assert cmd[thread_idx + 1] == "-"
-        assert cmd.index("--sandbox") < thread_idx
+        assert "--sandbox" not in cmd
+        assert "--profile" not in cmd
+        assert "--full-auto" in cmd
         assert cmd.index("--model") < thread_idx
         message_payload = json.dumps(
             {
@@ -347,3 +350,21 @@ def test_parse_event_line_rejects_non_dict_json(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("mergexo.codex_adapter.json.loads", fake_loads)
     assert _parse_event_line("{}") is None
+
+
+def test_filter_resume_extra_args_strips_unsupported_options() -> None:
+    extra = (
+        "--sandbox",
+        "workspace-write",
+        "--profile",
+        "default",
+        "--full-auto",
+        "--sandbox=danger-full-access",
+        "--profile=alt",
+        "-s",
+        "read-only",
+        "-p",
+        "dev",
+        "--ephemeral",
+    )
+    assert _filter_resume_extra_args(extra) == ["--full-auto", "--ephemeral"]
