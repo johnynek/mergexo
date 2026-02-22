@@ -8,6 +8,7 @@ from mergexo.agent_adapter import (
     DesignStartResult,
     FeedbackResult,
     FeedbackTurn,
+    GitOpRequest,
     ReviewReply,
 )
 from mergexo.models import (
@@ -53,6 +54,7 @@ class DummyAdapter(AgentAdapter):
             review_replies=(ReviewReply(review_comment_id=1, body="ok"),),
             general_comment="done",
             commit_message="commit",
+            git_ops=(GitOpRequest(op="fetch_origin"),),
         )
 
 
@@ -115,3 +117,4 @@ def test_agent_adapter_data_model() -> None:
     assert start.session is not None
     assert start.session.thread_id == "th"
     assert feedback.review_replies[0].review_comment_id == 1
+    assert feedback.git_ops[0].op == "fetch_origin"

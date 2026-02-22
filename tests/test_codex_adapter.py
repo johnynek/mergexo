@@ -12,6 +12,7 @@ from mergexo.codex_adapter import (
     _extract_final_agent_message,
     _extract_thread_id,
     _filter_resume_extra_args,
+    _parse_git_ops,
     _optional_output_text,
     _parse_event_line,
     _parse_json_payload,
@@ -244,6 +245,7 @@ def test_respond_to_feedback_happy_path(
     assert result.review_replies[0].review_comment_id == 101
     assert result.general_comment == "Updated"
     assert result.commit_message == "fix: update"
+    assert result.git_ops == ()
     stderr = capsys.readouterr().err
     assert "event=feedback_agent_call_started issue_number=1 pr_number=8" in stderr
     assert (
@@ -368,3 +370,18 @@ def test_filter_resume_extra_args_strips_unsupported_options() -> None:
         "--ephemeral",
     )
     assert _filter_resume_extra_args(extra) == ["--full-auto", "--ephemeral"]
+
+
+def test_parse_git_ops_validation() -> None:
+    assert _parse_git_ops(None) == []
+    assert [req.op for req in _parse_git_ops([{"op": "fetch_origin"}])] == ["fetch_origin"]
+    assert [req.op for req in _parse_git_ops([{"op": "merge_origin_default_branch"}])] == [
+        "merge_origin_default_branch"
+    ]
+
+    with pytest.raises(RuntimeError, match="must be a list"):
+        _parse_git_ops("bad")
+    with pytest.raises(RuntimeError, match="must be an object"):
+        _parse_git_ops(["bad"])
+    with pytest.raises(RuntimeError, match="must be one of"):
+        _parse_git_ops([{"op": "unknown"}])
