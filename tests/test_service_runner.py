@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 from mergexo.agent_adapter import AgentAdapter
-from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
+from mergexo.config import AppConfig, AuthConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import append_action_token, compute_operator_command_token
 from mergexo.github_gateway import GitHubGateway
 from mergexo.git_ops import GitRepoManager
@@ -54,6 +54,7 @@ def _app_config(
             operator_logins=("alice",),
         ),
         codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
+        auth=AuthConfig(allowed_users=frozenset({"alice"})),
     )
 
 

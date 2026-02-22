@@ -58,10 +58,22 @@ class CodexConfig:
 
 
 @dataclass(frozen=True)
+class AuthConfig:
+    allowed_users: frozenset[str]
+
+    def allows(self, login: str) -> bool:
+        normalized = login.strip().lower()
+        if not normalized:
+            return False
+        return normalized in self.allowed_users
+
+
+@dataclass(frozen=True)
 class AppConfig:
     runtime: RuntimeConfig
     repo: RepoConfig
     codex: CodexConfig
+    auth: AuthConfig
 
 
 class ConfigError(ValueError):
@@ -74,6 +86,7 @@ def load_config(path: Path) -> AppConfig:
 
     runtime_data = _require_table(data, "runtime")
     repo_data = _require_table(data, "repo")
+    auth_data = _require_table(data, "auth")
     codex_data = data.get("codex", {})
     if not isinstance(codex_data, dict):
         raise ConfigError("[codex] must be a TOML table")
@@ -135,7 +148,9 @@ def load_config(path: Path) -> AppConfig:
         extra_args=_tuple_of_str(codex_data, "extra_args"),
     )
 
-    return AppConfig(runtime=runtime, repo=repo, codex=codex)
+    auth = AuthConfig(allowed_users=_require_allowed_users(auth_data, "allowed_users"))
+
+    return AppConfig(runtime=runtime, repo=repo, codex=codex, auth=auth)
 
 
 def _require_table(data: dict[str, object], key: str) -> dict[str, object]:
@@ -267,3 +282,19 @@ def _operator_logins_with_default(
         if login not in normalized:
             normalized.append(login)
     return tuple(normalized)
+
+
+def _require_allowed_users(data: dict[str, object], key: str) -> frozenset[str]:
+    value = data.get(key)
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{key} is required and must be a non-empty list of strings")
+
+    out: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigError(f"{key} is required and must be a non-empty list of strings")
+        normalized = item.strip().lower()
+        if not normalized:
+            raise ConfigError(f"{key} is required and must be a non-empty list of strings")
+        out.add(normalized)
+    return frozenset(out)

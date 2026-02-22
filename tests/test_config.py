@@ -43,6 +43,9 @@ local_clone_source = "/tmp/local.git"
 operations_issue_number = 99
 operator_logins = ["Alice", "bob"]
 
+[auth]
+allowed_users = [" Alice ", "BOB", "alice"]
+
 [codex]
 enabled = true
 model = "gpt"
@@ -73,6 +76,11 @@ extra_args = ["--full-auto"]
     assert loaded.repo.operations_issue_number == 99
     assert loaded.repo.operator_logins == ("alice", "bob")
     assert loaded.codex.extra_args == ("--full-auto",)
+    assert loaded.auth.allowed_users == frozenset({"alice", "bob"})
+    assert loaded.auth.allows("ALICE")
+    assert loaded.auth.allows(" bob ")
+    assert loaded.auth.allows("carol") is False
+    assert loaded.auth.allows("   ") is False
 
 
 def test_load_config_uses_explicit_remote(tmp_path: Path) -> None:
@@ -91,6 +99,9 @@ default_branch = "main"
 trigger_label = "l"
 design_docs_dir = "docs/design"
 remote_url = "git@github.com:example/custom.git"
+
+[auth]
+allowed_users = ["o"]
 """.strip(),
     )
 
@@ -106,6 +117,7 @@ remote_url = "git@github.com:example/custom.git"
     assert loaded.runtime.git_checkout_root is None
     assert loaded.repo.operations_issue_number is None
     assert loaded.repo.operator_logins == ()
+    assert loaded.auth.allowed_users == frozenset({"o"})
 
 
 @pytest.mark.parametrize(
@@ -125,6 +137,9 @@ name = "n"
 default_branch = "main"
 trigger_label = "l"
 design_docs_dir = "docs/design"
+
+[auth]
+allowed_users = ["o"]
 """.strip(),
             "worker_count",
         ),
@@ -141,6 +156,9 @@ name = "n"
 default_branch = "main"
 trigger_label = "l"
 design_docs_dir = "docs/design"
+
+[auth]
+allowed_users = ["o"]
 """.strip(),
             "poll_interval_seconds",
         ),
@@ -159,6 +177,9 @@ name = "n"
 default_branch = "main"
 trigger_label = "l"
 design_docs_dir = "docs/design"
+
+[auth]
+allowed_users = ["o"]
 """.strip(),
             "[codex] must be a TOML table",
         ),
@@ -176,6 +197,9 @@ name = "n"
 default_branch = "main"
 trigger_label = "l"
 design_docs_dir = "docs/design"
+
+[auth]
+allowed_users = ["o"]
 """.strip(),
             "restart_drain_timeout_seconds",
         ),
@@ -194,6 +218,9 @@ name = "n"
 default_branch = "main"
 trigger_label = "l"
 design_docs_dir = "docs/design"
+
+[auth]
+allowed_users = ["o"]
 """.strip(),
             "restart_default_mode",
         ),
@@ -278,3 +305,80 @@ def test_helper_numeric_bool_and_tuple() -> None:
         config._operator_logins_with_default({"k": ["alice", 7]}, "k", ())
     with pytest.raises(ConfigError, match="non-empty"):
         config._operator_logins_with_default({"k": [""]}, "k", ())
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+""".strip(),
+            "[auth] is required and must be a TOML table",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+
+[auth]
+allowed_users = []
+""".strip(),
+            "allowed_users is required and must be a non-empty list of strings",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+default_branch = "main"
+trigger_label = "l"
+design_docs_dir = "docs/design"
+
+[auth]
+allowed_users = ["ok", "   "]
+""".strip(),
+            "allowed_users is required and must be a non-empty list of strings",
+        ),
+    ],
+)
+def test_load_config_auth_errors(tmp_path: Path, content: str, expected: str) -> None:
+    cfg_path = _write(tmp_path / "bad-auth.toml", content)
+    with pytest.raises(ConfigError, match=re.escape(expected)):
+        config.load_config(cfg_path)
+
+
+def test_helper_require_allowed_users() -> None:
+    assert config._require_allowed_users({"users": [" Alice ", "BOB"]}, "users") == frozenset(
+        {"alice", "bob"}
+    )
+    with pytest.raises(ConfigError, match="non-empty list of strings"):
+        config._require_allowed_users({"users": []}, "users")
+    with pytest.raises(ConfigError, match="non-empty list of strings"):
+        config._require_allowed_users({"users": ["ok", "   "]}, "users")
+    with pytest.raises(ConfigError, match="non-empty list of strings"):
+        config._require_allowed_users({"users": ["ok", 1]}, "users")

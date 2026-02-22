@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from mergexo import cli
-from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
+from mergexo.config import AppConfig, AuthConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.state import BlockedPullRequestState
 
 
@@ -32,6 +32,7 @@ def _app_config(tmp_path: Path) -> AppConfig:
             remote_url=None,
         ),
         codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
+        auth=AuthConfig(allowed_users=frozenset({"issue-author", "reviewer"})),
     )
 
 

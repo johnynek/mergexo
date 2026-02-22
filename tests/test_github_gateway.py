@@ -25,12 +25,33 @@ def test_list_open_issues_with_any_labels_dedupes(monkeypatch: pytest.MonkeyPatc
         _ = self
         if label == "agent:design":
             return [
-                Issue(number=2, title="Two", body="b", html_url="u2", labels=("agent:design",)),
-                Issue(number=1, title="One", body="b", html_url="u1", labels=("agent:design",)),
+                Issue(
+                    number=2,
+                    title="Two",
+                    body="b",
+                    html_url="u2",
+                    labels=("agent:design",),
+                    author_login="alice",
+                ),
+                Issue(
+                    number=1,
+                    title="One",
+                    body="b",
+                    html_url="u1",
+                    labels=("agent:design",),
+                    author_login="bob",
+                ),
             ]
         if label == "agent:bugfix":
             return [
-                Issue(number=2, title="Two", body="b", html_url="u2", labels=("agent:bugfix",)),
+                Issue(
+                    number=2,
+                    title="Two",
+                    body="b",
+                    html_url="u2",
+                    labels=("agent:bugfix",),
+                    author_login="",
+                ),
             ]
         return []
 
@@ -39,6 +60,7 @@ def test_list_open_issues_with_any_labels_dedupes(monkeypatch: pytest.MonkeyPatc
     issues = gateway.list_open_issues_with_any_labels(("agent:design", "agent:bugfix"))
     assert [issue.number for issue in issues] == [1, 2]
     assert issues[1].labels == ("agent:design", "agent:bugfix")
+    assert issues[1].author_login == "alice"
 
 
 def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,6 +70,7 @@ def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.Monk
             "title": "Issue",
             "body": "Body",
             "html_url": "u",
+            "user": {"login": "  Alice  "},
             "labels": [{"name": "x"}, 9],
         },
         {"pull_request": {"url": "pr"}, "number": 2},
@@ -72,6 +95,7 @@ def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.Monk
     assert len(issues) == 1
     assert issues[0].number == 1
     assert issues[0].labels == ("x",)
+    assert issues[0].author_login == "alice"
 
 
 def test_list_open_issues_rejects_non_list(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -129,6 +153,7 @@ def test_get_issue_parses_object(monkeypatch: pytest.MonkeyPatch) -> None:
             "title": "Issue title",
             "body": "Issue body",
             "html_url": "https://example/issue/9",
+            "user": {"login": "Bob"},
             "labels": [{"name": "agent:design"}, "skip"],
         }
 
@@ -136,6 +161,7 @@ def test_get_issue_parses_object(monkeypatch: pytest.MonkeyPatch) -> None:
     issue = gateway.get_issue(9)
     assert issue.number == 9
     assert issue.labels == ("agent:design",)
+    assert issue.author_login == "bob"
 
 
 def test_get_issue_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:

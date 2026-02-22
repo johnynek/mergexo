@@ -1,8 +1,8 @@
 [runtime]
 base_dir = "~/.local/share/mergexo"
 worker_count = 2
-poll_interval_seconds = 60
-enable_feedback_loop = false
+poll_interval_seconds = 600
+enable_feedback_loop = true
 enable_github_operations = false
 # Restart drain timeout before pending restart is marked failed.
 restart_drain_timeout_seconds = 900
@@ -36,6 +36,11 @@ operator_logins = []
 # local_clone_source = "/Users/oscar/code/target-repo/.git"
 # Optional explicit remote URL. Defaults to git@github.com:<owner>/<name>.git
 # remote_url = "git@github.com:johnynek/target-repo.git"
+
+[auth]
+# Required allowlist of GitHub usernames. Only these users can trigger issue intake
+# and feedback-loop processing. Matching is case-insensitive.
+allowed_users = ["maintainer1", "maintainer2"]
 
 [codex]
 enabled = true
