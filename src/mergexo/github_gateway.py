@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 from typing import cast
 from urllib.parse import urlencode
 
@@ -12,7 +13,11 @@ from mergexo.models import (
     PullRequestReviewComment,
     PullRequestSnapshot,
 )
+from mergexo.observability import log_event
 from mergexo.shell import run
+
+
+LOGGER = logging.getLogger("mergexo.github_gateway")
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,12 @@ class GitHubGateway:
                     labels=tuple(label_names),
                 )
             )
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="issues",
+            count=len(issues),
+        )
         return issues
 
     def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
@@ -72,6 +83,13 @@ class GitHubGateway:
             raise RuntimeError("Unexpected GitHub response: expected object for PR")
         number = _as_int(payload_obj.get("number"), field="number")
         html_url = _as_string(payload_obj.get("html_url"))
+        log_event(
+            LOGGER,
+            "github_pr_created",
+            pr_number=number,
+            base=base,
+            head=head,
+        )
         return PullRequest(number=number, html_url=html_url)
 
     def get_issue(self, issue_number: int) -> Issue:
@@ -94,6 +112,12 @@ class GitHubGateway:
                 label = entry_obj.get("name")
                 if isinstance(label, str):
                     label_names.append(label)
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="issue",
+            issue_number=number,
+        )
         return Issue(
             number=number, title=title, body=body, html_url=html_url, labels=tuple(label_names)
         )
@@ -110,7 +134,7 @@ class GitHubGateway:
         if head is None or base is None:
             raise RuntimeError("Unexpected GitHub response: missing pull request head/base")
 
-        return PullRequestSnapshot(
+        snapshot = PullRequestSnapshot(
             number=_as_int(payload_obj.get("number"), field="number"),
             title=_as_string(payload_obj.get("title")),
             body=_as_string(payload_obj.get("body")),
@@ -120,6 +144,13 @@ class GitHubGateway:
             state=_as_string(payload_obj.get("state")),
             merged=_as_bool(payload_obj.get("merged")),
         )
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="pull_request",
+            pr_number=snapshot.number,
+        )
+        return snapshot
 
     def list_pull_request_files(self, pr_number: int) -> tuple[str, ...]:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/files?per_page=100"
@@ -135,6 +166,13 @@ class GitHubGateway:
             filename = item_obj.get("filename")
             if isinstance(filename, str) and filename:
                 files.append(filename)
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="pull_request_files",
+            pr_number=pr_number,
+            count=len(files),
+        )
         return tuple(files)
 
     def list_pull_request_review_comments(self, pr_number: int) -> list[PullRequestReviewComment]:
@@ -163,6 +201,13 @@ class GitHubGateway:
                     updated_at=_as_string(item_obj.get("updated_at")),
                 )
             )
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="pull_request_review_comments",
+            pr_number=pr_number,
+            count=len(comments),
+        )
         return comments
 
     def list_pull_request_issue_comments(self, pr_number: int) -> list[PullRequestIssueComment]:
@@ -187,11 +232,19 @@ class GitHubGateway:
                     updated_at=_as_string(item_obj.get("updated_at")),
                 )
             )
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="pull_request_issue_comments",
+            pr_number=pr_number,
+            count=len(comments),
+        )
         return comments
 
     def post_issue_comment(self, issue_number: int, body: str) -> None:
         path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}/comments"
         self._api_json("POST", path, payload={"body": body})
+        log_event(LOGGER, "github_issue_comment_posted", issue_number=issue_number)
 
     def post_review_comment_reply(self, pr_number: int, review_comment_id: int, body: str) -> None:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/comments"
@@ -199,6 +252,12 @@ class GitHubGateway:
             "POST",
             path,
             payload={"body": body, "in_reply_to": review_comment_id},
+        )
+        log_event(
+            LOGGER,
+            "github_review_reply_posted",
+            pr_number=pr_number,
+            review_comment_id=review_comment_id,
         )
 
     def _api_json(self, method: str, path: str, payload: dict[str, object] | None = None) -> object:

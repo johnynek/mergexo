@@ -34,6 +34,7 @@ from mergexo.orchestrator import (
     _render_design_doc,
     _slugify,
 )
+from mergexo.observability import configure_logging
 from mergexo.state import StateStore, TrackedPullRequestState
 
 
@@ -399,6 +400,34 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     assert state.saved_sessions == [(7, "codex", "thread-123")]
 
 
+def test_process_issue_emits_lifecycle_logs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    configure_logging(verbose=True)
+    _ = orch._process_issue(_issue())
+
+    text = capsys.readouterr().err
+    assert "event=slot_acquired" in text
+    assert "event=issue_processing_started issue_number=7" in text
+    assert (
+        "event=design_turn_started branch=agent/design/7-add-worker-scheduler issue_number=7"
+        in text
+    )
+    assert "event=design_turn_completed issue_number=7" in text
+    assert (
+        "event=issue_processing_completed branch=agent/design/7-add-worker-scheduler issue_number=7 pr_number=101"
+        in text
+    )
+    assert "event=slot_released" in text
+
+
 def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -686,7 +715,9 @@ def test_feedback_turn_retry_after_crash_does_not_duplicate_replies(
     assert state.list_pending_feedback_events(101) == ()
 
 
-def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(tmp_path: Path) -> None:
+def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     cfg = _config(tmp_path, enable_feedback_loop=True)
     git = FakeGitManager(tmp_path / "checkouts")
     git.restore_feedback_result = False
@@ -712,12 +743,18 @@ def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(tmp_pat
     )
     state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    configure_logging(verbose=True)
 
     tracked = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked)
 
     assert agent.feedback_calls == []
     assert len(state.list_pending_feedback_events(101)) == 1
+    stderr = capsys.readouterr().err
+    assert (
+        "event=feedback_turn_blocked issue_number=7 pr_number=101 reason=head_mismatch_retry"
+        in stderr
+    )
 
     git.restore_feedback_result = True
     tracked_retry = _tracked_state_from_store(state)
@@ -855,6 +892,23 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
 
     orch._reap_finished()
     assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
+
+
+def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    ok_feedback: Future[None] = Future()
+    ok_feedback.set_result(None)
+    orch._running_feedback = {101: _FeedbackFuture(issue_number=7, future=ok_feedback)}
+
+    orch._reap_finished()
+    assert orch._running_feedback == {}
+    assert state.status_updates == []
 
 
 def test_feedback_turn_marks_merged_pr_and_stops_tracking(tmp_path: Path) -> None:

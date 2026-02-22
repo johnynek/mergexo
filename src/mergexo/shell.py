@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 import subprocess
 
 
 class CommandError(RuntimeError):
     pass
+
+
+LOGGER = logging.getLogger("mergexo.shell")
 
 
 def run(
@@ -24,6 +28,11 @@ def run(
         check=False,
     )
     if check and proc.returncode != 0:
+        LOGGER.error(
+            "event=command_failed command=%s exit_code=%s",
+            " ".join(argv),
+            proc.returncode,
+        )
         raise CommandError(
             "Command failed\n"
             f"cmd: {' '.join(argv)}\n"

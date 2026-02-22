@@ -13,6 +13,7 @@ from mergexo.github_gateway import (
     _as_object_dict,
     _as_string,
 )
+from mergexo.observability import configure_logging
 
 
 def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,6 +271,51 @@ def test_api_json_invokes_gh_api(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls[0][0] == ["gh", "api", "--method", "GET", "/path"]
     assert "--input" in calls[1][0]
     assert calls[1][1] == '{"k": "v"}'
+
+
+def test_gateway_emits_read_and_write_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    configure_logging(verbose=True)
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        if method == "GET" and path.startswith("/repos/o/r/issues?"):
+            return [{"number": 1, "title": "Issue", "body": "", "html_url": "u", "labels": []}]
+        if method == "GET" and path.endswith("/pulls/9/files?per_page=100"):
+            return [{"filename": "src/a.py"}]
+        if method == "GET" and path.endswith("/pulls/9/comments?per_page=100"):
+            return []
+        if method == "GET" and path.endswith("/issues/9/comments?per_page=100"):
+            return []
+        if method == "POST" and path.endswith("/pulls"):
+            return {"number": 9, "html_url": "https://example/pr/9"}
+        if method == "POST":
+            return {"ok": True}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+
+    gateway.list_open_issues_with_label("agent:design")
+    gateway.list_pull_request_files(9)
+    gateway.list_pull_request_review_comments(9)
+    gateway.list_pull_request_issue_comments(9)
+    gateway.create_pull_request("t", "h", "b", "body")
+    gateway.post_issue_comment(9, "hello")
+    gateway.post_review_comment_reply(9, 10, "reply")
+
+    text = capsys.readouterr().err
+    assert "event=github_read count=1 endpoint=issues" in text
+    assert "event=github_pr_created" in text
+    assert "event=github_issue_comment_posted issue_number=9" in text
+    assert "event=github_review_reply_posted pr_number=9 review_comment_id=10" in text
 
 
 def test_helper_conversion_functions() -> None:

@@ -44,6 +44,12 @@ uv run mergexo init --config mergexo.toml
 uv run mergexo run --config mergexo.toml --once
 ```
 
+Verbose mode (structured stderr runtime events):
+
+```bash
+uv run mergexo run --config mergexo.toml --once --verbose
+```
+
 5. Run continuously:
 
 ```bash
@@ -55,6 +61,8 @@ uv run mergexo run --config mergexo.toml
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
 
 The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `false`) until rollout is complete.
+
+Use `--verbose` on `init` or `run` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
 
 ## Generated design doc contract
 

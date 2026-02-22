@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import logging
 import tempfile
 from typing import cast
 
@@ -15,6 +16,7 @@ from mergexo.agent_adapter import (
 )
 from mergexo.config import CodexConfig
 from mergexo.models import GeneratedDesign, Issue
+from mergexo.observability import log_event
 from mergexo.prompts import build_design_prompt, build_feedback_prompt
 from mergexo.shell import run
 
@@ -36,6 +38,9 @@ _DESIGN_OUTPUT_SCHEMA: dict[str, object] = {
 }
 
 
+LOGGER = logging.getLogger("mergexo.codex_adapter")
+
+
 class CodexAdapter(AgentAdapter):
     def __init__(self, config: CodexConfig) -> None:
         self._config = config
@@ -49,6 +54,12 @@ class CodexAdapter(AgentAdapter):
         default_branch: str,
         cwd: Path,
     ) -> DesignStartResult:
+        log_event(
+            LOGGER,
+            "design_turn_started",
+            issue_number=issue.number,
+            design_doc_path=design_doc_path,
+        )
         prompt = build_design_prompt(
             issue=issue,
             repo_full_name=repo_full_name,
@@ -56,6 +67,13 @@ class CodexAdapter(AgentAdapter):
             default_branch=default_branch,
         )
         design, thread_id = self._run_design_turn(prompt=prompt, cwd=cwd)
+        log_event(
+            LOGGER,
+            "design_turn_completed",
+            issue_number=issue.number,
+            thread_id=thread_id or "<none>",
+            touch_path_count=len(design.touch_paths),
+        )
         return DesignStartResult(
             design=design, session=AgentSession(adapter="codex", thread_id=thread_id)
         )
@@ -70,6 +88,14 @@ class CodexAdapter(AgentAdapter):
         if session.thread_id is None:
             raise RuntimeError("Cannot resume Codex feedback turn without a thread_id")
 
+        log_event(
+            LOGGER,
+            "feedback_agent_call_started",
+            issue_number=turn.issue.number,
+            pr_number=turn.pull_request.number,
+            thread_id=session.thread_id,
+            turn_key=turn.turn_key,
+        )
         prompt = build_feedback_prompt(turn=turn)
         cmd = [
             "codex",
@@ -92,6 +118,16 @@ class CodexAdapter(AgentAdapter):
 
         resumed_thread_id = _extract_thread_id(raw_events) or session.thread_id
 
+        log_event(
+            LOGGER,
+            "feedback_agent_call_completed",
+            issue_number=turn.issue.number,
+            pr_number=turn.pull_request.number,
+            thread_id=resumed_thread_id,
+            review_reply_count=len(replies),
+            has_general_comment=general_comment is not None,
+            has_commit_message=commit_message is not None,
+        )
         return FeedbackResult(
             session=AgentSession(adapter="codex", thread_id=resumed_thread_id),
             review_replies=tuple(replies),

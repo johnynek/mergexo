@@ -25,6 +25,7 @@ from mergexo.models import (
     PullRequestReviewComment,
     PullRequestSnapshot,
 )
+from mergexo.observability import configure_logging
 
 
 def _enabled_config() -> CodexConfig:
@@ -80,7 +81,9 @@ def _feedback_turn() -> FeedbackTurn:
 
 
 def test_start_design_from_issue_happy_path(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls: list[list[str]] = []
 
@@ -113,6 +116,7 @@ def test_start_design_from_issue_happy_path(
         return '{"type":"thread.started","thread_id":"thread-123"}\n'
 
     monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    configure_logging(verbose=True)
 
     adapter = CodexAdapter(_enabled_config())
     result = adapter.start_design_from_issue(
@@ -135,6 +139,15 @@ def test_start_design_from_issue_happy_path(
     assert "--sandbox" in cmd
     assert "--profile" in cmd
     assert "--full-auto" in cmd
+    stderr = capsys.readouterr().err
+    assert (
+        "event=design_turn_started design_doc_path=docs/design/1-issue.md issue_number=1" in stderr
+    )
+    assert (
+        "event=design_turn_completed issue_number=1 thread_id=thread-123 touch_path_count=2"
+        in stderr
+    )
+    assert "Issue body:" not in stderr
 
 
 def test_start_design_from_issue_returns_session(
@@ -178,7 +191,11 @@ def test_start_design_from_issue_returns_session(
     assert result.session.thread_id == "thread-abc"
 
 
-def test_respond_to_feedback_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_respond_to_feedback_happy_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     def fake_run(
         cmd: list[str],
         *,
@@ -207,6 +224,7 @@ def test_respond_to_feedback_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_pat
         )
 
     monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    configure_logging(verbose=True)
 
     adapter = CodexAdapter(_enabled_config())
     result = adapter.respond_to_feedback(
@@ -219,6 +237,12 @@ def test_respond_to_feedback_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert result.review_replies[0].review_comment_id == 101
     assert result.general_comment == "Updated"
     assert result.commit_message == "fix: update"
+    stderr = capsys.readouterr().err
+    assert "event=feedback_agent_call_started issue_number=1 pr_number=8" in stderr
+    assert (
+        "event=feedback_agent_call_completed has_commit_message=true has_general_comment=true issue_number=1 pr_number=8 review_reply_count=1 thread_id=thread-resumed"
+        in stderr
+    )
 
 
 def test_respond_to_feedback_requires_thread_id(tmp_path: Path) -> None:

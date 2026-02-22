@@ -7,6 +7,7 @@ from mergexo.codex_adapter import CodexAdapter
 from mergexo.config import AppConfig, load_config
 from mergexo.git_ops import GitRepoManager
 from mergexo.github_gateway import GitHubGateway
+from mergexo.observability import configure_logging
 from mergexo.orchestrator import Phase1Orchestrator
 from mergexo.state import StateStore
 
@@ -19,6 +20,12 @@ def build_parser() -> argparse.ArgumentParser:
         "init", help="Initialize state DB, mirror, and worker checkouts"
     )
     init_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
+    init_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose runtime logging to stderr",
+    )
 
     run_parser = subparsers.add_parser(
         "run", help="Run phase-1 issue polling and design PR generation"
@@ -27,12 +34,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--once", action="store_true", help="Poll once and wait for active workers"
     )
+    run_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose runtime logging to stderr",
+    )
 
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    configure_logging(bool(getattr(args, "verbose", False)))
     config = load_config(args.config)
 
     if args.command == "init":

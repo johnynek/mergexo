@@ -6,6 +6,7 @@ import pytest
 
 from mergexo.config import RepoConfig, RuntimeConfig
 from mergexo.git_ops import GitRepoManager
+from mergexo.observability import configure_logging
 
 
 def _config(tmp_path: Path, *, worker_count: int = 2) -> tuple[RuntimeConfig, RepoConfig]:
@@ -100,6 +101,41 @@ def test_prepare_branch_push_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
     assert ["git", "-C", str(checkout), "checkout", "-B", "feature"] in calls
     assert ["git", "-C", str(checkout), "push", "-u", "origin", "feature"] in calls
+
+
+def test_git_ops_emits_action_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[-3:] == ["diff", "--cached", "--name-only"]:
+            return "file.py\n"
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return "goodsha\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+    configure_logging(verbose=True)
+
+    checkout = tmp_path / "checkout"
+    manager.ensure_checkout(0)
+    manager.prepare_checkout(checkout)
+    manager.create_or_reset_branch(checkout, "feature")
+    manager.commit_all(checkout, "msg")
+    manager.push_branch(checkout, "feature")
+    manager.restore_feedback_branch(checkout, "feature", "goodsha")
+
+    text = capsys.readouterr().err
+    assert "event=git_prepare_checkout" in text
+    assert "event=git_branch_reset" in text
+    assert "event=git_commit" in text
+    assert "event=git_push" in text
+    assert "event=git_restore_feedback_branch" in text
 
 
 def test_restore_feedback_branch_retries_once_on_head_mismatch(
