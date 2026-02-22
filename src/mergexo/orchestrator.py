@@ -10,7 +10,13 @@ import re
 import threading
 import time
 
-from mergexo.agent_adapter import AgentAdapter, AgentSession, FeedbackTurn
+from mergexo.agent_adapter import (
+    AgentAdapter,
+    AgentSession,
+    FeedbackResult,
+    FeedbackTurn,
+    GitOpRequest,
+)
 from mergexo.config import AppConfig
 from mergexo.feedback_loop import (
     FeedbackEventRecord,
@@ -29,6 +35,7 @@ from mergexo.models import (
     GeneratedDesign,
     Issue,
     PullRequestIssueComment,
+    PullRequestSnapshot,
     PullRequestReviewComment,
     WorkResult,
 )
@@ -37,6 +44,8 @@ from mergexo.state import StateStore, TrackedPullRequestState
 
 
 LOGGER = logging.getLogger("mergexo.orchestrator")
+_MAX_FEEDBACK_GIT_OP_ROUNDS = 3
+_MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,13 @@ class _SlotLease:
 class _FeedbackFuture:
     issue_number: int
     future: Future[None]
+
+
+@dataclass(frozen=True)
+class _GitOpOutcome:
+    op: str
+    success: bool
+    detail: str
 
 
 class SlotPool:
@@ -502,28 +518,16 @@ class Phase1Orchestrator:
                 changed_files=changed_files,
             )
 
-            log_event(
-                LOGGER,
-                "feedback_agent_call_started",
-                issue_number=tracked.issue_number,
-                pr_number=tracked.pr_number,
-                turn_key=turn_key,
-            )
-            result = self._agent.respond_to_feedback(
+            feedback_outcome = self._run_feedback_agent_with_git_ops(
+                tracked=tracked,
                 session=session,
                 turn=turn,
-                cwd=lease.path,
+                checkout_path=lease.path,
+                pull_request=pr,
             )
-            log_event(
-                LOGGER,
-                "feedback_agent_call_completed",
-                issue_number=tracked.issue_number,
-                pr_number=tracked.pr_number,
-                turn_key=turn_key,
-                review_reply_count=len(result.review_replies),
-                has_general_comment=result.general_comment is not None,
-                has_commit_message=result.commit_message is not None,
-            )
+            if feedback_outcome is None:
+                return
+            result, pr = feedback_outcome
 
             if result.commit_message:
                 try:
@@ -643,6 +647,201 @@ class Phase1Orchestrator:
             finally:
                 self._slot_pool.release(lease)
 
+    def _run_feedback_agent_with_git_ops(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        session: AgentSession,
+        turn: FeedbackTurn,
+        checkout_path: Path,
+        pull_request: PullRequestSnapshot,
+    ) -> tuple[FeedbackResult, PullRequestSnapshot] | None:
+        current_session = session
+        current_turn = turn
+        current_pr = pull_request
+        round_number = 0
+
+        while True:
+            log_event(
+                LOGGER,
+                "feedback_agent_call_started",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                turn_key=current_turn.turn_key,
+            )
+            result = self._agent.respond_to_feedback(
+                session=current_session,
+                turn=current_turn,
+                cwd=checkout_path,
+            )
+            log_event(
+                LOGGER,
+                "feedback_agent_call_completed",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                turn_key=current_turn.turn_key,
+                review_reply_count=len(result.review_replies),
+                has_general_comment=result.general_comment is not None,
+                has_commit_message=result.commit_message is not None,
+            )
+            current_session = result.session
+            if not result.git_ops:
+                return result, current_pr
+
+            if len(result.git_ops) > _MAX_FEEDBACK_GIT_OPS_PER_ROUND:
+                error = (
+                    "agent requested too many git operations in one round; "
+                    f"max={_MAX_FEEDBACK_GIT_OPS_PER_ROUND}"
+                )
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="blocked",
+                    last_seen_head_sha=current_pr.head_sha,
+                    error=error,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason="too_many_git_ops_requested",
+                )
+                return None
+
+            round_number += 1
+            if round_number > _MAX_FEEDBACK_GIT_OP_ROUNDS:
+                error = (
+                    "agent exceeded maximum git-op follow-up rounds; "
+                    f"max={_MAX_FEEDBACK_GIT_OP_ROUNDS}"
+                )
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="blocked",
+                    last_seen_head_sha=current_pr.head_sha,
+                    error=error,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason="git_op_round_limit_exceeded",
+                )
+                return None
+
+            outcomes = self._execute_feedback_git_ops(
+                tracked=tracked,
+                checkout_path=checkout_path,
+                requests=result.git_ops,
+            )
+
+            current_pr = self._github.get_pull_request(tracked.pr_number)
+            if current_pr.merged:
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="merged",
+                    last_seen_head_sha=current_pr.head_sha,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_merged",
+                )
+                return None
+            if current_pr.state.lower() != "open":
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="closed",
+                    last_seen_head_sha=current_pr.head_sha,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_closed",
+                )
+                return None
+
+            current_turn = FeedbackTurn(
+                turn_key=current_turn.turn_key,
+                issue=current_turn.issue,
+                pull_request=current_pr,
+                review_comments=current_turn.review_comments,
+                issue_comments=current_turn.issue_comments
+                + (
+                    PullRequestIssueComment(
+                        comment_id=-(1000 + round_number),
+                        body=_render_git_op_result_comment(
+                            outcomes=outcomes, round_number=round_number
+                        ),
+                        user_login="mergexo-system",
+                        html_url="",
+                        created_at="now",
+                        updated_at="now",
+                    ),
+                ),
+                changed_files=self._github.list_pull_request_files(tracked.pr_number),
+            )
+
+    def _execute_feedback_git_ops(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        checkout_path: Path,
+        requests: tuple[GitOpRequest, ...],
+    ) -> list[_GitOpOutcome]:
+        outcomes: list[_GitOpOutcome] = []
+        for request in requests:
+            log_event(
+                LOGGER,
+                "feedback_git_op_requested",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                op=request.op,
+            )
+            try:
+                self._execute_feedback_git_op(checkout_path=checkout_path, request=request)
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    "feedback_git_op_failed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    op=request.op,
+                    error_type=type(exc).__name__,
+                )
+                outcomes.append(
+                    _GitOpOutcome(
+                        op=request.op, success=False, detail=_summarize_git_error(str(exc))
+                    )
+                )
+            else:
+                log_event(
+                    LOGGER,
+                    "feedback_git_op_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    op=request.op,
+                )
+                outcomes.append(_GitOpOutcome(op=request.op, success=True, detail="ok"))
+        return outcomes
+
+    def _execute_feedback_git_op(self, *, checkout_path: Path, request: GitOpRequest) -> None:
+        if request.op == "fetch_origin":
+            self._git.fetch_origin(checkout_path)
+            return
+        if request.op == "merge_origin_default_branch":
+            self._git.merge_origin_default_branch(checkout_path)
+            return
+        raise RuntimeError(f"Unsupported git operation request: {request.op}")
+
     def _normalize_review_events(
         self,
         *,
@@ -730,6 +929,27 @@ def _slugify(value: str) -> str:
 
 def _is_no_staged_changes_error(exc: RuntimeError) -> bool:
     return "No staged changes to commit" in str(exc)
+
+
+def _render_git_op_result_comment(*, outcomes: list[_GitOpOutcome], round_number: int) -> str:
+    header = f"MergeXO git operation results (round {round_number}):"
+    lines = [header]
+    for outcome in outcomes:
+        status = "ok" if outcome.success else "failed"
+        lines.append(f"- {outcome.op}: {status} ({outcome.detail})")
+    lines.append(
+        "Continue by editing files directly. If more repository git actions are needed, request them in git_ops."
+    )
+    return "\n".join(lines)
+
+
+def _summarize_git_error(raw_error: str) -> str:
+    normalized = " ".join(line.strip() for line in raw_error.splitlines() if line.strip())
+    if not normalized:
+        return "git operation failed"
+    if len(normalized) > 240:
+        return normalized[:237] + "..."
+    return normalized
 
 
 def _render_design_doc(*, issue: Issue, design: GeneratedDesign) -> str:
