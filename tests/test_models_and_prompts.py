@@ -11,7 +11,12 @@ from mergexo.models import (
     PullRequestSnapshot,
     WorkResult,
 )
-from mergexo.prompts import build_design_prompt, build_feedback_prompt
+from mergexo.prompts import (
+    build_bugfix_prompt,
+    build_design_prompt,
+    build_feedback_prompt,
+    build_small_job_prompt,
+)
 
 
 def test_model_dataclasses_and_version() -> None:
@@ -132,3 +137,43 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "src/a.py" in prompt
     assert "turn_key" in prompt
     assert "If you provide commit_message" in prompt
+
+
+def test_build_bugfix_prompt_requires_regression_tests() -> None:
+    issue = Issue(
+        number=21,
+        title="Fix flaky scheduler",
+        body="Queue occasionally stalls after retries.",
+        html_url="https://example/issue/21",
+        labels=("agent:bugfix",),
+    )
+
+    prompt = build_bugfix_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+    )
+
+    assert "regression tests in tests/" in prompt
+    assert "blocked_reason" in prompt
+    assert "issue #21" in prompt.lower()
+
+
+def test_build_small_job_prompt_is_scoped() -> None:
+    issue = Issue(
+        number=22,
+        title="Add docs index",
+        body="Create docs/index.md and link from README.",
+        html_url="https://example/issue/22",
+        labels=("agent:small-job",),
+    )
+
+    prompt = build_small_job_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+    )
+
+    assert "small-job agent" in prompt
+    assert "blocked_reason" in prompt
+    assert "Keep scope tight" in prompt

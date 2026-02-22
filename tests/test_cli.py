@@ -22,6 +22,8 @@ def _app_config(tmp_path: Path) -> AppConfig:
             name="mergexo",
             default_branch="main",
             trigger_label="agent:design",
+            bugfix_label="agent:bugfix",
+            small_job_label="agent:small-job",
             design_docs_dir="docs/design",
             local_clone_source=None,
             remote_url=None,

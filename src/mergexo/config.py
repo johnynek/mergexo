@@ -20,6 +20,8 @@ class RepoConfig:
     name: str
     default_branch: str
     trigger_label: str
+    bugfix_label: str
+    small_job_label: str
     design_docs_dir: str
     local_clone_source: str | None
     remote_url: str | None
@@ -82,6 +84,8 @@ def load_config(path: Path) -> AppConfig:
         name=_require_str(repo_data, "name"),
         default_branch=_require_str(repo_data, "default_branch"),
         trigger_label=_require_str(repo_data, "trigger_label"),
+        bugfix_label=_str_with_default(repo_data, "bugfix_label", "agent:bugfix"),
+        small_job_label=_str_with_default(repo_data, "small_job_label", "agent:small-job"),
         design_docs_dir=_require_str(repo_data, "design_docs_dir"),
         local_clone_source=_optional_str(repo_data, "local_clone_source"),
         remote_url=_optional_str(repo_data, "remote_url"),
@@ -134,6 +138,13 @@ def _bool_with_default(data: dict[str, object], key: str, default: bool) -> bool
     value = data.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(f"{key} must be a boolean")
+    return value
+
+
+def _str_with_default(data: dict[str, object], key: str, default: str) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{key} must be a non-empty string")
     return value
 
 

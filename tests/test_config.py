@@ -29,6 +29,8 @@ owner = "johnynek"
 name = "repo"
 default_branch = "main"
 trigger_label = "agent:design"
+bugfix_label = "agent:bugfix-custom"
+small_job_label = "agent:small-custom"
 design_docs_dir = "docs/design"
 local_clone_source = "/tmp/local.git"
 
@@ -49,6 +51,8 @@ extra_args = ["--full-auto"]
     assert loaded.runtime.enable_feedback_loop is True
     assert loaded.repo.full_name == "johnynek/repo"
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
+    assert loaded.repo.bugfix_label == "agent:bugfix-custom"
+    assert loaded.repo.small_job_label == "agent:small-custom"
     assert loaded.codex.extra_args == ("--full-auto",)
 
 
@@ -73,6 +77,8 @@ remote_url = "git@github.com:example/custom.git"
 
     loaded = config.load_config(cfg_path)
     assert loaded.repo.effective_remote_url == "git@github.com:example/custom.git"
+    assert loaded.repo.bugfix_label == "agent:bugfix"
+    assert loaded.repo.small_job_label == "agent:small-job"
     assert loaded.runtime.enable_feedback_loop is False
 
 
@@ -166,6 +172,10 @@ def test_helper_numeric_bool_and_tuple() -> None:
     assert config._bool_with_default({"k": False}, "k", True) is False
     with pytest.raises(ConfigError, match="must be a boolean"):
         config._bool_with_default({"k": "yes"}, "k", True)
+
+    assert config._str_with_default({}, "k", "default") == "default"
+    with pytest.raises(ConfigError, match="non-empty string"):
+        config._str_with_default({"k": ""}, "k", "default")
 
     assert config._tuple_of_str({}, "k") == ()
     assert config._tuple_of_str({"k": ["a", "b"]}, "k") == ("a", "b")

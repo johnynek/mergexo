@@ -12,6 +12,7 @@ import pytest
 
 from mergexo.agent_adapter import (
     AgentSession,
+    DirectStartResult,
     DesignStartResult,
     FeedbackResult,
     FeedbackTurn,
@@ -21,6 +22,7 @@ from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.models import (
     GeneratedDesign,
     Issue,
+    IssueFlow,
     PullRequest,
     PullRequestIssueComment,
     PullRequestReviewComment,
@@ -31,8 +33,13 @@ from mergexo.orchestrator import (
     Phase1Orchestrator,
     SlotPool,
     _FeedbackFuture,
+    _default_commit_message,
+    _has_regression_test_changes,
+    _issue_branch,
     _render_design_doc,
+    _resolve_issue_flow,
     _slugify,
+    _trigger_labels,
 )
 from mergexo.observability import configure_logging
 from mergexo.state import StateStore, TrackedPullRequestState
@@ -56,6 +63,7 @@ class FakeGitManager:
         self.ensure_checkout_calls: list[int] = []
         self.restore_calls: list[tuple[Path, str, str]] = []
         self.restore_feedback_result = True
+        self.staged_files: tuple[str, ...] = ("src/a.py", "tests/test_a.py")
 
     def ensure_layout(self) -> None:
         self.ensure_layout_called = True
@@ -75,6 +83,10 @@ class FakeGitManager:
     def commit_all(self, checkout_path: Path, message: str) -> None:
         self.commit_calls.append((checkout_path, message))
 
+    def list_staged_files(self, checkout_path: Path) -> tuple[str, ...]:
+        _ = checkout_path
+        return self.staged_files
+
     def push_branch(self, checkout_path: Path, branch: str) -> None:
         self.push_calls.append((checkout_path, branch))
 
@@ -91,6 +103,7 @@ class FakeGitManager:
 class FakeGitHub:
     def __init__(self, issues: list[Issue]) -> None:
         self.issues = issues
+        self.requested_labels: tuple[str, ...] | None = None
         self.created_prs: list[tuple[str, str, str, str]] = []
         self.comments: list[tuple[int, str]] = []
         self.review_replies: list[tuple[int, int, str]] = []
@@ -109,8 +122,8 @@ class FakeGitHub:
         )
         self._next_comment_id = 1000
 
-    def list_open_issues_with_label(self, label: str) -> list[Issue]:
-        _ = label
+    def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
+        self.requested_labels = labels
         return self.issues
 
     def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
@@ -198,7 +211,23 @@ class FakeAgent:
         )
         self.fail = fail
         self.calls: list[tuple[Issue, Path]] = []
+        self.bugfix_calls: list[tuple[Issue, Path]] = []
+        self.small_job_calls: list[tuple[Issue, Path]] = []
         self.feedback_calls: list[tuple[AgentSession, FeedbackTurn, Path]] = []
+        self.bugfix_result = DirectStartResult(
+            pr_title="Fix bug",
+            pr_summary="Applies bugfix changes.",
+            commit_message="fix: resolve issue",
+            blocked_reason=None,
+            session=AgentSession(adapter="codex", thread_id="thread-123"),
+        )
+        self.small_job_result = DirectStartResult(
+            pr_title="Implement small job",
+            pr_summary="Applies scoped change.",
+            commit_message="feat: complete small job",
+            blocked_reason=None,
+            session=AgentSession(adapter="codex", thread_id="thread-123"),
+        )
         self.feedback_result = FeedbackResult(
             session=AgentSession(adapter="codex", thread_id="thread-123"),
             review_replies=(),
@@ -229,6 +258,34 @@ class FakeAgent:
     ) -> FeedbackResult:
         self.feedback_calls.append((session, turn, cwd))
         return self.feedback_result
+
+    def start_bugfix_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        cwd: Path,
+    ) -> DirectStartResult:
+        _ = repo_full_name, default_branch
+        self.bugfix_calls.append((issue, cwd))
+        if self.fail:
+            raise RuntimeError("codex failed")
+        return self.bugfix_result
+
+    def start_small_job_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        cwd: Path,
+    ) -> DirectStartResult:
+        _ = repo_full_name, default_branch
+        self.small_job_calls.append((issue, cwd))
+        if self.fail:
+            raise RuntimeError("codex failed")
+        return self.small_job_result
 
 
 class FakeState:
@@ -314,6 +371,8 @@ def _config(
             name="mergexo",
             default_branch="main",
             trigger_label="agent:design",
+            bugfix_label="agent:bugfix",
+            small_job_label="agent:small-job",
             design_docs_dir="docs/design",
             local_clone_source=None,
             remote_url=None,
@@ -322,13 +381,17 @@ def _config(
     )
 
 
-def _issue(number: int = 7, title: str = "Add worker scheduler") -> Issue:
+def _issue(
+    number: int = 7,
+    title: str = "Add worker scheduler",
+    labels: tuple[str, ...] = ("agent:design",),
+) -> Issue:
     return Issue(
         number=number,
         title=title,
         body="Body",
         html_url=f"https://example/issues/{number}",
-        labels=("agent:design",),
+        labels=labels,
     )
 
 
@@ -350,6 +413,48 @@ def test_slugify_is_safe(text: str) -> None:
     slug = _slugify(text)
     assert slug
     assert re.fullmatch(r"[a-z0-9-]+", slug)
+
+
+def test_flow_helpers() -> None:
+    cfg = RepoConfig(
+        owner="o",
+        name="r",
+        default_branch="main",
+        trigger_label="agent:design",
+        bugfix_label="agent:bugfix",
+        small_job_label="agent:small-job",
+        design_docs_dir="docs/design",
+        local_clone_source=None,
+        remote_url=None,
+    )
+    assert _trigger_labels(cfg) == ("agent:design", "agent:bugfix", "agent:small-job")
+
+    issue = _issue(labels=("agent:design", "agent:bugfix", "agent:small-job"))
+    assert (
+        _resolve_issue_flow(
+            issue=issue,
+            design_label=cfg.trigger_label,
+            bugfix_label=cfg.bugfix_label,
+            small_job_label=cfg.small_job_label,
+        )
+        == "bugfix"
+    )
+    assert _issue_branch(flow="design_doc", issue_number=7, slug="x") == "agent/design/7-x"
+    assert _issue_branch(flow="bugfix", issue_number=7, slug="x") == "agent/bugfix/7-x"
+    assert _issue_branch(flow="small_job", issue_number=7, slug="x") == "agent/small/7-x"
+    assert _default_commit_message(flow="bugfix", issue_number=7) == "fix: resolve issue #7"
+    assert _default_commit_message(flow="small_job", issue_number=7) == "feat: implement issue #7"
+    assert (
+        _resolve_issue_flow(
+            issue=_issue(labels=("triage",)),
+            design_label=cfg.trigger_label,
+            bugfix_label=cfg.bugfix_label,
+            small_job_label=cfg.small_job_label,
+        )
+        is None
+    )
+    assert _has_regression_test_changes(("tests/test_a.py", "src/a.py")) is True
+    assert _has_regression_test_changes(("src/a.py",)) is False
 
 
 def test_render_design_doc_includes_frontmatter_and_summary() -> None:
@@ -378,11 +483,12 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     state = FakeState()
 
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
-    result = orch._process_issue(_issue())
+    result = orch._process_issue(_issue(), "design_doc")
 
     assert result.issue_number == 7
     assert result.pr_number == 101
     assert github.created_prs
+    assert "Refs #7" in github.created_prs[0][3]
     assert github.comments == [(7, "Opened design PR: https://example/pr/101")]
     assert git.prepare_calls
     assert git.branch_calls
@@ -400,6 +506,112 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     assert state.saved_sessions == [(7, "codex", "thread-123")]
 
 
+def test_process_issue_bugfix_flow_happy_path(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:bugfix",))
+    result = orch._process_issue(issue, "bugfix")
+
+    assert result.branch.startswith("agent/bugfix/7-")
+    assert len(agent.bugfix_calls) == 1
+    assert len(agent.small_job_calls) == 0
+    assert git.commit_calls[-1][1] == "fix: resolve issue"
+    assert github.created_prs[0][0] == "Fix bug"
+    assert "Fixes #7" in github.created_prs[0][3]
+    assert f"Source issue: {issue.html_url}" in github.created_prs[0][3]
+    assert github.comments == [(7, "Opened bugfix PR: https://example/pr/101")]
+
+
+def test_process_issue_small_job_flow_uses_default_commit_message(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    agent.small_job_result = DirectStartResult(
+        pr_title="Do a small thing",
+        pr_summary="Summary",
+        commit_message=None,
+        blocked_reason=None,
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:small-job",))
+    result = orch._process_issue(issue, "small_job")
+
+    assert result.branch.startswith("agent/small/7-")
+    assert len(agent.small_job_calls) == 1
+    assert git.commit_calls[-1][1] == "feat: implement issue #7"
+    assert "Fixes #7" in github.created_prs[0][3]
+    assert github.comments == [(7, "Opened small-job PR: https://example/pr/101")]
+
+
+def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.staged_files = ("src/a.py",)
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(RuntimeError, match="regression test"):
+        orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert github.created_prs == []
+    assert git.commit_calls == []
+    assert any(
+        "requires at least one staged regression test" in body for _, body in github.comments
+    )
+
+
+def test_process_issue_direct_flow_blocked_posts_comment(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    agent.bugfix_result = DirectStartResult(
+        pr_title="Fix bug",
+        pr_summary="Summary",
+        commit_message=None,
+        blocked_reason="Missing reproduction steps",
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(RuntimeError, match="blocked"):
+        orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert github.created_prs == []
+    assert git.commit_calls == []
+    assert any("Missing reproduction steps" in body for _, body in github.comments)
+
+
+def test_process_direct_issue_rejects_unsupported_flow(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(RuntimeError, match="Unsupported direct flow"):
+        orch._process_direct_issue(
+            issue=_issue(labels=("agent:design",)),
+            flow="design_doc",
+            checkout_path=tmp_path / "checkout",
+        )
+
+
 def test_process_issue_emits_lifecycle_logs(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -411,20 +623,20 @@ def test_process_issue_emits_lifecycle_logs(
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     configure_logging(verbose=True)
-    _ = orch._process_issue(_issue())
+    _ = orch._process_issue(_issue(), "design_doc")
 
     text = capsys.readouterr().err
     assert "event=slot_acquired" in text
-    assert "event=issue_processing_started issue_number=7" in text
+    assert "event=issue_processing_started flow=design_doc issue_number=7" in text
     assert (
         "event=design_turn_started branch=agent/design/7-add-worker-scheduler issue_number=7"
         in text
     )
     assert "event=design_turn_completed issue_number=7" in text
-    assert (
-        "event=issue_processing_completed branch=agent/design/7-add-worker-scheduler issue_number=7 pr_number=101"
-        in text
-    )
+    assert "event=issue_processing_completed" in text
+    assert "branch=agent/design/7-add-worker-scheduler" in text
+    assert "flow=design_doc" in text
+    assert "pr_number=101" in text
     assert "event=slot_released" in text
 
 
@@ -438,7 +650,7 @@ def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     with pytest.raises(RuntimeError, match="codex failed"):
-        orch._process_issue(_issue())
+        orch._process_issue(_issue(), "design_doc")
 
     assert git.cleanup_calls
     # Slot should have been released; re-acquire should not block and should return slot 0.
@@ -459,9 +671,9 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
 
     class FakePool:
         def __init__(self) -> None:
-            self.submitted: list[int] = []
+            self.submitted: list[tuple[int, IssueFlow]] = []
 
-        def submit(self, fn, issue):  # type: ignore[no-untyped-def]
+        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
             _ = fn
             fut: Future[WorkResult] = Future()
             fut.set_result(
@@ -472,14 +684,15 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
                     pr_url="u",
                 )
             )
-            self.submitted.append(issue.number)
+            self.submitted.append((issue.number, flow))
             return fut
 
     pool = FakePool()
 
     orch._enqueue_new_work(pool)
     assert state.running == [1]
-    assert pool.submitted == [1]
+    assert pool.submitted == [(1, "design_doc")]
+    assert github.requested_labels == ("agent:design", "agent:bugfix", "agent:small-job")
 
     # Already-running path: skip existing issue number.
     already_running_future: Future[WorkResult] = Future()
@@ -490,6 +703,55 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
     running_future: Future[WorkResult] = Future()
     orch._running = {99: running_future, 100: running_future}
     orch._enqueue_new_work(pool)
+
+
+def test_enqueue_new_work_uses_flow_precedence(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=3)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issues = [
+        _issue(1, "Bug", labels=("agent:design", "agent:bugfix")),
+        _issue(2, "Small", labels=("agent:design", "agent:small-job")),
+        _issue(3, "Design", labels=("agent:design",)),
+    ]
+    github = FakeGitHub(issues)
+    agent = FakeAgent()
+    state = FakeState(allowed={1, 2, 3})
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.submitted: list[tuple[int, IssueFlow]] = []
+
+        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
+            _ = fn
+            self.submitted.append((issue.number, flow))
+            fut: Future[WorkResult] = Future()
+            fut.set_result(
+                WorkResult(issue_number=issue.number, branch="b", pr_number=1, pr_url="u")
+            )
+            return fut
+
+    pool = FakePool()
+    orch._enqueue_new_work(pool)
+
+    assert pool.submitted == [(1, "bugfix"), (2, "small_job"), (3, "design_doc")]
+
+
+def test_enqueue_new_work_skips_issues_without_matching_labels(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(1, "Bad label", labels=("triage",))])
+    agent = FakeAgent()
+    state = FakeState(allowed={1})
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    class FakePool:
+        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow
+            raise AssertionError("submit should not be called")
+
+    orch._enqueue_new_work(FakePool())
+    assert state.running == []
 
 
 def test_reap_finished_marks_success_and_failure(tmp_path: Path) -> None:
