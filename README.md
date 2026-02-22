@@ -84,6 +84,8 @@ Enable GitHub operations with:
 - `runtime.enable_github_operations = true`
 - `repo.operator_logins = ["<maintainer-login>", ...]`
 - optional `repo.operations_issue_number = <issue-number>` for global commands
+  (the issue does not need to stay open; MergeXO scans comments by issue number
+  and reads comments from open or closed issues)
 
 Supported comment commands:
 
