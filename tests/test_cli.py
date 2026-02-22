@@ -42,7 +42,18 @@ def test_build_parser_supports_commands() -> None:
     parsed_run = parser.parse_args(["run", "--once", "--verbose"])
     parsed_feedback_list = parser.parse_args(["feedback", "blocked", "list", "--json"])
     parsed_feedback_reset = parser.parse_args(
-        ["feedback", "blocked", "reset", "--pr", "12", "--pr", "14", "--dry-run"]
+        [
+            "feedback",
+            "blocked",
+            "reset",
+            "--pr",
+            "12",
+            "--pr",
+            "14",
+            "--dry-run",
+            "--head-sha",
+            "abc1234",
+        ]
     )
 
     assert parsed_init.command == "init"
@@ -57,6 +68,7 @@ def test_build_parser_supports_commands() -> None:
     assert parsed_feedback_reset.blocked_command == "reset"
     assert parsed_feedback_reset.pr == [12, 14]
     assert parsed_feedback_reset.dry_run is True
+    assert parsed_feedback_reset.head_sha == "abc1234"
 
 
 def test_main_dispatches_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -266,6 +278,7 @@ def test_cmd_feedback_blocked_dispatches_reset_and_unknown(
         all=False,
         yes=False,
         dry_run=True,
+        head_sha="abc1234",
     )
     monkeypatch.setattr(
         cli,
@@ -277,6 +290,7 @@ def test_cmd_feedback_blocked_dispatches_reset_and_unknown(
     reset_call = called["reset"]
     assert isinstance(reset_call, tuple)
     assert reset_call[1]["pr_numbers"] == (12,)
+    assert reset_call[1]["head_sha_override"] == "abc1234"
 
     with pytest.raises(RuntimeError, match="Unknown blocked command"):
         cli._cmd_feedback_blocked(FakeState(), SimpleNamespace(blocked_command="oops"))
@@ -360,14 +374,19 @@ def test_cmd_feedback_blocked_reset_variants(capsys: pytest.CaptureFixture[str])
             pending_event_count=2,
         ),
     )
-    reset_calls: list[tuple[int, ...] | None] = []
+    reset_calls: list[tuple[tuple[int, ...] | None, str | None]] = []
 
     class FakeState:
         def list_blocked_pull_requests(self) -> tuple[BlockedPullRequestState, ...]:
             return blocked
 
-        def reset_blocked_pull_requests(self, *, pr_numbers: tuple[int, ...] | None = None) -> int:
-            reset_calls.append(pr_numbers)
+        def reset_blocked_pull_requests(
+            self,
+            *,
+            pr_numbers: tuple[int, ...] | None = None,
+            last_seen_head_sha_override: str | None = None,
+        ) -> int:
+            reset_calls.append((pr_numbers, last_seen_head_sha_override))
             if pr_numbers is None:
                 return len(blocked)
             return len(pr_numbers)
@@ -379,6 +398,7 @@ def test_cmd_feedback_blocked_reset_variants(capsys: pytest.CaptureFixture[str])
             reset_all=True,
             yes=False,
             dry_run=False,
+            head_sha_override=None,
         )
 
     cli._cmd_feedback_blocked_reset(
@@ -387,8 +407,12 @@ def test_cmd_feedback_blocked_reset_variants(capsys: pytest.CaptureFixture[str])
         reset_all=False,
         yes=False,
         dry_run=True,
+        head_sha_override="abc1234",
     )
-    assert "Would reset blocked pull requests: 12" in capsys.readouterr().out
+    assert (
+        "Would reset blocked pull requests: 12 (override last_seen_head_sha=abc1234)"
+        in capsys.readouterr().out
+    )
     assert reset_calls == []
 
     cli._cmd_feedback_blocked_reset(
@@ -397,9 +421,10 @@ def test_cmd_feedback_blocked_reset_variants(capsys: pytest.CaptureFixture[str])
         reset_all=False,
         yes=False,
         dry_run=False,
+        head_sha_override=None,
     )
     assert "Reset 1 blocked pull request(s)." in capsys.readouterr().out
-    assert reset_calls == [(12,)]
+    assert reset_calls == [((12,), None)]
 
     cli._cmd_feedback_blocked_reset(
         FakeState(),
@@ -407,9 +432,10 @@ def test_cmd_feedback_blocked_reset_variants(capsys: pytest.CaptureFixture[str])
         reset_all=True,
         yes=True,
         dry_run=False,
+        head_sha_override="ABCDEF1",
     )
     assert "Reset 2 blocked pull request(s)." in capsys.readouterr().out
-    assert reset_calls[-1] is None
+    assert reset_calls[-1] == (None, "abcdef1")
 
     cli._cmd_feedback_blocked_reset(
         FakeState(),
@@ -417,8 +443,25 @@ def test_cmd_feedback_blocked_reset_variants(capsys: pytest.CaptureFixture[str])
         reset_all=False,
         yes=False,
         dry_run=False,
+        head_sha_override=None,
     )
     assert "No blocked pull requests matched." in capsys.readouterr().out
+
+
+def test_cmd_feedback_blocked_reset_rejects_invalid_head_sha() -> None:
+    class FakeState:
+        def list_blocked_pull_requests(self) -> tuple[BlockedPullRequestState, ...]:
+            return ()
+
+    with pytest.raises(RuntimeError, match="--head-sha must be a hex git commit SHA"):
+        cli._cmd_feedback_blocked_reset(
+            FakeState(),
+            pr_numbers=(12,),
+            reset_all=False,
+            yes=False,
+            dry_run=True,
+            head_sha_override="not-a-sha",
+        )
 
 
 def test_summarize_block_reason_truncation() -> None:

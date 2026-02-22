@@ -5,6 +5,7 @@ import json
 import pytest
 
 from mergexo.github_gateway import (
+    CompareCommitsStatus,
     GitHubGateway,
     _as_bool,
     _as_int,
@@ -249,6 +250,46 @@ def test_get_pull_request_requires_head_and_base(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.parametrize(
+    "status",
+    ("ahead", "identical", "behind", "diverged"),
+)
+def test_compare_commits_parses_known_statuses(
+    monkeypatch: pytest.MonkeyPatch, status: CompareCommitsStatus
+) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        assert method == "GET"
+        assert path == "/repos/o/r/compare/base123...head456"
+        return {"status": status}
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    assert gateway.compare_commits("base123", "head456") == status
+
+
+def test_compare_commits_rejects_bad_payload_and_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+    with pytest.raises(RuntimeError, match="expected object for compare commits"):
+        gateway.compare_commits("a", "b")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"status": "unknown_status"},
+    )
+    with pytest.raises(RuntimeError, match="Unexpected GitHub compare status"):
+        gateway.compare_commits("a", "b")
+
+
+@pytest.mark.parametrize(
     "method_name, bad_payload, expected",
     [
         ("get_pull_request", [], "expected object"),
@@ -319,6 +360,8 @@ def test_gateway_emits_read_and_write_logs(
             return []
         if method == "GET" and path.endswith("/issues/9/comments?per_page=100"):
             return []
+        if method == "GET" and path.endswith("/compare/base...head"):
+            return {"status": "ahead"}
         if method == "POST" and path.endswith("/pulls"):
             return {"number": 9, "html_url": "https://example/pr/9"}
         if method == "POST":
@@ -331,12 +374,14 @@ def test_gateway_emits_read_and_write_logs(
     gateway.list_pull_request_files(9)
     gateway.list_pull_request_review_comments(9)
     gateway.list_pull_request_issue_comments(9)
+    gateway.compare_commits("base", "head")
     gateway.create_pull_request("t", "h", "b", "body")
     gateway.post_issue_comment(9, "hello")
     gateway.post_review_comment_reply(9, 10, "reply")
 
     text = capsys.readouterr().err
     assert "event=github_read count=1 endpoint=issues" in text
+    assert "endpoint=compare_commits" in text
     assert "event=github_pr_created" in text
     assert "event=github_issue_comment_posted issue_number=9" in text
     assert "event=github_review_reply_posted pr_number=9 review_comment_id=10" in text

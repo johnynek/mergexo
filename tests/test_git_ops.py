@@ -7,6 +7,7 @@ import pytest
 from mergexo.config import RepoConfig, RuntimeConfig
 from mergexo.git_ops import GitRepoManager
 from mergexo.observability import configure_logging
+from mergexo.shell import CommandError
 
 
 def _config(tmp_path: Path, *, worker_count: int = 2) -> tuple[RuntimeConfig, RepoConfig]:
@@ -259,3 +260,51 @@ def test_fetch_origin_and_merge_default_branch(
         ["git", "-C", str(checkout), "fetch", "origin", "--prune", "--tags"],
         ["git", "-C", str(checkout), "merge", "--no-edit", "origin/main"],
     ]
+
+
+def test_is_ancestor_true_for_equal_and_ancestor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-3] == "merge-base":
+            return "oldsha\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    assert manager.is_ancestor(checkout, "same", "same") is True
+    assert manager.is_ancestor(checkout, "oldsha", "newsha") is True
+    assert calls == [["git", "-C", str(checkout), "merge-base", "oldsha", "newsha"]]
+
+
+def test_is_ancestor_false_for_non_ancestor_or_missing_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+
+    def fake_run_non_ancestor(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        _ = cmd
+        return "different-merge-base\n"
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run_non_ancestor)
+    assert manager.is_ancestor(checkout, "oldsha", "newsha") is False
+
+    def fake_run_error(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        raise CommandError(
+            "Command failed\ncmd: git\nexit: 128\nstdout:\n\nstderr:\nunknown revision"
+        )
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run_error)
+    assert manager.is_ancestor(checkout, "oldsha", "newsha") is False

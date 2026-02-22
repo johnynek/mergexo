@@ -69,8 +69,12 @@ class FakeGitManager:
         self.restore_calls: list[tuple[Path, str, str]] = []
         self.fetch_calls: list[Path] = []
         self.merge_calls: list[Path] = []
+        self.current_head_calls: list[Path] = []
+        self.is_ancestor_calls: list[tuple[Path, str, str]] = []
         self.restore_feedback_result = True
         self.staged_files: tuple[str, ...] = ("src/a.py", "tests/test_a.py")
+        self.current_head_sha_value = "headsha"
+        self.is_ancestor_results: dict[tuple[str, str], bool] = {}
 
     def ensure_layout(self) -> None:
         self.ensure_layout_called = True
@@ -110,7 +114,17 @@ class FakeGitManager:
         self, checkout_path: Path, branch: str, expected_head_sha: str
     ) -> bool:
         self.restore_calls.append((checkout_path, branch, expected_head_sha))
+        if self.restore_feedback_result:
+            self.current_head_sha_value = expected_head_sha
         return self.restore_feedback_result
+
+    def current_head_sha(self, checkout_path: Path) -> str:
+        self.current_head_calls.append(checkout_path)
+        return self.current_head_sha_value
+
+    def is_ancestor(self, checkout_path: Path, older_sha: str, newer_sha: str) -> bool:
+        self.is_ancestor_calls.append((checkout_path, older_sha, newer_sha))
+        return self.is_ancestor_results.get((older_sha, newer_sha), True)
 
 
 class FakeGitHub:
@@ -134,6 +148,8 @@ class FakeGitHub:
             merged=False,
         )
         self._next_comment_id = 1000
+        self.compare_calls: list[tuple[str, str]] = []
+        self.compare_statuses: dict[tuple[str, str], str] = {}
 
     def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
         self.requested_labels = labels
@@ -212,6 +228,14 @@ class FakeGitHub:
                 updated_at="now",
             )
         )
+
+    def compare_commits(self, base_sha: str, head_sha: str) -> str:
+        self.compare_calls.append((base_sha, head_sha))
+        if (base_sha, head_sha) in self.compare_statuses:
+            return self.compare_statuses[(base_sha, head_sha)]
+        if base_sha == head_sha:
+            return "identical"
+        return "ahead"
 
 
 class FakeAgent:
@@ -1272,6 +1296,162 @@ def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(
     assert state.list_pending_feedback_events(101) == ()
 
 
+def test_feedback_turn_blocks_on_cross_cycle_history_rewrite_and_is_comment_idempotent(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-new",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.compare_statuses[("head-old", "head-new")] = "diverged"
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=issue.number,
+        status="awaiting_feedback",
+        last_seen_head_sha="head-old",
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    assert len(github.comments) == 1
+    assert "non-fast-forward" in github.comments[0][1].lower()
+    assert agent.feedback_calls == []
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT status, error FROM issue_runs WHERE issue_number = ?", (issue.number,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "blocked"
+        assert "non-fast-forward" in str(row[1]).lower()
+    finally:
+        conn.close()
+
+    # Repeat the same blocked transition and verify we do not post duplicate operator comments.
+    orch._process_feedback_turn(tracked)
+    assert len(github.comments) == 1
+
+
+def test_feedback_turn_allows_cross_cycle_fast_forward_drift(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-new",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.compare_statuses[("head-old", "head-new")] = "ahead"
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=issue.number,
+        status="awaiting_feedback",
+        last_seen_head_sha="head-old",
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 1
+    assert state.list_pending_feedback_events(101) == ()
+    tracked_after = _tracked_state_from_store(state)
+    assert tracked_after.last_seen_head_sha == "head-new"
+    assert ("head-old", "head-new") in github.compare_calls
+    assert github.comments == []
+
+
+def test_feedback_turn_blocks_when_agent_rewrites_local_history(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.is_ancestor_results[("head-1", "rewritten-head")] = False
+
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    original_respond = agent.respond_to_feedback
+
+    def respond_and_rewrite(
+        *, session: AgentSession, turn: FeedbackTurn, cwd: Path
+    ) -> FeedbackResult:
+        git.current_head_sha_value = "rewritten-head"
+        return original_respond(session=session, turn=turn, cwd=cwd)
+
+    agent.respond_to_feedback = respond_and_rewrite  # type: ignore[method-assign]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 1
+    assert git.push_calls == []
+    assert len(state.list_pending_feedback_events(101)) == 1
+    assert state.list_tracked_pull_requests() == ()
+    assert len(github.comments) == 1
+    assert "non-fast-forward" in github.comments[0][1].lower()
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT status, error FROM issue_runs WHERE issue_number = ?", (issue.number,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "blocked"
+        assert "non-fast-forward" in str(row[1]).lower()
+    finally:
+        conn.close()
+
+
 def test_feedback_turn_marks_closed_pr_and_stops_tracking(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_feedback_loop=True)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -1518,6 +1698,196 @@ def test_feedback_turn_commit_no_staged_changes_blocks_and_keeps_event_pending(
         assert row is not None
         assert row[0] == "blocked"
         assert "no staged changes" in str(row[1]).lower()
+    finally:
+        conn.close()
+
+
+def test_feedback_turn_blocks_on_pre_finalize_remote_history_rewrite(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.compare_statuses[("head-1", "head-rewritten")] = "behind"
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_results = [
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-1"),
+            review_replies=(),
+            general_comment=None,
+            commit_message=None,
+            git_ops=(GitOpRequest(op="fetch_origin"),),
+        ),
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-2"),
+            review_replies=(),
+            general_comment=None,
+            commit_message=None,
+            git_ops=(),
+        ),
+    ]
+
+    def fetch_and_rewrite(checkout_path: Path) -> None:
+        git.fetch_calls.append(checkout_path)
+        github.pr_snapshot = PullRequestSnapshot(
+            number=101,
+            title="Design PR",
+            body="Body",
+            head_sha="head-rewritten",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        )
+
+    git.fetch_origin = fetch_and_rewrite  # type: ignore[method-assign]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(git.fetch_calls) == 1
+    assert len(state.list_pending_feedback_events(101)) == 1
+    assert state.list_tracked_pull_requests() == ()
+    assert len(github.comments) == 1
+    assert "non-fast-forward" in github.comments[0][1].lower()
+
+
+def test_feedback_turn_marks_merged_when_pr_merges_before_finalize(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    original_respond = agent.respond_to_feedback
+
+    def respond_and_merge(
+        *, session: AgentSession, turn: FeedbackTurn, cwd: Path
+    ) -> FeedbackResult:
+        github.pr_snapshot = PullRequestSnapshot(
+            number=101,
+            title="Design PR",
+            body="Body",
+            head_sha="head-merged",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=True,
+        )
+        return original_respond(session=session, turn=turn, cwd=cwd)
+
+    agent.respond_to_feedback = respond_and_merge  # type: ignore[method-assign]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert state.list_tracked_pull_requests() == ()
+    assert len(state.list_pending_feedback_events(101)) == 1
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT status FROM issue_runs WHERE issue_number = ?", (issue.number,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "merged"
+    finally:
+        conn.close()
+
+
+def test_feedback_turn_marks_closed_when_pr_closes_before_finalize(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    original_respond = agent.respond_to_feedback
+
+    def respond_and_close(
+        *, session: AgentSession, turn: FeedbackTurn, cwd: Path
+    ) -> FeedbackResult:
+        github.pr_snapshot = PullRequestSnapshot(
+            number=101,
+            title="Design PR",
+            body="Body",
+            head_sha="head-closed",
+            base_sha="base-1",
+            draft=False,
+            state="closed",
+            merged=False,
+        )
+        return original_respond(session=session, turn=turn, cwd=cwd)
+
+    agent.respond_to_feedback = respond_and_close  # type: ignore[method-assign]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert state.list_tracked_pull_requests() == ()
+    assert len(state.list_pending_feedback_events(101)) == 1
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT status FROM issue_runs WHERE issue_number = ?", (issue.number,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "closed"
     finally:
         conn.close()
 

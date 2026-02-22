@@ -22,6 +22,7 @@ from mergexo.feedback_loop import (
     FeedbackEventRecord,
     append_action_token,
     compute_general_comment_token,
+    compute_history_rewrite_token,
     compute_review_reply_token,
     compute_turn_key,
     event_key,
@@ -30,7 +31,7 @@ from mergexo.feedback_loop import (
     is_bot_login,
 )
 from mergexo.git_ops import GitRepoManager
-from mergexo.github_gateway import GitHubGateway
+from mergexo.github_gateway import CompareCommitsStatus, GitHubGateway
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -51,6 +52,7 @@ from mergexo.state import (
 LOGGER = logging.getLogger("mergexo.orchestrator")
 _MAX_FEEDBACK_GIT_OP_ROUNDS = 3
 _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
+_ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
 
 
 @dataclass(frozen=True)
@@ -727,6 +729,21 @@ class Phase1Orchestrator:
                 )
                 return
 
+            if tracked.last_seen_head_sha and tracked.last_seen_head_sha != pr.head_sha:
+                transition_status = self._classify_remote_history_transition(
+                    older_sha=tracked.last_seen_head_sha,
+                    newer_sha=pr.head_sha,
+                )
+                if transition_status not in _ALLOWED_LINEAR_HISTORY_STATUSES:
+                    self._block_feedback_history_rewrite(
+                        tracked=tracked,
+                        expected_head_sha=tracked.last_seen_head_sha,
+                        observed_head_sha=pr.head_sha,
+                        phase="cross_cycle_drift",
+                        transition_status=transition_status,
+                    )
+                    return
+
             review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
             issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
             changed_files = self._github.list_pull_request_files(tracked.pr_number)
@@ -835,6 +852,7 @@ class Phase1Orchestrator:
                 issue_comments=pending_issue_comments,
                 changed_files=changed_files,
             )
+            turn_start_head = pr.head_sha
 
             feedback_outcome = self._run_feedback_agent_with_git_ops(
                 tracked=tracked,
@@ -846,6 +864,18 @@ class Phase1Orchestrator:
             if feedback_outcome is None:
                 return
             result, pr = feedback_outcome
+
+            local_head_sha = self._git.current_head_sha(lease.path)
+            if not self._git.is_ancestor(lease.path, turn_start_head, local_head_sha):
+                self._block_feedback_history_rewrite(
+                    tracked=tracked,
+                    expected_head_sha=turn_start_head,
+                    observed_head_sha=local_head_sha,
+                    phase="local_turn",
+                    transition_status="local_non_ancestor",
+                    state_head_sha=turn_start_head,
+                )
+                return
 
             if result.commit_message:
                 try:
@@ -905,6 +935,53 @@ class Phase1Orchestrator:
                             result="pr_closed",
                         )
                         return
+
+            refreshed_pr = self._github.get_pull_request(tracked.pr_number)
+            if refreshed_pr.merged:
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="merged",
+                    last_seen_head_sha=refreshed_pr.head_sha,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_merged",
+                )
+                return
+            if refreshed_pr.state.lower() != "open":
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="closed",
+                    last_seen_head_sha=refreshed_pr.head_sha,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_closed",
+                )
+                return
+
+            transition_status = self._classify_remote_history_transition(
+                older_sha=turn_start_head,
+                newer_sha=refreshed_pr.head_sha,
+            )
+            if transition_status not in _ALLOWED_LINEAR_HISTORY_STATUSES:
+                self._block_feedback_history_rewrite(
+                    tracked=tracked,
+                    expected_head_sha=turn_start_head,
+                    observed_head_sha=refreshed_pr.head_sha,
+                    phase="pre_finalize_remote",
+                    transition_status=transition_status,
+                )
+                return
+            pr = refreshed_pr
 
             expected_tokens: list[str] = []
             for review_reply in result.review_replies:
@@ -1225,6 +1302,77 @@ class Phase1Orchestrator:
                 )
             )
         return normalized
+
+    def _classify_remote_history_transition(
+        self, *, older_sha: str, newer_sha: str
+    ) -> CompareCommitsStatus:
+        if older_sha == newer_sha:
+            return "identical"
+        return self._github.compare_commits(older_sha, newer_sha)
+
+    def _block_feedback_history_rewrite(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        expected_head_sha: str,
+        observed_head_sha: str,
+        phase: str,
+        transition_status: str,
+        state_head_sha: str | None = None,
+    ) -> None:
+        token = compute_history_rewrite_token(
+            pr_number=tracked.pr_number,
+            expected_head_sha=expected_head_sha,
+            observed_head_sha=observed_head_sha,
+            reason=f"{phase}:{transition_status}",
+        )
+        if not self._token_exists_remotely(tracked.pr_number, token):
+            comment = (
+                "MergeXO feedback automation is blocked because the PR head moved in a "
+                "non-fast-forward way.\n\n"
+                f"- expected prior head: `{expected_head_sha}`\n"
+                f"- observed head: `{observed_head_sha}`\n"
+                f"- detected phase: `{phase}`\n"
+                f"- transition status: `{transition_status}`\n\n"
+                "Resolve by restoring linear history, or reset blocked state with an explicit "
+                "`--head-sha` override once the canonical head is confirmed."
+            )
+            self._github.post_issue_comment(
+                issue_number=tracked.pr_number,
+                body=append_action_token(body=comment, token=token),
+            )
+
+        error = (
+            "detected non-fast-forward PR history transition "
+            f"(phase={phase}, status={transition_status}, expected_head_sha={expected_head_sha}, "
+            f"observed_head_sha={observed_head_sha})"
+        )
+        self._state.mark_pr_status(
+            pr_number=tracked.pr_number,
+            issue_number=tracked.issue_number,
+            status="blocked",
+            last_seen_head_sha=state_head_sha if state_head_sha is not None else observed_head_sha,
+            error=error,
+        )
+        log_event(
+            LOGGER,
+            "history_rewrite_blocked",
+            issue_number=tracked.issue_number,
+            pr_number=tracked.pr_number,
+            phase=phase,
+            transition_status=transition_status,
+            expected_head_sha=expected_head_sha,
+            observed_head_sha=observed_head_sha,
+        )
+        log_event(
+            LOGGER,
+            "feedback_turn_blocked",
+            issue_number=tracked.issue_number,
+            pr_number=tracked.pr_number,
+            reason="history_rewrite_detected",
+            phase=phase,
+            transition_status=transition_status,
+        )
 
     def _token_exists_remotely(self, pr_number: int, token: str) -> bool:
         return token in self._fetch_remote_action_tokens(pr_number)
