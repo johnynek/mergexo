@@ -14,6 +14,7 @@ class Issue:
     body: str
     html_url: str
     labels: tuple[str, ...]
+    author_login: str = ""
 
 
 @dataclass(frozen=True)

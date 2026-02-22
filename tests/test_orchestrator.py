@@ -21,6 +21,7 @@ from mergexo.agent_adapter import (
     ReviewReply,
 )
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
+from mergexo.config import AuthConfig
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -193,6 +194,7 @@ class FakeGitHub:
             body="Body",
             html_url=f"https://example/issues/{issue_number}",
             labels=("agent:design",),
+            author_login="issue-author",
         )
 
     def get_pull_request(self, pr_number: int) -> PullRequestSnapshot:
@@ -438,7 +440,11 @@ class FakeState:
 
 
 def _config(
-    tmp_path: Path, *, worker_count: int = 1, enable_feedback_loop: bool = False
+    tmp_path: Path,
+    *,
+    worker_count: int = 1,
+    enable_feedback_loop: bool = False,
+    allowed_users: tuple[str, ...] = ("issue-author", "reviewer"),
 ) -> AppConfig:
     return AppConfig(
         runtime=RuntimeConfig(
@@ -460,6 +466,7 @@ def _config(
             remote_url=None,
         ),
         codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
+        auth=AuthConfig(allowed_users=frozenset(login.lower() for login in allowed_users)),
     )
 
 
@@ -467,6 +474,7 @@ def _issue(
     number: int = 7,
     title: str = "Add worker scheduler",
     labels: tuple[str, ...] = ("agent:design",),
+    author_login: str = "issue-author",
 ) -> Issue:
     return Issue(
         number=number,
@@ -474,6 +482,7 @@ def _issue(
         body="Body",
         html_url=f"https://example/issues/{number}",
         labels=labels,
+        author_login=author_login,
     )
 
 
@@ -600,6 +609,25 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     assert state.saved_sessions == [(7, "codex", "thread-123")]
 
 
+def test_process_issue_rejects_unauthorized_author_before_side_effects(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, allowed_users=("reviewer",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(RuntimeError, match="not allowed by auth.allowed_users"):
+        orch._process_issue(_issue(author_login="outsider"), "design_doc")
+
+    assert git.ensure_checkout_calls == []
+    assert git.prepare_calls == []
+    assert git.branch_calls == []
+    assert github.created_prs == []
+    assert github.comments == []
+
+
 def test_process_issue_bugfix_flow_happy_path(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -700,6 +728,31 @@ def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
     )
     assert "Design source PR: https://example/pr/44" in github.created_prs[0][3]
     assert github.comments == [(7, "Opened implementation PR: https://example/pr/101")]
+
+
+def test_process_implementation_candidate_rejects_unauthorized_author(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, allowed_users=("reviewer",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[_issue(author_login="outsider")])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    with pytest.raises(RuntimeError, match="not allowed by auth.allowed_users"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            )
+        )
+
+    assert git.ensure_checkout_calls == []
+    assert git.prepare_calls == []
+    assert github.created_prs == []
+    assert github.comments == []
+    assert len(agent.implementation_calls) == 0
 
 
 def test_process_implementation_candidate_requires_design_doc(tmp_path: Path) -> None:
@@ -909,6 +962,25 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
     running_future: Future[WorkResult] = Future()
     orch._running = {99: running_future, 100: running_future}
     orch._enqueue_new_work(pool)
+
+
+def test_enqueue_new_work_skips_unauthorized_issue_authors(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=2, allowed_users=("reviewer",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(1, "One", author_login="outsider")])
+    agent = FakeAgent()
+    state = FakeState(allowed={1})
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    class FakePool:
+        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow
+            raise AssertionError("submit should not be called for unauthorized issues")
+
+    orch._enqueue_new_work(FakePool())
+
+    assert state.running == []
+    assert orch._running == {}
 
 
 def test_enqueue_implementation_work_paths(tmp_path: Path) -> None:
@@ -1182,6 +1254,49 @@ def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
     tracked_again = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked_again)
     assert len(agent.feedback_calls) == 1
+
+
+def test_feedback_turn_blocks_legacy_tracked_pr_when_issue_author_unauthorized(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("reviewer",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(author_login="outsider")
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment()]
+    github.issue_comments = [_issue_comment()]
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert agent.feedback_calls == []
+    assert github.comments == []
+    assert github.review_replies == []
+    assert state.list_pending_feedback_events(101) == ()
+    assert state.list_tracked_pull_requests() == ()
+    blocked = state.list_blocked_pull_requests()
+    assert len(blocked) == 1
+    assert blocked[0].pr_number == 101
+    assert blocked[0].error is not None
+    assert "not allowed" in blocked[0].error
 
 
 def test_feedback_turn_retry_after_crash_does_not_duplicate_replies(
@@ -2097,6 +2212,165 @@ def test_normalize_filters_tokenized_comments(tmp_path: Path) -> None:
     assert normalized_review == []
     assert len(normalized_issue) == 1
     assert normalized_issue[0][0].kind == "issue"
+
+
+def test_normalize_filters_unauthorized_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("issue-author", "reviewer"))
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    unauthorized_review = PullRequestReviewComment(
+        comment_id=2,
+        body="Please change this",
+        path="src/a.py",
+        line=1,
+        side="RIGHT",
+        in_reply_to_id=None,
+        user_login="outsider",
+        html_url="u2",
+        created_at="t2",
+        updated_at="t2",
+    )
+    unauthorized_issue = PullRequestIssueComment(
+        comment_id=4,
+        body="Please update",
+        user_login="outsider",
+        html_url="u4",
+        created_at="t4",
+        updated_at="t4",
+    )
+
+    normalized_review = orch._normalize_review_events(
+        pr_number=10,
+        issue_number=20,
+        comments=[_review_comment(comment_id=1), unauthorized_review],
+    )
+    normalized_issue = orch._normalize_issue_events(
+        pr_number=10,
+        issue_number=20,
+        comments=[_issue_comment(comment_id=3), unauthorized_issue],
+    )
+
+    assert tuple(event.comment_id for event, _ in normalized_review) == (1,)
+    assert tuple(event.comment_id for event, _ in normalized_issue) == (3,)
+
+
+def test_feedback_turn_processes_only_authorized_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("issue-author", "reviewer"))
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [
+        _review_comment(comment_id=11),
+        PullRequestReviewComment(
+            comment_id=12,
+            body="Unauthorized review",
+            path="src/a.py",
+            line=2,
+            side="RIGHT",
+            in_reply_to_id=None,
+            user_login="outsider",
+            html_url="https://example/review/12",
+            created_at="2026-02-21T00:00:00Z",
+            updated_at="2026-02-21T00:00:00Z",
+        ),
+    ]
+    github.issue_comments = [
+        _issue_comment(comment_id=21),
+        PullRequestIssueComment(
+            comment_id=22,
+            body="Unauthorized issue feedback",
+            user_login="outsider",
+            html_url="https://example/issue-comment/22",
+            created_at="2026-02-21T00:00:00Z",
+            updated_at="2026-02-21T00:00:00Z",
+        ),
+    ]
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 1
+    turn = agent.feedback_calls[0][1]
+    assert tuple(comment.comment_id for comment in turn.review_comments) == (11,)
+    assert tuple(comment.comment_id for comment in turn.issue_comments) == (21,)
+    assert state.list_pending_feedback_events(101) == ()
+
+
+def test_feedback_turn_ignores_all_unauthorized_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("issue-author", "reviewer"))
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [
+        PullRequestReviewComment(
+            comment_id=12,
+            body="Unauthorized review",
+            path="src/a.py",
+            line=2,
+            side="RIGHT",
+            in_reply_to_id=None,
+            user_login="outsider",
+            html_url="https://example/review/12",
+            created_at="2026-02-21T00:00:00Z",
+            updated_at="2026-02-21T00:00:00Z",
+        ),
+    ]
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=22,
+            body="Unauthorized issue feedback",
+            user_login="outsider",
+            html_url="https://example/issue-comment/22",
+            created_at="2026-02-21T00:00:00Z",
+            updated_at="2026-02-21T00:00:00Z",
+        ),
+    ]
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number, "agent/design/7-add-worker-scheduler", 101, "https://example/pr/101"
+    )
+    state.save_agent_session(issue_number=issue.number, adapter="codex", thread_id="thread-123")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert agent.feedback_calls == []
+    assert state.list_pending_feedback_events(101) == ()
 
 
 def test_run_feedback_agent_with_git_ops_round_trip(tmp_path: Path) -> None:

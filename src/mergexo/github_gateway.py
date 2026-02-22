@@ -44,6 +44,7 @@ class GitHubGateway:
                     body=issue.body,
                     html_url=issue.html_url,
                     labels=tuple(merged_labels),
+                    author_login=existing.author_login or issue.author_login,
                 )
 
         issues = [deduped[number] for number in sorted(deduped)]
@@ -74,6 +75,7 @@ class GitHubGateway:
             title = _as_string(item_obj.get("title"))
             body = _as_string(item_obj.get("body"))
             html_url = _as_string(item_obj.get("html_url"))
+            user_obj = _as_object_dict(item_obj.get("user"))
             labels_obj = item_obj.get("labels")
             label_names: list[str] = []
             if isinstance(labels_obj, list):
@@ -91,6 +93,7 @@ class GitHubGateway:
                     body=body,
                     html_url=html_url,
                     labels=tuple(label_names),
+                    author_login=_as_login(user_obj.get("login") if user_obj else None),
                 )
             )
         log_event(
@@ -132,6 +135,7 @@ class GitHubGateway:
         title = _as_string(payload_obj.get("title"))
         body = _as_string(payload_obj.get("body"))
         html_url = _as_string(payload_obj.get("html_url"))
+        user_obj = _as_object_dict(payload_obj.get("user"))
         labels_obj = payload_obj.get("labels")
         label_names: list[str] = []
         if isinstance(labels_obj, list):
@@ -149,7 +153,12 @@ class GitHubGateway:
             issue_number=number,
         )
         return Issue(
-            number=number, title=title, body=body, html_url=html_url, labels=tuple(label_names)
+            number=number,
+            title=title,
+            body=body,
+            html_url=html_url,
+            labels=tuple(label_names),
+            author_login=_as_login(user_obj.get("login") if user_obj else None),
         )
 
     def get_pull_request(self, pr_number: int) -> PullRequestSnapshot:
@@ -345,6 +354,12 @@ def _as_optional_str(value: object) -> str | None:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _as_login(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
 
 
 def _as_int(value: object, *, field: str) -> int:

@@ -22,6 +22,11 @@ design_docs_dir = "docs/design"
 # Optional explicit remote URL. Defaults to git@github.com:<owner>/<name>.git
 # remote_url = "git@github.com:johnynek/target-repo.git"
 
+[auth]
+# Required allowlist of GitHub usernames. Only these users can trigger issue intake
+# and feedback-loop processing. Matching is case-insensitive.
+allowed_users = ["maintainer1", "maintainer2"]
+
 [codex]
 enabled = true
 # model = "gpt-5-codex"
