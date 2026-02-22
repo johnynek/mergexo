@@ -3,6 +3,7 @@ from __future__ import annotations
 from mergexo.feedback_loop import (
     append_action_token,
     compute_general_comment_token,
+    compute_history_rewrite_token,
     compute_review_reply_token,
     compute_turn_key,
     event_key,
@@ -45,6 +46,29 @@ def test_action_token_helpers() -> None:
     # Empty body should still emit a valid marker.
     marker_only = append_action_token(body="   ", token=general_token)
     assert marker_only == f"<!-- mergexo-action:{general_token} -->"
+
+
+def test_history_rewrite_token_is_stable_and_specific() -> None:
+    token_a = compute_history_rewrite_token(
+        pr_number=12,
+        expected_head_sha="abc",
+        observed_head_sha="def",
+        reason="cross_cycle:ahead",
+    )
+    token_b = compute_history_rewrite_token(
+        pr_number=12,
+        expected_head_sha="abc",
+        observed_head_sha="def",
+        reason="cross_cycle:ahead",
+    )
+    token_c = compute_history_rewrite_token(
+        pr_number=12,
+        expected_head_sha="abc",
+        observed_head_sha="xyz",
+        reason="cross_cycle:ahead",
+    )
+    assert token_a == token_b
+    assert token_a != token_c
 
 
 def test_bot_detection() -> None:

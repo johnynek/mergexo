@@ -318,7 +318,12 @@ class StateStore:
             for issue_number, branch, pr_number, pr_url in rows
         )
 
-    def reset_blocked_pull_requests(self, *, pr_numbers: tuple[int, ...] | None = None) -> int:
+    def reset_blocked_pull_requests(
+        self,
+        *,
+        pr_numbers: tuple[int, ...] | None = None,
+        last_seen_head_sha_override: str | None = None,
+    ) -> int:
         if pr_numbers is not None and not pr_numbers:
             return 0
 
@@ -345,15 +350,27 @@ class StateStore:
             issue_numbers = tuple(sorted({int(row[1]) for row in rows}))
 
             pr_placeholders = ",".join("?" for _ in blocked_pr_numbers)
-            conn.execute(
-                f"""
-                UPDATE pr_feedback_state
-                SET status = 'awaiting_feedback',
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE pr_number IN ({pr_placeholders})
-                """,
-                blocked_pr_numbers,
-            )
+            if last_seen_head_sha_override is None:
+                conn.execute(
+                    f"""
+                    UPDATE pr_feedback_state
+                    SET status = 'awaiting_feedback',
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE pr_number IN ({pr_placeholders})
+                    """,
+                    blocked_pr_numbers,
+                )
+            else:
+                conn.execute(
+                    f"""
+                    UPDATE pr_feedback_state
+                    SET status = 'awaiting_feedback',
+                        last_seen_head_sha = ?,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE pr_number IN ({pr_placeholders})
+                    """,
+                    tuple([last_seen_head_sha_override, *blocked_pr_numbers]),
+                )
 
             conn.executemany(
                 """

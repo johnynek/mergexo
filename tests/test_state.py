@@ -226,6 +226,11 @@ def test_list_blocked_and_reset_pull_requests(tmp_path: Path) -> None:
     blocked_after_single_reset = store.list_blocked_pull_requests()
     assert [item.pr_number for item in blocked_after_single_reset] == [102]
 
+    tracked_after_single_reset = {
+        item.pr_number: item for item in store.list_tracked_pull_requests()
+    }
+    assert tracked_after_single_reset[101].last_seen_head_sha == "head-1"
+
     pending_after_reset = store.list_pending_feedback_events(101)
     assert len(pending_after_reset) == 1
     assert pending_after_reset[0].event_key == "101:review:1:2026-02-22T00:00:00Z"
@@ -237,6 +242,46 @@ def test_list_blocked_and_reset_pull_requests(tmp_path: Path) -> None:
     reset_all_count = store.reset_blocked_pull_requests()
     assert reset_all_count == 1
     assert store.list_blocked_pull_requests() == ()
+
+
+def test_reset_blocked_pull_requests_with_head_override_updates_last_seen(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_completed(8, "agent/design/8", 101, "https://example/pr/101")
+    store.mark_pr_status(
+        pr_number=101,
+        issue_number=8,
+        status="blocked",
+        last_seen_head_sha="head-old",
+        error="rewrite detected",
+    )
+
+    store.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:review:1:2026-02-22T00:00:00Z",
+                pr_number=101,
+                issue_number=8,
+                kind="review",
+                comment_id=1,
+                updated_at="2026-02-22T00:00:00Z",
+            ),
+        )
+    )
+
+    reset_count = store.reset_blocked_pull_requests(
+        pr_numbers=(101,),
+        last_seen_head_sha_override="head-new",
+    )
+    assert reset_count == 1
+
+    tracked = store.list_tracked_pull_requests()
+    assert len(tracked) == 1
+    assert tracked[0].last_seen_head_sha == "head-new"
+    pending = store.list_pending_feedback_events(101)
+    assert len(pending) == 1
+    assert pending[0].event_key == "101:review:1:2026-02-22T00:00:00Z"
 
 
 def test_reset_blocked_pull_requests_noop_paths(tmp_path: Path) -> None:

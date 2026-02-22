@@ -6,7 +6,7 @@ import logging
 
 from mergexo.config import RepoConfig, RuntimeConfig
 from mergexo.observability import log_event
-from mergexo.shell import run
+from mergexo.shell import CommandError, run
 
 
 LOGGER = logging.getLogger("mergexo.git_ops")
@@ -184,6 +184,18 @@ class GitRepoManager:
 
     def current_head_sha(self, checkout_path: Path) -> str:
         return run(["git", "-C", str(checkout_path), "rev-parse", "HEAD"]).strip()
+
+    def is_ancestor(self, checkout_path: Path, older_sha: str, newer_sha: str) -> bool:
+        if older_sha == newer_sha:
+            return True
+        try:
+            merge_base = run(
+                ["git", "-C", str(checkout_path), "merge-base", older_sha, newer_sha]
+            ).strip()
+        except CommandError:
+            # Missing or unrelated commits should be treated as non-ancestor in guard checks.
+            return False
+        return merge_base == older_sha
 
     def _checkout_remote_branch(self, checkout_path: Path, branch: str) -> None:
         run(["git", "-C", str(checkout_path), "checkout", "-B", branch, f"origin/{branch}"])

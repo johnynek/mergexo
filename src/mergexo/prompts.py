@@ -247,6 +247,9 @@ Rules:
 - Allowed git_ops are exactly: `fetch_origin`, `merge_origin_default_branch`.
 - If you need MergeXO to run one of those git operations (for example because of sandbox git metadata limits), request it via git_ops and set commit_message to null for that response.
 - When git_ops are requested, do not post proposal-only review replies yet; wait for the follow-up turn with operation results and then implement/finalize.
+- Never rewrite git history. Do not run: `git rebase`, `git commit --amend`, `git reset`, `git push --force`, `git push --force-with-lease`.
+- Keep history append-only: only add new commits on top of the current PR head.
+- If you think rewrite is necessary, do not request commit_message; explain the constraint in general_comment so a human can decide.
 - If you provide commit_message, you MUST have edited repository files for this turn.
 - Only skip file edits when blocked by genuine ambiguity or missing requirements; in that case, set commit_message to null and ask a precise clarifying question in the review reply.
 - Do not claim you pushed or updated files unless you actually edited them in this turn.

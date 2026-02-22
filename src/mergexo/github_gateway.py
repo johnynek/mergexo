@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlencode
 
 from mergexo.models import (
@@ -18,6 +18,7 @@ from mergexo.shell import run
 
 
 LOGGER = logging.getLogger("mergexo.github_gateway")
+CompareCommitsStatus = Literal["ahead", "identical", "behind", "diverged"]
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,29 @@ class GitHubGateway:
             pr_number=snapshot.number,
         )
         return snapshot
+
+    def compare_commits(self, base_sha: str, head_sha: str) -> CompareCommitsStatus:
+        path = f"/repos/{self.owner}/{self.name}/compare/{base_sha}...{head_sha}"
+        payload = self._api_json("GET", path)
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for compare commits")
+
+        status_raw = _as_string(payload_obj.get("status")).strip().lower()
+        valid_statuses = {"ahead", "identical", "behind", "diverged"}
+        if status_raw not in valid_statuses:
+            raise RuntimeError(f"Unexpected GitHub compare status: {status_raw!r}")
+        status = cast(CompareCommitsStatus, status_raw)
+
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="compare_commits",
+            base_sha=base_sha,
+            head_sha=head_sha,
+            status=status,
+        )
+        return status
 
     def list_pull_request_files(self, pr_number: int) -> tuple[str, ...]:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/files?per_page=100"

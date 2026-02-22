@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 
 from mergexo.codex_adapter import CodexAdapter
 from mergexo.config import AppConfig, load_config
@@ -97,6 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show what would be reset without mutating state",
     )
+    blocked_reset_parser.add_argument(
+        "--head-sha",
+        type=str,
+        help="Override last_seen_head_sha when resetting blocked PRs",
+    )
 
     return parser
 
@@ -168,6 +174,7 @@ def _cmd_feedback_blocked(state: StateStore, args: argparse.Namespace) -> None:
             reset_all=bool(args.all),
             yes=bool(args.yes),
             dry_run=bool(args.dry_run),
+            head_sha_override=str(args.head_sha) if args.head_sha is not None else None,
         )
         return
     raise RuntimeError(f"Unknown blocked command: {args.blocked_command}")
@@ -212,9 +219,16 @@ def _cmd_feedback_blocked_reset(
     reset_all: bool,
     yes: bool,
     dry_run: bool,
+    head_sha_override: str | None,
 ) -> None:
     if reset_all and not (yes or dry_run):
         raise RuntimeError("--all requires --yes (or run with --dry-run)")
+    normalized_head_sha: str | None = None
+    if head_sha_override is not None:
+        candidate = head_sha_override.strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", candidate):
+            raise RuntimeError("--head-sha must be a hex git commit SHA (7-64 chars)")
+        normalized_head_sha = candidate.lower()
 
     blocked = state.list_blocked_pull_requests()
     blocked_by_pr = {item.pr_number: item for item in blocked}
@@ -231,14 +245,17 @@ def _cmd_feedback_blocked_reset(
         return
 
     if dry_run:
-        print(
-            "Would reset blocked pull requests: "
-            + ", ".join(str(pr_number) for pr_number in matched_pr_numbers)
+        summary = "Would reset blocked pull requests: " + ", ".join(
+            str(pr_number) for pr_number in matched_pr_numbers
         )
+        if normalized_head_sha is not None:
+            summary += f" (override last_seen_head_sha={normalized_head_sha})"
+        print(summary)
         return
 
     reset_count = state.reset_blocked_pull_requests(
-        pr_numbers=None if reset_all else matched_pr_numbers
+        pr_numbers=None if reset_all else matched_pr_numbers,
+        last_seen_head_sha_override=normalized_head_sha,
     )
     print(f"Reset {reset_count} blocked pull request(s).")
 

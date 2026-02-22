@@ -141,6 +141,10 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "Primary objective: resolve review feedback by editing repository files" in prompt
     assert "For comments on design docs" in prompt
     assert "Only skip file edits when blocked by genuine ambiguity" in prompt
+    assert "Never rewrite git history." in prompt
+    assert "`git rebase`" in prompt
+    assert "`git commit --amend`" in prompt
+    assert "Keep history append-only" in prompt
 
 
 def test_build_bugfix_prompt_requires_regression_tests() -> None:
