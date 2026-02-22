@@ -9,7 +9,6 @@ touch_paths:
   - src/mergexo/state.py
   - src/mergexo/git_ops.py
   - src/mergexo/service_runner.py
-  - src/mergexo/feedback_loop.py
   - README.md
   - mergexo.toml.example
   - tests/test_config.py
@@ -17,41 +16,6 @@ touch_paths:
   - tests/test_orchestrator.py
   - tests/test_state.py
   - tests/test_service_runner.py
-  - tests/test_feedback_loop.py
-  - tests/test_git_ops.py
-depends_on: []
-estimated_size: M
-generated_at: 2026-02-22T19:25:36Z
----
-
-# Multi repo support
-
-_Issue: #33 (https://github.com/johnynek/mergexo/issues/33)_
-
-## Summary
-
-Design for adding multi-repository monitoring to one MergeXO process with per-repo auth and operations configuration, while keeping restart and update global.
-
----
-issue: 33
-priority: 3
-touch_paths:
-  - src/mergexo/config.py
-  - src/mergexo/models.py
-  - src/mergexo/cli.py
-  - src/mergexo/orchestrator.py
-  - src/mergexo/state.py
-  - src/mergexo/git_ops.py
-  - src/mergexo/service_runner.py
-  - src/mergexo/feedback_loop.py
-  - README.md
-  - mergexo.toml.example
-  - tests/test_config.py
-  - tests/test_cli.py
-  - tests/test_orchestrator.py
-  - tests/test_state.py
-  - tests/test_service_runner.py
-  - tests/test_feedback_loop.py
   - tests/test_git_ops.py
 depends_on: []
 estimated_size: L
@@ -68,13 +32,13 @@ Allow one MergeXO process to monitor multiple repositories by supporting keyed r
 
 ## Context
 
-Current code assumes exactly one repo in `AppConfig.repo`, one `GitHubGateway`, one `GitRepoManager`, and state rows keyed only by issue and PR numbers. That breaks for multi-repo operation because issue and PR numbers collide across repos and auth policy must be per repo.
+Current code assumes exactly one repo in `AppConfig.repo`, one `GitHubGateway`, one `GitRepoManager`, and state rows keyed only by issue/PR numbers. That does not scale to multi-repo operation because issue/PR numbers collide across repositories and auth policy needs to be repo-specific.
 
 ## Goals
 
 1. Support one process monitoring N repositories from one config file.
-2. Keep per-repo configuration for `operations_issue_number`, `operator_logins`, and allowed users.
-3. Preserve clean migration from the current single-repo config.
+2. Keep per-repo configuration for `operations_issue_number`, `operator_logins`, and `allowed_users`.
+3. Keep a single internal runtime/data model regardless of one-repo or multi-repo config input.
 4. Keep restart and update behavior global to the process.
 
 ## Non-goals
@@ -82,185 +46,188 @@ Current code assumes exactly one repo in `AppConfig.repo`, one `GitHubGateway`, 
 1. Cross-repo dependency scheduling.
 2. Webhook redesign.
 3. Per-repo worker-count limits in this issue (worker count remains global).
-4. Multi-process distributed coordination.
+4. In-place migration from old single-repo DB schema.
 
 ## Proposed Architecture
 
-### 1. Config contract and parsing
+### 1. Config contract and normalization
 
-Add first-class multi-repo config in `src/mergexo/config.py`:
+Update `src/mergexo/config.py` to normalize all config inputs into one internal representation: `AppConfig.repos`.
 
-1. `AppConfig` changes from `repo` to `repos`.
-2. `RepoConfig` adds:
-- `repo_id`: local identifier from table key.
-- `allowed_users`: per-repo normalized allowlist.
-3. Supported TOML shapes:
-- Legacy single repo: `[repo]` with existing fields. This remains supported.
+1. `RepoConfig` adds `repo_id` (local config identifier) and `allowed_users` (normalized allowlist).
+2. Supported TOML shapes:
+- Legacy single repo: `[repo]` + existing fields.
 - Multi repo: `[repo.<id>]` entries.
-4. Name inference rule:
-- For `[repo.<id>]`, if `name` is omitted, use `<id>` as repo name.
-- If `name` is provided, `<id>` is only a local config identifier.
-5. Auth migration:
-- `allowed_users` becomes a repo field.
-- Keep `[auth].allowed_users` as a deprecated fallback only for legacy single-repo configs during transition.
-- Reject `[auth]` when multiple repo tables are configured to avoid ambiguity.
-6. Validation:
-- At least one repo must be configured.
-- `repo_id` values must be unique.
-- `owner/name` pairs must be unique across repos.
-- Every repo must have a non-empty allowlist after fallback resolution.
+3. Internal normalization:
+- Legacy `[repo]` config is translated after parsing into one `RepoConfig` entry in `AppConfig.repos`.
+- Multi repo config directly populates multiple `RepoConfig` entries.
+4. `name` inference for keyed sections:
+- In `[repo.<id>]`, when `name` is omitted, use `<id>` as GitHub repo name.
+- When `name` is set, `<id>` remains only a local config identifier.
+5. `allowed_users` placement:
+- In multi-repo mode, `allowed_users` is required inside each `[repo.<id>]` section.
+- Global `[auth]` is not used in multi-repo mode.
+- In legacy single-repo mode, `[auth].allowed_users` can be read as a compatibility fallback and translated into the single normalized repo entry.
+
+Example multi-repo config shape:
+
+```toml
+[repo.mergexo]
+owner = "johnynek"
+# name omitted, resolves to "mergexo"
+default_branch = "main"
+trigger_label = "agent:design"
+design_docs_dir = "docs/design"
+allowed_users = ["alice", "bob"]
+
+[repo.bosatsu]
+owner = "johnynek"
+name = "bosatsu"
+default_branch = "main"
+trigger_label = "agent:design"
+design_docs_dir = "docs/design"
+allowed_users = ["alice"]
+```
 
 ### 2. Repo runtime contexts
 
-Refactor orchestration setup to build one `RepoRuntime` per configured repo:
+Create one runtime context per configured repo:
 
-- `RepoRuntime` contains `RepoConfig`, `GitHubGateway`, `GitRepoManager`, and a normalized operator allowlist.
-- `Phase1Orchestrator` becomes multi-repo aware and accepts a map of repo runtimes.
-- Logging adds `repo_full_name` to all repo-scoped events.
+- `RepoRuntime` contains `RepoConfig`, `GitHubGateway`, `GitRepoManager`, and normalized operator allowlist.
+- `Phase1Orchestrator` operates on a map/list of repo runtimes.
+- All repo-scoped logs include `repo_full_name`.
 
-### 3. Global worker scheduling with fairness
+### 3. Global worker scheduling and split polling cadence
 
-Keep `runtime.worker_count` as one global limit across all repos:
+Keep `runtime.worker_count` as one global capacity, and adjust polling to preserve global API rate expectations.
 
-1. Maintain global running sets keyed by `(repo_full_name, issue_number)` and `(repo_full_name, pr_number)`.
-2. Poll each repo for candidates, then enqueue with round-robin fairness so one busy repo does not starve others.
-3. Continue using one `ThreadPoolExecutor` capped by `worker_count`.
+1. Poll one repo per scheduler tick in round-robin order.
+2. With `runtime.poll_interval_seconds = P` and repo count `R`, each repo is polled every `P * R` seconds.
+3. This makes `poll_interval_seconds` approximate overall GitHub request cadence at the process level, rather than per-repo cadence.
+4. Work dispatch still uses global worker capacity and fair cross-repo scheduling.
 
-### 4. State store repo scoping
+### 4. Git layout and lazy clone strategy
 
-Update `src/mergexo/state.py` schema so all repo-bound records are keyed by repo:
+Keep per-repo mirrors and checkout roots, and make slot checkout cloning fully lazy.
+
+1. `init` / startup ensures mirror and directory layout only.
+2. Worker slot checkout for a repo is cloned only on first use of that `(repo, slot)` pair.
+3. Initial clone uses `--reference-if-able` against the per-repo mirror.
+4. Result: no `worker_count * repo_count` network clones at startup, and no repeated network fetch per slot clone.
+
+### 5. State schema: single repo-scoped form, no in-place migration
+
+Use one schema keyed by `repo_full_name` for all installs:
 
 - `issue_runs`: primary key `(repo_full_name, issue_number)`
 - `agent_sessions`: primary key `(repo_full_name, issue_number)`
 - `feedback_events`: primary key `(repo_full_name, event_key)`
 - `pr_feedback_state`: primary key `(repo_full_name, pr_number)`
 - `operator_commands`: primary key `(repo_full_name, command_key)`
-- `runtime_operations`: stays global, but add `request_repo_full_name` for restart reply routing.
+- `runtime_operations`: global single-flight rows, plus `request_repo_full_name` for restart reply routing.
 
-All state APIs take `repo_full_name` for read and write operations. Returned dataclasses include `repo_full_name` so CLI and orchestrator can disambiguate rows.
+For this issue, we intentionally do not implement in-place DB migration from the old schema.
 
-### 5. DB migration strategy
+1. Upgrade behavior: require reinitializing state DB after deploying this change.
+2. Operator flow: stop process, remove prior state DB, run `mergexo init`, restart service.
+3. Startup should detect obvious legacy-schema mismatch and fail with a clear reinit instruction.
 
-Because primary keys change, implement an explicit SQLite migration path:
-
-1. Detect legacy schema at startup.
-2. Create v2 tables with repo-scoped keys.
-3. Copy legacy rows into v2 using the configured legacy repo full name.
-4. Swap tables in one transaction.
-5. Keep migration idempotent.
-
-If migration data cannot be mapped to exactly one configured repo, fail fast with a clear error.
-
-### 6. Git layout and checkout strategy
-
-Keep per-repo mirrors and checkout roots, but avoid eager clone explosion:
-
-1. `GitRepoManager.ensure_layout` ensures mirror and root directories.
-2. Worker checkouts are created lazily on first slot use per repo.
-3. Paths remain repo-scoped under `base_dir/checkouts/<owner>/<name>/worker-xx`.
-
-### 7. Operator commands and auth behavior
+### 6. Operator commands and auth behavior
 
 Per-repo behavior:
 
 1. `allowed_users` gates issue intake and PR feedback for that repo only.
-2. `operations_issue_number` and `operator_logins` are resolved from that repo config.
-3. `/mergexo unblock` only affects blocked PRs in the same repo context.
+2. `operations_issue_number` and `operator_logins` are resolved from the same repo config.
+3. `/mergexo unblock` only affects blocked PRs in that repo context.
 
 Global behavior:
 
-1. `/mergexo restart` remains single-flight for the whole process.
-2. Restart command acknowledgement posts back to the originating repo issue thread using `request_repo_full_name`.
+1. `/mergexo restart` remains process-global single-flight.
+2. Restart status replies post back to the originating repo issue thread via stored `request_repo_full_name`.
 
-### 8. CLI changes
+### 7. CLI changes
 
 `src/mergexo/cli.py` updates:
 
-1. `init` initializes mirrors and layout for all configured repos.
-2. `run` and `service` construct multi-repo runtimes.
+1. `init` initializes mirrors/layout for all configured repos (without eagerly cloning slot checkouts).
+2. `run` and `service` construct multi-repo runtimes and use round-robin polling.
 3. `feedback blocked list` output includes `repo_full_name`.
 4. `feedback blocked reset` adds `--repo` filter and requires it with `--pr` when multiple repos are configured.
 
 ## Implementation Plan
 
-1. Refactor config models and parser in `src/mergexo/config.py`, including legacy compatibility logic.
-2. Update config consumers for `AppConfig.repos` in `src/mergexo/cli.py`, `src/mergexo/orchestrator.py`, and `src/mergexo/service_runner.py`.
-3. Move allowlist ownership from global auth to repo config and update auth checks in `src/mergexo/orchestrator.py`.
-4. Introduce repo-scoped runtime context objects in `src/mergexo/models.py` or `src/mergexo/orchestrator.py`.
-5. Add repo-scoped state schema and API signatures in `src/mergexo/state.py` with migration.
-6. Update feedback and operator key handling as needed in `src/mergexo/feedback_loop.py`.
-7. Adjust git manager behavior for lazy checkout creation in `src/mergexo/git_ops.py`.
-8. Update restart reply routing and global update branch sourcing in `src/mergexo/service_runner.py`.
-9. Update docs and sample config in `README.md` and `mergexo.toml.example`.
-10. Expand tests across config, CLI, orchestrator, state, feedback, service runner, and git ops.
+1. Refactor config models and parser in `src/mergexo/config.py` to always produce normalized `AppConfig.repos`.
+2. Add `repo_id` and repo-local `allowed_users` handling to `RepoConfig` and related types in `src/mergexo/models.py` as needed.
+3. Update orchestrator setup in `src/mergexo/cli.py` and `src/mergexo/service_runner.py` to create one runtime context per repo.
+4. Implement round-robin per-tick repo polling and global worker fairness in `src/mergexo/orchestrator.py`.
+5. Update `src/mergexo/git_ops.py` so slot checkout clone occurs on first slot use, not during init/startup.
+6. Convert state APIs and schema in `src/mergexo/state.py` to repo-scoped keys and add legacy-schema detection with reinit error messaging.
+7. Ensure restart operations carry repo origin for reply routing in `src/mergexo/state.py`, `src/mergexo/orchestrator.py`, and `src/mergexo/service_runner.py`.
+8. Update docs and config examples in `README.md` and `mergexo.toml.example`.
+9. Expand tests across config, CLI, orchestrator, state, service runner, and git ops.
 
 ## Testing Plan
 
 1. Config parsing:
-- legacy `[repo]` plus `[auth]` still loads.
-- `[repo.<id>]` multi config loads and normalizes ids and names correctly.
-- `name` omission uses table id.
-- invalid mixed modes and duplicate repos fail.
+- legacy `[repo]` config normalizes to a single `AppConfig.repos` entry.
+- `[repo.<id>]` config supports omitted/explicit `name` and required per-repo `allowed_users`.
+- invalid mixed/duplicate repo definitions fail with clear errors.
 
 2. Orchestrator behavior:
 - two repos in one process both enqueue and process work.
-- issue and PR number collisions across repos remain isolated.
+- issue/PR number collisions across repos remain isolated.
 - per-repo allowlist and operator allowlist enforcement works independently.
-- restart request from repo A drains globally and replies in repo A thread.
+- with three repos and `poll_interval_seconds = 600`, each repo is polled every 1800 seconds.
 
-3. State behavior:
-- all APIs operate correctly with repo-scoped keys.
-- migration preserves existing single-repo data.
-- blocked reset works with repo filters.
+3. Git behavior:
+- init/startup does not clone all slot checkouts.
+- first use of a slot for a repo performs lazy clone from mirror.
 
-4. CLI behavior:
-- `init` reports all repos.
-- feedback list and reset include repo disambiguation.
-- multi-repo reset requires repo when `--pr` is used.
+4. State behavior:
+- repo-scoped keys are used in all state read/write paths.
+- startup with legacy schema returns a clear error instructing reinit.
 
-5. Performance and safety:
-- startup does not clone `worker_count * repo_count` checkouts eagerly.
-- round-robin scheduling prevents starvation in synthetic backlog tests.
+5. CLI behavior:
+- `feedback blocked list` displays `repo_full_name`.
+- `feedback blocked reset --pr` requires repo disambiguation in multi-repo mode.
 
 ## Acceptance Criteria
 
 1. A config with two `[repo.<id>]` entries runs one process that polls both repos.
-2. Existing single-repo configs continue to run without mandatory immediate rewrite.
-3. In `[repo.<id>]`, omitted `name` resolves to `<id>`, and explicit `name` overrides only repo name, not id.
-4. `allowed_users` is enforced per repo for issue intake and feedback comments.
-5. `operations_issue_number` and `operator_logins` are enforced per repo.
-6. The same issue number in two repos can run concurrently without state collisions.
-7. The same PR number in two repos can be tracked independently in feedback state.
-8. `feedback blocked list` clearly identifies repo for each row.
-9. `feedback blocked reset --pr` in multi-repo mode requires repo disambiguation and only mutates that repo rows.
-10. `/mergexo restart` remains global single-flight and posts result in the originating repo thread.
-11. State migration from legacy single-repo schema to repo-scoped schema completes without data loss for tracked runs.
-12. Startup clone behavior is lazy enough to avoid cloning all worker slots for all repos during init.
+2. For multi-repo configs, `allowed_users` is configured in each repo section and enforced per repo.
+3. Legacy single-repo config input is normalized into one internal repo entry after parsing.
+4. The same issue number in two repos can run concurrently without state collisions.
+5. The same PR number in two repos can be tracked independently in feedback state.
+6. With `poll_interval_seconds = P` and `R` repos, each repo is polled every `P * R` seconds.
+7. `init` and startup do not eagerly clone all worker slots for all repos.
+8. First use of an unused `(repo, slot)` performs a lazy clone from that repo mirror.
+9. `feedback blocked list` clearly identifies repo for each row.
+10. `feedback blocked reset --pr` in multi-repo mode requires repo disambiguation and only mutates that repo’s rows.
+11. `/mergexo restart` remains global single-flight and posts result in the originating repo thread.
+12. Upgrading to this version requires state reinit; documented operator steps work end-to-end.
 
 ## Risks and Mitigations
 
-1. Risk: schema migration bugs could corrupt existing state.
-Mitigation: transactional migration, backup recommendation, and migration tests with real legacy fixtures.
+1. Risk: requiring state reinit drops historical local run metadata.
+Mitigation: explicit rollout/runbook steps and clear startup error messaging for legacy DB detection.
 
-2. Risk: API usage scales linearly with repo count and may hit GitHub limits.
-Mitigation: per-repo poll pacing, keep polling interval configurable, and add repo-level metrics.
+2. Risk: API usage scales with repo count.
+Mitigation: round-robin per-tick polling so configured interval represents process-level GitHub polling cadence.
 
 3. Risk: one noisy repo starves others.
-Mitigation: round-robin enqueue policy with global capacity checks.
+Mitigation: fair cross-repo scheduling with global capacity checks.
 
 4. Risk: disk growth from many repo checkout trees.
-Mitigation: lazy checkout creation and clear cleanup guidance in docs.
+Mitigation: lazy slot clone strategy plus shared mirror references.
 
 5. Risk: operator confusion when resetting blocked PRs across repos.
 Mitigation: require repo disambiguation for targeted reset and include repo in CLI output.
 
 ## Rollout Notes
 
-1. Release parser support first with legacy compatibility enabled.
-2. Upgrade one existing single-repo install and verify no behavior change.
-3. Add a second low-traffic repo using `[repo.<id>]` and run in canary mode.
-4. Validate per-repo auth and operator command boundaries with test accounts.
-5. Validate restart command from each repo operations issue posts in the correct thread.
-6. After canary stability, migrate production configs to multi-repo shape.
-7. Document deprecation timeline for global `[auth]` fallback.
-8. Keep a rollback plan: revert to one repo entry and restore pre-migration state DB backup if needed.
+1. Ship parser/runtime changes with updated docs showing per-repo `allowed_users`.
+2. Before upgrade, stop MergeXO and remove old state DB.
+3. Run `mergexo init` to recreate state and mirrors under the new expectations.
+4. Start service and canary with two repos.
+5. Validate per-repo auth boundaries and operator command routing.
+6. Validate split polling cadence and GitHub request volume against expectations.
