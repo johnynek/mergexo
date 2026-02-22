@@ -213,3 +213,6 @@ def test_build_implementation_prompt_links_design_context() -> None:
     assert "Source design PR: #144 (https://example/pr/144)" in prompt
     assert "blocked_reason" in prompt
     assert "Merged design doc markdown" in prompt
+    assert "Re-read the full diff against main." in prompt
+    assert "Add concise comments around subtle logic" in prompt
+    assert "Re-run formatting and CI-required checks from docs/python_style.md." in prompt

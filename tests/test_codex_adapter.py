@@ -300,6 +300,8 @@ def test_start_implementation_from_design_happy_path(
         assert "implementation agent" in input_text
         assert "docs/design/1-issue.md" in input_text
         assert "Source design PR: #77 (https://example/pr/77)" in input_text
+        assert "Re-read the full diff against main." in input_text
+        assert "Re-run formatting and CI-required checks from docs/python_style.md." in input_text
         idx = cmd.index("--output-last-message")
         Path(cmd[idx + 1]).write_text(
             json.dumps(

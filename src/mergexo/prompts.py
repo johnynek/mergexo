@@ -150,6 +150,14 @@ Output requirements:
 - Keep changes aligned to the design doc scope unless explicitly blocked by missing requirements.
 - Return PR metadata with a clear summary of what changed.
 - If you cannot proceed safely, return a blocked_reason.
+- Before finalizing your output:
+  - Re-read the full diff against {default_branch}.
+  - Re-read the design doc and any PR comments provided in context.
+  - Confirm all requested work is addressed.
+  - Minimize duplication and remove confusing or unnecessary code.
+  - Add concise comments around subtle logic to help future readers.
+  - Re-run formatting and CI-required checks from {coding_guidelines_path}.
+  - Only finalize when those checks pass so MergeXO can commit and push confidently.
 
 Response format:
 - Return JSON only.
