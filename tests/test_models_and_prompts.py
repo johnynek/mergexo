@@ -132,3 +132,6 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "src/a.py" in prompt
     assert "turn_key" in prompt
     assert "If you provide commit_message" in prompt
+    assert "Primary objective: resolve review feedback by editing repository files" in prompt
+    assert "For comments on design docs" in prompt
+    assert "Only skip file edits when blocked by genuine ambiguity" in prompt
