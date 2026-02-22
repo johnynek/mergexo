@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+
+IssueFlow = Literal["design_doc", "bugfix", "small_job"]
 
 
 @dataclass(frozen=True)

@@ -107,10 +107,15 @@ class GitRepoManager:
         )
         run(["git", "-C", str(checkout_path), "checkout", "-B", branch])
 
-    def commit_all(self, checkout_path: Path, message: str) -> None:
+    def list_staged_files(self, checkout_path: Path) -> tuple[str, ...]:
         run(["git", "-C", str(checkout_path), "add", "-A"])
         diff = run(["git", "-C", str(checkout_path), "diff", "--cached", "--name-only"]).strip()
         if not diff:
+            return ()
+        return tuple(line for line in diff.splitlines() if line.strip())
+
+    def commit_all(self, checkout_path: Path, message: str) -> None:
+        if not self.list_staged_files(checkout_path):
             raise RuntimeError("No staged changes to commit")
         log_event(
             LOGGER,

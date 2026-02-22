@@ -17,7 +17,7 @@ from mergexo.agent_adapter import (
     FeedbackTurn,
     GitOpRequest,
 )
-from mergexo.config import AppConfig
+from mergexo.config import AppConfig, RepoConfig
 from mergexo.feedback_loop import (
     FeedbackEventRecord,
     append_action_token,
@@ -34,6 +34,7 @@ from mergexo.github_gateway import GitHubGateway
 from mergexo.models import (
     GeneratedDesign,
     Issue,
+    IssueFlow,
     PullRequestIssueComment,
     PullRequestSnapshot,
     PullRequestReviewComment,
@@ -65,6 +66,18 @@ class _GitOpOutcome:
     op: str
     success: bool
     detail: str
+
+
+class DirectFlowError(RuntimeError):
+    """Base class for direct-flow startup failures."""
+
+
+class DirectFlowBlockedError(DirectFlowError):
+    """Agent reported it cannot safely proceed without more context."""
+
+
+class DirectFlowValidationError(DirectFlowError):
+    """Direct-flow output failed deterministic policy checks."""
 
 
 class SlotPool:
@@ -134,9 +147,25 @@ class Phase1Orchestrator:
                 time.sleep(self._config.runtime.poll_interval_seconds)
 
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
-        issues = self._github.list_open_issues_with_label(self._config.repo.trigger_label)
-        log_event(LOGGER, "issues_fetched", issue_count=len(issues))
+        labels = _trigger_labels(self._config.repo)
+        issues = self._github.list_open_issues_with_any_labels(labels)
+        log_event(LOGGER, "issues_fetched", issue_count=len(issues), label_count=len(labels))
         for issue in issues:
+            flow = _resolve_issue_flow(
+                issue=issue,
+                design_label=self._config.repo.trigger_label,
+                bugfix_label=self._config.repo.bugfix_label,
+                small_job_label=self._config.repo.small_job_label,
+            )
+            if flow is None:
+                log_event(
+                    LOGGER,
+                    "issue_skipped",
+                    issue_number=issue.number,
+                    reason="no_matching_trigger_label",
+                )
+                continue
+
             with self._running_lock:
                 if not self._has_capacity_locked():
                     log_event(
@@ -165,10 +194,10 @@ class Phase1Orchestrator:
                 continue
 
             self._state.mark_running(issue.number)
-            fut = pool.submit(self._process_issue, issue)
+            fut = pool.submit(self._process_issue, issue, flow)
             with self._running_lock:
                 self._running[issue.number] = fut
-            log_event(LOGGER, "issue_enqueued", issue_number=issue.number)
+            log_event(LOGGER, "issue_enqueued", issue_number=issue.number, flow=flow)
 
     def _enqueue_feedback_work(self, pool: ThreadPoolExecutor) -> None:
         tracked_prs = self._state.list_tracked_pull_requests()
@@ -275,7 +304,7 @@ class Phase1Orchestrator:
                     return
             time.sleep(1.0)
 
-    def _process_issue(self, issue: Issue) -> WorkResult:
+    def _process_issue(self, issue: Issue, flow: IssueFlow) -> WorkResult:
         lease = self._slot_pool.acquire()
         try:
             log_event(
@@ -283,88 +312,198 @@ class Phase1Orchestrator:
                 "issue_processing_started",
                 issue_number=issue.number,
                 slot=lease.slot,
+                flow=flow,
             )
             self._git.prepare_checkout(lease.path)
-
-            slug = _slugify(issue.title)
-            branch = f"agent/design/{issue.number}-{slug}"
-            self._git.create_or_reset_branch(lease.path, branch)
-
-            design_relpath = f"{self._config.repo.design_docs_dir}/{issue.number}-{slug}.md"
-            log_event(
-                LOGGER,
-                "design_turn_started",
-                issue_number=issue.number,
-                branch=branch,
-            )
-            start_result = self._agent.start_design_from_issue(
-                issue=issue,
-                repo_full_name=self._config.repo.full_name,
-                design_doc_path=design_relpath,
-                default_branch=self._config.repo.default_branch,
-                cwd=lease.path,
-            )
-            log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
-            generated = start_result.design
-            if start_result.session:
-                self._state.save_agent_session(
-                    issue_number=issue.number,
-                    adapter=start_result.session.adapter,
-                    thread_id=start_result.session.thread_id,
-                )
-
-            design_abs_path = lease.path / design_relpath
-            design_abs_path.parent.mkdir(parents=True, exist_ok=True)
-            design_abs_path.write_text(
-                _render_design_doc(issue=issue, design=generated),
-                encoding="utf-8",
-            )
-
-            self._git.commit_all(lease.path, f"docs: add design for issue #{issue.number}")
-            self._git.push_branch(lease.path, branch)
-
-            pr = self._github.create_pull_request(
-                title=f"Design doc for #{issue.number}: {generated.title}",
-                head=branch,
-                base=self._config.repo.default_branch,
-                body=(
-                    f"Design doc for issue #{issue.number}.\n\n"
-                    f"Refs #{issue.number}\n\n"
-                    f"Source issue: {issue.html_url}"
-                ),
-            )
-
-            self._github.post_issue_comment(
-                issue_number=issue.number,
-                body=f"Opened design PR: {pr.html_url}",
-            )
-
-            log_event(
-                LOGGER,
-                "issue_processing_completed",
-                issue_number=issue.number,
-                pr_number=pr.number,
-                branch=branch,
-            )
-            return WorkResult(
-                issue_number=issue.number,
-                branch=branch,
-                pr_number=pr.number,
-                pr_url=pr.html_url,
-            )
+            if flow == "design_doc":
+                return self._process_design_issue(issue=issue, checkout_path=lease.path)
+            return self._process_direct_issue(issue=issue, flow=flow, checkout_path=lease.path)
         except Exception as exc:  # noqa: BLE001
             log_event(
                 LOGGER,
                 "issue_processing_failed",
                 issue_number=issue.number,
+                flow=flow,
                 error_type=type(exc).__name__,
             )
+            # Re-raise by design: _reap_finished() consumes Future failures and marks
+            # the issue as failed in state without crashing the orchestrator loop.
             raise
         finally:
             try:
                 self._git.cleanup_slot(lease.path)
             finally:
                 self._slot_pool.release(lease)
+
+    def _process_design_issue(self, *, issue: Issue, checkout_path: Path) -> WorkResult:
+        slug = _slugify(issue.title)
+        branch = _issue_branch(flow="design_doc", issue_number=issue.number, slug=slug)
+        self._git.create_or_reset_branch(checkout_path, branch)
+
+        design_relpath = f"{self._config.repo.design_docs_dir}/{issue.number}-{slug}.md"
+        log_event(
+            LOGGER,
+            "design_turn_started",
+            issue_number=issue.number,
+            branch=branch,
+        )
+        start_result = self._agent.start_design_from_issue(
+            issue=issue,
+            repo_full_name=self._config.repo.full_name,
+            design_doc_path=design_relpath,
+            default_branch=self._config.repo.default_branch,
+            cwd=checkout_path,
+        )
+        log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
+        generated = start_result.design
+        if start_result.session:
+            self._state.save_agent_session(
+                issue_number=issue.number,
+                adapter=start_result.session.adapter,
+                thread_id=start_result.session.thread_id,
+            )
+
+        design_abs_path = checkout_path / design_relpath
+        design_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        design_abs_path.write_text(
+            _render_design_doc(issue=issue, design=generated),
+            encoding="utf-8",
+        )
+
+        self._git.commit_all(checkout_path, f"docs: add design for issue #{issue.number}")
+        self._git.push_branch(checkout_path, branch)
+
+        pr = self._github.create_pull_request(
+            title=f"Design doc for #{issue.number}: {generated.title}",
+            head=branch,
+            base=self._config.repo.default_branch,
+            body=(
+                f"Design doc for issue #{issue.number}.\n\n"
+                f"Refs #{issue.number}\n\n"
+                f"Source issue: {issue.html_url}"
+            ),
+        )
+
+        self._github.post_issue_comment(
+            issue_number=issue.number,
+            body=f"Opened design PR: {pr.html_url}",
+        )
+
+        log_event(
+            LOGGER,
+            "issue_processing_completed",
+            issue_number=issue.number,
+            pr_number=pr.number,
+            branch=branch,
+            flow="design_doc",
+        )
+        return WorkResult(
+            issue_number=issue.number,
+            branch=branch,
+            pr_number=pr.number,
+            pr_url=pr.html_url,
+        )
+
+    def _process_direct_issue(
+        self,
+        *,
+        issue: Issue,
+        flow: IssueFlow,
+        checkout_path: Path,
+    ) -> WorkResult:
+        slug = _slugify(issue.title)
+        branch = _issue_branch(flow=flow, issue_number=issue.number, slug=slug)
+        self._git.create_or_reset_branch(checkout_path, branch)
+
+        if flow == "bugfix":
+            start_result = self._agent.start_bugfix_from_issue(
+                issue=issue,
+                repo_full_name=self._config.repo.full_name,
+                default_branch=self._config.repo.default_branch,
+                coding_guidelines_path=self._config.repo.coding_guidelines_path,
+                cwd=checkout_path,
+            )
+            flow_label = "bugfix"
+        elif flow == "small_job":
+            start_result = self._agent.start_small_job_from_issue(
+                issue=issue,
+                repo_full_name=self._config.repo.full_name,
+                default_branch=self._config.repo.default_branch,
+                coding_guidelines_path=self._config.repo.coding_guidelines_path,
+                cwd=checkout_path,
+            )
+            flow_label = "small-job"
+        else:
+            raise DirectFlowValidationError(f"Unsupported direct flow: {flow}")
+
+        if start_result.session:
+            self._state.save_agent_session(
+                issue_number=issue.number,
+                adapter=start_result.session.adapter,
+                thread_id=start_result.session.thread_id,
+            )
+
+        if start_result.blocked_reason:
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=(
+                    f"MergeXO {flow_label} flow was blocked for issue #{issue.number}: "
+                    f"{start_result.blocked_reason}"
+                ),
+            )
+            raise DirectFlowBlockedError(
+                f"{flow_label} flow blocked: {start_result.blocked_reason}"
+            )
+
+        if flow == "bugfix":
+            staged_files = self._git.list_staged_files(checkout_path)
+            if not _has_regression_test_changes(staged_files):
+                self._github.post_issue_comment(
+                    issue_number=issue.number,
+                    body=(
+                        "MergeXO bugfix flow requires at least one staged regression test under "
+                        "`tests/`. No PR was opened."
+                    ),
+                )
+                raise DirectFlowValidationError(
+                    "Bugfix flow requires at least one staged regression test under tests/"
+                )
+
+        commit_message = start_result.commit_message or _default_commit_message(
+            flow=flow, issue_number=issue.number
+        )
+        self._git.commit_all(checkout_path, commit_message)
+        self._git.push_branch(checkout_path, branch)
+
+        pr = self._github.create_pull_request(
+            title=start_result.pr_title,
+            head=branch,
+            base=self._config.repo.default_branch,
+            body=(
+                f"{start_result.pr_summary}\n\n"
+                f"Fixes #{issue.number}\n\n"
+                f"Source issue: {issue.html_url}"
+            ),
+        )
+
+        self._github.post_issue_comment(
+            issue_number=issue.number,
+            body=f"Opened {flow_label} PR: {pr.html_url}",
+        )
+        log_event(
+            LOGGER,
+            "issue_processing_completed",
+            issue_number=issue.number,
+            pr_number=pr.number,
+            branch=branch,
+            flow=flow,
+        )
+        return WorkResult(
+            issue_number=issue.number,
+            branch=branch,
+            pr_number=pr.number,
+            pr_url=pr.html_url,
+        )
 
     def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> None:
         lease = self._slot_pool.acquire()
@@ -925,6 +1064,51 @@ class Phase1Orchestrator:
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "issue"
+
+
+def _trigger_labels(repo: RepoConfig) -> tuple[str, ...]:
+    # Operators may intentionally configure overlapping labels across flows; dedupe avoids
+    # repeated GitHub queries while preserving first-occurrence precedence semantics.
+    labels: list[str] = []
+    for label in (repo.trigger_label, repo.bugfix_label, repo.small_job_label):
+        if label not in labels:
+            labels.append(label)
+    return tuple(labels)
+
+
+def _resolve_issue_flow(
+    *,
+    issue: Issue,
+    design_label: str,
+    bugfix_label: str,
+    small_job_label: str,
+) -> IssueFlow | None:
+    issue_labels = set(issue.labels)
+    if bugfix_label in issue_labels:
+        return "bugfix"
+    if small_job_label in issue_labels:
+        return "small_job"
+    if design_label in issue_labels:
+        return "design_doc"
+    return None
+
+
+def _issue_branch(*, flow: IssueFlow, issue_number: int, slug: str) -> str:
+    if flow == "design_doc":
+        return f"agent/design/{issue_number}-{slug}"
+    if flow == "bugfix":
+        return f"agent/bugfix/{issue_number}-{slug}"
+    return f"agent/small/{issue_number}-{slug}"
+
+
+def _default_commit_message(*, flow: IssueFlow, issue_number: int) -> str:
+    if flow == "bugfix":
+        return f"fix: resolve issue #{issue_number}"
+    return f"feat: implement issue #{issue_number}"
+
+
+def _has_regression_test_changes(paths: tuple[str, ...]) -> bool:
+    return any(path == "tests" or path.startswith("tests/") for path in paths)
 
 
 def _is_no_staged_changes_error(exc: RuntimeError) -> bool:

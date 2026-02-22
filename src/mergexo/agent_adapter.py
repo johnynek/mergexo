@@ -27,6 +27,15 @@ class DesignStartResult:
 
 
 @dataclass(frozen=True)
+class DirectStartResult:
+    pr_title: str
+    pr_summary: str
+    commit_message: str | None
+    blocked_reason: str | None
+    session: AgentSession | None
+
+
+@dataclass(frozen=True)
 class ReviewReply:
     review_comment_id: int
     body: str
@@ -71,6 +80,30 @@ class AgentAdapter(ABC):
         cwd: Path,
     ) -> DesignStartResult:
         """Start a PR lifecycle from an issue and produce an initial design artifact."""
+
+    @abstractmethod
+    def start_bugfix_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        cwd: Path,
+    ) -> DirectStartResult:
+        """Start a direct bugfix PR flow from an issue."""
+
+    @abstractmethod
+    def start_small_job_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        cwd: Path,
+    ) -> DirectStartResult:
+        """Start a direct small-job PR flow from an issue."""
 
     @abstractmethod
     def respond_to_feedback(

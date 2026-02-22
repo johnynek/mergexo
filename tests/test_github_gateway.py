@@ -13,7 +13,31 @@ from mergexo.github_gateway import (
     _as_object_dict,
     _as_string,
 )
+from mergexo.models import Issue
 from mergexo.observability import configure_logging
+
+
+def test_list_open_issues_with_any_labels_dedupes(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_list(self: GitHubGateway, label: str) -> list[Issue]:
+        _ = self
+        if label == "agent:design":
+            return [
+                Issue(number=2, title="Two", body="b", html_url="u2", labels=("agent:design",)),
+                Issue(number=1, title="One", body="b", html_url="u1", labels=("agent:design",)),
+            ]
+        if label == "agent:bugfix":
+            return [
+                Issue(number=2, title="Two", body="b", html_url="u2", labels=("agent:bugfix",)),
+            ]
+        return []
+
+    monkeypatch.setattr(GitHubGateway, "list_open_issues_with_label", fake_list)
+
+    issues = gateway.list_open_issues_with_any_labels(("agent:design", "agent:bugfix"))
+    assert [issue.number for issue in issues] == [1, 2]
+    assert issues[1].labels == ("agent:design", "agent:bugfix")
 
 
 def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.MonkeyPatch) -> None:

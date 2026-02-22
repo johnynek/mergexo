@@ -21,6 +21,9 @@ def _config(tmp_path: Path, *, worker_count: int = 2) -> tuple[RuntimeConfig, Re
         name="mergexo",
         default_branch="main",
         trigger_label="agent:design",
+        bugfix_label="agent:bugfix",
+        small_job_label="agent:small-job",
+        coding_guidelines_path="docs/python_style.md",
         design_docs_dir="docs/design",
         local_clone_source=None,
         remote_url=None,
@@ -192,6 +195,22 @@ def test_commit_all_raises_when_no_diff(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     with pytest.raises(RuntimeError, match="No staged changes"):
         manager.commit_all(tmp_path, "msg")
+
+
+def test_list_staged_files_parses_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[-3:] == ["diff", "--cached", "--name-only"]:
+            return "tests/test_x.py\nsrc/x.py\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    files = manager.list_staged_files(tmp_path)
+    assert files == ("tests/test_x.py", "src/x.py")
 
 
 def test_ensure_mirror_skips_clone_if_existing(

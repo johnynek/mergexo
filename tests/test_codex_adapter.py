@@ -193,6 +193,98 @@ def test_start_design_from_issue_returns_session(
     assert result.session.thread_id == "thread-abc"
 
 
+def test_start_bugfix_from_issue_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert "regression tests in tests/" in input_text
+        assert "docs/python_style.md" in input_text
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "pr_title": "Fix flaky scheduler",
+                    "pr_summary": "Adds a guard and regression test.",
+                    "commit_message": "fix: stabilize scheduler retries",
+                    "blocked_reason": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-bugfix"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.start_bugfix_from_issue(
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        cwd=tmp_path,
+    )
+
+    assert result.pr_title == "Fix flaky scheduler"
+    assert result.commit_message == "fix: stabilize scheduler retries"
+    assert result.blocked_reason is None
+    assert result.session is not None
+    assert result.session.thread_id == "thread-bugfix"
+
+
+def test_start_small_job_from_issue_can_return_blocked_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert "small-job agent" in input_text
+        assert "docs/python_style.md" in input_text
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "pr_title": "N/A",
+                    "pr_summary": "N/A",
+                    "commit_message": None,
+                    "blocked_reason": "Missing required repository context.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-small"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.start_small_job_from_issue(
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        cwd=tmp_path,
+    )
+
+    assert result.pr_title == "N/A"
+    assert result.commit_message is None
+    assert result.blocked_reason == "Missing required repository context."
+    assert result.session is not None
+    assert result.session.thread_id == "thread-small"
+
+
 def test_respond_to_feedback_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -274,6 +366,20 @@ def test_start_design_from_issue_rejects_disabled(tmp_path: Path) -> None:
             repo_full_name="johnynek/mergexo",
             design_doc_path="docs/design/1-issue.md",
             default_branch="main",
+            cwd=tmp_path,
+        )
+
+
+def test_start_bugfix_from_issue_rejects_disabled(tmp_path: Path) -> None:
+    adapter = CodexAdapter(
+        CodexConfig(enabled=False, model=None, sandbox=None, profile=None, extra_args=())
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        adapter.start_bugfix_from_issue(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            coding_guidelines_path="docs/python_style.md",
             cwd=tmp_path,
         )
 

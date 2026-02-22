@@ -44,6 +44,81 @@ Issue body:
 """.strip()
 
 
+def build_bugfix_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    coding_guidelines_path: str,
+) -> str:
+    return f"""
+You are the bugfix agent for repository {repo_full_name}.
+
+Task:
+- Resolve issue #{issue.number} directly with code changes.
+- Base branch is: {default_branch}
+- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
+- Reproduce the issue behavior from the report details.
+- Add or update regression tests in tests/ that fail before the fix and pass after the fix.
+
+Output requirements:
+- Implement the fix and any required supporting updates.
+- Return PR metadata with a clear summary of what changed.
+- If you cannot proceed safely, return a blocked_reason.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Issue title:
+{issue.title}
+
+Issue URL:
+{issue.html_url}
+
+Issue body:
+{issue.body}
+""".strip()
+
+
+def build_small_job_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    coding_guidelines_path: str,
+) -> str:
+    return f"""
+You are the small-job agent for repository {repo_full_name}.
+
+Task:
+- Implement issue #{issue.number} directly with focused code changes.
+- Base branch is: {default_branch}
+- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
+- Keep scope tight to the requested job.
+
+Output requirements:
+- Implement only what is needed for the requested change.
+- Return PR metadata with a concise summary of what changed.
+- If you cannot proceed safely, return a blocked_reason.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Issue title:
+{issue.title}
+
+Issue URL:
+{issue.html_url}
+
+Issue body:
+{issue.body}
+""".strip()
+
+
 def build_feedback_prompt(*, turn: FeedbackTurn) -> str:
     review_comments = [
         {

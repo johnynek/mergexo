@@ -25,6 +25,35 @@ class GitHubGateway:
     owner: str
     name: str
 
+    def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
+        deduped: dict[int, Issue] = {}
+        for label in labels:
+            for issue in self.list_open_issues_with_label(label):
+                existing = deduped.get(issue.number)
+                if existing is None:
+                    deduped[issue.number] = issue
+                    continue
+                merged_labels: list[str] = list(existing.labels)
+                for candidate in issue.labels:
+                    if candidate not in merged_labels:
+                        merged_labels.append(candidate)
+                deduped[issue.number] = Issue(
+                    number=issue.number,
+                    title=issue.title,
+                    body=issue.body,
+                    html_url=issue.html_url,
+                    labels=tuple(merged_labels),
+                )
+
+        issues = [deduped[number] for number in sorted(deduped)]
+        log_event(
+            LOGGER,
+            "issues_deduped",
+            fetched_label_count=len(labels),
+            deduped_issue_count=len(issues),
+        )
+        return issues
+
     def list_open_issues_with_label(self, label: str) -> list[Issue]:
         query = urlencode({"state": "open", "labels": label, "per_page": "100"})
         path = f"/repos/{self.owner}/{self.name}/issues?{query}"

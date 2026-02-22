@@ -9,6 +9,7 @@ from typing import cast
 from mergexo.agent_adapter import (
     AgentAdapter,
     AgentSession,
+    DirectStartResult,
     DesignStartResult,
     FeedbackResult,
     FeedbackTurn,
@@ -18,7 +19,12 @@ from mergexo.agent_adapter import (
 from mergexo.config import CodexConfig
 from mergexo.models import GeneratedDesign, Issue
 from mergexo.observability import log_event
-from mergexo.prompts import build_design_prompt, build_feedback_prompt
+from mergexo.prompts import (
+    build_bugfix_prompt,
+    build_design_prompt,
+    build_feedback_prompt,
+    build_small_job_prompt,
+)
 from mergexo.shell import run
 
 
@@ -35,6 +41,18 @@ _DESIGN_OUTPUT_SCHEMA: dict[str, object] = {
             "minItems": 1,
         },
         "design_doc_markdown": {"type": "string", "minLength": 1},
+    },
+}
+
+_DIRECT_OUTPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["pr_title", "pr_summary", "commit_message", "blocked_reason"],
+    "properties": {
+        "pr_title": {"type": "string", "minLength": 1},
+        "pr_summary": {"type": "string", "minLength": 1},
+        "commit_message": {"type": ["string", "null"]},
+        "blocked_reason": {"type": ["string", "null"]},
     },
 }
 
@@ -78,6 +96,40 @@ class CodexAdapter(AgentAdapter):
         return DesignStartResult(
             design=design, session=AgentSession(adapter="codex", thread_id=thread_id)
         )
+
+    def start_bugfix_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        cwd: Path,
+    ) -> DirectStartResult:
+        prompt = build_bugfix_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+        )
+        return self._start_direct_turn(issue=issue, flow_name="bugfix", prompt=prompt, cwd=cwd)
+
+    def start_small_job_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str,
+        cwd: Path,
+    ) -> DirectStartResult:
+        prompt = build_small_job_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+        )
+        return self._start_direct_turn(issue=issue, flow_name="small_job", prompt=prompt, cwd=cwd)
 
     def respond_to_feedback(
         self,
@@ -176,6 +228,81 @@ class CodexAdapter(AgentAdapter):
                 summary=summary,
                 design_doc_markdown=design_doc_markdown,
                 touch_paths=tuple(touch_paths),
+            ),
+            _extract_thread_id(raw_events),
+        )
+
+    def _start_direct_turn(
+        self,
+        *,
+        issue: Issue,
+        flow_name: str,
+        prompt: str,
+        cwd: Path,
+    ) -> DirectStartResult:
+        log_event(
+            LOGGER,
+            "direct_turn_started",
+            issue_number=issue.number,
+            flow=flow_name,
+        )
+        result, thread_id = self._run_direct_turn(prompt=prompt, cwd=cwd)
+        log_event(
+            LOGGER,
+            "direct_turn_completed",
+            issue_number=issue.number,
+            flow=flow_name,
+            thread_id=thread_id or "<none>",
+            blocked=result.blocked_reason is not None,
+        )
+        return DirectStartResult(
+            pr_title=result.pr_title,
+            pr_summary=result.pr_summary,
+            commit_message=result.commit_message,
+            blocked_reason=result.blocked_reason,
+            session=AgentSession(adapter="codex", thread_id=thread_id),
+        )
+
+    def _run_direct_turn(self, *, prompt: str, cwd: Path) -> tuple[DirectStartResult, str | None]:
+        if not self._config.enabled:
+            raise RuntimeError("Codex is disabled in config")
+
+        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "schema.json"
+            output_path = tmp_path / "last_message.txt"
+            schema_path.write_text(json.dumps(_DIRECT_OUTPUT_SCHEMA), encoding="utf-8")
+
+            cmd = [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            self._append_common_options(cmd)
+
+            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+
+            raw = output_path.read_text(encoding="utf-8").strip()
+            payload = _parse_json_payload(raw)
+
+        pr_title = _require_str(payload, "pr_title")
+        pr_summary = _require_str(payload, "pr_summary")
+        commit_message = _optional_output_text(payload.get("commit_message"))
+        blocked_reason = _optional_output_text(payload.get("blocked_reason"))
+
+        return (
+            DirectStartResult(
+                pr_title=pr_title,
+                pr_summary=pr_summary,
+                commit_message=commit_message,
+                blocked_reason=blocked_reason,
+                session=None,
             ),
             _extract_thread_id(raw_events),
         )

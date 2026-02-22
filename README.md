@@ -1,14 +1,18 @@
 # MergeXO
 
-MergeXO is a local-first Python orchestrator that watches labeled issues and turns them into design-doc pull requests using Codex.
+MergeXO is a local-first Python orchestrator that watches labeled issues and routes each issue into one startup flow:
+
+- `design_doc`: generate a design-doc PR
+- `bugfix`: generate a direct bugfix PR
+- `small_job`: generate a direct scoped-change PR
 
 This repository currently implements Phase 1 of the MVP:
 
-- Configure one target repository, worker count `N`, base state directory, poll interval, and issue label.
+- Configure one target repository, worker count `N`, base state directory, poll interval, and flow labels.
 - Initialize a shared mirror plus `N` checkout slots.
-- Poll GitHub issues with the configured label using `gh api`.
+- Poll GitHub issues with configured trigger labels using `gh api`.
 - Farm each new issue to an available worker slot.
-- Generate a design doc via Codex and open a PR linked to the issue.
+- Run the flow-specific Codex prompt and open a linked PR.
 
 ## Requirements
 
@@ -63,6 +67,31 @@ Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added 
 The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `false`) until rollout is complete.
 
 Use `--verbose` on `init` or `run` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
+
+## Issue labels and precedence
+
+MergeXO reads three labels from `[repo]`:
+
+- `trigger_label` (default behavior, design-doc flow)
+- `bugfix_label` (direct bugfix flow)
+- `small_job_label` (direct small-job flow)
+- `coding_guidelines_path` (repo-relative file that defines coding style and required pre-PR tests for direct flows)
+
+When an issue has more than one trigger label, precedence is deterministic:
+
+1. `bugfix_label`
+2. `small_job_label`
+3. `trigger_label`
+
+Example:
+
+- issue labels: `agent:design` + `agent:bugfix` -> bugfix flow
+- issue labels: `agent:design` + `agent:small-job` -> small-job flow
+- issue labels: `agent:design` only -> design-doc flow
+
+Direct-flow PR bodies include `Fixes #<issue_number>`. Design-doc PR bodies keep `Refs #<issue_number>`.
+Bugfix flow enforces at least one staged file under `tests/` before opening a PR.
+Bugfix and small-job prompts require the agent to read and follow `coding_guidelines_path`.
 
 ## Generated design doc contract
 
