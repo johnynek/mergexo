@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 
 from mergexo.config import RepoConfig, RuntimeConfig
+from mergexo.observability import log_event
 from mergexo.shell import run
+
+
+LOGGER = logging.getLogger("mergexo.git_ops")
 
 
 @dataclass(frozen=True)
@@ -33,6 +38,12 @@ class GitRepoManager:
         checkout_path = self.slot_path(slot)
         remote_url = self.repo.effective_remote_url
         if not checkout_path.exists():
+            log_event(
+                LOGGER,
+                "git_checkout_cloned",
+                slot=slot,
+                checkout_path=str(checkout_path),
+            )
             run(
                 [
                     "git",
@@ -44,6 +55,12 @@ class GitRepoManager:
                 ]
             )
         else:
+            log_event(
+                LOGGER,
+                "git_checkout_remote_set",
+                slot=slot,
+                checkout_path=str(checkout_path),
+            )
             run(["git", "-C", str(checkout_path), "remote", "set-url", "origin", remote_url])
         return checkout_path
 
@@ -51,6 +68,12 @@ class GitRepoManager:
         return self.layout.checkouts_root / f"worker-{slot:02d}"
 
     def prepare_checkout(self, checkout_path: Path) -> None:
+        log_event(
+            LOGGER,
+            "git_prepare_checkout",
+            checkout_path=str(checkout_path),
+            default_branch=self.repo.default_branch,
+        )
         run(["git", "-C", str(checkout_path), "fetch", "origin", "--prune", "--tags"])
         run(
             [
@@ -76,6 +99,12 @@ class GitRepoManager:
         run(["git", "-C", str(checkout_path), "clean", "-ffdx"])
 
     def create_or_reset_branch(self, checkout_path: Path, branch: str) -> None:
+        log_event(
+            LOGGER,
+            "git_branch_reset",
+            checkout_path=str(checkout_path),
+            branch=branch,
+        )
         run(["git", "-C", str(checkout_path), "checkout", "-B", branch])
 
     def commit_all(self, checkout_path: Path, message: str) -> None:
@@ -83,9 +112,21 @@ class GitRepoManager:
         diff = run(["git", "-C", str(checkout_path), "diff", "--cached", "--name-only"]).strip()
         if not diff:
             raise RuntimeError("No staged changes to commit")
+        log_event(
+            LOGGER,
+            "git_commit",
+            checkout_path=str(checkout_path),
+            has_message=bool(message.strip()),
+        )
         run(["git", "-C", str(checkout_path), "commit", "-m", message])
 
     def push_branch(self, checkout_path: Path, branch: str) -> None:
+        log_event(
+            LOGGER,
+            "git_push",
+            checkout_path=str(checkout_path),
+            branch=branch,
+        )
         run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
 
     def cleanup_slot(self, checkout_path: Path) -> None:
@@ -94,6 +135,12 @@ class GitRepoManager:
     def restore_feedback_branch(
         self, checkout_path: Path, branch: str, expected_head_sha: str
     ) -> bool:
+        log_event(
+            LOGGER,
+            "git_restore_feedback_branch",
+            checkout_path=str(checkout_path),
+            branch=branch,
+        )
         self.prepare_checkout(checkout_path)
         self._checkout_remote_branch(checkout_path, branch)
         if self.current_head_sha(checkout_path) == expected_head_sha:
@@ -115,8 +162,18 @@ class GitRepoManager:
         remote_url = self.repo.effective_remote_url
         source = self.repo.local_clone_source or remote_url
         if not self.layout.mirror_path.exists():
+            log_event(
+                LOGGER,
+                "git_mirror_cloned",
+                mirror_path=str(self.layout.mirror_path),
+            )
             run(["git", "clone", "--mirror", source, str(self.layout.mirror_path)])
 
+        log_event(
+            LOGGER,
+            "git_mirror_synced",
+            mirror_path=str(self.layout.mirror_path),
+        )
         run(
             [
                 "git",

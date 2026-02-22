@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
 import queue
 import re
 import threading
@@ -31,7 +32,11 @@ from mergexo.models import (
     PullRequestReviewComment,
     WorkResult,
 )
+from mergexo.observability import log_event
 from mergexo.state import StateStore, TrackedPullRequestState
+
+
+LOGGER = logging.getLogger("mergexo.orchestrator")
 
 
 @dataclass(frozen=True)
@@ -56,10 +61,12 @@ class SlotPool:
     def acquire(self) -> _SlotLease:
         slot = self._slots.get(block=True)
         path = self._manager.ensure_checkout(slot)
+        log_event(LOGGER, "slot_acquired", slot=slot)
         return _SlotLease(slot=slot, path=path)
 
     def release(self, lease: _SlotLease) -> None:
         self._slots.put(lease.slot)
+        log_event(LOGGER, "slot_released", slot=lease.slot)
 
 
 class Phase1Orchestrator:
@@ -87,10 +94,22 @@ class Phase1Orchestrator:
 
         with ThreadPoolExecutor(max_workers=self._config.runtime.worker_count) as pool:
             while True:
+                log_event(
+                    LOGGER,
+                    "poll_started",
+                    once=once,
+                    feedback_loop_enabled=self._config.runtime.enable_feedback_loop,
+                )
                 self._reap_finished()
                 self._enqueue_new_work(pool)
                 if self._config.runtime.enable_feedback_loop:
                     self._enqueue_feedback_work(pool)
+                log_event(
+                    LOGGER,
+                    "poll_completed",
+                    running_issue_count=len(self._running),
+                    running_feedback_count=len(self._running_feedback),
+                )
 
                 if once:
                     self._wait_for_all(pool)
@@ -100,28 +119,63 @@ class Phase1Orchestrator:
 
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
         issues = self._github.list_open_issues_with_label(self._config.repo.trigger_label)
+        log_event(LOGGER, "issues_fetched", issue_count=len(issues))
         for issue in issues:
             with self._running_lock:
                 if not self._has_capacity_locked():
+                    log_event(
+                        LOGGER,
+                        "issue_skipped",
+                        issue_number=issue.number,
+                        reason="worker_capacity_full",
+                    )
                     return
                 if issue.number in self._running:
+                    log_event(
+                        LOGGER,
+                        "issue_skipped",
+                        issue_number=issue.number,
+                        reason="already_running",
+                    )
                     continue
 
             if not self._state.can_enqueue(issue.number):
+                log_event(
+                    LOGGER,
+                    "issue_skipped",
+                    issue_number=issue.number,
+                    reason="already_processed",
+                )
                 continue
 
             self._state.mark_running(issue.number)
             fut = pool.submit(self._process_issue, issue)
             with self._running_lock:
                 self._running[issue.number] = fut
+            log_event(LOGGER, "issue_enqueued", issue_number=issue.number)
 
     def _enqueue_feedback_work(self, pool: ThreadPoolExecutor) -> None:
         tracked_prs = self._state.list_tracked_pull_requests()
+        log_event(LOGGER, "feedback_scan_started", tracked_pr_count=len(tracked_prs))
         for tracked in tracked_prs:
             with self._running_lock:
                 if not self._has_capacity_locked():
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="worker_capacity_full",
+                    )
                     return
                 if tracked.pr_number in self._running_feedback:
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="already_running",
+                    )
                     continue
             fut = pool.submit(self._process_feedback_turn, tracked)
             with self._running_lock:
@@ -156,19 +210,45 @@ class Phase1Orchestrator:
                         pr_number=result.pr_number,
                         pr_url=result.pr_url,
                     )
+                    log_event(
+                        LOGGER,
+                        "issue_processing_completed",
+                        issue_number=result.issue_number,
+                        pr_number=result.pr_number,
+                        branch=result.branch,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self._state.mark_failed(issue_number=issue_number, error=str(exc))
+                    log_event(
+                        LOGGER,
+                        "issue_processing_failed",
+                        issue_number=issue_number,
+                        error_type=type(exc).__name__,
+                    )
 
             for pr_number in finished_pr_numbers:
                 handle = self._running_feedback.pop(pr_number)
                 try:
                     handle.future.result()
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_completed",
+                        issue_number=handle.issue_number,
+                        pr_number=pr_number,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self._state.mark_pr_status(
                         pr_number=pr_number,
                         issue_number=handle.issue_number,
                         status="blocked",
                         error=str(exc),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=handle.issue_number,
+                        pr_number=pr_number,
+                        reason=type(exc).__name__,
                     )
 
     def _wait_for_all(self, pool: ThreadPoolExecutor) -> None:
@@ -182,6 +262,12 @@ class Phase1Orchestrator:
     def _process_issue(self, issue: Issue) -> WorkResult:
         lease = self._slot_pool.acquire()
         try:
+            log_event(
+                LOGGER,
+                "issue_processing_started",
+                issue_number=issue.number,
+                slot=lease.slot,
+            )
             self._git.prepare_checkout(lease.path)
 
             slug = _slugify(issue.title)
@@ -189,6 +275,12 @@ class Phase1Orchestrator:
             self._git.create_or_reset_branch(lease.path, branch)
 
             design_relpath = f"{self._config.repo.design_docs_dir}/{issue.number}-{slug}.md"
+            log_event(
+                LOGGER,
+                "design_turn_started",
+                issue_number=issue.number,
+                branch=branch,
+            )
             start_result = self._agent.start_design_from_issue(
                 issue=issue,
                 repo_full_name=self._config.repo.full_name,
@@ -196,6 +288,7 @@ class Phase1Orchestrator:
                 default_branch=self._config.repo.default_branch,
                 cwd=lease.path,
             )
+            log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
             generated = start_result.design
             if start_result.session:
                 self._state.save_agent_session(
@@ -230,12 +323,27 @@ class Phase1Orchestrator:
                 body=f"Opened design PR: {pr.html_url}",
             )
 
+            log_event(
+                LOGGER,
+                "issue_processing_completed",
+                issue_number=issue.number,
+                pr_number=pr.number,
+                branch=branch,
+            )
             return WorkResult(
                 issue_number=issue.number,
                 branch=branch,
                 pr_number=pr.number,
                 pr_url=pr.html_url,
             )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "issue_processing_failed",
+                issue_number=issue.number,
+                error_type=type(exc).__name__,
+            )
+            raise
         finally:
             try:
                 self._git.cleanup_slot(lease.path)
@@ -245,6 +353,14 @@ class Phase1Orchestrator:
     def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> None:
         lease = self._slot_pool.acquire()
         try:
+            log_event(
+                LOGGER,
+                "feedback_turn_started",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                slot=lease.slot,
+                branch=tracked.branch,
+            )
             pr = self._github.get_pull_request(tracked.pr_number)
             if pr.merged:
                 self._state.mark_pr_status(
@@ -253,6 +369,13 @@ class Phase1Orchestrator:
                     status="merged",
                     last_seen_head_sha=pr.head_sha,
                 )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_merged",
+                )
                 return
             if pr.state.lower() != "open":
                 self._state.mark_pr_status(
@@ -260,6 +383,13 @@ class Phase1Orchestrator:
                     issue_number=tracked.issue_number,
                     status="closed",
                     last_seen_head_sha=pr.head_sha,
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_closed",
                 )
                 return
 
@@ -283,7 +413,21 @@ class Phase1Orchestrator:
             self._state.ingest_feedback_events([event for event, _ in normalized_issue])
 
             pending_events = self._state.list_pending_feedback_events(tracked.pr_number)
+            log_event(
+                LOGGER,
+                "feedback_events_pending",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                pending_count=len(pending_events),
+            )
             if not pending_events:
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="no_pending_events",
+                )
                 return
 
             pending_event_keys = tuple(event.event_key for event in pending_events)
@@ -315,10 +459,24 @@ class Phase1Orchestrator:
                     last_seen_head_sha=pr.head_sha,
                     error="missing saved agent session",
                 )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason="missing_agent_session",
+                )
                 return
             session = AgentSession(adapter=session_row[0], thread_id=session_row[1])
 
             if not self._git.restore_feedback_branch(lease.path, tracked.branch, pr.head_sha):
+                log_event(
+                    LOGGER,
+                    "feedback_turn_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason="head_mismatch_retry",
+                )
                 return
 
             turn_head_sha = (
@@ -344,10 +502,27 @@ class Phase1Orchestrator:
                 changed_files=changed_files,
             )
 
+            log_event(
+                LOGGER,
+                "feedback_agent_call_started",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                turn_key=turn_key,
+            )
             result = self._agent.respond_to_feedback(
                 session=session,
                 turn=turn,
                 cwd=lease.path,
+            )
+            log_event(
+                LOGGER,
+                "feedback_agent_call_completed",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                turn_key=turn_key,
+                review_reply_count=len(result.review_replies),
+                has_general_comment=result.general_comment is not None,
+                has_commit_message=result.commit_message is not None,
             )
 
             if result.commit_message:
@@ -366,6 +541,13 @@ class Phase1Orchestrator:
                             status="merged",
                             last_seen_head_sha=pr.head_sha,
                         )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_completed",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            result="pr_merged",
+                        )
                         return
                     if pr.state.lower() != "open":
                         self._state.mark_pr_status(
@@ -373,6 +555,13 @@ class Phase1Orchestrator:
                             issue_number=tracked.issue_number,
                             status="closed",
                             last_seen_head_sha=pr.head_sha,
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_completed",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            result="pr_closed",
                         )
                         return
 
@@ -405,6 +594,13 @@ class Phase1Orchestrator:
 
             remote_tokens = self._fetch_remote_action_tokens(tracked.pr_number)
             if not set(expected_tokens).issubset(remote_tokens):
+                log_event(
+                    LOGGER,
+                    "feedback_turn_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason="token_reconciliation_incomplete",
+                )
                 return
 
             self._state.finalize_feedback_turn(
@@ -413,6 +609,14 @@ class Phase1Orchestrator:
                 processed_event_keys=pending_event_keys,
                 session=result.session,
                 head_sha=pr.head_sha,
+            )
+            log_event(
+                LOGGER,
+                "feedback_turn_completed",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                turn_key=turn_key,
+                processed_event_count=len(pending_event_keys),
             )
         finally:
             try:

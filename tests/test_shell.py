@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 
+from mergexo.observability import configure_logging
 from mergexo.shell import CommandError, run
 
 
@@ -28,12 +29,16 @@ def test_run_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert kwargs["check"] is False
 
 
-def test_run_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_failure_raises(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         _ = args, kwargs
         return subprocess.CompletedProcess(args=["bad"], returncode=2, stdout="out", stderr="err")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    configure_logging(verbose=True)
 
     with pytest.raises(CommandError, match="Command failed"):
         run(["bad"])
+    assert "event=command_failed command=bad exit_code=2" in capsys.readouterr().err

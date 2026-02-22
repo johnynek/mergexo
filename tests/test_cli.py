@@ -33,15 +33,73 @@ def _app_config(tmp_path: Path) -> AppConfig:
 def test_build_parser_supports_commands() -> None:
     parser = cli.build_parser()
 
-    parsed_init = parser.parse_args(["init"])
-    parsed_run = parser.parse_args(["run", "--once"])
+    parsed_init = parser.parse_args(["init", "--verbose"])
+    parsed_run = parser.parse_args(["run", "--once", "--verbose"])
 
     assert parsed_init.command == "init"
+    assert parsed_init.verbose is True
     assert parsed_run.command == "run"
     assert parsed_run.once is True
+    assert parsed_run.verbose is True
 
 
 def test_main_dispatches_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+
+    class FakeParser:
+        def parse_args(self) -> SimpleNamespace:
+            return SimpleNamespace(command="init", config=Path("cfg.toml"), verbose=True)
+
+    called: dict[str, object] = {}
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+    )
+    monkeypatch.setattr(cli, "_cmd_init", lambda c: called.setdefault("init", c))
+
+    cli.main()
+    assert called["verbose"] is True
+    assert called["init"] == cfg
+
+
+def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+
+    class FakeParser:
+        def parse_args(self) -> SimpleNamespace:
+            return SimpleNamespace(command="run", config=Path("cfg.toml"), once=True, verbose=False)
+
+    called: dict[str, object] = {}
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+    )
+    monkeypatch.setattr(cli, "_cmd_run", lambda c, once: called.setdefault("run", (c, once)))
+
+    cli.main()
+    assert called["verbose"] is False
+    assert called["run"] == (cfg, True)
+
+
+def test_main_unknown_command_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+
+    class FakeParser:
+        def parse_args(self) -> SimpleNamespace:
+            return SimpleNamespace(command="unknown", config=Path("cfg.toml"), verbose=False)
+
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+
+    with pytest.raises(RuntimeError, match="Unknown command"):
+        cli.main()
+
+
+def test_main_defaults_verbose_to_false_when_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     cfg = _app_config(tmp_path)
 
     class FakeParser:
@@ -51,40 +109,13 @@ def test_main_dispatches_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     called: dict[str, object] = {}
     monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
     monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+    )
     monkeypatch.setattr(cli, "_cmd_init", lambda c: called.setdefault("init", c))
 
     cli.main()
-    assert called["init"] == cfg
-
-
-def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    cfg = _app_config(tmp_path)
-
-    class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
-            return SimpleNamespace(command="run", config=Path("cfg.toml"), once=True)
-
-    called: dict[str, object] = {}
-    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
-    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
-    monkeypatch.setattr(cli, "_cmd_run", lambda c, once: called.setdefault("run", (c, once)))
-
-    cli.main()
-    assert called["run"] == (cfg, True)
-
-
-def test_main_unknown_command_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    cfg = _app_config(tmp_path)
-
-    class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
-            return SimpleNamespace(command="unknown", config=Path("cfg.toml"))
-
-    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
-    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
-
-    with pytest.raises(RuntimeError, match="Unknown command"):
-        cli.main()
+    assert called["verbose"] is False
 
 
 def test_cmd_init_creates_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
