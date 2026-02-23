@@ -68,6 +68,7 @@ LOGGER = logging.getLogger("mergexo.orchestrator")
 _MAX_FEEDBACK_GIT_OP_ROUNDS = 3
 _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
 _MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
+_MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS = 3
 _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT = 12000
 _ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
 _RESTART_OPERATION_NAME = "restart"
@@ -1685,15 +1686,23 @@ class Phase1Orchestrator:
         else:
             raise DirectFlowValidationError(f"Unsupported direct flow: {flow}")
 
+        default_commit_message = _default_commit_message(flow=flow, issue_number=issue.number)
         start_result = self._run_direct_turn_with_required_tests_repair(
             issue=issue,
             flow_label=flow_label,
             checkout_path=checkout_path,
-            default_commit_message=_default_commit_message(flow=flow, issue_number=issue.number),
+            default_commit_message=default_commit_message,
             require_regression_tests=(flow == "bugfix"),
             direct_turn=direct_turn,
         )
-        self._git.push_branch(checkout_path, branch)
+        self._push_branch_with_merge_conflict_repair(
+            issue=issue,
+            flow_label=flow_label,
+            checkout_path=checkout_path,
+            branch=branch,
+            default_commit_message=f"chore: resolve merge conflicts for issue #{issue.number}",
+            direct_turn=direct_turn,
+        )
         self._run_pre_pr_ordering_gate(
             issue_number=issue.number,
             last_consumed_comment_id=pre_pr_last_consumed_comment_id,
@@ -1809,17 +1818,25 @@ class Phase1Orchestrator:
                     cwd=lease.path,
                 )
 
+            default_commit_message = _default_commit_message(
+                flow="small_job", issue_number=issue.number
+            )
             start_result = self._run_direct_turn_with_required_tests_repair(
                 issue=issue,
                 flow_label="implementation",
                 checkout_path=lease.path,
-                default_commit_message=_default_commit_message(
-                    flow="small_job", issue_number=issue.number
-                ),
+                default_commit_message=default_commit_message,
                 require_regression_tests=False,
                 direct_turn=run_implementation_turn,
             )
-            self._git.push_branch(lease.path, branch)
+            self._push_branch_with_merge_conflict_repair(
+                issue=issue,
+                flow_label="implementation",
+                checkout_path=lease.path,
+                branch=branch,
+                default_commit_message=f"chore: resolve merge conflicts for issue #{issue.number}",
+                direct_turn=run_implementation_turn,
+            )
             self._run_pre_pr_ordering_gate(
                 issue_number=issue.number,
                 last_consumed_comment_id=pre_pr_last_consumed_comment_id,
@@ -1905,6 +1922,65 @@ class Phase1Orchestrator:
             thread_id=session.thread_id,
             repo_full_name=self._state_repo_full_name(),
         )
+
+    def _push_branch_with_merge_conflict_repair(
+        self,
+        *,
+        issue: Issue,
+        flow_label: str,
+        checkout_path: Path,
+        branch: str,
+        default_commit_message: str,
+        direct_turn: Callable[[Issue], DirectStartResult],
+    ) -> None:
+        conflict_repair_round = 0
+        while True:
+            try:
+                self._git.push_branch(checkout_path, branch)
+                return
+            except CommandError as exc:
+                detail = str(exc)
+                if not _is_merge_conflict_error(detail):
+                    raise
+                conflict_repair_round += 1
+                log_event(
+                    LOGGER,
+                    "pre_pr_push_merge_conflict_detected",
+                    issue_number=issue.number,
+                    branch=branch,
+                    flow=flow_label,
+                    repair_round=conflict_repair_round,
+                )
+                if conflict_repair_round > _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS:
+                    summary = _summarize_git_error(detail)
+                    self._github.post_issue_comment(
+                        issue_number=issue.number,
+                        body=(
+                            "MergeXO could not resolve push-time merge conflicts before opening a PR.\n"
+                            f"- branch: `{branch}`\n"
+                            f"- attempts: {_MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS}\n"
+                            f"- last failure summary: {summary}"
+                        ),
+                    )
+                    raise DirectFlowBlockedError(
+                        f"{flow_label} flow blocked: push merge conflict unresolved after "
+                        f"{_MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS} repair attempts"
+                    )
+                repair_issue = self._issue_with_push_merge_conflict(
+                    issue=issue,
+                    branch=branch,
+                    failure_output=detail,
+                    attempt=conflict_repair_round,
+                    checkout_path=checkout_path,
+                )
+                _ = self._run_direct_turn_with_required_tests_repair(
+                    issue=repair_issue,
+                    flow_label=flow_label,
+                    checkout_path=checkout_path,
+                    default_commit_message=default_commit_message,
+                    require_regression_tests=False,
+                    direct_turn=direct_turn,
+                )
 
     def _resolve_checkout_path(self, *, configured_path: str, checkout_path: Path) -> Path:
         path = Path(configured_path)
@@ -2288,6 +2364,47 @@ class Phase1Orchestrator:
             f"Repair the code so `{required_tests_command}` passes.\n"
             "If impossible, set blocked_reason with a concrete explanation.\n\n"
             "Failure output:\n"
+            f"{trimmed_output}"
+        )
+        body = base_issue.body.strip()
+        merged_body = f"{body}\n\n{context}" if body else context
+        return Issue(
+            number=base_issue.number,
+            title=base_issue.title,
+            body=merged_body,
+            html_url=base_issue.html_url,
+            labels=base_issue.labels,
+            author_login=base_issue.author_login,
+        )
+
+    def _issue_with_push_merge_conflict(
+        self,
+        *,
+        issue: Issue,
+        branch: str,
+        failure_output: str,
+        attempt: int,
+        checkout_path: Path | None = None,
+    ) -> Issue:
+        base_issue = self._issue_with_required_tests_reminder(issue, checkout_path=checkout_path)
+        trimmed_output = failure_output.strip()
+        if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
+            trimmed_output = (
+                trimmed_output[:_REQUIRED_TEST_FAILURE_OUTPUT_LIMIT]
+                + "\n... [truncated by MergeXO]"
+            )
+        if not trimmed_output:
+            trimmed_output = "<empty>"
+
+        context = (
+            f"Push-time merge conflict encountered on repair attempt {attempt} for `{branch}`.\n"
+            "The remote branch was merged into this checkout and produced conflicts.\n"
+            "Resolve all conflicts in the existing working tree.\n"
+            "Preserve both local intent and remote updates.\n"
+            "Do not run history-rewrite commands.\n"
+            "After resolving conflicts, stage files and return commit_message.\n"
+            "If impossible, set blocked_reason with a concrete explanation.\n\n"
+            "Merge output:\n"
             f"{trimmed_output}"
         )
         body = base_issue.body.strip()
@@ -3597,6 +3714,19 @@ def _summarize_git_error(raw_error: str) -> str:
     if len(normalized) > 240:
         return normalized[:237] + "..."
     return normalized
+
+
+def _is_merge_conflict_error(raw_error: str) -> bool:
+    normalized = raw_error.strip().lower()
+    if not normalized:
+        return False
+    conflict_markers = (
+        "automatic merge failed",
+        "merge conflict",
+        "conflict (",
+        "fix conflicts and then commit",
+    )
+    return any(marker in normalized for marker in conflict_markers)
 
 
 def _operator_args_payload(command: OperatorCommandRecord) -> dict[str, object]:
