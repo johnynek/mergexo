@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import time
 
+from mergexo.agent_adapter import AgentAdapter
 from mergexo.codex_adapter import CodexAdapter
 from mergexo.config import AppConfig, RepoConfig, load_config
 from mergexo.git_ops import GitRepoManager
@@ -350,11 +351,11 @@ def _build_repo_runtimes(
     return tuple(runtimes)
 
 
-def _build_codex_agents_by_repo(config: AppConfig) -> dict[str, CodexAdapter]:
-    return {
-        repo.full_name: CodexAdapter(config.codex_for_repo(repo))
-        for repo in config.repos
-    }
+def _build_codex_agents_by_repo(config: AppConfig) -> dict[str, AgentAdapter]:
+    agents: dict[str, AgentAdapter] = {}
+    for repo in config.repos:
+        agents[repo.full_name] = CodexAdapter(config.codex_for_repo(repo))
+    return agents
 
 
 def _resolve_repo_filter(config: AppConfig, raw_repo_filter: str) -> str:
