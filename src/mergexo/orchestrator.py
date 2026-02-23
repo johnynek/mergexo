@@ -40,7 +40,7 @@ from mergexo.feedback_loop import (
     parse_operator_command,
 )
 from mergexo.git_ops import GitRepoManager
-from mergexo.github_gateway import CompareCommitsStatus, GitHubGateway
+from mergexo.github_gateway import CompareCommitsStatus, GitHubGateway, GitHubPollingError
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -191,7 +191,10 @@ class Phase1Orchestrator:
     def run(self, *, once: bool) -> None:
         self._git.ensure_layout()
         if self._config.runtime.enable_issue_comment_routing:
-            self._adopt_legacy_failed_pre_pr_runs()
+            self._run_poll_step(
+                step_name="adopt_legacy_failed_pre_pr_runs",
+                fn=self._adopt_legacy_failed_pre_pr_runs,
+            )
 
         with ThreadPoolExecutor(max_workers=self._config.runtime.worker_count) as pool:
             while True:
@@ -203,18 +206,43 @@ class Phase1Orchestrator:
                 )
                 self._reap_finished()
 
+                poll_had_github_errors = False
                 if self._config.runtime.enable_github_operations:
-                    self._scan_operator_commands()
+                    if not self._run_poll_step(
+                        step_name="scan_operator_commands",
+                        fn=self._scan_operator_commands,
+                    ):
+                        poll_had_github_errors = True
                 draining_for_restart = self._drain_for_pending_restart_if_needed()
 
                 if not draining_for_restart:
-                    self._enqueue_new_work(pool)
-                    self._enqueue_implementation_work(pool)
+                    if not self._run_poll_step(
+                        step_name="enqueue_new_work",
+                        fn=lambda: self._enqueue_new_work(pool),
+                    ):
+                        poll_had_github_errors = True
+                    if not self._run_poll_step(
+                        step_name="enqueue_implementation_work",
+                        fn=lambda: self._enqueue_implementation_work(pool),
+                    ):
+                        poll_had_github_errors = True
                     if self._config.runtime.enable_issue_comment_routing:
-                        self._enqueue_pre_pr_followup_work(pool)
-                    self._enqueue_feedback_work(pool)
+                        if not self._run_poll_step(
+                            step_name="enqueue_pre_pr_followup_work",
+                            fn=lambda: self._enqueue_pre_pr_followup_work(pool),
+                        ):
+                            poll_had_github_errors = True
+                    if not self._run_poll_step(
+                        step_name="enqueue_feedback_work",
+                        fn=lambda: self._enqueue_feedback_work(pool),
+                    ):
+                        poll_had_github_errors = True
                     if self._config.runtime.enable_issue_comment_routing:
-                        self._scan_post_pr_source_issue_comment_redirects()
+                        if not self._run_poll_step(
+                            step_name="scan_post_pr_source_issue_comment_redirects",
+                            fn=self._scan_post_pr_source_issue_comment_redirects,
+                        ):
+                            poll_had_github_errors = True
 
                 log_event(
                     LOGGER,
@@ -222,19 +250,41 @@ class Phase1Orchestrator:
                     running_issue_count=len(self._running),
                     running_feedback_count=len(self._running_feedback),
                     draining_for_restart=draining_for_restart,
+                    poll_had_github_errors=poll_had_github_errors,
                 )
 
                 if once:
                     self._wait_for_all(pool)
                     self._reap_finished()
                     if self._config.runtime.enable_github_operations:
-                        self._scan_operator_commands()
+                        self._run_poll_step(
+                            step_name="scan_operator_commands_once",
+                            fn=self._scan_operator_commands,
+                        )
                     self._drain_for_pending_restart_if_needed()
                     if self._config.runtime.enable_issue_comment_routing:
-                        self._scan_post_pr_source_issue_comment_redirects()
+                        self._run_poll_step(
+                            step_name="scan_post_pr_source_issue_comment_redirects_once",
+                            fn=self._scan_post_pr_source_issue_comment_redirects,
+                        )
                     break
 
                 time.sleep(self._config.runtime.poll_interval_seconds)
+
+    def _run_poll_step(self, *, step_name: str, fn: Callable[[], None]) -> bool:
+        try:
+            fn()
+            return True
+        except GitHubPollingError as exc:
+            log_event(
+                LOGGER,
+                "poll_step_failed",
+                repo_full_name=self._state_repo_full_name(),
+                step=step_name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return False
 
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
         labels = _trigger_labels(self._repo)

@@ -7,6 +7,8 @@ import pytest
 from mergexo.github_gateway import (
     CompareCommitsStatus,
     GitHubGateway,
+    GitHubPollingError,
+    _preview_for_log,
     _parse_http_response,
     _as_bool,
     _as_int,
@@ -470,6 +472,30 @@ def test_api_json_get_rejects_http_errors(monkeypatch: pytest.MonkeyPatch) -> No
         gateway._api_json("GET", "/path")
 
 
+def test_api_json_get_wraps_malformed_http_as_polling_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging(verbose=True)
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        return "not-http"
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(GitHubPollingError, match="GitHub polling GET failed for path /path"):
+        gateway._api_json("GET", "/path")
+
+    text = capsys.readouterr().err
+    assert "event=github_poll_get_failed" in text
+    assert "path=/path" in text
+    assert "raw_preview=not-http" in text
+
+
 def test_api_json_get_rejects_not_modified_without_cached_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -517,6 +543,11 @@ def test_parse_http_response_rejects_bad_status_output() -> None:
 
     with pytest.raises(RuntimeError, match="status line"):
         _parse_http_response("HTTP/2.0 okay\n\n{}")
+
+
+def test_preview_for_log_handles_empty_and_long_values() -> None:
+    assert _preview_for_log("") == "<empty>"
+    assert _preview_for_log("abcdef", limit=4) == "abcd..."
 
 
 def test_gateway_emits_read_and_write_logs(
