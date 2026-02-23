@@ -81,6 +81,7 @@ class AppConfig:
     runtime: RuntimeConfig
     repos: tuple[RepoConfig, ...]
     codex: CodexConfig
+    codex_overrides: tuple[tuple[str, CodexConfig], ...] = ()
 
     @property
     def repo(self) -> RepoConfig:
@@ -93,6 +94,13 @@ class AppConfig:
         # Single-repo compatibility shim for existing code/tests.
         return AuthConfig(allowed_users=self.repo.allowed_users)
 
+    def codex_for_repo(self, repo: RepoConfig | str) -> CodexConfig:
+        repo_id = repo.repo_id if isinstance(repo, RepoConfig) else repo
+        for configured_repo_id, codex in self.codex_overrides:
+            if configured_repo_id == repo_id:
+                return codex
+        return self.codex
+
 
 class ConfigError(ValueError):
     pass
@@ -104,9 +112,10 @@ def load_config(path: Path) -> AppConfig:
 
     runtime_data = _require_table(data, "runtime")
     repo_data = _require_table(data, "repo")
-    codex_data = data.get("codex", {})
-    if not isinstance(codex_data, dict):
+    raw_codex_data = data.get("codex", {})
+    if not isinstance(raw_codex_data, dict):
         raise ConfigError("[codex] must be a TOML table")
+    codex_data = cast(dict[str, object], raw_codex_data)
     auth_data = _optional_table(data, "auth")
 
     runtime = RuntimeConfig(
@@ -142,15 +151,15 @@ def load_config(path: Path) -> AppConfig:
 
     repos = _load_repo_configs(repo_data=repo_data, auth_data=auth_data)
 
-    codex = CodexConfig(
-        enabled=_bool_with_default(codex_data, "enabled", True),
-        model=_optional_str(codex_data, "model"),
-        sandbox=_optional_str(codex_data, "sandbox"),
-        profile=_optional_str(codex_data, "profile"),
-        extra_args=_tuple_of_str(codex_data, "extra_args"),
-    )
+    codex = _parse_codex_config(codex_data=codex_data)
+    codex_overrides = _load_codex_overrides(codex_data=codex_data, repos=repos, defaults=codex)
 
-    return AppConfig(runtime=runtime, repos=repos, codex=codex)
+    return AppConfig(
+        runtime=runtime,
+        repos=repos,
+        codex=codex,
+        codex_overrides=codex_overrides,
+    )
 
 
 def _load_repo_configs(
@@ -241,6 +250,57 @@ def _parse_repo_config(
     )
 
 
+def _parse_codex_config(
+    *, codex_data: dict[str, object], defaults: CodexConfig | None = None
+) -> CodexConfig:
+    enabled_default = defaults.enabled if defaults is not None else True
+    model_default = defaults.model if defaults is not None else None
+    sandbox_default = defaults.sandbox if defaults is not None else None
+    profile_default = defaults.profile if defaults is not None else None
+    extra_args_default = defaults.extra_args if defaults is not None else ()
+    return CodexConfig(
+        enabled=_bool_with_default(codex_data, "enabled", enabled_default),
+        model=_optional_str_with_default(codex_data, "model", model_default),
+        sandbox=_optional_str_with_default(codex_data, "sandbox", sandbox_default),
+        profile=_optional_str_with_default(codex_data, "profile", profile_default),
+        extra_args=_tuple_of_str_with_default(codex_data, "extra_args", extra_args_default),
+    )
+
+
+def _load_codex_overrides(
+    *,
+    codex_data: dict[str, object],
+    repos: tuple[RepoConfig, ...],
+    defaults: CodexConfig,
+) -> tuple[tuple[str, CodexConfig], ...]:
+    repo_data = codex_data.get("repo")
+    if repo_data is None:
+        return ()
+    if not isinstance(repo_data, dict):
+        raise ConfigError("[codex.repo] must be a TOML table")
+    if not all(isinstance(item, str) for item in repo_data.keys()):
+        raise ConfigError("[codex.repo] must have string keys")
+    normalized_repo_data = cast(dict[str, object], repo_data)
+
+    configured_repo_ids = {repo.repo_id for repo in repos}
+    overrides: list[tuple[str, CodexConfig]] = []
+    for repo_id, raw_value in sorted(normalized_repo_data.items()):
+        if repo_id not in configured_repo_ids:
+            available = ", ".join(sorted(configured_repo_ids))
+            raise ConfigError(
+                f"Unknown repo id {repo_id!r} in [codex.repo.{repo_id}]; expected one of: "
+                f"{available}"
+            )
+        override_table = _require_repo_table(raw_value, table_name=f"[codex.repo.{repo_id}]")
+        overrides.append(
+            (
+                repo_id,
+                _parse_codex_config(codex_data=override_table, defaults=defaults),
+            )
+        )
+    return tuple(overrides)
+
+
 def _require_table(data: dict[str, object], key: str) -> dict[str, object]:
     value = data.get(key)
     if not isinstance(value, dict):
@@ -285,6 +345,14 @@ def _optional_str(data: dict[str, object], key: str) -> str | None:
     return value
 
 
+def _optional_str_with_default(
+    data: dict[str, object], key: str, default: str | None
+) -> str | None:
+    if key not in data:
+        return default
+    return _optional_str(data, key)
+
+
 def _require_int(data: dict[str, object], key: str) -> int:
     value = data.get(key)
     if not isinstance(value, int):
@@ -323,6 +391,14 @@ def _tuple_of_str(data: dict[str, object], key: str) -> tuple[str, ...]:
             raise ConfigError(f"{key} must be a list of strings")
         out.append(item)
     return tuple(out)
+
+
+def _tuple_of_str_with_default(
+    data: dict[str, object], key: str, default: tuple[str, ...]
+) -> tuple[str, ...]:
+    if key not in data:
+        return default
+    return _tuple_of_str(data, key)
 
 
 def _optional_positive_int(data: dict[str, object], key: str) -> int | None:

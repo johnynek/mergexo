@@ -422,6 +422,43 @@ def test_cmd_service_constructs_runner(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert service_call["config"] == cfg
     assert service_call["once"] is False
     assert len(service_call["repo_runtimes"]) == 1
+    assert service_call["agent_by_repo_full_name"] == {"johnynek/mergexo": "codex:True"}
+
+
+def test_build_codex_agents_by_repo_uses_repo_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    cfg = AppConfig(
+        runtime=cfg.runtime,
+        repos=cfg.repos,
+        codex=cfg.codex,
+        codex_overrides=(
+            (
+                "bosatsu",
+                CodexConfig(
+                    enabled=False,
+                    model="gpt-b",
+                    sandbox="danger-full-access",
+                    profile=None,
+                    extra_args=("--b",),
+                ),
+            ),
+        ),
+    )
+    calls: list[CodexConfig] = []
+
+    def fake_codex_adapter(codex: CodexConfig) -> str:
+        calls.append(codex)
+        return f"codex:{codex.enabled}:{codex.model}"
+
+    monkeypatch.setattr(cli, "CodexAdapter", fake_codex_adapter)
+
+    built = cli._build_codex_agents_by_repo(cfg)
+    assert set(built) == {"johnynek/mergexo", "johnynek/bosatsu"}
+    assert built["johnynek/mergexo"] == "codex:True:None"
+    assert built["johnynek/bosatsu"] == "codex:False:gpt-b"
+    assert calls == [cfg.codex, cfg.codex_for_repo("bosatsu")]
 
 
 def test_cmd_feedback_dispatches_blocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
