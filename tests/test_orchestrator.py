@@ -265,6 +265,9 @@ class FakeAgent:
         self.bugfix_calls: list[tuple[Issue, Path]] = []
         self.small_job_calls: list[tuple[Issue, Path]] = []
         self.implementation_calls: list[tuple[Issue, Path, str]] = []
+        self.bugfix_guidelines_paths: list[str | None] = []
+        self.small_job_guidelines_paths: list[str | None] = []
+        self.implementation_guidelines_paths: list[str | None] = []
         self.feedback_calls: list[tuple[AgentSession, FeedbackTurn, Path]] = []
         self.bugfix_result = DirectStartResult(
             pr_title="Fix bug",
@@ -328,10 +331,11 @@ class FakeAgent:
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
-        _ = repo_full_name, default_branch, coding_guidelines_path
+        _ = repo_full_name, default_branch
+        self.bugfix_guidelines_paths.append(coding_guidelines_path)
         self.bugfix_calls.append((issue, cwd))
         if self.fail:
             raise RuntimeError("codex failed")
@@ -343,10 +347,11 @@ class FakeAgent:
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
-        _ = repo_full_name, default_branch, coding_guidelines_path
+        _ = repo_full_name, default_branch
+        self.small_job_guidelines_paths.append(coding_guidelines_path)
         self.small_job_calls.append((issue, cwd))
         if self.fail:
             raise RuntimeError("codex failed")
@@ -358,7 +363,7 @@ class FakeAgent:
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         design_doc_path: str,
         design_doc_markdown: str,
         design_pr_number: int | None,
@@ -368,11 +373,11 @@ class FakeAgent:
         _ = (
             repo_full_name,
             default_branch,
-            coding_guidelines_path,
             design_doc_markdown,
             design_pr_number,
             design_pr_url,
         )
+        self.implementation_guidelines_paths.append(coding_guidelines_path)
         self.implementation_calls.append((issue, cwd, design_doc_path))
         if self.fail:
             raise RuntimeError("codex failed")
@@ -611,6 +616,28 @@ def _issue(
     )
 
 
+def _write_checkout_file(
+    checkout_root: Path,
+    relative_path: str,
+    *,
+    content: str = "",
+    slot: int = 0,
+) -> Path:
+    path = checkout_root / f"worker-{slot}" / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _write_required_tests_script(checkout_root: Path, *, slot: int = 0) -> Path:
+    return _write_checkout_file(
+        checkout_root,
+        "scripts/required-tests.sh",
+        content="#!/usr/bin/env bash\nexit 0\n",
+        slot=slot,
+    )
+
+
 def test_slot_pool_acquire_release(tmp_path: Path) -> None:
     manager = FakeGitManager(tmp_path / "checkouts")
     pool = SlotPool(manager, worker_count=1)
@@ -782,11 +809,99 @@ def test_process_issue_bugfix_flow_happy_path(tmp_path: Path) -> None:
     ]
 
 
+def test_process_issue_bugfix_omits_missing_coding_guidelines_file(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert agent.bugfix_guidelines_paths == [None]
+
+
+def test_process_issue_bugfix_uses_coding_guidelines_file_when_present(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    _write_checkout_file(git.checkout_root, "docs/python_style.md", content="# style\n")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert agent.bugfix_guidelines_paths == ["docs/python_style.md"]
+
+
+def test_resolve_checkout_path_returns_absolute_path_unchanged(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    absolute_path = tmp_path / "required-tests.sh"
+    resolved = orch._resolve_checkout_path(
+        configured_path=str(absolute_path),
+        checkout_path=tmp_path / "checkout",
+    )
+
+    assert resolved == absolute_path
+
+
+def test_required_tests_command_for_checkout_none_uses_configured_command(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    assert (
+        orch._required_tests_command_for_checkout(checkout_path=None) == "scripts/required-tests.sh"
+    )
+
+
+def test_process_issue_bugfix_skips_missing_required_tests_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        raise AssertionError("required tests command should be skipped when the file is missing")
+
+    monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert len(agent.bugfix_calls) == 1
+    assert "Required pre-push test command" not in agent.bugfix_calls[0][0].body
+    assert len(git.commit_calls) == 1
+    assert len(git.push_calls) == 1
+
+
 def test_process_issue_bugfix_retries_when_required_tests_fail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
     github = FakeGitHub(issues=[])
     agent = FakeAgent()
     state = FakeState()
@@ -836,6 +951,7 @@ def test_process_issue_design_flow_blocks_when_required_tests_fail(
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
     github = FakeGitHub(issues=[])
     agent = FakeAgent()
     state = FakeState()
@@ -870,6 +986,7 @@ def test_process_issue_bugfix_blocks_when_required_tests_repair_limit_exceeded(
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
     github = FakeGitHub(issues=[])
     agent = FakeAgent()
     state = FakeState()
@@ -1518,6 +1635,9 @@ def test_required_tests_helpers_handle_exception_idempotence_and_truncation(
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    script_path = tmp_path / "scripts" / "required-tests.sh"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     github = FakeGitHub([])
     agent = FakeAgent()
     state = FakeState()
@@ -1545,14 +1665,18 @@ def test_required_tests_helpers_handle_exception_idempotence_and_truncation(
         labels=("agent:bugfix",),
         author_login="issue-author",
     )
-    with_reminder = orch._issue_with_required_tests_reminder(issue)
+    with_reminder = orch._issue_with_required_tests_reminder(issue, checkout_path=tmp_path)
     assert "Required pre-push test command" in with_reminder.body
-    assert orch._issue_with_required_tests_reminder(with_reminder) is with_reminder
+    assert (
+        orch._issue_with_required_tests_reminder(with_reminder, checkout_path=tmp_path)
+        is with_reminder
+    )
 
     empty_failure = orch._issue_with_required_tests_failure(
         issue=issue,
         failure_output="   ",
         attempt=1,
+        checkout_path=tmp_path,
     )
     assert "Failure output:\n<empty>" in empty_failure.body
 
@@ -1560,6 +1684,7 @@ def test_required_tests_helpers_handle_exception_idempotence_and_truncation(
         issue=issue,
         failure_output="x" * 13000,
         attempt=2,
+        checkout_path=tmp_path,
     )
     assert "... [truncated by MergeXO]" in large_failure.body
 
@@ -1577,6 +1702,62 @@ def test_required_tests_helpers_handle_exception_idempotence_and_truncation(
         attempt=1,
     )
     assert untouched_issue is issue
+
+
+def test_required_tests_helpers_skip_when_required_tests_file_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    run_called = False
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        nonlocal run_called
+        _ = cmd, cwd, input_text, check
+        run_called = True
+        return ""
+
+    monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
+
+    required_error = orch._run_required_tests_before_push(checkout_path=tmp_path)
+    assert required_error is None
+    assert run_called is False
+
+    issue = Issue(
+        number=8,
+        title="Issue",
+        body="Body",
+        html_url="https://example/issues/8",
+        labels=("agent:small-job",),
+        author_login="issue-author",
+    )
+    assert orch._issue_with_required_tests_reminder(issue, checkout_path=tmp_path) is issue
+    assert (
+        orch._issue_with_required_tests_failure(
+            issue=issue,
+            failure_output="failure",
+            attempt=1,
+            checkout_path=tmp_path,
+        )
+        is issue
+    )
+
+    comment = _issue_comment()
+    assert orch._append_required_tests_feedback_reminder(
+        (comment,),
+        checkout_path=tmp_path,
+    ) == (comment,)
 
 
 def test_save_agent_session_if_present_skips_none(tmp_path: Path) -> None:
@@ -2691,6 +2872,7 @@ def test_feedback_turn_retries_required_tests_failure_before_push(
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
     issue = _issue()
     github = FakeGitHub([issue])
     github.review_comments = [_review_comment()]
@@ -2773,6 +2955,7 @@ def test_feedback_turn_blocks_when_required_tests_reported_impossible(
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
     issue = _issue()
     github = FakeGitHub([issue])
     github.review_comments = [_review_comment()]
@@ -2907,6 +3090,7 @@ def test_feedback_turn_blocks_when_required_tests_repair_limit_exceeded(
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
     issue = _issue()
     github = FakeGitHub([issue])
     github.review_comments = [_review_comment()]
@@ -2999,6 +3183,7 @@ def test_feedback_turn_blocks_when_required_tests_repair_outcome_blocks(
 ) -> None:
     cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
     git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
     issue = _issue()
     github = FakeGitHub([issue])
     github.review_comments = [_review_comment()]

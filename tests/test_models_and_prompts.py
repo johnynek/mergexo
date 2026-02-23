@@ -196,6 +196,27 @@ def test_build_bugfix_prompt_requires_regression_tests() -> None:
     assert "issue #21" in prompt.lower()
 
 
+def test_build_bugfix_prompt_without_guidelines_path_uses_fallback() -> None:
+    issue = Issue(
+        number=210,
+        title="Fix edge case",
+        body="Handle sparse payloads.",
+        html_url="https://example/issue/210",
+        labels=("agent:bugfix",),
+    )
+
+    prompt = build_bugfix_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path=None,
+    )
+
+    assert "Coding/testing guidelines file is not present" in prompt
+    assert "target 100% test coverage" in prompt
+    assert "docs/python_style.md" not in prompt
+
+
 def test_build_small_job_prompt_is_scoped() -> None:
     issue = Issue(
         number=22,
@@ -247,3 +268,29 @@ def test_build_implementation_prompt_links_design_context() -> None:
     assert "Re-read the full diff against main." in prompt
     assert "Add concise comments around subtle logic" in prompt
     assert "Re-run formatting and CI-required checks from docs/python_style.md." in prompt
+
+
+def test_build_implementation_prompt_without_guidelines_path_uses_fallback() -> None:
+    issue = Issue(
+        number=231,
+        title="Ship scheduler",
+        body="Implement with tests.",
+        html_url="https://example/issue/231",
+        labels=("agent:design",),
+    )
+
+    prompt = build_implementation_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path=None,
+        design_doc_path="docs/design/231-ship.md",
+        design_doc_markdown="# Design",
+        design_pr_number=200,
+        design_pr_url="https://example/pr/200",
+    )
+
+    assert "Coding/testing guidelines file is not present" in prompt
+    assert "target 100% test coverage" in prompt
+    assert "Re-run formatting and tests expected by this repo" in prompt
+    assert "docs/python_style.md" not in prompt

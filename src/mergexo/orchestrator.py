@@ -1108,6 +1108,9 @@ class Phase1Orchestrator:
         slug = _slugify(issue.title)
         branch = _issue_branch(flow=flow, issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
+        coding_guidelines_path = self._coding_guidelines_path_for_checkout(
+            checkout_path=checkout_path
+        )
 
         flow_label: str
         direct_turn: Callable[[Issue], DirectStartResult]
@@ -1119,7 +1122,7 @@ class Phase1Orchestrator:
                     issue=agent_issue,
                     repo_full_name=self._state_repo_full_name(),
                     default_branch=self._repo.default_branch,
-                    coding_guidelines_path=self._repo.coding_guidelines_path,
+                    coding_guidelines_path=coding_guidelines_path,
                     cwd=checkout_path,
                 )
 
@@ -1132,7 +1135,7 @@ class Phase1Orchestrator:
                     issue=agent_issue,
                     repo_full_name=self._state_repo_full_name(),
                     default_branch=self._repo.default_branch,
-                    coding_guidelines_path=self._repo.coding_guidelines_path,
+                    coding_guidelines_path=coding_guidelines_path,
                     cwd=checkout_path,
                 )
 
@@ -1240,13 +1243,16 @@ class Phase1Orchestrator:
                     f"Implementation flow requires merged design doc at {design_relpath}"
                 )
             design_doc_markdown = design_abs_path.read_text(encoding="utf-8")
+            coding_guidelines_path = self._coding_guidelines_path_for_checkout(
+                checkout_path=lease.path
+            )
 
             def run_implementation_turn(agent_issue: Issue) -> DirectStartResult:
                 return self._agent.start_implementation_from_design(
                     issue=agent_issue,
                     repo_full_name=self._state_repo_full_name(),
                     default_branch=self._repo.default_branch,
-                    coding_guidelines_path=self._repo.coding_guidelines_path,
+                    coding_guidelines_path=coding_guidelines_path,
                     design_doc_path=design_relpath,
                     design_doc_markdown=design_doc_markdown,
                     design_pr_number=candidate.design_pr_number,
@@ -1335,6 +1341,54 @@ class Phase1Orchestrator:
             repo_full_name=self._state_repo_full_name(),
         )
 
+    def _resolve_checkout_path(self, *, configured_path: str, checkout_path: Path) -> Path:
+        path = Path(configured_path)
+        if path.is_absolute():
+            return path
+        return checkout_path / path
+
+    def _coding_guidelines_path_for_checkout(self, *, checkout_path: Path) -> str | None:
+        configured_path = self._repo.coding_guidelines_path
+        resolved_path = self._resolve_checkout_path(
+            configured_path=configured_path, checkout_path=checkout_path
+        )
+        if resolved_path.is_file():
+            return configured_path
+
+        log_event(
+            LOGGER,
+            "coding_guidelines_missing",
+            issue_repo_full_name=self._state_repo_full_name(),
+            configured_path=configured_path,
+            resolved_path=str(resolved_path),
+            checkout_path=str(checkout_path),
+        )
+        return None
+
+    def _required_tests_command_for_checkout(self, *, checkout_path: Path | None) -> str | None:
+        required_tests_command = self._repo.required_tests
+        if required_tests_command is None:
+            return None
+        if checkout_path is None:
+            return required_tests_command
+
+        resolved_path = self._resolve_checkout_path(
+            configured_path=required_tests_command,
+            checkout_path=checkout_path,
+        )
+        if resolved_path.is_file():
+            return required_tests_command
+
+        log_event(
+            LOGGER,
+            "required_tests_missing",
+            issue_repo_full_name=self._state_repo_full_name(),
+            command=required_tests_command,
+            resolved_path=str(resolved_path),
+            checkout_path=str(checkout_path),
+        )
+        return None
+
     def _run_direct_turn_with_required_tests_repair(
         self,
         *,
@@ -1345,7 +1399,9 @@ class Phase1Orchestrator:
         require_regression_tests: bool,
         direct_turn: Callable[[Issue], DirectStartResult],
     ) -> DirectStartResult:
-        result = direct_turn(self._issue_with_required_tests_reminder(issue))
+        result = direct_turn(
+            self._issue_with_required_tests_reminder(issue, checkout_path=checkout_path)
+        )
         repair_round = 0
 
         while True:
@@ -1403,17 +1459,21 @@ class Phase1Orchestrator:
                 issue=issue,
                 failure_output=required_tests_error,
                 attempt=repair_round,
+                checkout_path=checkout_path,
             )
             result = direct_turn(repair_issue)
 
     def _run_required_tests_before_push(self, *, checkout_path: Path) -> str | None:
-        required_tests_command = self._repo.required_tests
+        required_tests_command = self._required_tests_command_for_checkout(
+            checkout_path=checkout_path
+        )
         if required_tests_command is None:
             return None
 
-        executable_path = Path(required_tests_command)
-        if not executable_path.is_absolute():
-            executable_path = checkout_path / executable_path
+        executable_path = self._resolve_checkout_path(
+            configured_path=required_tests_command,
+            checkout_path=checkout_path,
+        )
         argv = [str(executable_path)]
 
         log_event(
@@ -1457,8 +1517,12 @@ class Phase1Orchestrator:
         )
         return None
 
-    def _issue_with_required_tests_reminder(self, issue: Issue) -> Issue:
-        required_tests_command = self._repo.required_tests
+    def _issue_with_required_tests_reminder(
+        self, issue: Issue, *, checkout_path: Path | None = None
+    ) -> Issue:
+        required_tests_command = self._required_tests_command_for_checkout(
+            checkout_path=checkout_path
+        )
         if required_tests_command is None:
             return issue
 
@@ -1487,9 +1551,12 @@ class Phase1Orchestrator:
         issue: Issue,
         failure_output: str,
         attempt: int,
+        checkout_path: Path | None = None,
     ) -> Issue:
-        base_issue = self._issue_with_required_tests_reminder(issue)
-        required_tests_command = self._repo.required_tests
+        base_issue = self._issue_with_required_tests_reminder(issue, checkout_path=checkout_path)
+        required_tests_command = self._required_tests_command_for_checkout(
+            checkout_path=checkout_path
+        )
         if required_tests_command is None:
             return base_issue
 
@@ -1671,7 +1738,8 @@ class Phase1Orchestrator:
                 if normalized_event.event_key in pending_event_key_set
             )
             turn_issue_comments = self._append_required_tests_feedback_reminder(
-                pending_issue_comments
+                pending_issue_comments,
+                checkout_path=lease.path,
             )
 
             session_row = self._state.get_agent_session(
@@ -1884,9 +1952,14 @@ class Phase1Orchestrator:
                 self._slot_pool.release(lease)
 
     def _append_required_tests_feedback_reminder(
-        self, issue_comments: tuple[PullRequestIssueComment, ...]
+        self,
+        issue_comments: tuple[PullRequestIssueComment, ...],
+        *,
+        checkout_path: Path | None = None,
     ) -> tuple[PullRequestIssueComment, ...]:
-        required_tests_command = self._repo.required_tests
+        required_tests_command = self._required_tests_command_for_checkout(
+            checkout_path=checkout_path
+        )
         if required_tests_command is None:
             return issue_comments
 

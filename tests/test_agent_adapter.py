@@ -64,7 +64,7 @@ class DummyAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
         _ = issue, repo_full_name, default_branch, coding_guidelines_path, cwd
@@ -82,7 +82,7 @@ class DummyAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
         _ = issue, repo_full_name, default_branch, coding_guidelines_path, cwd
@@ -100,7 +100,7 @@ class DummyAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         design_doc_path: str,
         design_doc_markdown: str,
         design_pr_number: int | None,

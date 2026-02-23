@@ -135,7 +135,7 @@ class CodexAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
         prompt = build_bugfix_prompt(
@@ -158,7 +158,7 @@ class CodexAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
         prompt = build_small_job_prompt(
@@ -181,7 +181,7 @@ class CodexAdapter(AgentAdapter):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         design_doc_path: str,
         design_doc_markdown: str,
         design_pr_number: int | None,

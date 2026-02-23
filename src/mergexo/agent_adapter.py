@@ -88,7 +88,7 @@ class AgentAdapter(ABC):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
         """Start a direct bugfix PR flow from an issue."""
@@ -100,7 +100,7 @@ class AgentAdapter(ABC):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         cwd: Path,
     ) -> DirectStartResult:
         """Start a direct small-job PR flow from an issue."""
@@ -112,7 +112,7 @@ class AgentAdapter(ABC):
         issue: Issue,
         repo_full_name: str,
         default_branch: str,
-        coding_guidelines_path: str,
+        coding_guidelines_path: str | None,
         design_doc_path: str,
         design_doc_markdown: str,
         design_pr_number: int | None,
