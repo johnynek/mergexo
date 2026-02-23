@@ -13,7 +13,6 @@ class RuntimeConfig:
     base_dir: Path
     worker_count: int
     poll_interval_seconds: int
-    enable_feedback_loop: bool
     enable_github_operations: bool = False
     restart_drain_timeout_seconds: int = 900
     restart_default_mode: RestartMode = "git_checkout"
@@ -113,7 +112,6 @@ def load_config(path: Path) -> AppConfig:
         base_dir=Path(_require_str(runtime_data, "base_dir")).expanduser(),
         worker_count=_require_int(runtime_data, "worker_count"),
         poll_interval_seconds=_require_int(runtime_data, "poll_interval_seconds"),
-        enable_feedback_loop=_bool_with_default(runtime_data, "enable_feedback_loop", False),
         enable_github_operations=_bool_with_default(
             runtime_data, "enable_github_operations", False
         ),

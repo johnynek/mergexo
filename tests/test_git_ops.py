@@ -15,7 +15,6 @@ def _config(tmp_path: Path, *, worker_count: int = 2) -> tuple[RuntimeConfig, Re
         base_dir=tmp_path / "state",
         worker_count=worker_count,
         poll_interval_seconds=60,
-        enable_feedback_loop=False,
     )
     repo = RepoConfig(
         repo_id="mergexo",

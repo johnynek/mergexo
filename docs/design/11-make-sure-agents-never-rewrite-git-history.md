@@ -195,7 +195,7 @@ Mitigation: comparisons happen only on active feedback turns and add low overhea
 Mitigation: this is an intentional safety policy; follow-up can add explicit operator override workflow.
 
 ## Rollout notes
-1. Ship with enforcement enabled whenever `runtime.enable_feedback_loop` is enabled.
+1. Ship with enforcement enabled in any environment where feedback turns run.
 2. Roll out to one repository first and monitor blocked-turn rate.
 3. Verify that blocked events include clear reasons in state and PR comments.
 4. After canary confidence, enable broadly with no behavior change to append-only workflows.
