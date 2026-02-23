@@ -90,6 +90,38 @@ Multi-repo support uses a repo-scoped state schema. Upgrading from older builds 
 3. Run `mergexo init`.
 4. Restart MergeXO.
 
+## Source issue comment routing (before/after PR)
+
+Enable issue-comment routing with:
+
+- `runtime.enable_issue_comment_routing = true`
+
+Behavior:
+
+1. Before a PR exists:
+   - Recoverable pre-PR blocked outcomes move to `awaiting_issue_followup` instead of terminal `failed`.
+   - Reply on the source issue to unblock/resume.
+   - Comments are queued by comment id and consumed in order on the next retry turn.
+2. While a retry worker is active:
+   - New source-issue comments are not lost; they remain queued for the following retry turn.
+3. Right before PR creation:
+   - MergeXO checks for newly queued source-issue comments.
+   - If any are pending, PR creation is deferred until those comments are processed.
+4. After a PR exists (`awaiting_feedback` or PR-level `blocked`):
+   - Source-issue comments are no longer actioned.
+   - MergeXO posts a deterministic redirect reply that links the PR and instructs users to comment on the PR thread.
+5. Legacy recovery after upgrade:
+   - Historical `failed` runs with no PR that match known pre-PR blocked signatures are adopted into `awaiting_issue_followup` automatically, so a new source-issue comment can resume work.
+
+Recommended rollout:
+
+1. Leave the flag off by default.
+2. Enable on one repo and verify canary scenarios:
+   - blocked-before-PR then issue reply then retry;
+   - comment during active retry;
+   - issue comment after PR exists (redirect only).
+3. Expand once stable.
+
 ## GitHub operator commands
 
 Enable GitHub operations with:

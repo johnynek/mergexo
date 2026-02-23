@@ -13,6 +13,7 @@ from mergexo.state import (
     _parse_operator_command_name,
     _parse_operator_command_row,
     _parse_operator_command_status,
+    _parse_pre_pr_followup_flow,
     _parse_restart_mode,
     _parse_runtime_operation_row,
     _parse_runtime_operation_status,
@@ -133,6 +134,62 @@ def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:
         assert int(processed_count[0]) == 2
     finally:
         conn.close()
+
+
+def test_pre_pr_followup_state_and_issue_comment_cursors(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="small_job",
+        branch="agent/small/7-worker",
+        context_json='{"flow":"small_job"}',
+        waiting_reason="small-job flow blocked: waiting on reporter context",
+    )
+    status, branch, pr_number, pr_url, error = _get_row(db_path, 7)
+    assert status == "awaiting_issue_followup"
+    assert branch == "agent/small/7-worker"
+    assert pr_number is None
+    assert pr_url is None
+    assert error is not None
+
+    followups = store.list_pre_pr_followups()
+    assert len(followups) == 1
+    followup = followups[0]
+    assert followup.issue_number == 7
+    assert followup.flow == "small_job"
+    assert followup.context_json == '{"flow":"small_job"}'
+
+    cursor0 = store.get_issue_comment_cursor(7)
+    assert cursor0.pre_pr_last_consumed_comment_id == 0
+    assert cursor0.post_pr_last_redirected_comment_id == 0
+
+    cursor1 = store.advance_pre_pr_last_consumed_comment_id(issue_number=7, comment_id=11)
+    assert cursor1.pre_pr_last_consumed_comment_id == 11
+    cursor2 = store.advance_pre_pr_last_consumed_comment_id(issue_number=7, comment_id=9)
+    assert cursor2.pre_pr_last_consumed_comment_id == 11
+
+    cursor3 = store.advance_post_pr_last_redirected_comment_id(issue_number=7, comment_id=21)
+    assert cursor3.post_pr_last_redirected_comment_id == 21
+    cursor4 = store.advance_post_pr_last_redirected_comment_id(issue_number=7, comment_id=20)
+    assert cursor4.post_pr_last_redirected_comment_id == 21
+
+    store.clear_pre_pr_followup_state(7)
+    assert store.list_pre_pr_followups() == ()
+
+
+def test_list_legacy_failed_issue_runs_without_pr_filters_rows(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+
+    store.mark_failed(1, "bugfix flow blocked: waiting for repro")
+    store.mark_completed(2, "agent/design/2", 101, "https://example/pr/101")
+    store.mark_failed(2, "small-job flow blocked: waiting for context")
+
+    legacy = store.list_legacy_failed_issue_runs_without_pr()
+    assert len(legacy) == 1
+    assert legacy[0].issue_number == 1
+    assert "flow blocked" in (legacy[0].error or "")
 
 
 def test_mark_pr_status_updates_run_and_tracking_rows(tmp_path: Path) -> None:
@@ -398,6 +455,50 @@ def test_get_agent_session_requires_repo_when_issue_number_collides(tmp_path: Pa
     )
     with pytest.raises(RuntimeError, match="specify repo_full_name"):
         store.get_agent_session(5)
+
+
+def test_get_issue_comment_cursor_rejects_invalid_column_types(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.advance_pre_pr_last_consumed_comment_id(issue_number=7, comment_id=1)
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute(
+            "UPDATE issue_comment_cursors SET pre_pr_last_consumed_comment_id = ? WHERE issue_number = ?",
+            (sqlite3.Binary(b"\x01"), 7),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="pre_pr_last_consumed_comment_id"):
+        store.get_issue_comment_cursor(7)
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute(
+            "UPDATE issue_comment_cursors SET pre_pr_last_consumed_comment_id = ?, post_pr_last_redirected_comment_id = ? WHERE issue_number = ?",
+            (1, sqlite3.Binary(b"\x02"), 7),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="post_pr_last_redirected_comment_id"):
+        store.get_issue_comment_cursor(7)
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute(
+            "UPDATE issue_comment_cursors SET post_pr_last_redirected_comment_id = ?, updated_at = ? WHERE issue_number = ?",
+            (2, sqlite3.Binary(b"\x03"), 7),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="updated_at"):
+        store.get_issue_comment_cursor(7)
 
 
 def test_operator_commands_and_runtime_operations(tmp_path: Path) -> None:
@@ -766,6 +867,11 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
         _parse_restart_mode(1)
     with pytest.raises(RuntimeError, match="Unknown mode value"):
         _parse_restart_mode("other")
+
+    with pytest.raises(RuntimeError, match="Invalid flow value"):
+        _parse_pre_pr_followup_flow(1)
+    with pytest.raises(RuntimeError, match="Unknown flow value"):
+        _parse_pre_pr_followup_flow("other")
 
 
 def test_state_store_repo_scoped_isolation(tmp_path: Path) -> None:

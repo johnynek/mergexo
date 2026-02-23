@@ -3,6 +3,8 @@ base_dir = "~/.local/share/mergexo"
 worker_count = 2
 poll_interval_seconds = 600
 enable_github_operations = false
+# Enable pre-PR issue comment routing (queued retries before PR creation + post-PR redirects).
+enable_issue_comment_routing = false
 # Restart drain timeout before pending restart is marked failed.
 restart_drain_timeout_seconds = 900
 # Default restart mode when /mergexo restart omits mode=...

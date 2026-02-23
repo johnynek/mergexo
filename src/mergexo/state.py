@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import threading
-from typing import cast
+from typing import Literal, cast
 
 from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
@@ -25,6 +25,7 @@ _LEGACY_SCHEMA_REINIT_MESSAGE = (
     "Detected a legacy state schema that is incompatible with multi-repo support. "
     "Reinitialize state: stop MergeXO, remove the old state DB, run `mergexo init`, then restart."
 )
+PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,34 @@ class ImplementationCandidateState:
     repo_full_name: str = ""
 
 
+@dataclass(frozen=True)
+class PrePrFollowupState:
+    issue_number: int
+    flow: PrePrFollowupFlow
+    branch: str
+    context_json: str
+    waiting_reason: str
+    updated_at: str
+    repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class IssueCommentCursorState:
+    issue_number: int
+    pre_pr_last_consumed_comment_id: int
+    post_pr_last_redirected_comment_id: int
+    updated_at: str
+    repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class LegacyFailedIssueRunState:
+    issue_number: int
+    branch: str | None
+    error: str | None
+    repo_full_name: str = ""
+
+
 class StateStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,6 +129,32 @@ class StateStore:
                     pr_number INTEGER,
                     pr_url TEXT,
                     error TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, issue_number)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pre_pr_followup_state (
+                    repo_full_name TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    flow TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    waiting_reason TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, issue_number)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS issue_comment_cursors (
+                    repo_full_name TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    pre_pr_last_consumed_comment_id INTEGER NOT NULL DEFAULT 0,
+                    post_pr_last_redirected_comment_id INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, issue_number)
                 )
@@ -281,6 +336,13 @@ class StateStore:
                 """,
                 (repo_key, pr_number, issue_number, branch),
             )
+            conn.execute(
+                """
+                DELETE FROM pre_pr_followup_state
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            )
 
     def mark_failed(
         self, issue_number: int, error: str, *, repo_full_name: str | None = None
@@ -298,6 +360,304 @@ class StateStore:
                 """,
                 (repo_key, issue_number, error),
             )
+            conn.execute(
+                """
+                DELETE FROM pre_pr_followup_state
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            )
+
+    def mark_awaiting_issue_followup(
+        self,
+        *,
+        issue_number: int,
+        flow: PrePrFollowupFlow,
+        branch: str,
+        context_json: str,
+        waiting_reason: str,
+        repo_full_name: str | None = None,
+    ) -> None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO issue_runs(
+                    repo_full_name,
+                    issue_number,
+                    status,
+                    branch,
+                    pr_number,
+                    pr_url,
+                    error
+                )
+                VALUES(?, ?, 'awaiting_issue_followup', ?, NULL, NULL, ?)
+                ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
+                    status='awaiting_issue_followup',
+                    branch=excluded.branch,
+                    pr_number=NULL,
+                    pr_url=NULL,
+                    error=excluded.error,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, issue_number, branch, waiting_reason),
+            )
+            conn.execute(
+                """
+                INSERT INTO pre_pr_followup_state(
+                    repo_full_name,
+                    issue_number,
+                    flow,
+                    branch,
+                    context_json,
+                    waiting_reason
+                )
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
+                    flow=excluded.flow,
+                    branch=excluded.branch,
+                    context_json=excluded.context_json,
+                    waiting_reason=excluded.waiting_reason,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, issue_number, flow, branch, context_json, waiting_reason),
+            )
+
+    def list_pre_pr_followups(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[PrePrFollowupState, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        p.repo_full_name,
+                        p.issue_number,
+                        p.flow,
+                        p.branch,
+                        p.context_json,
+                        p.waiting_reason,
+                        p.updated_at
+                    FROM pre_pr_followup_state AS p
+                    INNER JOIN issue_runs AS r
+                        ON r.repo_full_name = p.repo_full_name
+                       AND r.issue_number = p.issue_number
+                    WHERE r.status = 'awaiting_issue_followup'
+                    ORDER BY p.updated_at ASC, p.repo_full_name ASC, p.issue_number ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        p.repo_full_name,
+                        p.issue_number,
+                        p.flow,
+                        p.branch,
+                        p.context_json,
+                        p.waiting_reason,
+                        p.updated_at
+                    FROM pre_pr_followup_state AS p
+                    INNER JOIN issue_runs AS r
+                        ON r.repo_full_name = p.repo_full_name
+                       AND r.issue_number = p.issue_number
+                    WHERE r.status = 'awaiting_issue_followup'
+                      AND p.repo_full_name = ?
+                    ORDER BY p.updated_at ASC, p.issue_number ASC
+                    """,
+                    (repo_key,),
+                ).fetchall()
+        return tuple(
+            PrePrFollowupState(
+                repo_full_name=str(row_repo_full_name),
+                issue_number=int(issue_number),
+                flow=_parse_pre_pr_followup_flow(flow),
+                branch=str(branch),
+                context_json=str(context_json),
+                waiting_reason=str(waiting_reason),
+                updated_at=str(updated_at),
+            )
+            for (
+                row_repo_full_name,
+                issue_number,
+                flow,
+                branch,
+                context_json,
+                waiting_reason,
+                updated_at,
+            ) in rows
+        )
+
+    def clear_pre_pr_followup_state(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM pre_pr_followup_state
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            )
+
+    def list_legacy_failed_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[LegacyFailedIssueRunState, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        r.repo_full_name,
+                        r.issue_number,
+                        r.branch,
+                        r.error
+                    FROM issue_runs AS r
+                    LEFT JOIN pre_pr_followup_state AS p
+                        ON p.repo_full_name = r.repo_full_name
+                       AND p.issue_number = r.issue_number
+                    WHERE r.status = 'failed'
+                      AND r.pr_number IS NULL
+                      AND p.issue_number IS NULL
+                    ORDER BY r.updated_at ASC, r.repo_full_name ASC, r.issue_number ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        r.repo_full_name,
+                        r.issue_number,
+                        r.branch,
+                        r.error
+                    FROM issue_runs AS r
+                    LEFT JOIN pre_pr_followup_state AS p
+                        ON p.repo_full_name = r.repo_full_name
+                       AND p.issue_number = r.issue_number
+                    WHERE r.status = 'failed'
+                      AND r.pr_number IS NULL
+                      AND p.issue_number IS NULL
+                      AND r.repo_full_name = ?
+                    ORDER BY r.updated_at ASC, r.issue_number ASC
+                    """,
+                    (repo_key,),
+                ).fetchall()
+        return tuple(
+            LegacyFailedIssueRunState(
+                repo_full_name=str(row_repo_full_name),
+                issue_number=int(issue_number),
+                branch=str(branch) if isinstance(branch, str) else None,
+                error=str(error) if isinstance(error, str) else None,
+            )
+            for row_repo_full_name, issue_number, branch, error in rows
+        )
+
+    def get_issue_comment_cursor(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> IssueCommentCursorState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    pre_pr_last_consumed_comment_id,
+                    post_pr_last_redirected_comment_id,
+                    updated_at
+                FROM issue_comment_cursors
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            ).fetchone()
+        if row is None:
+            return IssueCommentCursorState(
+                repo_full_name=repo_key,
+                issue_number=issue_number,
+                pre_pr_last_consumed_comment_id=0,
+                post_pr_last_redirected_comment_id=0,
+                updated_at="",
+            )
+
+        pre_pr_last_consumed_comment_id, post_pr_last_redirected_comment_id, updated_at = row
+        if not isinstance(pre_pr_last_consumed_comment_id, int):
+            raise RuntimeError(
+                "Invalid pre_pr_last_consumed_comment_id value stored in issue_comment_cursors"
+            )
+        if not isinstance(post_pr_last_redirected_comment_id, int):
+            raise RuntimeError(
+                "Invalid post_pr_last_redirected_comment_id value stored in issue_comment_cursors"
+            )
+        if not isinstance(updated_at, str):
+            raise RuntimeError("Invalid updated_at value stored in issue_comment_cursors")
+        return IssueCommentCursorState(
+            repo_full_name=repo_key,
+            issue_number=issue_number,
+            pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+            post_pr_last_redirected_comment_id=post_pr_last_redirected_comment_id,
+            updated_at=updated_at,
+        )
+
+    def advance_pre_pr_last_consumed_comment_id(
+        self,
+        *,
+        issue_number: int,
+        comment_id: int,
+        repo_full_name: str | None = None,
+    ) -> IssueCommentCursorState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO issue_comment_cursors(
+                    repo_full_name,
+                    issue_number,
+                    pre_pr_last_consumed_comment_id,
+                    post_pr_last_redirected_comment_id
+                )
+                VALUES(?, ?, ?, 0)
+                ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
+                    pre_pr_last_consumed_comment_id = CASE
+                        WHEN issue_comment_cursors.pre_pr_last_consumed_comment_id > excluded.pre_pr_last_consumed_comment_id
+                        THEN issue_comment_cursors.pre_pr_last_consumed_comment_id
+                        ELSE excluded.pre_pr_last_consumed_comment_id
+                    END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, issue_number, comment_id),
+            )
+        return self.get_issue_comment_cursor(issue_number, repo_full_name=repo_key)
+
+    def advance_post_pr_last_redirected_comment_id(
+        self,
+        *,
+        issue_number: int,
+        comment_id: int,
+        repo_full_name: str | None = None,
+    ) -> IssueCommentCursorState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO issue_comment_cursors(
+                    repo_full_name,
+                    issue_number,
+                    pre_pr_last_consumed_comment_id,
+                    post_pr_last_redirected_comment_id
+                )
+                VALUES(?, ?, 0, ?)
+                ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
+                    post_pr_last_redirected_comment_id = CASE
+                        WHEN issue_comment_cursors.post_pr_last_redirected_comment_id > excluded.post_pr_last_redirected_comment_id
+                        THEN issue_comment_cursors.post_pr_last_redirected_comment_id
+                        ELSE excluded.post_pr_last_redirected_comment_id
+                    END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, issue_number, comment_id),
+            )
+        return self.get_issue_comment_cursor(issue_number, repo_full_name=repo_key)
 
     def save_agent_session(
         self,
@@ -1316,3 +1676,11 @@ def _parse_restart_mode(value: object) -> RestartMode:
     if value not in {"git_checkout", "pypi"}:
         raise RuntimeError(f"Unknown mode value stored in runtime_operations: {value}")
     return cast(RestartMode, value)
+
+
+def _parse_pre_pr_followup_flow(value: object) -> PrePrFollowupFlow:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid flow value stored in pre_pr_followup_state")
+    if value not in {"design_doc", "bugfix", "small_job", "implementation"}:
+        raise RuntimeError(f"Unknown flow value stored in pre_pr_followup_state: {value}")
+    return cast(PrePrFollowupFlow, value)
