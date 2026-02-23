@@ -86,6 +86,13 @@ def compute_operator_command_token(*, command_key: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def compute_source_issue_redirect_token(
+    *, issue_number: int, pr_number: int, comment_id: int
+) -> str:
+    payload = f"source_issue_redirect:{issue_number}:{pr_number}:{comment_id}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def append_action_token(*, body: str, token: str) -> str:
     marker = f"<!-- mergexo-action:{token} -->"
     stripped = body.strip()

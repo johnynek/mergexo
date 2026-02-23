@@ -29,6 +29,7 @@ from mergexo.feedback_loop import (
     compute_history_rewrite_token,
     compute_operator_command_token,
     compute_review_reply_token,
+    compute_source_issue_redirect_token,
     compute_turn_key,
     event_key,
     extract_action_tokens,
@@ -39,7 +40,7 @@ from mergexo.feedback_loop import (
     parse_operator_command,
 )
 from mergexo.git_ops import GitRepoManager
-from mergexo.github_gateway import CompareCommitsStatus, GitHubGateway
+from mergexo.github_gateway import CompareCommitsStatus, GitHubGateway, GitHubPollingError
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -57,6 +58,7 @@ from mergexo.observability import log_event, logging_repo_context
 from mergexo.shell import CommandError, run
 from mergexo.state import (
     ImplementationCandidateState,
+    PrePrFollowupState,
     StateStore,
     TrackedPullRequestState,
 )
@@ -66,10 +68,20 @@ LOGGER = logging.getLogger("mergexo.orchestrator")
 _MAX_FEEDBACK_GIT_OP_ROUNDS = 3
 _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
 _MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
+_MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS = 3
 _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT = 12000
 _ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
 _RESTART_OPERATION_NAME = "restart"
 _RESTART_PENDING_STATUSES = {"pending", "running"}
+_RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
+    "flow blocked:",
+    "required pre-push tests failed before pushing design branch",
+    "required pre-push tests did not pass after automated repair attempts",
+    "new_issue_comments_pending",
+)
+_PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(r"(bugfix|small-job|implementation) flow blocked:")
+
+PrePrFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
 
 
 @dataclass(frozen=True)
@@ -89,6 +101,15 @@ class _GitOpOutcome:
     op: str
     success: bool
     detail: str
+
+
+@dataclass(frozen=True)
+class _RunningIssueMetadata:
+    flow: PrePrFlow
+    branch: str
+    context_json: str
+    source_issue_number: int
+    consumed_comment_id_max: int
 
 
 class DirectFlowError(RuntimeError):
@@ -135,6 +156,35 @@ class SlotPool:
         log_event(LOGGER, "slot_released", slot=lease.slot)
 
 
+class GlobalWorkLimiter:
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("GlobalWorkLimiter capacity must be at least 1")
+        self._capacity = capacity
+        self._in_flight = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._in_flight >= self._capacity:
+                return False
+            self._in_flight += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._in_flight < 1:
+                raise RuntimeError("GlobalWorkLimiter release called when no work is in flight")
+            self._in_flight -= 1
+
+    def in_flight(self) -> int:
+        with self._lock:
+            return self._in_flight
+
+    def capacity(self) -> int:
+        return self._capacity
+
+
 class Phase1Orchestrator:
     def __init__(
         self,
@@ -147,6 +197,7 @@ class Phase1Orchestrator:
         github_by_repo_full_name: dict[str, GitHubGateway] | None = None,
         agent: AgentAdapter,
         allow_runtime_restart: bool = False,
+        work_limiter: GlobalWorkLimiter | None = None,
     ) -> None:
         self._config = config
         self._state = state
@@ -157,55 +208,149 @@ class Phase1Orchestrator:
         self._github_by_repo_full_name.setdefault(self._repo.full_name, github)
         self._agent = agent
         self._allow_runtime_restart = allow_runtime_restart
+        self._work_limiter = (
+            work_limiter
+            if work_limiter is not None
+            else GlobalWorkLimiter(config.runtime.worker_count)
+        )
         self._slot_pool = SlotPool(git_manager, config.runtime.worker_count)
         self._running: dict[int, Future[WorkResult]] = {}
+        self._running_issue_metadata: dict[int, _RunningIssueMetadata] = {}
         self._running_feedback: dict[int, _FeedbackFuture] = {}
         self._running_lock = threading.Lock()
+        self._poll_setup_done = False
         self._restart_drain_started_at_monotonic: float | None = None
+        self._legacy_pre_pr_adopted = False
         self._authorized_operator_logins = {
             login.strip().lower() for login in self._repo.operator_logins if login.strip()
         }
 
     def run(self, *, once: bool) -> None:
         with logging_repo_context(self._repo.full_name):
-            self._git.ensure_layout()
-
             with ThreadPoolExecutor(max_workers=self._config.runtime.worker_count) as pool:
                 while True:
-                    log_event(
-                        LOGGER,
-                        "poll_started",
-                        once=once,
-                        github_operations_enabled=self._config.runtime.enable_github_operations,
-                    )
-                    self._reap_finished()
-
-                    if self._config.runtime.enable_github_operations:
-                        self._scan_operator_commands()
-                    draining_for_restart = self._drain_for_pending_restart_if_needed()
-
-                    if not draining_for_restart:
-                        self._enqueue_new_work(pool)
-                        self._enqueue_implementation_work(pool)
-                        self._enqueue_feedback_work(pool)
-
-                    log_event(
-                        LOGGER,
-                        "poll_completed",
-                        running_issue_count=len(self._running),
-                        running_feedback_count=len(self._running_feedback),
-                        draining_for_restart=draining_for_restart,
-                    )
+                    self.poll_once(pool, allow_enqueue=True)
+                    self._drain_for_pending_restart_if_needed()
 
                     if once:
                         self._wait_for_all(pool)
                         self._reap_finished()
                         if self._config.runtime.enable_github_operations:
-                            self._scan_operator_commands()
+                            self._run_poll_step(
+                                step_name="scan_operator_commands_once",
+                                fn=self._scan_operator_commands,
+                            )
                         self._drain_for_pending_restart_if_needed()
+                        if self._config.runtime.enable_issue_comment_routing:
+                            self._run_poll_step(
+                                step_name="scan_post_pr_source_issue_comment_redirects_once",
+                                fn=self._scan_post_pr_source_issue_comment_redirects,
+                            )
                         break
 
                     time.sleep(self._config.runtime.poll_interval_seconds)
+
+    def poll_once(self, pool: ThreadPoolExecutor, *, allow_enqueue: bool = True) -> None:
+        with logging_repo_context(self._repo.full_name):
+            self._ensure_poll_setup()
+            log_event(
+                LOGGER,
+                "poll_started",
+                once=False,
+                github_operations_enabled=self._config.runtime.enable_github_operations,
+                allow_enqueue=allow_enqueue,
+            )
+            self._reap_finished()
+
+            poll_had_github_errors = False
+            if self._config.runtime.enable_github_operations:
+                if not self._run_poll_step(
+                    step_name="scan_operator_commands",
+                    fn=self._scan_operator_commands,
+                ):
+                    poll_had_github_errors = True
+
+            restart_pending = self._is_restart_pending()
+            enqueue_allowed = allow_enqueue and not restart_pending
+
+            if enqueue_allowed:
+                if not self._run_poll_step(
+                    step_name="enqueue_new_work",
+                    fn=lambda: self._enqueue_new_work(pool),
+                ):
+                    poll_had_github_errors = True
+                if not self._run_poll_step(
+                    step_name="enqueue_implementation_work",
+                    fn=lambda: self._enqueue_implementation_work(pool),
+                ):
+                    poll_had_github_errors = True
+                if self._config.runtime.enable_issue_comment_routing:
+                    if not self._run_poll_step(
+                        step_name="enqueue_pre_pr_followup_work",
+                        fn=lambda: self._enqueue_pre_pr_followup_work(pool),
+                    ):
+                        poll_had_github_errors = True
+                if not self._run_poll_step(
+                    step_name="enqueue_feedback_work",
+                    fn=lambda: self._enqueue_feedback_work(pool),
+                ):
+                    poll_had_github_errors = True
+                if self._config.runtime.enable_issue_comment_routing:
+                    if not self._run_poll_step(
+                        step_name="scan_post_pr_source_issue_comment_redirects",
+                        fn=self._scan_post_pr_source_issue_comment_redirects,
+                    ):
+                        poll_had_github_errors = True
+
+            log_event(
+                LOGGER,
+                "poll_completed",
+                running_issue_count=len(self._running),
+                running_feedback_count=len(self._running_feedback),
+                draining_for_restart=not enqueue_allowed,
+                poll_had_github_errors=poll_had_github_errors,
+            )
+
+    def pending_work_count(self) -> int:
+        with self._running_lock:
+            return len(self._running) + len(self._running_feedback)
+
+    def queue_counts(self) -> tuple[int, int]:
+        with self._running_lock:
+            return len(self._running), len(self._running_feedback)
+
+    def in_flight_work_count(self) -> int:
+        return self._work_limiter.in_flight()
+
+    def _ensure_poll_setup(self) -> None:
+        if self._poll_setup_done:
+            return
+        self._git.ensure_layout()
+        if self._config.runtime.enable_issue_comment_routing:
+            self._run_poll_step(
+                step_name="adopt_legacy_failed_pre_pr_runs",
+                fn=self._adopt_legacy_failed_pre_pr_runs,
+            )
+        self._poll_setup_done = True
+
+    def _is_restart_pending(self) -> bool:
+        operation = self._state.get_runtime_operation(_RESTART_OPERATION_NAME)
+        return operation is not None and operation.status in _RESTART_PENDING_STATUSES
+
+    def _run_poll_step(self, *, step_name: str, fn: Callable[[], None]) -> bool:
+        try:
+            fn()
+            return True
+        except GitHubPollingError as exc:
+            log_event(
+                LOGGER,
+                "poll_step_failed",
+                repo_full_name=self._state_repo_full_name(),
+                step=step_name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return False
 
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
         labels = _trigger_labels(self._repo)
@@ -240,48 +385,73 @@ class Phase1Orchestrator:
                 )
                 continue
 
-            with self._running_lock:
-                if not self._has_capacity_locked():
+            capacity_reserved = False
+            try:
+                with self._running_lock:
+                    if not self._has_capacity_locked() or not self._work_limiter.try_acquire():
+                        log_event(
+                            LOGGER,
+                            "issue_skipped",
+                            issue_number=issue.number,
+                            reason="worker_capacity_full",
+                        )
+                        return
+                    capacity_reserved = True
+                    if issue.number in self._running:
+                        log_event(
+                            LOGGER,
+                            "issue_skipped",
+                            issue_number=issue.number,
+                            reason="already_running",
+                        )
+                        continue
+
+                if not self._state.can_enqueue(
+                    issue.number, repo_full_name=self._state_repo_full_name()
+                ):
                     log_event(
                         LOGGER,
                         "issue_skipped",
                         issue_number=issue.number,
-                        reason="worker_capacity_full",
-                    )
-                    return
-                if issue.number in self._running:
-                    log_event(
-                        LOGGER,
-                        "issue_skipped",
-                        issue_number=issue.number,
-                        reason="already_running",
+                        reason="already_processed",
                     )
                     continue
 
-            if not self._state.can_enqueue(
-                issue.number, repo_full_name=self._state_repo_full_name()
-            ):
+                branch = _branch_for_issue_flow(flow=flow, issue=issue)
+                context_json = self._serialize_pre_pr_context_for_issue(
+                    issue=issue,
+                    flow=flow,
+                    branch=branch,
+                )
+                consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
+                    issue.number
+                )
+                self._state.mark_running(issue.number, repo_full_name=self._state_repo_full_name())
+                fut = pool.submit(self._process_issue_worker, issue, flow, consumed_comment_id_max)
+                # Ensure global capacity is returned even if worker code fails.
+                fut.add_done_callback(lambda _: self._work_limiter.release())
+                capacity_reserved = False
+                with self._running_lock:
+                    self._running[issue.number] = fut
+                    self._running_issue_metadata[issue.number] = _RunningIssueMetadata(
+                        flow=flow,
+                        branch=branch,
+                        context_json=context_json,
+                        source_issue_number=issue.number,
+                        consumed_comment_id_max=consumed_comment_id_max,
+                    )
                 log_event(
                     LOGGER,
-                    "issue_skipped",
+                    "issue_enqueued",
                     issue_number=issue.number,
-                    reason="already_processed",
+                    flow=flow,
+                    repo_full_name=self._state_repo_full_name(),
+                    trigger_label=_flow_trigger_label(flow=flow, repo=self._repo),
+                    issue_url=issue.html_url,
                 )
-                continue
-
-            self._state.mark_running(issue.number, repo_full_name=self._state_repo_full_name())
-            fut = pool.submit(self._process_issue_with_repo_logging_context, issue, flow)
-            with self._running_lock:
-                self._running[issue.number] = fut
-            log_event(
-                LOGGER,
-                "issue_enqueued",
-                issue_number=issue.number,
-                flow=flow,
-                repo_full_name=self._state_repo_full_name(),
-                trigger_label=_flow_trigger_label(flow=flow, repo=self._repo),
-                issue_url=issue.html_url,
-            )
+            finally:
+                if capacity_reserved:
+                    self._work_limiter.release()
 
     def _enqueue_implementation_work(self, pool: ThreadPoolExecutor) -> None:
         candidates = self._state.list_implementation_candidates(
@@ -293,39 +463,66 @@ class Phase1Orchestrator:
             candidate_count=len(candidates),
         )
         for candidate in candidates:
-            with self._running_lock:
-                if not self._has_capacity_locked():
-                    log_event(
-                        LOGGER,
-                        "implementation_skipped",
-                        issue_number=candidate.issue_number,
-                        reason="worker_capacity_full",
-                    )
-                    return
-                if candidate.issue_number in self._running:
-                    log_event(
-                        LOGGER,
-                        "implementation_skipped",
-                        issue_number=candidate.issue_number,
-                        reason="already_running",
-                    )
-                    continue
+            capacity_reserved = False
+            try:
+                with self._running_lock:
+                    if not self._has_capacity_locked() or not self._work_limiter.try_acquire():
+                        log_event(
+                            LOGGER,
+                            "implementation_skipped",
+                            issue_number=candidate.issue_number,
+                            reason="worker_capacity_full",
+                        )
+                        return
+                    capacity_reserved = True
+                    if candidate.issue_number in self._running:
+                        log_event(
+                            LOGGER,
+                            "implementation_skipped",
+                            issue_number=candidate.issue_number,
+                            reason="already_running",
+                        )
+                        continue
 
-            self._state.mark_running(
-                candidate.issue_number, repo_full_name=self._state_repo_full_name()
-            )
-            fut = pool.submit(
-                self._process_implementation_candidate_with_repo_logging_context,
-                candidate,
-            )
-            with self._running_lock:
-                self._running[candidate.issue_number] = fut
-            log_event(
-                LOGGER,
-                "implementation_enqueued",
-                issue_number=candidate.issue_number,
-                flow="implementation",
-            )
+                branch = _branch_for_implementation_candidate(candidate)
+                issue = self._github.get_issue(candidate.issue_number)
+                context_json = self._serialize_pre_pr_context_for_implementation(
+                    issue=issue,
+                    candidate=candidate,
+                    branch=branch,
+                )
+                consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
+                    candidate.issue_number
+                )
+                self._state.mark_running(
+                    candidate.issue_number, repo_full_name=self._state_repo_full_name()
+                )
+                fut = pool.submit(
+                    self._process_implementation_candidate_worker,
+                    candidate,
+                    issue,
+                    consumed_comment_id_max,
+                )
+                fut.add_done_callback(lambda _: self._work_limiter.release())
+                capacity_reserved = False
+                with self._running_lock:
+                    self._running[candidate.issue_number] = fut
+                    self._running_issue_metadata[candidate.issue_number] = _RunningIssueMetadata(
+                        flow="implementation",
+                        branch=branch,
+                        context_json=context_json,
+                        source_issue_number=candidate.issue_number,
+                        consumed_comment_id_max=consumed_comment_id_max,
+                    )
+                log_event(
+                    LOGGER,
+                    "implementation_enqueued",
+                    issue_number=candidate.issue_number,
+                    flow="implementation",
+                )
+            finally:
+                if capacity_reserved:
+                    self._work_limiter.release()
 
     def _enqueue_feedback_work(self, pool: ThreadPoolExecutor) -> None:
         tracked_prs = self._state.list_tracked_pull_requests(
@@ -333,35 +530,287 @@ class Phase1Orchestrator:
         )
         log_event(LOGGER, "feedback_scan_started", tracked_pr_count=len(tracked_prs))
         for tracked in tracked_prs:
-            with self._running_lock:
-                if not self._has_capacity_locked():
-                    log_event(
-                        LOGGER,
-                        "feedback_turn_blocked",
+            capacity_reserved = False
+            try:
+                with self._running_lock:
+                    if not self._has_capacity_locked() or not self._work_limiter.try_acquire():
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_blocked",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            reason="worker_capacity_full",
+                        )
+                        return
+                    capacity_reserved = True
+                    if tracked.pr_number in self._running_feedback:
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_blocked",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            reason="already_running",
+                        )
+                        continue
+                fut = pool.submit(self._process_feedback_turn_worker, tracked)
+                fut.add_done_callback(lambda _: self._work_limiter.release())
+                capacity_reserved = False
+                with self._running_lock:
+                    self._running_feedback[tracked.pr_number] = _FeedbackFuture(
                         issue_number=tracked.issue_number,
-                        pr_number=tracked.pr_number,
-                        reason="worker_capacity_full",
+                        future=fut,
                     )
-                    return
-                if tracked.pr_number in self._running_feedback:
-                    log_event(
-                        LOGGER,
-                        "feedback_turn_blocked",
-                        issue_number=tracked.issue_number,
-                        pr_number=tracked.pr_number,
-                        reason="already_running",
-                    )
+            finally:
+                if capacity_reserved:
+                    self._work_limiter.release()
+
+    def _enqueue_pre_pr_followup_work(self, pool: ThreadPoolExecutor) -> None:
+        followups = self._state.list_pre_pr_followups(repo_full_name=self._state_repo_full_name())
+        if not followups:
+            return
+
+        for followup in followups:
+            capacity_reserved = False
+            try:
+                with self._running_lock:
+                    if not self._has_capacity_locked() or not self._work_limiter.try_acquire():
+                        log_event(
+                            LOGGER,
+                            "pre_pr_followup_enqueued",
+                            repo_full_name=self._state_repo_full_name(),
+                            issue_number=followup.issue_number,
+                            reason="worker_capacity_full",
+                        )
+                        return
+                    capacity_reserved = True
+                    if followup.issue_number in self._running:
+                        continue
+
+                source_comments = self._github.list_issue_comments(followup.issue_number)
+                cursor = self._state.get_issue_comment_cursor(
+                    followup.issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                pending_comments = self._pending_source_issue_followups(
+                    comments=source_comments,
+                    after_comment_id=cursor.pre_pr_last_consumed_comment_id,
+                )
+                if not pending_comments:
                     continue
-            fut = pool.submit(self._process_feedback_turn_with_repo_logging_context, tracked)
-            with self._running_lock:
-                self._running_feedback[tracked.pr_number] = _FeedbackFuture(
-                    issue_number=tracked.issue_number,
-                    future=fut,
+
+                log_event(
+                    LOGGER,
+                    "pre_pr_followup_comments_detected",
+                    repo_full_name=self._state_repo_full_name(),
+                    issue_number=followup.issue_number,
+                    pending_comment_count=len(pending_comments),
+                    first_comment_id=pending_comments[0].comment_id,
+                    last_comment_id=pending_comments[-1].comment_id,
                 )
 
+                issue, candidate = self._decode_pre_pr_context(followup=followup)
+                if followup.flow == "implementation" and candidate is None:
+                    log_event(
+                        LOGGER,
+                        "pre_pr_followup_waiting",
+                        repo_full_name=self._state_repo_full_name(),
+                        issue_number=followup.issue_number,
+                        reason="missing_implementation_context",
+                    )
+                    continue
+
+                resume_issue = self._augment_issue_with_pre_pr_followups(
+                    issue=issue,
+                    waiting_reason=followup.waiting_reason,
+                    followups=pending_comments,
+                )
+                consumed_comment_id_max = pending_comments[-1].comment_id
+                branch = _branch_for_pre_pr_followup(
+                    flow=followup.flow,
+                    issue=resume_issue,
+                    stored_branch=followup.branch,
+                    candidate=candidate,
+                )
+                context_json = self._serialize_pre_pr_context(
+                    flow=followup.flow,
+                    branch=branch,
+                    issue=resume_issue,
+                    candidate=candidate,
+                )
+
+                self._state.mark_running(
+                    followup.issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "pre_pr_followup_resumed",
+                    repo_full_name=self._state_repo_full_name(),
+                    issue_number=followup.issue_number,
+                    flow=followup.flow,
+                    waiting_reason=followup.waiting_reason,
+                )
+                if followup.flow == "implementation":
+                    assert candidate is not None
+                    fut = pool.submit(
+                        self._process_implementation_candidate_worker,
+                        candidate,
+                        resume_issue,
+                        consumed_comment_id_max,
+                    )
+                else:
+                    fut = pool.submit(
+                        self._process_issue_worker,
+                        resume_issue,
+                        cast(IssueFlow, followup.flow),
+                        consumed_comment_id_max,
+                    )
+                fut.add_done_callback(lambda _: self._work_limiter.release())
+                capacity_reserved = False
+                with self._running_lock:
+                    self._running[followup.issue_number] = fut
+                    self._running_issue_metadata[followup.issue_number] = _RunningIssueMetadata(
+                        flow=followup.flow,
+                        branch=branch,
+                        context_json=context_json,
+                        source_issue_number=followup.issue_number,
+                        consumed_comment_id_max=consumed_comment_id_max,
+                    )
+                log_event(
+                    LOGGER,
+                    "pre_pr_followup_enqueued",
+                    repo_full_name=self._state_repo_full_name(),
+                    issue_number=followup.issue_number,
+                    flow=followup.flow,
+                    first_comment_id=pending_comments[0].comment_id,
+                    last_comment_id=consumed_comment_id_max,
+                )
+            finally:
+                if capacity_reserved:
+                    self._work_limiter.release()
+
+    def _scan_post_pr_source_issue_comment_redirects(self) -> None:
+        redirect_targets: dict[int, int] = {}
+        for tracked in self._state.list_tracked_pull_requests(
+            repo_full_name=self._state_repo_full_name()
+        ):
+            redirect_targets.setdefault(tracked.issue_number, tracked.pr_number)
+        for blocked in self._state.list_blocked_pull_requests(
+            repo_full_name=self._state_repo_full_name()
+        ):
+            redirect_targets.setdefault(blocked.issue_number, blocked.pr_number)
+
+        if not redirect_targets:
+            return
+
+        for issue_number, pr_number in sorted(redirect_targets.items()):
+            comments = self._github.list_issue_comments(issue_number)
+            cursor = self._state.get_issue_comment_cursor(
+                issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            max_scanned_comment_id = cursor.post_pr_last_redirected_comment_id
+            known_tokens = {
+                token for comment in comments for token in extract_action_tokens(comment.body)
+            }
+            pr_url = _pull_request_url(
+                repo_full_name=self._state_repo_full_name(),
+                pr_number=pr_number,
+            )
+            for comment in sorted(comments, key=lambda item: item.comment_id):
+                if comment.comment_id <= cursor.post_pr_last_redirected_comment_id:
+                    continue
+                if comment.comment_id > max_scanned_comment_id:
+                    max_scanned_comment_id = comment.comment_id
+                if not self._is_qualifying_source_issue_comment(comment):
+                    continue
+
+                token = compute_source_issue_redirect_token(
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                    comment_id=comment.comment_id,
+                )
+                if token not in known_tokens:
+                    self._github.post_issue_comment(
+                        issue_number=issue_number,
+                        body=append_action_token(
+                            body=_render_source_issue_redirect_comment(
+                                pr_number=pr_number,
+                                pr_url=pr_url,
+                                source_comment_url=comment.html_url,
+                            ),
+                            token=token,
+                        ),
+                    )
+                    known_tokens.add(token)
+                log_event(
+                    LOGGER,
+                    "source_issue_comment_redirected",
+                    repo_full_name=self._state_repo_full_name(),
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                    comment_id=comment.comment_id,
+                )
+
+            if max_scanned_comment_id > cursor.post_pr_last_redirected_comment_id:
+                self._state.advance_post_pr_last_redirected_comment_id(
+                    issue_number=issue_number,
+                    comment_id=max_scanned_comment_id,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+
+    def _adopt_legacy_failed_pre_pr_runs(self) -> None:
+        if self._legacy_pre_pr_adopted:
+            return
+        self._legacy_pre_pr_adopted = True
+        legacy_runs = self._state.list_legacy_failed_issue_runs_without_pr(
+            repo_full_name=self._state_repo_full_name()
+        )
+        for legacy in legacy_runs:
+            if not _is_recoverable_pre_pr_error(legacy.error or ""):
+                continue
+            issue = self._github.get_issue(legacy.issue_number)
+            flow = _infer_pre_pr_flow_from_issue_and_error(
+                issue=issue,
+                error=legacy.error or "",
+                design_label=self._repo.trigger_label,
+                bugfix_label=self._repo.bugfix_label,
+                small_job_label=self._repo.small_job_label,
+            )
+            if flow is None:
+                continue
+            if flow == "implementation":
+                # Legacy implementation retries cannot be reconstructed safely without
+                # candidate metadata (design branch/PR linkage).
+                continue
+            branch = _branch_for_issue_flow(flow=flow, issue=issue)
+            context_json = self._serialize_pre_pr_context_for_issue(
+                issue=issue,
+                flow=flow,
+                branch=branch,
+            )
+            self._state.mark_awaiting_issue_followup(
+                issue_number=legacy.issue_number,
+                flow=flow,
+                branch=branch,
+                context_json=context_json,
+                waiting_reason=legacy.error or "legacy_pre_pr_failed_run_adopted",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            self._capture_run_start_comment_id_if_enabled(legacy.issue_number)
+            log_event(
+                LOGGER,
+                "pre_pr_followup_waiting",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=legacy.issue_number,
+                reason="legacy_failed_run_adopted",
+            )
+
     def _has_capacity_locked(self) -> bool:
-        active = len(self._running) + len(self._running_feedback)
-        return active < self._config.runtime.worker_count
+        local_active = len(self._running) + len(self._running_feedback)
+        if local_active >= self._config.runtime.worker_count:
+            return False
+        return self._work_limiter.in_flight() < self._work_limiter.capacity()
 
     def _active_worker_count(self) -> int:
         with self._running_lock:
@@ -909,6 +1358,7 @@ class Phase1Orchestrator:
 
             for issue_number in finished_issue_numbers:
                 fut = self._running.pop(issue_number)
+                metadata = self._running_issue_metadata.pop(issue_number, None)
                 try:
                     result = fut.result()
                     self._state.mark_completed(
@@ -925,7 +1375,60 @@ class Phase1Orchestrator:
                         pr_number=result.pr_number,
                         branch=result.branch,
                     )
+                    if self._config.runtime.enable_issue_comment_routing and metadata is not None:
+                        self._state.clear_pre_pr_followup_state(
+                            issue_number=issue_number,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        self._state.advance_pre_pr_last_consumed_comment_id(
+                            issue_number=metadata.source_issue_number,
+                            comment_id=metadata.consumed_comment_id_max,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "pre_pr_followup_consumed",
+                            repo_full_name=self._state_repo_full_name(),
+                            issue_number=issue_number,
+                            consumed_comment_id_max=metadata.consumed_comment_id_max,
+                        )
                 except Exception as exc:  # noqa: BLE001
+                    if (
+                        self._config.runtime.enable_issue_comment_routing
+                        and metadata is not None
+                        and _is_recoverable_pre_pr_exception(exc)
+                    ):
+                        waiting_reason = str(exc).strip() or type(exc).__name__
+                        self._state.mark_awaiting_issue_followup(
+                            issue_number=issue_number,
+                            flow=metadata.flow,
+                            branch=metadata.branch,
+                            context_json=metadata.context_json,
+                            waiting_reason=waiting_reason,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        self._state.advance_pre_pr_last_consumed_comment_id(
+                            issue_number=metadata.source_issue_number,
+                            comment_id=metadata.consumed_comment_id_max,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "pre_pr_followup_consumed",
+                            repo_full_name=self._state_repo_full_name(),
+                            issue_number=issue_number,
+                            consumed_comment_id_max=metadata.consumed_comment_id_max,
+                        )
+                        log_event(
+                            LOGGER,
+                            "pre_pr_followup_waiting",
+                            repo_full_name=self._state_repo_full_name(),
+                            issue_number=issue_number,
+                            flow=metadata.flow,
+                            reason=waiting_reason,
+                        )
+                        continue
+
                     self._state.mark_failed(
                         issue_number=issue_number,
                         error=str(exc),
@@ -972,25 +1475,26 @@ class Phase1Orchestrator:
                     return
             time.sleep(1.0)
 
-    def _process_issue_with_repo_logging_context(self, issue: Issue, flow: IssueFlow) -> WorkResult:
-        with logging_repo_context(self._repo.full_name):
-            return self._process_issue(issue, flow)
-
-    def _process_implementation_candidate_with_repo_logging_context(
+    def _process_issue_worker(
         self,
-        candidate: ImplementationCandidateState,
+        issue: Issue,
+        flow: IssueFlow,
+        consumed_comment_id_max: int,
     ) -> WorkResult:
         with logging_repo_context(self._repo.full_name):
-            return self._process_implementation_candidate(candidate)
+            return self._process_issue(
+                issue,
+                flow,
+                pre_pr_last_consumed_comment_id=consumed_comment_id_max,
+            )
 
-    def _process_feedback_turn_with_repo_logging_context(
+    def _process_issue(
         self,
-        tracked: TrackedPullRequestState,
-    ) -> None:
-        with logging_repo_context(self._repo.full_name):
-            self._process_feedback_turn(tracked)
-
-    def _process_issue(self, issue: Issue, flow: IssueFlow) -> WorkResult:
+        issue: Issue,
+        flow: IssueFlow,
+        *,
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
         if not self._is_issue_author_allowed(
             issue_number=issue.number,
             author_login=issue.author_login,
@@ -1015,8 +1519,17 @@ class Phase1Orchestrator:
             )
             self._git.prepare_checkout(lease.path)
             if flow == "design_doc":
-                return self._process_design_issue(issue=issue, checkout_path=lease.path)
-            return self._process_direct_issue(issue=issue, flow=flow, checkout_path=lease.path)
+                return self._process_design_issue(
+                    issue=issue,
+                    checkout_path=lease.path,
+                    pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+                )
+            return self._process_direct_issue(
+                issue=issue,
+                flow=flow,
+                checkout_path=lease.path,
+                pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+            )
         except Exception as exc:  # noqa: BLE001
             log_event(
                 LOGGER,
@@ -1034,7 +1547,13 @@ class Phase1Orchestrator:
             finally:
                 self._slot_pool.release(lease)
 
-    def _process_design_issue(self, *, issue: Issue, checkout_path: Path) -> WorkResult:
+    def _process_design_issue(
+        self,
+        *,
+        issue: Issue,
+        checkout_path: Path,
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
         slug = _slugify(issue.title)
         branch = _issue_branch(flow="design_doc", issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
@@ -1087,6 +1606,10 @@ class Phase1Orchestrator:
                 "required pre-push tests failed before pushing design branch"
             )
         self._git.push_branch(checkout_path, branch)
+        self._run_pre_pr_ordering_gate(
+            issue_number=issue.number,
+            last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+        )
 
         pr = self._github.create_pull_request(
             title=f"Design doc for #{issue.number}: {generated.title}",
@@ -1126,6 +1649,7 @@ class Phase1Orchestrator:
         issue: Issue,
         flow: IssueFlow,
         checkout_path: Path,
+        pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         slug = _slugify(issue.title)
         branch = _issue_branch(flow=flow, issue_number=issue.number, slug=slug)
@@ -1165,15 +1689,27 @@ class Phase1Orchestrator:
         else:
             raise DirectFlowValidationError(f"Unsupported direct flow: {flow}")
 
+        default_commit_message = _default_commit_message(flow=flow, issue_number=issue.number)
         start_result = self._run_direct_turn_with_required_tests_repair(
             issue=issue,
             flow_label=flow_label,
             checkout_path=checkout_path,
-            default_commit_message=_default_commit_message(flow=flow, issue_number=issue.number),
+            default_commit_message=default_commit_message,
             require_regression_tests=(flow == "bugfix"),
             direct_turn=direct_turn,
         )
-        self._git.push_branch(checkout_path, branch)
+        self._push_branch_with_merge_conflict_repair(
+            issue=issue,
+            flow_label=flow_label,
+            checkout_path=checkout_path,
+            branch=branch,
+            default_commit_message=f"chore: resolve merge conflicts for issue #{issue.number}",
+            direct_turn=direct_turn,
+        )
+        self._run_pre_pr_ordering_gate(
+            issue_number=issue.number,
+            last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+        )
 
         pr = self._github.create_pull_request(
             title=start_result.pr_title,
@@ -1209,8 +1745,11 @@ class Phase1Orchestrator:
     def _process_implementation_candidate(
         self,
         candidate: ImplementationCandidateState,
+        *,
+        issue_override: Issue | None = None,
+        pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
-        issue = self._github.get_issue(candidate.issue_number)
+        issue = issue_override or self._github.get_issue(candidate.issue_number)
         if not self._is_issue_author_allowed(
             issue_number=issue.number,
             author_login=issue.author_login,
@@ -1282,17 +1821,29 @@ class Phase1Orchestrator:
                     cwd=lease.path,
                 )
 
+            default_commit_message = _default_commit_message(
+                flow="small_job", issue_number=issue.number
+            )
             start_result = self._run_direct_turn_with_required_tests_repair(
                 issue=issue,
                 flow_label="implementation",
                 checkout_path=lease.path,
-                default_commit_message=_default_commit_message(
-                    flow="small_job", issue_number=issue.number
-                ),
+                default_commit_message=default_commit_message,
                 require_regression_tests=False,
                 direct_turn=run_implementation_turn,
             )
-            self._git.push_branch(lease.path, branch)
+            self._push_branch_with_merge_conflict_repair(
+                issue=issue,
+                flow_label="implementation",
+                checkout_path=lease.path,
+                branch=branch,
+                default_commit_message=f"chore: resolve merge conflicts for issue #{issue.number}",
+                direct_turn=run_implementation_turn,
+            )
+            self._run_pre_pr_ordering_gate(
+                issue_number=issue.number,
+                last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+            )
 
             design_doc_url = _design_doc_url(
                 repo_full_name=self._state_repo_full_name(),
@@ -1351,6 +1902,23 @@ class Phase1Orchestrator:
             finally:
                 self._slot_pool.release(lease)
 
+    def _process_implementation_candidate_worker(
+        self,
+        candidate: ImplementationCandidateState,
+        issue: Issue,
+        consumed_comment_id_max: int,
+    ) -> WorkResult:
+        with logging_repo_context(self._repo.full_name):
+            return self._process_implementation_candidate(
+                candidate,
+                issue_override=issue,
+                pre_pr_last_consumed_comment_id=consumed_comment_id_max,
+            )
+
+    def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> None:
+        with logging_repo_context(self._repo.full_name):
+            self._process_feedback_turn(tracked)
+
     def _save_agent_session_if_present(
         self, *, issue_number: int, session: AgentSession | None
     ) -> None:
@@ -1362,6 +1930,65 @@ class Phase1Orchestrator:
             thread_id=session.thread_id,
             repo_full_name=self._state_repo_full_name(),
         )
+
+    def _push_branch_with_merge_conflict_repair(
+        self,
+        *,
+        issue: Issue,
+        flow_label: str,
+        checkout_path: Path,
+        branch: str,
+        default_commit_message: str,
+        direct_turn: Callable[[Issue], DirectStartResult],
+    ) -> None:
+        conflict_repair_round = 0
+        while True:
+            try:
+                self._git.push_branch(checkout_path, branch)
+                return
+            except CommandError as exc:
+                detail = str(exc)
+                if not _is_merge_conflict_error(detail):
+                    raise
+                conflict_repair_round += 1
+                log_event(
+                    LOGGER,
+                    "pre_pr_push_merge_conflict_detected",
+                    issue_number=issue.number,
+                    branch=branch,
+                    flow=flow_label,
+                    repair_round=conflict_repair_round,
+                )
+                if conflict_repair_round > _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS:
+                    summary = _summarize_git_error(detail)
+                    self._github.post_issue_comment(
+                        issue_number=issue.number,
+                        body=(
+                            "MergeXO could not resolve push-time merge conflicts before opening a PR.\n"
+                            f"- branch: `{branch}`\n"
+                            f"- attempts: {_MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS}\n"
+                            f"- last failure summary: {summary}"
+                        ),
+                    )
+                    raise DirectFlowBlockedError(
+                        f"{flow_label} flow blocked: push merge conflict unresolved after "
+                        f"{_MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS} repair attempts"
+                    )
+                repair_issue = self._issue_with_push_merge_conflict(
+                    issue=issue,
+                    branch=branch,
+                    failure_output=detail,
+                    attempt=conflict_repair_round,
+                    checkout_path=checkout_path,
+                )
+                _ = self._run_direct_turn_with_required_tests_repair(
+                    issue=repair_issue,
+                    flow_label=flow_label,
+                    checkout_path=checkout_path,
+                    default_commit_message=default_commit_message,
+                    require_regression_tests=False,
+                    direct_turn=direct_turn,
+                )
 
     def _resolve_checkout_path(self, *, configured_path: str, checkout_path: Path) -> Path:
         path = Path(configured_path)
@@ -1539,6 +2166,154 @@ class Phase1Orchestrator:
         )
         return None
 
+    def _run_pre_pr_ordering_gate(
+        self, *, issue_number: int, last_consumed_comment_id: int
+    ) -> None:
+        if not self._config.runtime.enable_issue_comment_routing:
+            return
+        comments = self._github.list_issue_comments(issue_number)
+        pending = self._pending_source_issue_followups(
+            comments=comments,
+            after_comment_id=last_consumed_comment_id,
+        )
+        if not pending:
+            return
+        raise DirectFlowBlockedError("new_issue_comments_pending")
+
+    def _pending_source_issue_followups(
+        self,
+        *,
+        comments: list[PullRequestIssueComment],
+        after_comment_id: int,
+    ) -> list[PullRequestIssueComment]:
+        pending = [
+            comment
+            for comment in sorted(comments, key=lambda item: item.comment_id)
+            if comment.comment_id > after_comment_id
+            and self._is_qualifying_source_issue_comment(comment)
+        ]
+        return pending
+
+    def _is_qualifying_source_issue_comment(self, comment: PullRequestIssueComment) -> bool:
+        if is_bot_login(comment.user_login):
+            return False
+        if not self._repo.allows(comment.user_login):
+            return False
+        if has_action_token(comment.body):
+            return False
+        return True
+
+    def _capture_run_start_comment_id_if_enabled(self, issue_number: int) -> int:
+        if not self._config.runtime.enable_issue_comment_routing:
+            return 0
+        comments = self._github.list_issue_comments(issue_number)
+        run_start_comment_id = max((comment.comment_id for comment in comments), default=0)
+        self._state.advance_pre_pr_last_consumed_comment_id(
+            issue_number=issue_number,
+            comment_id=run_start_comment_id,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return run_start_comment_id
+
+    def _serialize_pre_pr_context_for_issue(
+        self,
+        *,
+        issue: Issue,
+        flow: IssueFlow,
+        branch: str,
+    ) -> str:
+        return self._serialize_pre_pr_context(
+            flow=flow,
+            branch=branch,
+            issue=issue,
+            candidate=None,
+        )
+
+    def _serialize_pre_pr_context_for_implementation(
+        self,
+        *,
+        issue: Issue,
+        candidate: ImplementationCandidateState,
+        branch: str,
+    ) -> str:
+        return self._serialize_pre_pr_context(
+            flow="implementation",
+            branch=branch,
+            issue=issue,
+            candidate=candidate,
+        )
+
+    def _serialize_pre_pr_context(
+        self,
+        *,
+        flow: PrePrFlow,
+        branch: str,
+        issue: Issue,
+        candidate: ImplementationCandidateState | None,
+    ) -> str:
+        payload: dict[str, object] = {
+            "flow": flow,
+            "branch": branch,
+            "issue": _issue_to_json_dict(issue),
+        }
+        if candidate is not None:
+            payload["candidate"] = _implementation_candidate_to_json_dict(candidate)
+        return json.dumps(payload, sort_keys=True)
+
+    def _decode_pre_pr_context(
+        self,
+        *,
+        followup: PrePrFollowupState,
+    ) -> tuple[Issue, ImplementationCandidateState | None]:
+        issue_from_context: Issue | None = None
+        candidate: ImplementationCandidateState | None = None
+        try:
+            payload_raw = json.loads(followup.context_json)
+        except json.JSONDecodeError:
+            payload_raw = {}
+        if isinstance(payload_raw, dict):
+            payload = cast(dict[str, object], payload_raw)
+            issue_from_context = _issue_from_json_dict(payload.get("issue"))
+            candidate = _implementation_candidate_from_json_dict(payload.get("candidate"))
+
+        if issue_from_context is None:
+            issue = self._github.get_issue(followup.issue_number)
+        else:
+            issue = issue_from_context
+        return issue, candidate
+
+    def _augment_issue_with_pre_pr_followups(
+        self,
+        *,
+        issue: Issue,
+        waiting_reason: str,
+        followups: list[PullRequestIssueComment],
+    ) -> Issue:
+        followup_lines = [
+            (
+                f"- @{comment.user_login} ({comment.created_at}) [{comment.html_url}]"
+                f"\n{comment.body.strip() or '<empty>'}"
+            )
+            for comment in followups
+        ]
+        followup_section = "\n\n".join(followup_lines)
+        context = (
+            "Previous MergeXO pre-PR wait reason:\n"
+            f"{waiting_reason}\n\n"
+            "Ordered issue follow-up comments:\n"
+            f"{followup_section}"
+        )
+        base_body = issue.body.strip()
+        merged_body = f"{base_body}\n\n{context}" if base_body else context
+        return Issue(
+            number=issue.number,
+            title=issue.title,
+            body=merged_body,
+            html_url=issue.html_url,
+            labels=issue.labels,
+            author_login=issue.author_login,
+        )
+
     def _issue_with_required_tests_reminder(
         self, issue: Issue, *, checkout_path: Path | None = None
     ) -> Issue:
@@ -1597,6 +2372,47 @@ class Phase1Orchestrator:
             f"Repair the code so `{required_tests_command}` passes.\n"
             "If impossible, set blocked_reason with a concrete explanation.\n\n"
             "Failure output:\n"
+            f"{trimmed_output}"
+        )
+        body = base_issue.body.strip()
+        merged_body = f"{body}\n\n{context}" if body else context
+        return Issue(
+            number=base_issue.number,
+            title=base_issue.title,
+            body=merged_body,
+            html_url=base_issue.html_url,
+            labels=base_issue.labels,
+            author_login=base_issue.author_login,
+        )
+
+    def _issue_with_push_merge_conflict(
+        self,
+        *,
+        issue: Issue,
+        branch: str,
+        failure_output: str,
+        attempt: int,
+        checkout_path: Path | None = None,
+    ) -> Issue:
+        base_issue = self._issue_with_required_tests_reminder(issue, checkout_path=checkout_path)
+        trimmed_output = failure_output.strip()
+        if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
+            trimmed_output = (
+                trimmed_output[:_REQUIRED_TEST_FAILURE_OUTPUT_LIMIT]
+                + "\n... [truncated by MergeXO]"
+            )
+        if not trimmed_output:
+            trimmed_output = "<empty>"
+
+        context = (
+            f"Push-time merge conflict encountered on repair attempt {attempt} for `{branch}`.\n"
+            "The remote branch was merged into this checkout and produced conflicts.\n"
+            "Resolve all conflicts in the existing working tree.\n"
+            "Preserve both local intent and remote updates.\n"
+            "Do not run history-rewrite commands.\n"
+            "After resolving conflicts, stage files and return commit_message.\n"
+            "If impossible, set blocked_reason with a concrete explanation.\n\n"
+            "Merge output:\n"
             f"{trimmed_output}"
         )
         body = base_issue.body.strip()
@@ -2623,6 +3439,184 @@ class Phase1Orchestrator:
         return False
 
 
+def _issue_to_json_dict(issue: Issue) -> dict[str, object]:
+    return {
+        "number": issue.number,
+        "title": issue.title,
+        "body": issue.body,
+        "html_url": issue.html_url,
+        "labels": list(issue.labels),
+        "author_login": issue.author_login,
+    }
+
+
+def _issue_from_json_dict(raw: object) -> Issue | None:
+    if not isinstance(raw, dict):
+        return None
+    if not all(isinstance(key, str) for key in raw.keys()):
+        return None
+    payload = cast(dict[str, object], raw)
+    number = payload.get("number")
+    title = payload.get("title")
+    body = payload.get("body")
+    html_url = payload.get("html_url")
+    labels_raw = payload.get("labels")
+    author_login = payload.get("author_login")
+    if not isinstance(number, int):
+        return None
+    if not isinstance(title, str):
+        return None
+    if not isinstance(body, str):
+        return None
+    if not isinstance(html_url, str):
+        return None
+    if not isinstance(author_login, str):
+        return None
+    if not isinstance(labels_raw, list):
+        return None
+    labels: list[str] = []
+    for label in labels_raw:
+        if not isinstance(label, str):
+            return None
+        labels.append(label)
+    return Issue(
+        number=number,
+        title=title,
+        body=body,
+        html_url=html_url,
+        labels=tuple(labels),
+        author_login=author_login,
+    )
+
+
+def _implementation_candidate_to_json_dict(
+    candidate: ImplementationCandidateState,
+) -> dict[str, object]:
+    return {
+        "issue_number": candidate.issue_number,
+        "design_branch": candidate.design_branch,
+        "design_pr_number": candidate.design_pr_number,
+        "design_pr_url": candidate.design_pr_url,
+        "repo_full_name": candidate.repo_full_name,
+    }
+
+
+def _implementation_candidate_from_json_dict(raw: object) -> ImplementationCandidateState | None:
+    if not isinstance(raw, dict):
+        return None
+    if not all(isinstance(key, str) for key in raw.keys()):
+        return None
+    payload = cast(dict[str, object], raw)
+    issue_number = payload.get("issue_number")
+    design_branch = payload.get("design_branch")
+    design_pr_number = payload.get("design_pr_number")
+    design_pr_url = payload.get("design_pr_url")
+    repo_full_name = payload.get("repo_full_name")
+    if not isinstance(issue_number, int):
+        return None
+    if not isinstance(design_branch, str):
+        return None
+    if design_pr_number is not None and not isinstance(design_pr_number, int):
+        return None
+    if design_pr_url is not None and not isinstance(design_pr_url, str):
+        return None
+    if repo_full_name is not None and not isinstance(repo_full_name, str):
+        return None
+    return ImplementationCandidateState(
+        issue_number=issue_number,
+        design_branch=design_branch,
+        design_pr_number=design_pr_number,
+        design_pr_url=design_pr_url,
+        repo_full_name=repo_full_name or "",
+    )
+
+
+def _branch_for_issue_flow(*, flow: IssueFlow, issue: Issue) -> str:
+    return _issue_branch(flow=flow, issue_number=issue.number, slug=_slugify(issue.title))
+
+
+def _branch_for_implementation_candidate(candidate: ImplementationCandidateState) -> str:
+    slug = _design_branch_slug(candidate.design_branch)
+    if slug is None:
+        return candidate.design_branch
+    return f"agent/impl/{slug}"
+
+
+def _branch_for_pre_pr_followup(
+    *,
+    flow: PrePrFlow,
+    issue: Issue,
+    stored_branch: str,
+    candidate: ImplementationCandidateState | None,
+) -> str:
+    if stored_branch.strip():
+        return stored_branch
+    if flow == "implementation" and candidate is not None:
+        return _branch_for_implementation_candidate(candidate)
+    if flow == "implementation":
+        return "agent/impl/unknown"
+    return _branch_for_issue_flow(flow=flow, issue=issue)
+
+
+def _infer_pre_pr_flow_from_issue_and_error(
+    *,
+    issue: Issue,
+    error: str,
+    design_label: str,
+    bugfix_label: str,
+    small_job_label: str,
+) -> PrePrFlow | None:
+    resolved = _resolve_issue_flow(
+        issue=issue,
+        design_label=design_label,
+        bugfix_label=bugfix_label,
+        small_job_label=small_job_label,
+    )
+    if resolved is not None:
+        return resolved
+    error_match = _PRE_PR_BLOCKED_FLOW_PATTERN.search(error.lower())
+    if error_match is None:
+        return None
+    matched = error_match.group(1)
+    if matched == "small-job":
+        return "small_job"
+    return cast(PrePrFlow, matched)
+
+
+def _is_recoverable_pre_pr_error(error: str) -> bool:
+    normalized = error.strip().lower()
+    if not normalized:
+        return False
+    return any(signature in normalized for signature in _RECOVERABLE_PRE_PR_ERROR_SIGNATURES)
+
+
+def _is_recoverable_pre_pr_exception(exc: Exception) -> bool:
+    if isinstance(exc, DirectFlowBlockedError):
+        return True
+    if isinstance(exc, DirectFlowValidationError):
+        return _is_recoverable_pre_pr_error(str(exc))
+    return _is_recoverable_pre_pr_error(str(exc))
+
+
+def _pull_request_url(*, repo_full_name: str, pr_number: int) -> str:
+    return f"https://github.com/{repo_full_name}/pull/{pr_number}"
+
+
+def _render_source_issue_redirect_comment(
+    *,
+    pr_number: int,
+    pr_url: str,
+    source_comment_url: str,
+) -> str:
+    return (
+        "MergeXO source-issue comment routing update:\n"
+        f"- source comment: {source_comment_url}\n"
+        f"- linked PR: #{pr_number} ({pr_url})\n\n"
+        "Comments on the source issue are no longer actioned after a PR exists. "
+        "Please comment on the PR thread instead."
+    )
+
+
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "issue"
@@ -2728,6 +3722,19 @@ def _summarize_git_error(raw_error: str) -> str:
     if len(normalized) > 240:
         return normalized[:237] + "..."
     return normalized
+
+
+def _is_merge_conflict_error(raw_error: str) -> bool:
+    normalized = raw_error.strip().lower()
+    if not normalized:
+        return False
+    conflict_markers = (
+        "automatic merge failed",
+        "merge conflict",
+        "conflict (",
+        "fix conflicts and then commit",
+    )
+    return any(marker in normalized for marker in conflict_markers)
 
 
 def _operator_args_payload(command: OperatorCommandRecord) -> dict[str, object]:

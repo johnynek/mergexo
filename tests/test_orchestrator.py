@@ -23,8 +23,12 @@ from mergexo.agent_adapter import (
     ReviewReply,
 )
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
-from mergexo.feedback_loop import ParsedOperatorCommand, parse_operator_command
-from mergexo.github_gateway import GitHubGateway
+from mergexo.feedback_loop import (
+    ParsedOperatorCommand,
+    compute_source_issue_redirect_token,
+    parse_operator_command,
+)
+from mergexo.github_gateway import GitHubGateway, GitHubPollingError
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -38,30 +42,51 @@ from mergexo.models import (
     WorkResult,
 )
 from mergexo.orchestrator import (
+    DirectFlowBlockedError,
+    DirectFlowValidationError,
+    GlobalWorkLimiter,
     Phase1Orchestrator,
     RestartRequested,
     SlotPool,
     _FeedbackFuture,
+    _RunningIssueMetadata,
+    _branch_for_implementation_candidate,
+    _branch_for_pre_pr_followup,
     _design_branch_slug,
     _design_doc_url,
     _default_commit_message,
     _has_regression_test_changes,
+    _is_merge_conflict_error,
+    _implementation_candidate_from_json_dict,
+    _implementation_candidate_to_json_dict,
+    _infer_pre_pr_flow_from_issue_and_error,
+    _is_recoverable_pre_pr_error,
+    _is_recoverable_pre_pr_exception,
+    _issue_from_json_dict,
+    _issue_to_json_dict,
     _issue_branch,
-    _render_design_doc,
-    _render_operator_command_result,
-    _resolve_issue_flow,
-    _summarize_git_error,
     _operator_args_payload,
     _operator_normalized_command,
     _operator_reply_issue_number,
     _operator_reply_status_for_record,
     _operator_source_comment_url,
+    _pull_request_url,
+    _render_source_issue_redirect_comment,
+    _render_design_doc,
+    _render_operator_command_result,
+    _resolve_issue_flow,
+    _summarize_git_error,
     _slugify,
     _trigger_labels,
 )
 from mergexo.observability import configure_logging
 from mergexo.shell import CommandError
-from mergexo.state import ImplementationCandidateState, StateStore, TrackedPullRequestState
+from mergexo.state import (
+    ImplementationCandidateState,
+    PrePrFollowupState,
+    StateStore,
+    TrackedPullRequestState,
+)
 
 
 @dataclass
@@ -224,6 +249,10 @@ class FakeGitHub:
 
     def list_pull_request_issue_comments(self, pr_number: int) -> list[PullRequestIssueComment]:
         assert pr_number == self.pr_snapshot.number
+        return list(self.issue_comments)
+
+    def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
+        _ = issue_number
         return list(self.issue_comments)
 
     def post_review_comment_reply(self, pr_number: int, review_comment_id: int, body: str) -> None:
@@ -560,6 +589,7 @@ def _config(
     *,
     worker_count: int = 1,
     enable_github_operations: bool = False,
+    enable_issue_comment_routing: bool = False,
     restart_drain_timeout_seconds: int = 900,
     restart_default_mode: str = "git_checkout",
     restart_supported_modes: tuple[str, ...] = ("git_checkout",),
@@ -574,6 +604,7 @@ def _config(
             worker_count=worker_count,
             poll_interval_seconds=1,
             enable_github_operations=enable_github_operations,
+            enable_issue_comment_routing=enable_issue_comment_routing,
             restart_drain_timeout_seconds=restart_drain_timeout_seconds,
             restart_default_mode=cast(RestartMode, restart_default_mode),
             restart_supported_modes=cast(tuple[RestartMode, ...], restart_supported_modes),
@@ -639,6 +670,28 @@ def _write_required_tests_script(checkout_root: Path, *, slot: int = 0) -> Path:
     )
 
 
+def _issue_run_row(
+    db_path: Path,
+    issue_number: int,
+) -> tuple[str, str | None, int | None, str | None, str | None]:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status, branch, pr_number, pr_url, error FROM issue_runs WHERE issue_number = ?",
+            (issue_number,),
+        ).fetchone()
+        assert row is not None
+        status, branch, pr_number, pr_url, error = row
+        assert isinstance(status, str)
+        assert branch is None or isinstance(branch, str)
+        assert pr_number is None or isinstance(pr_number, int)
+        assert pr_url is None or isinstance(pr_url, str)
+        assert error is None or isinstance(error, str)
+        return status, branch, pr_number, pr_url, error
+    finally:
+        conn.close()
+
+
 def test_slot_pool_acquire_release(tmp_path: Path) -> None:
     manager = FakeGitManager(tmp_path / "checkouts")
     pool = SlotPool(manager, worker_count=1)
@@ -650,6 +703,40 @@ def test_slot_pool_acquire_release(tmp_path: Path) -> None:
     pool.release(lease)
     lease2 = pool.acquire()
     assert lease2.slot == 0
+
+
+def test_global_work_limiter_guards_bounds() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        GlobalWorkLimiter(0)
+
+    limiter = GlobalWorkLimiter(1)
+    assert limiter.try_acquire() is True
+    assert limiter.try_acquire() is False
+    assert limiter.in_flight() == 1
+    assert limiter.capacity() == 1
+
+    limiter.release()
+    assert limiter.in_flight() == 0
+    with pytest.raises(RuntimeError, match="no work is in flight"):
+        limiter.release()
+
+
+def test_orchestrator_queue_count_accessors(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    running: Future[WorkResult] = Future()
+    feedback: Future[None] = Future()
+    orch._running = {1: running}
+    orch._running_feedback = {101: _FeedbackFuture(issue_number=1, future=feedback)}
+    assert orch.pending_work_count() == 2
+    assert orch.queue_counts() == (1, 1)
+    assert orch.in_flight_work_count() == 0
 
 
 @given(st.text())
@@ -1072,6 +1159,100 @@ def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
     )
 
 
+def test_process_issue_repairs_push_merge_conflict_with_agent(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:small-job",))
+
+    original_push = git.push_branch
+    push_attempts = 0
+
+    def push_with_merge_conflict_once(checkout_path: Path, branch: str) -> None:
+        nonlocal push_attempts
+        push_attempts += 1
+        if push_attempts == 1:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: git merge\n"
+                "exit: 1\n"
+                "stdout:\n\n"
+                "stderr:\n"
+                "CONFLICT (content): Merge conflict in src/a.py\n"
+                "Automatic merge failed; fix conflicts and then commit the result.\n"
+            )
+        original_push(checkout_path, branch)
+
+    git.push_branch = push_with_merge_conflict_once  # type: ignore[method-assign]
+
+    result = orch._process_issue(issue, "small_job")
+
+    assert result.pr_number == 101
+    assert push_attempts == 2
+    assert len(agent.small_job_calls) == 2
+    assert "merge conflict" in agent.small_job_calls[1][0].body.lower()
+    assert len(git.commit_calls) == 2
+    assert github.created_prs != []
+
+
+def test_process_issue_blocks_after_repeated_push_merge_conflicts(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:small-job",))
+
+    def push_always_conflicts(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError(
+            "Command failed\n"
+            "cmd: git merge\n"
+            "exit: 1\n"
+            "stdout:\n\n"
+            "stderr:\n"
+            "CONFLICT (content): Merge conflict in src/a.py\n"
+            "Automatic merge failed; fix conflicts and then commit the result.\n"
+        )
+
+    git.push_branch = push_always_conflicts  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="flow blocked"):
+        orch._process_issue(issue, "small_job")
+
+    assert github.created_prs == []
+    assert any(
+        "could not resolve push-time merge conflicts" in body.lower() for _, body in github.comments
+    )
+    assert len(agent.small_job_calls) == 4
+
+
+def test_process_issue_push_non_conflict_error_propagates(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:small-job",))
+
+    def push_non_conflict_failure(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError("push rejected for unrelated reason")
+
+    git.push_branch = push_non_conflict_failure  # type: ignore[method-assign]
+
+    with pytest.raises(CommandError, match="unrelated reason"):
+        orch._process_issue(issue, "small_job")
+
+    assert len(agent.small_job_calls) == 1
+    assert github.created_prs == []
+
+
 def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -1294,16 +1475,26 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
     impl_result = WorkResult(issue_number=7, branch="b2", pr_number=12, pr_url="u2")
     observed: dict[str, object] = {}
 
-    def fake_process_issue(issue: Issue, flow: IssueFlow) -> WorkResult:
+    def fake_process_issue(
+        issue: Issue, flow: IssueFlow, *, pre_pr_last_consumed_comment_id: int = 0
+    ) -> WorkResult:
         observed["issue_number"] = issue.number
         observed["flow"] = flow
+        observed["pre_pr_last_consumed_comment_id"] = pre_pr_last_consumed_comment_id
         logging.getLogger("mergexo.tests.wrapper").info("event=wrapper_probe")
         return issue_result
 
     def fake_process_implementation_candidate(
         candidate: ImplementationCandidateState,
+        *,
+        issue_override: Issue | None = None,
+        pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         observed["implementation_issue_number"] = candidate.issue_number
+        observed["implementation_issue_override"] = (
+            issue_override.number if issue_override else None
+        )
+        observed["implementation_pre_pr_last_consumed_comment_id"] = pre_pr_last_consumed_comment_id
         return impl_result
 
     def fake_process_feedback_turn(tracked: TrackedPullRequestState) -> None:
@@ -1319,7 +1510,7 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
     configure_logging(verbose=True)
 
     issue = _issue()
-    assert orch._process_issue_with_repo_logging_context(issue, "design_doc") == issue_result
+    assert orch._process_issue_worker(issue, "design_doc", 17) == issue_result
 
     candidate = ImplementationCandidateState(
         issue_number=issue.number,
@@ -1327,9 +1518,7 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
         design_pr_number=101,
         design_pr_url="https://example/pr/101",
     )
-    assert (
-        orch._process_implementation_candidate_with_repo_logging_context(candidate) == impl_result
-    )
+    assert orch._process_implementation_candidate_worker(candidate, issue, 23) == impl_result
 
     tracked = TrackedPullRequestState(
         pr_number=101,
@@ -1338,12 +1527,15 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
         status="awaiting_feedback",
         last_seen_head_sha="headsha",
     )
-    orch._process_feedback_turn_with_repo_logging_context(tracked)
+    orch._process_feedback_turn_worker(tracked)
 
     assert observed == {
         "issue_number": issue.number,
         "flow": "design_doc",
+        "pre_pr_last_consumed_comment_id": 17,
         "implementation_issue_number": issue.number,
+        "implementation_issue_override": issue.number,
+        "implementation_pre_pr_last_consumed_comment_id": 23,
         "feedback_pr_number": 101,
     }
     assert "repo_full_name=johnynek/mergexo event=wrapper_probe" in capsys.readouterr().err
@@ -1382,8 +1574,8 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.submitted: list[tuple[int, IssueFlow]] = []
 
-        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
-            _ = fn
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, extra
             fut: Future[WorkResult] = Future()
             fut.set_result(
                 WorkResult(
@@ -1423,8 +1615,8 @@ def test_enqueue_new_work_skips_unauthorized_issue_authors(tmp_path: Path) -> No
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     class FakePool:
-        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
-            _ = fn, issue, flow
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, extra
             raise AssertionError("submit should not be called for unauthorized issues")
 
     orch._enqueue_new_work(FakePool())
@@ -1459,8 +1651,8 @@ def test_enqueue_implementation_work_paths(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.submitted: list[int] = []
 
-        def submit(self, fn, candidate):  # type: ignore[no-untyped-def]
-            _ = fn
+        def submit(self, fn, candidate, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, extra
             fut: Future[WorkResult] = Future()
             fut.set_result(
                 WorkResult(
@@ -1497,6 +1689,76 @@ def test_enqueue_implementation_work_paths(tmp_path: Path) -> None:
     assert pool.submitted == []
 
 
+def test_shared_global_work_limiter_caps_enqueue_across_orchestrators(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    git = FakeGitManager(tmp_path / "checkouts")
+    limiter = GlobalWorkLimiter(1)
+
+    first = Phase1Orchestrator(
+        cfg,
+        state=FakeState(allowed={1}),
+        github=FakeGitHub([_issue(1, "One")]),
+        git_manager=git,
+        agent=FakeAgent(),
+        work_limiter=limiter,
+    )
+    second = Phase1Orchestrator(
+        cfg,
+        state=FakeState(allowed={1}),
+        github=FakeGitHub([_issue(1, "One")]),
+        git_manager=git,
+        agent=FakeAgent(),
+        work_limiter=limiter,
+    )
+
+    class PendingPool:
+        def __init__(self) -> None:
+            self.submitted = 0
+            self.last_future: Future[WorkResult] | None = None
+
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, extra
+            fut: Future[WorkResult] = Future()
+            self.last_future = fut
+            self.submitted += 1
+            return fut
+
+    pool = PendingPool()
+
+    first._enqueue_new_work(pool)
+    assert pool.submitted == 1
+    second._enqueue_new_work(pool)
+    assert pool.submitted == 1
+
+    assert pool.last_future is not None
+    pool.last_future.set_result(WorkResult(issue_number=1, branch="b", pr_number=1, pr_url="u"))
+    second._enqueue_new_work(pool)
+    assert pool.submitted == 2
+
+
+def test_enqueue_new_work_releases_capacity_when_submit_fails(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    limiter = GlobalWorkLimiter(1)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(allowed={1}),
+        github=FakeGitHub([_issue(1, "One")]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+        work_limiter=limiter,
+    )
+
+    class FailingPool:
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, extra
+            raise RuntimeError("submit failed")
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        orch._enqueue_new_work(FailingPool())
+
+    assert limiter.in_flight() == 0
+
+
 def test_enqueue_new_work_uses_flow_precedence(tmp_path: Path) -> None:
     cfg = _config(tmp_path, worker_count=3)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -1514,8 +1776,8 @@ def test_enqueue_new_work_uses_flow_precedence(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.submitted: list[tuple[int, IssueFlow]] = []
 
-        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
-            _ = fn
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, extra
             self.submitted.append((issue.number, flow))
             fut: Future[WorkResult] = Future()
             fut.set_result(
@@ -1538,8 +1800,8 @@ def test_enqueue_new_work_skips_issues_without_matching_labels(tmp_path: Path) -
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     class FakePool:
-        def submit(self, fn, issue, flow):  # type: ignore[no-untyped-def]
-            _ = fn, issue, flow
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, extra
             raise AssertionError("submit should not be called")
 
     orch._enqueue_new_work(FakePool())
@@ -1566,6 +1828,868 @@ def test_reap_finished_marks_success_and_failure(tmp_path: Path) -> None:
     assert [w.issue_number for w in state.completed] == [1]
     assert state.failed[0][0] == 2
     assert orch._running == {}
+
+
+def test_reap_finished_recoverable_pre_pr_failure_moves_to_followup_waiting(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    bad: Future[WorkResult] = Future()
+    bad.set_exception(RuntimeError("bugfix flow blocked: need reporter follow-up"))
+    orch._running = {7: bad}
+    orch._running_issue_metadata = {
+        7: _RunningIssueMetadata(
+            flow="bugfix",
+            branch="agent/bugfix/7-worker",
+            context_json='{"flow":"bugfix"}',
+            source_issue_number=7,
+            consumed_comment_id_max=19,
+        )
+    }
+
+    orch._reap_finished()
+
+    row = _issue_run_row(tmp_path / "state.db", 7)
+    assert row[0] == "awaiting_issue_followup"
+    followups = state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name)
+    assert len(followups) == 1
+    assert followups[0].flow == "bugfix"
+    assert "reporter follow-up" in followups[0].waiting_reason
+    cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor.pre_pr_last_consumed_comment_id == 19
+
+
+def test_process_issue_pre_pr_ordering_gate_blocks_pr_creation_until_comments_processed(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=22,
+            body="Please include a regression test.",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-22",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(RuntimeError, match="new_issue_comments_pending"):
+        orch._process_issue(
+            _issue(labels=("agent:bugfix",)),
+            "bugfix",
+            pre_pr_last_consumed_comment_id=0,
+        )
+
+    assert github.created_prs == []
+
+
+def test_enqueue_pre_pr_followup_work_enqueues_pending_comments_in_order(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=5,
+            body="old",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-5",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=6,
+            body="new direction",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-6",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        ),
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-add-worker-scheduler",
+        context_json='{"flow":"bugfix","issue":{"number":7,"title":"Add worker scheduler","body":"Body","html_url":"https://example/issues/7","labels":["agent:bugfix"],"author_login":"issue-author"}}',
+        waiting_reason="bugfix flow blocked: waiting for clarifications",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=5,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.submitted: list[tuple[Issue, IssueFlow, int]] = []
+
+        def submit(self, fn, issue_arg, flow_arg, consumed):  # type: ignore[no-untyped-def]
+            _ = fn
+            self.submitted.append((issue_arg, flow_arg, consumed))
+            fut: Future[WorkResult] = Future()
+            return fut
+
+    pool = FakePool()
+    orch._enqueue_pre_pr_followup_work(pool)
+
+    assert len(pool.submitted) == 1
+    submitted_issue, submitted_flow, consumed_comment_id = pool.submitted[0]
+    assert submitted_flow == "bugfix"
+    assert consumed_comment_id == 6
+    assert "new direction" in submitted_issue.body
+    assert "waiting for clarifications" in submitted_issue.body
+
+
+def test_post_pr_source_issue_comment_redirects_are_idempotent_and_filtered(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=30,
+            body="Could you revise this?",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-30",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=31,
+            body="bot-noise",
+            user_login="mergexo[bot]",
+            html_url="https://example/issues/7#issuecomment-31",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=32,
+            body="outsider",
+            user_login="outsider",
+            html_url="https://example/issues/7#issuecomment-32",
+            created_at="2026-02-23T00:00:02Z",
+            updated_at="2026-02-23T00:00:02Z",
+        ),
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/bugfix/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert len(github.comments) == 1
+    redirected_body = github.comments[0][1]
+    token = compute_source_issue_redirect_token(issue_number=7, pr_number=101, comment_id=30)
+    assert token in redirected_body
+    assert "no longer actioned" in redirected_body
+
+    cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor.post_pr_last_redirected_comment_id == 32
+
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert len(github.comments) == 1
+
+
+def test_adopt_legacy_failed_pre_pr_runs_moves_recoverable_rows_to_followup_waiting(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:small-job",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=99,
+            body="latest context",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-99",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_failed(
+        issue_number=7,
+        error="small-job flow blocked: environment issue",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._adopt_legacy_failed_pre_pr_runs()
+
+    row = _issue_run_row(tmp_path / "state.db", 7)
+    assert row[0] == "awaiting_issue_followup"
+    followups = state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name)
+    assert len(followups) == 1
+    assert followups[0].flow == "small_job"
+    cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor.pre_pr_last_consumed_comment_id == 99
+
+
+def test_run_once_with_issue_comment_routing_invokes_followup_and_redirect_scans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    calls = {"adopt": 0, "followup": 0, "redirect": 0}
+
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(orch, "_wait_for_all", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_new_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_implementation_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_feedback_work", lambda pool: None)
+    monkeypatch.setattr(
+        orch,
+        "_enqueue_pre_pr_followup_work",
+        lambda pool: calls.__setitem__("followup", calls["followup"] + 1),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_scan_post_pr_source_issue_comment_redirects",
+        lambda: calls.__setitem__("redirect", calls["redirect"] + 1),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_adopt_legacy_failed_pre_pr_runs",
+        lambda: calls.__setitem__("adopt", calls["adopt"] + 1),
+    )
+
+    orch.run(once=True)
+    assert calls == {"adopt": 1, "followup": 1, "redirect": 2}
+
+
+def test_enqueue_pre_pr_followup_work_handles_capacity_and_missing_context_paths(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, worker_count=2, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:small-job",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=40,
+            body="please continue",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-40",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+
+    # No followups path: should no-op.
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class NoopPool:
+        def submit(self, *args: object, **kwargs: object) -> Future[WorkResult]:
+            _ = args, kwargs
+            raise AssertionError("submit should not be called")
+
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+
+    # Capacity-full path: should return without submit.
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="small_job",
+        branch="agent/small/7-add-worker-scheduler",
+        context_json='{"flow":"small_job","issue":{"number":7,"title":"Add worker scheduler","body":"Body","html_url":"https://example/issues/7","labels":["agent:small-job"],"author_login":"issue-author"}}',
+        waiting_reason="small-job flow blocked: waiting",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=39,
+        repo_full_name=cfg.repo.full_name,
+    )
+    full_future: Future[WorkResult] = Future()
+    orch._running = {1: full_future}
+    orch._running_feedback = {2: _FeedbackFuture(issue_number=8, future=Future())}
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+
+    # Already-running path.
+    orch._running = {7: Future()}
+    orch._running_feedback = {}
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+
+    # Pending-empty path.
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=40,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch._running = {}
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+    state.clear_pre_pr_followup_state(7, repo_full_name=cfg.repo.full_name)
+
+    # Missing implementation context path: skip and keep waiting.
+    state.mark_awaiting_issue_followup(
+        issue_number=8,
+        flow="implementation",
+        branch="agent/impl/8-add-worker-scheduler",
+        context_json='{"flow":"implementation"}',
+        waiting_reason="implementation flow blocked: waiting",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=8,
+        comment_id=39,
+        repo_full_name=cfg.repo.full_name,
+    )
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=40,
+            body="continue",
+            user_login="reviewer",
+            html_url="https://example/issues/8#issuecomment-40",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    orch._running = {}
+    orch._running_feedback = {}
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+    followups = state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name)
+    assert any(item.issue_number == 8 for item in followups)
+
+
+def test_enqueue_pre_pr_followup_work_implementation_resume_path_submits_worker(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:small-job",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=11,
+            body="resume",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-11",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="implementation",
+        branch="agent/impl/7-add-worker-scheduler",
+        context_json='{"flow":"implementation","issue":{"number":7,"title":"Add worker scheduler","body":"Body","html_url":"https://example/issues/7","labels":["agent:small-job"],"author_login":"issue-author"},"candidate":{"issue_number":7,"design_branch":"agent/design/7-add-worker-scheduler","design_pr_number":44,"design_pr_url":"https://example/pr/44","repo_full_name":""}}',
+        waiting_reason="implementation flow blocked: waiting",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=10,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    class CapturePool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def submit(self, fn, *args):  # type: ignore[no-untyped-def]
+            self.calls.append((fn, *args))
+            fut: Future[WorkResult] = Future()
+            return fut
+
+    pool = CapturePool()
+    orch._enqueue_pre_pr_followup_work(pool)
+
+    assert len(pool.calls) == 1
+    submitted = pool.calls[0]
+    assert submitted[0] == orch._process_implementation_candidate_worker
+    assert isinstance(submitted[1], ImplementationCandidateState)
+    assert isinstance(submitted[2], Issue)
+    assert submitted[3] == 11
+
+
+def test_scan_post_pr_source_issue_comment_redirects_handles_no_targets_and_blocked_targets(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    state = StateStore(tmp_path / "state.db")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    # No targets path.
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert github.comments == []
+
+    # Blocked PR target path.
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=issue.number,
+        status="blocked",
+        last_seen_head_sha="head",
+        error="blocked",
+        repo_full_name=cfg.repo.full_name,
+    )
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=15,
+            body="please handle this",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-15",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert len(github.comments) == 1
+
+
+def test_adopt_legacy_failed_pre_pr_runs_skips_non_recoverable_unknown_and_implementation(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue_unknown = _issue(number=8, labels=("triage",))
+    issue_impl = _issue(number=9, labels=("triage",))
+    github = FakeGitHub([issue_unknown, issue_impl])
+    state = StateStore(tmp_path / "state.db")
+    state.mark_failed(
+        issue_number=7,
+        error="plain failure",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_failed(
+        issue_number=8,
+        error="required pre-push tests did not pass after automated repair attempts",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_failed(
+        issue_number=9,
+        error="implementation flow blocked: waiting for info",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._adopt_legacy_failed_pre_pr_runs()
+    assert state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name) == ()
+
+    # Second pass returns immediately when already adopted.
+    orch._adopt_legacy_failed_pre_pr_runs()
+
+
+def test_reap_finished_success_with_metadata_updates_followup_cursor(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-worker",
+        context_json='{"flow":"bugfix"}',
+        waiting_reason="blocked",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    ok: Future[WorkResult] = Future()
+    ok.set_result(
+        WorkResult(
+            issue_number=7,
+            branch="agent/bugfix/7-worker",
+            pr_number=101,
+            pr_url="https://example/pr/101",
+        )
+    )
+    orch._running = {7: ok}
+    orch._running_issue_metadata = {
+        7: _RunningIssueMetadata(
+            flow="bugfix",
+            branch="agent/bugfix/7-worker",
+            context_json='{"flow":"bugfix"}',
+            source_issue_number=7,
+            consumed_comment_id_max=55,
+        )
+    }
+
+    orch._reap_finished()
+
+    cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor.pre_pr_last_consumed_comment_id == 55
+    assert state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name) == ()
+
+
+def test_worker_wrappers_delegate_with_consumed_comment_id(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    issue = _issue()
+    candidate = ImplementationCandidateState(
+        issue_number=7,
+        design_branch="agent/design/7-add-worker-scheduler",
+        design_pr_number=44,
+        design_pr_url="https://example/pr/44",
+    )
+
+    def fake_process_issue(
+        arg_issue: Issue, flow: IssueFlow, *, pre_pr_last_consumed_comment_id: int = 0
+    ) -> WorkResult:
+        assert arg_issue.number == 7
+        assert flow == "design_doc"
+        assert pre_pr_last_consumed_comment_id == 12
+        return WorkResult(issue_number=7, branch="b", pr_number=1, pr_url="u")
+
+    def fake_process_impl(
+        arg_candidate: ImplementationCandidateState,
+        *,
+        issue_override: Issue | None = None,
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
+        assert arg_candidate.issue_number == 7
+        assert issue_override is issue
+        assert pre_pr_last_consumed_comment_id == 13
+        return WorkResult(issue_number=7, branch="b", pr_number=1, pr_url="u")
+
+    orch._process_issue = fake_process_issue  # type: ignore[method-assign]
+    orch._process_implementation_candidate = fake_process_impl  # type: ignore[method-assign]
+
+    assert orch._process_issue_worker(issue, "design_doc", 12).issue_number == 7
+    assert orch._process_implementation_candidate_worker(candidate, issue, 13).issue_number == 7
+
+
+def test_pre_pr_comment_helpers_filter_tokenized_and_allow_empty_pending(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    github = FakeGitHub([])
+    marker = "<!-- mergexo-action:" + ("a" * 64) + " -->"
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=1,
+            body=marker,
+            user_login="reviewer",
+            html_url="u",
+            created_at="now",
+            updated_at="now",
+        )
+    ]
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    # Tokenized comment is filtered out, so no pending comments at gate.
+    orch._run_pre_pr_ordering_gate(issue_number=7, last_consumed_comment_id=0)
+    assert (
+        orch._pending_source_issue_followups(comments=github.issue_comments, after_comment_id=0)
+        == []
+    )
+
+
+def test_decode_pre_pr_context_invalid_json_falls_back_to_live_issue(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    issue = _issue()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=FakeGitHub([issue]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    parsed_issue, parsed_candidate = orch._decode_pre_pr_context(
+        followup=PrePrFollowupState(
+            issue_number=7,
+            flow="bugfix",
+            branch="b",
+            context_json="{not-json",
+            waiting_reason="x",
+            updated_at="now",
+            repo_full_name=cfg.repo.full_name,
+        )
+    )
+    assert parsed_issue.number == 7
+    assert parsed_candidate is None
+
+
+def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
+    issue = _issue(labels=("triage",))
+    assert _issue_to_json_dict(issue)["number"] == 7
+    assert _issue_from_json_dict({1: "bad"}) is None  # type: ignore[arg-type]
+    assert _issue_from_json_dict({"number": "7"}) is None  # type: ignore[dict-item]
+    assert _issue_from_json_dict({"number": 7, "title": 1}) is None  # type: ignore[dict-item]
+    assert _issue_from_json_dict({"number": 7, "title": "x", "body": 1}) is None  # type: ignore[dict-item]
+    assert _issue_from_json_dict({"number": 7, "title": "x", "body": "y", "html_url": 1}) is None  # type: ignore[dict-item]
+    assert (
+        _issue_from_json_dict(
+            {"number": 7, "title": "x", "body": "y", "html_url": "u", "author_login": 1}
+        )
+        is None
+    )  # type: ignore[dict-item]
+    assert (
+        _issue_from_json_dict(
+            {
+                "number": 7,
+                "title": "x",
+                "body": "y",
+                "html_url": "u",
+                "author_login": "a",
+                "labels": "bad",
+            }
+        )
+        is None
+    )
+    assert (
+        _issue_from_json_dict(
+            {
+                "number": 7,
+                "title": "x",
+                "body": "y",
+                "html_url": "u",
+                "labels": ["ok", 2],
+                "author_login": "a",
+            }
+        )
+        is None
+    )
+    valid_issue = _issue_from_json_dict(_issue_to_json_dict(issue))
+    assert isinstance(valid_issue, Issue)
+
+    candidate = ImplementationCandidateState(
+        issue_number=7,
+        design_branch="bad-branch",
+        design_pr_number=None,
+        design_pr_url=None,
+    )
+    assert _implementation_candidate_to_json_dict(candidate)["issue_number"] == 7
+    assert _implementation_candidate_from_json_dict({1: "x"}) is None  # type: ignore[arg-type]
+    assert _implementation_candidate_from_json_dict({"issue_number": "7"}) is None  # type: ignore[dict-item]
+    assert _implementation_candidate_from_json_dict({"issue_number": 7, "design_branch": 1}) is None  # type: ignore[dict-item]
+    assert (
+        _implementation_candidate_from_json_dict(
+            {"issue_number": 7, "design_branch": "b", "design_pr_number": "x"}
+        )
+        is None
+    )  # type: ignore[dict-item]
+    assert (
+        _implementation_candidate_from_json_dict(
+            {"issue_number": 7, "design_branch": "b", "design_pr_number": 1, "design_pr_url": 2}
+        )
+        is None
+    )  # type: ignore[dict-item]
+    assert (
+        _implementation_candidate_from_json_dict(
+            {
+                "issue_number": 7,
+                "design_branch": "b",
+                "design_pr_number": 1,
+                "design_pr_url": "u",
+                "repo_full_name": 3,
+            }
+        )
+        is None
+    )  # type: ignore[dict-item]
+    assert _branch_for_implementation_candidate(candidate) == "bad-branch"
+    assert (
+        _branch_for_pre_pr_followup(
+            flow="implementation",
+            issue=issue,
+            stored_branch="",
+            candidate=None,
+        )
+        == "agent/impl/unknown"
+    )
+    assert (
+        _branch_for_pre_pr_followup(
+            flow="implementation",
+            issue=issue,
+            stored_branch="",
+            candidate=ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-x",
+                design_pr_number=None,
+                design_pr_url=None,
+            ),
+        )
+        == "agent/impl/7-x"
+    )
+    assert _branch_for_pre_pr_followup(
+        flow="bugfix",
+        issue=issue,
+        stored_branch="",
+        candidate=None,
+    ).startswith("agent/bugfix/")
+
+    assert (
+        _infer_pre_pr_flow_from_issue_and_error(
+            issue=issue,
+            error="small-job flow blocked: waiting",
+            design_label="agent:design",
+            bugfix_label="agent:bugfix",
+            small_job_label="agent:small-job",
+        )
+        == "small_job"
+    )
+    assert (
+        _infer_pre_pr_flow_from_issue_and_error(
+            issue=issue,
+            error="implementation flow blocked: waiting",
+            design_label="agent:design",
+            bugfix_label="agent:bugfix",
+            small_job_label="agent:small-job",
+        )
+        == "implementation"
+    )
+    assert (
+        _infer_pre_pr_flow_from_issue_and_error(
+            issue=issue,
+            error="plain failure",
+            design_label="agent:design",
+            bugfix_label="agent:bugfix",
+            small_job_label="agent:small-job",
+        )
+        is None
+    )
+    assert _is_recoverable_pre_pr_error("") is False
+    assert _is_merge_conflict_error("") is False
+    assert _is_merge_conflict_error("Automatic merge failed; fix conflicts and then commit") is True
+    assert _is_merge_conflict_error("plain push rejection") is False
+    assert _is_recoverable_pre_pr_exception(DirectFlowBlockedError("x")) is True
+    assert (
+        _is_recoverable_pre_pr_exception(
+            DirectFlowValidationError(
+                "required pre-push tests did not pass after automated repair attempts"
+            )
+        )
+        is True
+    )
+    assert _is_recoverable_pre_pr_exception(RuntimeError("plain")) is False
+    assert _pull_request_url(repo_full_name="o/r", pr_number=9) == "https://github.com/o/r/pull/9"
+    assert "no longer actioned" in _render_source_issue_redirect_comment(
+        pr_number=9,
+        pr_url="https://github.com/o/r/pull/9",
+        source_comment_url="https://example/comment/1",
+    )
+
+
+def test_issue_with_push_merge_conflict_helper_truncates_and_handles_empty_output(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    issue = _issue(labels=("agent:small-job",))
+    checkout_path = git.checkout_root / "worker-0"
+
+    long_output = "x" * 13000
+    with_long_output = orch._issue_with_push_merge_conflict(
+        issue=issue,
+        branch="agent/small/7-add-worker-scheduler",
+        failure_output=long_output,
+        attempt=1,
+        checkout_path=checkout_path,
+    )
+    assert "... [truncated by MergeXO]" in with_long_output.body
+
+    with_empty_output = orch._issue_with_push_merge_conflict(
+        issue=issue,
+        branch="agent/small/7-add-worker-scheduler",
+        failure_output="   \n\t",
+        attempt=2,
+        checkout_path=checkout_path,
+    )
+    assert "Merge output:\n<empty>" in with_empty_output.body
 
 
 def test_wait_for_all_calls_sleep_when_needed(
@@ -1597,6 +2721,40 @@ def test_wait_for_all_calls_sleep_when_needed(
 
     orch._wait_for_all(pool=object())
     assert calls["sleep"] == 1
+
+
+def test_poll_once_respects_allow_enqueue_and_restart_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    calls = {"scan": 0, "new": 0, "impl": 0, "feedback": 0}
+
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(
+        orch, "_scan_operator_commands", lambda: calls.__setitem__("scan", calls["scan"] + 1)
+    )
+    monkeypatch.setattr(orch, "_enqueue_new_work", lambda pool: calls.__setitem__("new", 1))
+    monkeypatch.setattr(
+        orch, "_enqueue_implementation_work", lambda pool: calls.__setitem__("impl", 1)
+    )
+    monkeypatch.setattr(
+        orch, "_enqueue_feedback_work", lambda pool: calls.__setitem__("feedback", 1)
+    )
+
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=False)  # type: ignore[arg-type]
+    assert calls == {"scan": 1, "new": 0, "impl": 0, "feedback": 0}
+
+    monkeypatch.setattr(orch, "_is_restart_pending", lambda: True)
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+    assert calls == {"scan": 2, "new": 0, "impl": 0, "feedback": 0}
 
 
 def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1633,6 +2791,91 @@ def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.Monke
 
     with pytest.raises(StopLoop):
         orch.run(once=False)
+
+
+def test_run_continues_after_github_polling_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    configure_logging(verbose=True)
+
+    calls = {"enqueue": 0, "sleep": 0}
+
+    def fail_enqueue(pool) -> None:  # type: ignore[no-untyped-def]
+        _ = pool
+        calls["enqueue"] += 1
+        raise GitHubPollingError("malformed response")
+
+    class StopLoop(RuntimeError):
+        pass
+
+    def stop_sleep(seconds: float) -> None:
+        _ = seconds
+        calls["sleep"] += 1
+        raise StopLoop("stop")
+
+    monkeypatch.setattr(orch, "_enqueue_new_work", fail_enqueue)
+    monkeypatch.setattr(orch, "_enqueue_implementation_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_feedback_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(time, "sleep", stop_sleep)
+
+    with pytest.raises(StopLoop, match="stop"):
+        orch.run(once=False)
+
+    assert calls["enqueue"] == 1
+    assert calls["sleep"] == 1
+    text = capsys.readouterr().err
+    assert "event=poll_step_failed" in text
+    assert "step=enqueue_new_work" in text
+    assert "error_type=GitHubPollingError" in text
+
+
+def test_run_marks_poll_error_when_multiple_poll_steps_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        enable_issue_comment_routing=True,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    configure_logging(verbose=True)
+
+    steps: list[str] = []
+
+    def fail_poll_step(*, step_name: str, fn) -> bool:  # type: ignore[no-untyped-def]
+        _ = fn
+        steps.append(step_name)
+        return False
+
+    monkeypatch.setattr(orch, "_run_poll_step", fail_poll_step)
+    monkeypatch.setattr(orch, "_wait_for_all", lambda pool: None)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+
+    orch.run(once=True)
+
+    assert "scan_operator_commands" in steps
+    assert "enqueue_implementation_work" in steps
+    assert "enqueue_pre_pr_followup_work" in steps
+    assert "enqueue_feedback_work" in steps
+    assert "scan_post_pr_source_issue_comment_redirects" in steps
+    text = capsys.readouterr().err
+    assert "event=poll_completed" in text
+    assert "poll_had_github_errors=true" in text
 
 
 def test_run_once_with_github_ops_scans_commands_twice(

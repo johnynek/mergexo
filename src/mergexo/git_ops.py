@@ -12,6 +12,13 @@ from mergexo.shell import CommandError, run
 LOGGER = logging.getLogger("mergexo.git_ops")
 
 
+def _is_non_fast_forward_push_error(detail: str) -> bool:
+    normalized = detail.strip().lower()
+    if not normalized:
+        return False
+    return "non-fast-forward" in normalized
+
+
 @dataclass(frozen=True)
 class RepoLayout:
     mirror_path: Path
@@ -97,12 +104,27 @@ class GitRepoManager:
         run(["git", "-C", str(checkout_path), "clean", "-ffdx"])
 
     def create_or_reset_branch(self, checkout_path: Path, branch: str) -> None:
+        has_remote_branch = self._remote_branch_exists(checkout_path, branch)
         log_event(
             LOGGER,
             "git_branch_reset",
             checkout_path=str(checkout_path),
             branch=branch,
+            has_remote_branch=has_remote_branch,
         )
+        if has_remote_branch:
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(checkout_path),
+                    "checkout",
+                    "-B",
+                    branch,
+                    f"origin/{branch}",
+                ]
+            )
+            return
         run(["git", "-C", str(checkout_path), "checkout", "-B", branch])
 
     def list_staged_files(self, checkout_path: Path) -> tuple[str, ...]:
@@ -132,6 +154,59 @@ class GitRepoManager:
         )
         try:
             run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
+            return
+        except CommandError as exc:
+            if _is_non_fast_forward_push_error(str(exc)):
+                log_event(
+                    LOGGER,
+                    "git_push_non_fast_forward_retry",
+                    checkout_path=str(checkout_path),
+                    branch=branch,
+                )
+                try:
+                    self.fetch_origin(checkout_path)
+                    run(
+                        [
+                            "git",
+                            "-C",
+                            str(checkout_path),
+                            "merge",
+                            "--no-edit",
+                            f"origin/{branch}",
+                        ]
+                    )
+                    run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
+                except Exception as retry_exc:  # noqa: BLE001
+                    log_event(
+                        LOGGER,
+                        "git_push_non_fast_forward_retry_failed",
+                        checkout_path=str(checkout_path),
+                        branch=branch,
+                        error_type=type(retry_exc).__name__,
+                    )
+                    log_event(
+                        LOGGER,
+                        "git_push_failed",
+                        checkout_path=str(checkout_path),
+                        branch=branch,
+                        error_type=type(retry_exc).__name__,
+                    )
+                    raise
+                log_event(
+                    LOGGER,
+                    "git_push_non_fast_forward_recovered",
+                    checkout_path=str(checkout_path),
+                    branch=branch,
+                )
+                return
+            log_event(
+                LOGGER,
+                "git_push_failed",
+                checkout_path=str(checkout_path),
+                branch=branch,
+                error_type=type(exc).__name__,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             log_event(
                 LOGGER,
@@ -208,6 +283,23 @@ class GitRepoManager:
     def _checkout_remote_branch(self, checkout_path: Path, branch: str) -> None:
         run(["git", "-C", str(checkout_path), "checkout", "-B", branch, f"origin/{branch}"])
         run(["git", "-C", str(checkout_path), "reset", "--hard", f"origin/{branch}"])
+
+    def _remote_branch_exists(self, checkout_path: Path, branch: str) -> bool:
+        try:
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(checkout_path),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/remotes/origin/{branch}",
+                ]
+            )
+        except CommandError:
+            return False
+        return True
 
     def _ensure_mirror(self) -> None:
         remote_url = self.repo.effective_remote_url
