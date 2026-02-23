@@ -55,3 +55,8 @@ enabled = true
 # profile = "default"
 # Example: ["--full-auto"]
 extra_args = []
+
+# Optional per-repo codex overrides. Any omitted key inherits from [codex].
+# [codex.repo.mergexo]
+# sandbox = "danger-full-access"
+# extra_args = ["--full-auto"]

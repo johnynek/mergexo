@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 from pathlib import Path
@@ -40,6 +40,7 @@ class ServiceRunner:
     state: StateStore
     agent: AgentAdapter
     startup_argv: tuple[str, ...]
+    agent_by_repo_full_name: dict[str, AgentAdapter] = field(default_factory=dict)
     github: GitHubGateway | None = None
     git_manager: GitRepoManager | None = None
     repo_runtimes: tuple[tuple[RepoConfig, GitHubGateway, GitRepoManager], ...] = ()
@@ -61,7 +62,7 @@ class ServiceRunner:
                     git_manager=git_manager,
                     repo=repo,
                     github_by_repo_full_name=github_by_repo_full_name,
-                    agent=self.agent,
+                    agent=self._agent_for_repo(repo),
                     allow_runtime_restart=True,
                 )
                 try:
@@ -85,7 +86,7 @@ class ServiceRunner:
                 git_manager=git_manager,
                 repo=repo,
                 github_by_repo_full_name=github_by_repo_full_name,
-                agent=self.agent,
+                agent=self._agent_for_repo(repo),
                 allow_runtime_restart=True,
             )
             try:
@@ -258,6 +259,9 @@ class ServiceRunner:
             )
         return tuple(runtimes)
 
+    def _agent_for_repo(self, repo: RepoConfig) -> AgentAdapter:
+        return self.agent_by_repo_full_name.get(repo.full_name, self.agent)
+
     def _github_for_repo(self, repo_full_name: str) -> GitHubGateway:
         if repo_full_name:
             for repo, github, _ in self._effective_repo_runtimes():
@@ -281,6 +285,7 @@ def run_service(
     config: AppConfig,
     state: StateStore,
     agent: AgentAdapter,
+    agent_by_repo_full_name: dict[str, AgentAdapter] | None = None,
     once: bool,
     github: GitHubGateway | None = None,
     git_manager: GitRepoManager | None = None,
@@ -292,6 +297,7 @@ def run_service(
         config=config,
         state=state,
         agent=agent,
+        agent_by_repo_full_name=dict(agent_by_repo_full_name or {}),
         startup_argv=argv,
         github=github,
         git_manager=git_manager,

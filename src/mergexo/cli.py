@@ -166,7 +166,7 @@ def _cmd_init(config: AppConfig) -> None:
 def _cmd_run(config: AppConfig, *, once: bool) -> None:
     config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
     state = StateStore(_state_db_path(config))
-    agent = CodexAdapter(config.codex)
+    agents_by_repo_full_name = _build_codex_agents_by_repo(config)
     runtimes = _build_repo_runtimes(config)
     github_by_repo_full_name = {repo.full_name: github for repo, github, _ in runtimes}
     orchestrators = [
@@ -177,7 +177,7 @@ def _cmd_run(config: AppConfig, *, once: bool) -> None:
             git_manager=git_manager,
             repo=repo,
             github_by_repo_full_name=github_by_repo_full_name,
-            agent=agent,
+            agent=agents_by_repo_full_name[repo.full_name],
         )
         for repo, github, git_manager in runtimes
     ]
@@ -199,13 +199,15 @@ def _cmd_run(config: AppConfig, *, once: bool) -> None:
 def _cmd_service(config: AppConfig, *, once: bool) -> None:
     config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
     state = StateStore(_state_db_path(config))
-    agent = CodexAdapter(config.codex)
+    agents_by_repo_full_name = _build_codex_agents_by_repo(config)
+    default_agent = agents_by_repo_full_name[config.repo.full_name]
     runtimes = _build_repo_runtimes(config)
     run_service(
         config=config,
         state=state,
         repo_runtimes=runtimes,
-        agent=agent,
+        agent=default_agent,
+        agent_by_repo_full_name=agents_by_repo_full_name,
         once=once,
     )
 
@@ -346,6 +348,13 @@ def _build_repo_runtimes(
             )
         )
     return tuple(runtimes)
+
+
+def _build_codex_agents_by_repo(config: AppConfig) -> dict[str, CodexAdapter]:
+    return {
+        repo.full_name: CodexAdapter(config.codex_for_repo(repo))
+        for repo in config.repos
+    }
 
 
 def _resolve_repo_filter(config: AppConfig, raw_repo_filter: str) -> str:

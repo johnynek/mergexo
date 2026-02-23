@@ -47,6 +47,10 @@ model = "gpt"
 sandbox = "workspace-write"
 profile = "default"
 extra_args = ["--full-auto"]
+
+[codex.repo.repo]
+sandbox = "danger-full-access"
+extra_args = ["--repo-mode"]
 """.strip(),
     )
 
@@ -76,7 +80,14 @@ extra_args = ["--full-auto"]
     assert loaded.repo.operator_logins == ("alice", "bob")
     assert loaded.repo.allowed_users == frozenset({"alice", "bob"})
     assert loaded.repo.allows(" ALICE ")
+    assert loaded.codex.sandbox == "workspace-write"
     assert loaded.codex.extra_args == ("--full-auto",)
+    repo_codex = loaded.codex_for_repo(loaded.repo)
+    assert repo_codex.model == "gpt"
+    assert repo_codex.sandbox == "danger-full-access"
+    assert repo_codex.profile == "default"
+    assert repo_codex.extra_args == ("--repo-mode",)
+    assert loaded.codex_for_repo("unknown") == loaded.codex
     # Single-repo compatibility shim:
     assert loaded.auth.allowed_users == frozenset({"alice", "bob"})
 
@@ -114,6 +125,79 @@ coding_guidelines_path = "docs/python_style.md"
     assert by_id["bosatsu"].full_name == "johnynek/bosatsu"
     # owner default when allowed_users omitted in multi-repo mode
     assert by_id["bosatsu"].allowed_users == frozenset({"johnynek"})
+
+
+def test_load_config_codex_repo_overrides_inherit_global_defaults(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "mergexo.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo.alpha]
+owner = "o"
+coding_guidelines_path = "docs/python_style.md"
+
+[repo.beta]
+owner = "o"
+coding_guidelines_path = "docs/python_style.md"
+
+[codex]
+enabled = true
+model = "gpt-global"
+sandbox = "workspace-write"
+extra_args = ["--full-auto"]
+
+[codex.repo.alpha]
+enabled = false
+sandbox = "danger-full-access"
+
+[codex.repo.beta]
+profile = "strict"
+extra_args = ["--beta-only"]
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+    by_id = {repo.repo_id: repo for repo in loaded.repos}
+    alpha_codex = loaded.codex_for_repo(by_id["alpha"])
+    beta_codex = loaded.codex_for_repo(by_id["beta"])
+
+    assert alpha_codex.enabled is False
+    assert alpha_codex.model == "gpt-global"
+    assert alpha_codex.sandbox == "danger-full-access"
+    assert alpha_codex.profile is None
+    assert alpha_codex.extra_args == ("--full-auto",)
+
+    assert beta_codex.enabled is True
+    assert beta_codex.model == "gpt-global"
+    assert beta_codex.sandbox == "workspace-write"
+    assert beta_codex.profile == "strict"
+    assert beta_codex.extra_args == ("--beta-only",)
+
+
+def test_load_config_rejects_codex_override_for_unknown_repo(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "known"
+coding_guidelines_path = "docs/python_style.md"
+
+[codex.repo.unknown]
+enabled = false
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match="Unknown repo id"):
+        config.load_config(cfg_path)
 
 
 def test_load_config_legacy_defaults_owner_when_no_allowlists(tmp_path: Path) -> None:
@@ -302,6 +386,40 @@ coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "restart_default_mode",
         ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+
+[codex]
+repo = ["oops"]
+""".strip(),
+            "[codex.repo] must be a TOML table",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+
+[codex]
+repo = { n = 1 }
+""".strip(),
+            "[codex.repo.n] must be a TOML table",
+        ),
     ],
 )
 def test_load_config_runtime_and_shape_errors(tmp_path: Path, content: str, expected: str) -> None:
@@ -358,12 +476,19 @@ def test_helper_numeric_bool_and_tuple() -> None:
     with pytest.raises(ConfigError, match="non-empty string"):
         config._str_with_default({"k": ""}, "k", "default")
 
+    assert config._optional_str_with_default({}, "k", "d") == "d"
+    assert config._optional_str_with_default({"k": "v"}, "k", "d") == "v"
+    with pytest.raises(ConfigError, match="non-empty string"):
+        config._optional_str_with_default({"k": ""}, "k", "d")
+
     assert config._tuple_of_str({}, "k") == ()
     assert config._tuple_of_str({"k": ["a", "b"]}, "k") == ("a", "b")
     with pytest.raises(ConfigError, match="list of strings"):
         config._tuple_of_str({"k": "oops"}, "k")
     with pytest.raises(ConfigError, match="list of strings"):
         config._tuple_of_str({"k": ["ok", 3]}, "k")
+    assert config._tuple_of_str_with_default({}, "k", ("base",)) == ("base",)
+    assert config._tuple_of_str_with_default({"k": ["x"]}, "k", ("base",)) == ("x",)
 
     assert config._optional_positive_int({}, "k") is None
     assert config._optional_positive_int({"k": 2}, "k") == 2
@@ -429,6 +554,28 @@ def test_repo_auth_and_app_config_helpers() -> None:
     with pytest.raises(RuntimeError, match="AppConfig.repos is empty"):
         _ = app.repo
 
+    override = config.CodexConfig(
+        enabled=False,
+        model="gpt",
+        sandbox="danger-full-access",
+        profile=None,
+        extra_args=("--x",),
+    )
+    app_with_repo = config.AppConfig(
+        runtime=app.runtime,
+        repos=(repo,),
+        codex=config.CodexConfig(
+            enabled=True,
+            model="base",
+            sandbox="workspace-write",
+            profile="default",
+            extra_args=("--full-auto",),
+        ),
+        codex_overrides=((repo.repo_id, override),),
+    )
+    assert app_with_repo.codex_for_repo(repo) == override
+    assert app_with_repo.codex_for_repo("missing") == app_with_repo.codex
+
 
 def test_load_repo_configs_rejects_empty_and_non_string_keys() -> None:
     with pytest.raises(ConfigError, match=r"\[repo\] must define one repo configuration"):
@@ -437,6 +584,19 @@ def test_load_repo_configs_rejects_empty_and_non_string_keys() -> None:
     bad_repo_data = cast(dict[str, object], {1: {"owner": "o", "coding_guidelines_path": "p"}})
     with pytest.raises(ConfigError, match=r"\[repo\] must have string keys"):
         config._load_repo_configs(repo_data=bad_repo_data, auth_data=None)
+
+    with pytest.raises(ConfigError, match=r"\[codex.repo\] must have string keys"):
+        config._load_codex_overrides(
+            codex_data=cast(dict[str, object], {"repo": cast(dict[str, object], {1: {}})}),
+            repos=(),
+            defaults=config.CodexConfig(
+                enabled=True,
+                model=None,
+                sandbox=None,
+                profile=None,
+                extra_args=(),
+            ),
+        )
 
     assert config._operator_logins_with_default({}, "k", ()) == ()
     assert config._operator_logins_with_default({"k": ["A", "a", "b"]}, "k", ()) == ("a", "b")

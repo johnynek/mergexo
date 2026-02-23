@@ -34,6 +34,10 @@ Set allowlists per repo with `repo.allowed_users` (or use `[auth].allowed_users`
 legacy single-repo fallback). In multi-repo configs, each `[repo.<id>]` can set its own
 allowlist; if omitted it defaults to `[owner]`.
 
+Agent settings under `[codex]` are global defaults. To override per repo, set
+`[codex.repo.<repo_id>]` and only include keys that should differ (all omitted keys inherit
+from `[codex]`).
+
 2. Sync environment:
 
 ```bash

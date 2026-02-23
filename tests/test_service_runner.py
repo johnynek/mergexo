@@ -226,6 +226,56 @@ def test_service_runner_multi_repo_once_polls_each_repo(
     assert runs == [cfg.repos[0].full_name, cfg.repos[1].full_name]
 
 
+def test_service_runner_multi_repo_uses_repo_specific_agents(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    calls: list[tuple[str, object]] = []
+    agent_a = cast(AgentAdapter, object())
+    agent_b = cast(AgentAdapter, object())
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args
+            repo = cast(RepoConfig, kwargs["repo"])
+            agent = kwargs["agent"]
+            calls.append((repo.full_name, agent))
+
+        def run(self, *, once: bool) -> None:
+            assert once is True
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        agent_by_repo_full_name={
+            cfg.repos[0].full_name: agent_a,
+            cfg.repos[1].full_name: agent_b,
+        },
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (
+                cfg.repos[0],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+            (
+                cfg.repos[1],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+        ),
+    )
+
+    runner.run(once=True)
+    assert calls == [
+        (cfg.repos[0].full_name, agent_a),
+        (cfg.repos[1].full_name, agent_b),
+    ]
+
+
 def test_service_runner_multi_repo_non_once_sleeps_between_polls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -623,6 +673,7 @@ def test_run_service_wrapper_constructs_runner(
     state = StateStore(tmp_path / "state.db")
     github = FakeGitHub()
     calls: dict[str, object] = {}
+    agent_overrides = {cfg.repo.full_name: cast(AgentAdapter, object())}
 
     class FakeRunner:
         def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
@@ -638,12 +689,16 @@ def test_run_service_wrapper_constructs_runner(
         github=cast(GitHubGateway, github),
         git_manager=cast(GitRepoManager, object()),
         agent=cast(AgentAdapter, object()),
+        agent_by_repo_full_name=agent_overrides,
         once=True,
         startup_argv=("mergexo", "service"),
     )
     assert calls["once"] is True
     kwargs = cast(dict[str, object], calls["kwargs"])
     assert kwargs["startup_argv"] == ("mergexo", "service")
+    built_overrides = cast(dict[str, AgentAdapter], kwargs["agent_by_repo_full_name"])
+    assert built_overrides == agent_overrides
+    assert built_overrides is not agent_overrides
 
 
 def test_effective_repo_runtimes_and_github_fallback_paths(tmp_path: Path) -> None:
