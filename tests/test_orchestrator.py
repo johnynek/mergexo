@@ -4,6 +4,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -1277,6 +1278,75 @@ def test_process_issue_emits_lifecycle_logs(
     assert "flow=design_doc" in text
     assert "pr_number=101" in text
     assert "event=slot_released" in text
+
+
+def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    issue_result = WorkResult(issue_number=7, branch="b1", pr_number=11, pr_url="u1")
+    impl_result = WorkResult(issue_number=7, branch="b2", pr_number=12, pr_url="u2")
+    observed: dict[str, object] = {}
+
+    def fake_process_issue(issue: Issue, flow: IssueFlow) -> WorkResult:
+        observed["issue_number"] = issue.number
+        observed["flow"] = flow
+        logging.getLogger("mergexo.tests.wrapper").info("event=wrapper_probe")
+        return issue_result
+
+    def fake_process_implementation_candidate(
+        candidate: ImplementationCandidateState,
+    ) -> WorkResult:
+        observed["implementation_issue_number"] = candidate.issue_number
+        return impl_result
+
+    def fake_process_feedback_turn(tracked: TrackedPullRequestState) -> None:
+        observed["feedback_pr_number"] = tracked.pr_number
+
+    monkeypatch.setattr(orch, "_process_issue", fake_process_issue)
+    monkeypatch.setattr(
+        orch,
+        "_process_implementation_candidate",
+        fake_process_implementation_candidate,
+    )
+    monkeypatch.setattr(orch, "_process_feedback_turn", fake_process_feedback_turn)
+    configure_logging(verbose=True)
+
+    issue = _issue()
+    assert orch._process_issue_with_repo_logging_context(issue, "design_doc") == issue_result
+
+    candidate = ImplementationCandidateState(
+        issue_number=issue.number,
+        design_branch="agent/design/7-add-worker-scheduler",
+        design_pr_number=101,
+        design_pr_url="https://example/pr/101",
+    )
+    assert (
+        orch._process_implementation_candidate_with_repo_logging_context(candidate) == impl_result
+    )
+
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=issue.number,
+        branch="agent/design/7-add-worker-scheduler",
+        status="awaiting_feedback",
+        last_seen_head_sha="headsha",
+    )
+    orch._process_feedback_turn_with_repo_logging_context(tracked)
+
+    assert observed == {
+        "issue_number": issue.number,
+        "flow": "design_doc",
+        "implementation_issue_number": issue.number,
+        "feedback_pr_number": 101,
+    }
+    assert "repo_full_name=johnynek/mergexo event=wrapper_probe" in capsys.readouterr().err
 
 
 def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:

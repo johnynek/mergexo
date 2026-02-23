@@ -53,7 +53,7 @@ from mergexo.models import (
     PullRequestReviewComment,
     WorkResult,
 )
-from mergexo.observability import log_event
+from mergexo.observability import log_event, logging_repo_context
 from mergexo.shell import CommandError, run
 from mergexo.state import (
     ImplementationCandidateState,
@@ -167,44 +167,45 @@ class Phase1Orchestrator:
         }
 
     def run(self, *, once: bool) -> None:
-        self._git.ensure_layout()
+        with logging_repo_context(self._repo.full_name):
+            self._git.ensure_layout()
 
-        with ThreadPoolExecutor(max_workers=self._config.runtime.worker_count) as pool:
-            while True:
-                log_event(
-                    LOGGER,
-                    "poll_started",
-                    once=once,
-                    github_operations_enabled=self._config.runtime.enable_github_operations,
-                )
-                self._reap_finished()
-
-                if self._config.runtime.enable_github_operations:
-                    self._scan_operator_commands()
-                draining_for_restart = self._drain_for_pending_restart_if_needed()
-
-                if not draining_for_restart:
-                    self._enqueue_new_work(pool)
-                    self._enqueue_implementation_work(pool)
-                    self._enqueue_feedback_work(pool)
-
-                log_event(
-                    LOGGER,
-                    "poll_completed",
-                    running_issue_count=len(self._running),
-                    running_feedback_count=len(self._running_feedback),
-                    draining_for_restart=draining_for_restart,
-                )
-
-                if once:
-                    self._wait_for_all(pool)
+            with ThreadPoolExecutor(max_workers=self._config.runtime.worker_count) as pool:
+                while True:
+                    log_event(
+                        LOGGER,
+                        "poll_started",
+                        once=once,
+                        github_operations_enabled=self._config.runtime.enable_github_operations,
+                    )
                     self._reap_finished()
+
                     if self._config.runtime.enable_github_operations:
                         self._scan_operator_commands()
-                    self._drain_for_pending_restart_if_needed()
-                    break
+                    draining_for_restart = self._drain_for_pending_restart_if_needed()
 
-                time.sleep(self._config.runtime.poll_interval_seconds)
+                    if not draining_for_restart:
+                        self._enqueue_new_work(pool)
+                        self._enqueue_implementation_work(pool)
+                        self._enqueue_feedback_work(pool)
+
+                    log_event(
+                        LOGGER,
+                        "poll_completed",
+                        running_issue_count=len(self._running),
+                        running_feedback_count=len(self._running_feedback),
+                        draining_for_restart=draining_for_restart,
+                    )
+
+                    if once:
+                        self._wait_for_all(pool)
+                        self._reap_finished()
+                        if self._config.runtime.enable_github_operations:
+                            self._scan_operator_commands()
+                        self._drain_for_pending_restart_if_needed()
+                        break
+
+                    time.sleep(self._config.runtime.poll_interval_seconds)
 
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
         labels = _trigger_labels(self._repo)
@@ -269,7 +270,7 @@ class Phase1Orchestrator:
                 continue
 
             self._state.mark_running(issue.number, repo_full_name=self._state_repo_full_name())
-            fut = pool.submit(self._process_issue, issue, flow)
+            fut = pool.submit(self._process_issue_with_repo_logging_context, issue, flow)
             with self._running_lock:
                 self._running[issue.number] = fut
             log_event(
@@ -313,7 +314,10 @@ class Phase1Orchestrator:
             self._state.mark_running(
                 candidate.issue_number, repo_full_name=self._state_repo_full_name()
             )
-            fut = pool.submit(self._process_implementation_candidate, candidate)
+            fut = pool.submit(
+                self._process_implementation_candidate_with_repo_logging_context,
+                candidate,
+            )
             with self._running_lock:
                 self._running[candidate.issue_number] = fut
             log_event(
@@ -348,7 +352,7 @@ class Phase1Orchestrator:
                         reason="already_running",
                     )
                     continue
-            fut = pool.submit(self._process_feedback_turn, tracked)
+            fut = pool.submit(self._process_feedback_turn_with_repo_logging_context, tracked)
             with self._running_lock:
                 self._running_feedback[tracked.pr_number] = _FeedbackFuture(
                     issue_number=tracked.issue_number,
@@ -967,6 +971,24 @@ class Phase1Orchestrator:
                 if not self._running and not self._running_feedback:
                     return
             time.sleep(1.0)
+
+    def _process_issue_with_repo_logging_context(self, issue: Issue, flow: IssueFlow) -> WorkResult:
+        with logging_repo_context(self._repo.full_name):
+            return self._process_issue(issue, flow)
+
+    def _process_implementation_candidate_with_repo_logging_context(
+        self,
+        candidate: ImplementationCandidateState,
+    ) -> WorkResult:
+        with logging_repo_context(self._repo.full_name):
+            return self._process_implementation_candidate(candidate)
+
+    def _process_feedback_turn_with_repo_logging_context(
+        self,
+        tracked: TrackedPullRequestState,
+    ) -> None:
+        with logging_repo_context(self._repo.full_name):
+            self._process_feedback_turn(tracked)
 
     def _process_issue(self, issue: Issue, flow: IssueFlow) -> WorkResult:
         if not self._is_issue_author_allowed(

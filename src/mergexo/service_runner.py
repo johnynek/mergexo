@@ -18,7 +18,7 @@ from mergexo.feedback_loop import (
 from mergexo.github_gateway import GitHubGateway
 from mergexo.git_ops import GitRepoManager
 from mergexo.models import OperatorCommandRecord, OperatorReplyStatus, RestartMode
-from mergexo.observability import log_event
+from mergexo.observability import log_event, logging_repo_context
 from mergexo.orchestrator import (
     Phase1Orchestrator,
     RestartRequested,
@@ -67,10 +67,13 @@ class ServiceRunner:
                     allow_runtime_restart=True,
                 )
                 try:
-                    orchestrator.run(once=once)
+                    with logging_repo_context(repo.full_name):
+                        orchestrator.run(once=once)
                     return
                 except RestartRequested as requested:
-                    restarted = self._handle_restart_requested(requested=requested)
+                    requested_repo_full_name = requested.repo_full_name or repo.full_name
+                    with logging_repo_context(requested_repo_full_name):
+                        restarted = self._handle_restart_requested(requested=requested)
                     if restarted:
                         return
                     if once:
@@ -91,9 +94,12 @@ class ServiceRunner:
                 allow_runtime_restart=True,
             )
             try:
-                orchestrator.run(once=True)
+                with logging_repo_context(repo.full_name):
+                    orchestrator.run(once=True)
             except RestartRequested as requested:
-                restarted = self._handle_restart_requested(requested=requested)
+                requested_repo_full_name = requested.repo_full_name or repo.full_name
+                with logging_repo_context(requested_repo_full_name):
+                    restarted = self._handle_restart_requested(requested=requested)
                 if restarted:
                     return
                 if once:
@@ -109,80 +115,81 @@ class ServiceRunner:
         command_key = requested.command_key
         mode = requested.mode
         request_repo_full_name = requested.repo_full_name
-        log_event(
-            LOGGER,
-            "restart_update_started",
-            command_key=command_key,
-            mode=mode,
-        )
-        try:
-            self._run_update(mode=mode)
-        except Exception as exc:  # noqa: BLE001
-            detail = f"Restart update failed in mode={mode}: {exc}"
+        with logging_repo_context(request_repo_full_name or None):
+            log_event(
+                LOGGER,
+                "restart_update_started",
+                command_key=command_key,
+                mode=mode,
+            )
+            try:
+                self._run_update(mode=mode)
+            except Exception as exc:  # noqa: BLE001
+                detail = f"Restart update failed in mode={mode}: {exc}"
+                self.state.set_runtime_operation_status(
+                    op_name=_RESTART_OPERATION_NAME,
+                    status="failed",
+                    detail=detail,
+                )
+                record = self.state.update_operator_command_result(
+                    command_key=command_key,
+                    status="failed",
+                    result=detail,
+                    repo_full_name=request_repo_full_name or None,
+                )
+                if record is not None:
+                    self._post_operator_command_result(
+                        command=record,
+                        reply_status="failed",
+                        detail=detail,
+                    )
+                log_event(
+                    LOGGER,
+                    "operator_command_failed",
+                    command_key=command_key,
+                    actor=record.author_login if record is not None else "<unknown>",
+                    command="restart",
+                )
+                log_event(
+                    LOGGER,
+                    "restart_update_failed",
+                    command_key=command_key,
+                    mode=mode,
+                )
+                return False
+
+            detail = f"Restart update completed in mode={mode}; re-executing service command."
             self.state.set_runtime_operation_status(
                 op_name=_RESTART_OPERATION_NAME,
-                status="failed",
+                status="completed",
                 detail=detail,
             )
             record = self.state.update_operator_command_result(
                 command_key=command_key,
-                status="failed",
+                status="applied",
                 result=detail,
                 repo_full_name=request_repo_full_name or None,
             )
             if record is not None:
                 self._post_operator_command_result(
-                    command=record,
-                    reply_status="failed",
-                    detail=detail,
+                    command=record, reply_status="applied", detail=detail
                 )
             log_event(
                 LOGGER,
-                "operator_command_failed",
+                "operator_command_applied",
                 command_key=command_key,
                 actor=record.author_login if record is not None else "<unknown>",
                 command="restart",
+                mode=mode,
             )
             log_event(
                 LOGGER,
-                "restart_update_failed",
+                "restart_completed",
                 command_key=command_key,
                 mode=mode,
             )
-            return False
-
-        detail = f"Restart update completed in mode={mode}; re-executing service command."
-        self.state.set_runtime_operation_status(
-            op_name=_RESTART_OPERATION_NAME,
-            status="completed",
-            detail=detail,
-        )
-        record = self.state.update_operator_command_result(
-            command_key=command_key,
-            status="applied",
-            result=detail,
-            repo_full_name=request_repo_full_name or None,
-        )
-        if record is not None:
-            self._post_operator_command_result(
-                command=record, reply_status="applied", detail=detail
-            )
-        log_event(
-            LOGGER,
-            "operator_command_applied",
-            command_key=command_key,
-            actor=record.author_login if record is not None else "<unknown>",
-            command="restart",
-            mode=mode,
-        )
-        log_event(
-            LOGGER,
-            "restart_completed",
-            command_key=command_key,
-            mode=mode,
-        )
-        self._reexec()
-        return True
+            self._reexec()
+            return True
 
     def _run_update(self, *, mode: RestartMode) -> None:
         if mode not in self.config.runtime.restart_supported_modes:
@@ -217,24 +224,26 @@ class ServiceRunner:
         reply_status: OperatorReplyStatus,
         detail: str,
     ) -> None:
-        github = self._github_for_repo(command.repo_full_name)
-        issue_number = _operator_reply_issue_number(command)
-        token = compute_operator_command_token(command_key=command.command_key)
-        if self._issue_has_action_token(github=github, issue_number=issue_number, token=token):
-            return
-        body = _render_operator_command_result(
-            normalized_command=_operator_normalized_command(command),
-            status=reply_status,
-            detail=detail,
-            source_comment_url=_operator_source_comment_url(
-                command=command,
-                repo_full_name=command.repo_full_name or self.config.repo.full_name,
-            ),
-        )
-        github.post_issue_comment(
-            issue_number=issue_number,
-            body=append_action_token(body=body, token=token),
-        )
+        default_repo_full_name = command.repo_full_name or self.config.repo.full_name
+        with logging_repo_context(default_repo_full_name):
+            github = self._github_for_repo(command.repo_full_name)
+            issue_number = _operator_reply_issue_number(command)
+            token = compute_operator_command_token(command_key=command.command_key)
+            if self._issue_has_action_token(github=github, issue_number=issue_number, token=token):
+                return
+            body = _render_operator_command_result(
+                normalized_command=_operator_normalized_command(command),
+                status=reply_status,
+                detail=detail,
+                source_comment_url=_operator_source_comment_url(
+                    command=command,
+                    repo_full_name=default_repo_full_name,
+                ),
+            )
+            github.post_issue_comment(
+                issue_number=issue_number,
+                body=append_action_token(body=body, token=token),
+            )
 
     def _issue_has_action_token(
         self, *, github: GitHubGateway, issue_number: int, token: str
