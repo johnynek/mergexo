@@ -21,6 +21,10 @@ LOGGER = logging.getLogger("mergexo.github_gateway")
 CompareCommitsStatus = Literal["ahead", "identical", "behind", "diverged"]
 
 
+class GitHubPollingError(RuntimeError):
+    """Recoverable GitHub polling failure; caller should retry next poll."""
+
+
 @dataclass(frozen=True)
 class GitHubGateway:
     owner: str
@@ -389,26 +393,39 @@ class GitHubGateway:
             cmd.extend(["--include", path])
 
             raw = run(cmd, check=False)
-            status_code, headers, body = _parse_http_response(raw)
+            try:
+                status_code, headers, body = _parse_http_response(raw)
 
-            if status_code == 304:
-                cached_payload = self._cached_get_payload_by_path.get(path)
-                if cached_payload is None:
-                    raise RuntimeError(f"GitHub returned 304 for uncached path: {path}")
-                return cached_payload
+                if status_code == 304:
+                    cached_payload = self._cached_get_payload_by_path.get(path)
+                    if cached_payload is None:
+                        raise RuntimeError(f"GitHub returned 304 for uncached path: {path}")
+                    return cached_payload
 
-            if status_code < 200 or status_code >= 300:
-                message = body.strip() or "<empty>"
-                raise RuntimeError(
-                    f"GitHub API request failed with status {status_code}: {message}"
+                if status_code < 200 or status_code >= 300:
+                    message = body.strip() or "<empty>"
+                    raise RuntimeError(
+                        f"GitHub API request failed with status {status_code}: {message}"
+                    )
+
+                payload_obj = json.loads(body)
+                etag = headers.get("etag")
+                if etag:
+                    self._etags_by_path[path] = etag
+                    self._cached_get_payload_by_path[path] = payload_obj
+                return payload_obj
+            except Exception as exc:
+                log_event(
+                    LOGGER,
+                    "github_poll_get_failed",
+                    path=path,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    raw_preview=_preview_for_log(raw),
                 )
-
-            payload_obj = json.loads(body)
-            etag = headers.get("etag")
-            if etag:
-                self._etags_by_path[path] = etag
-                self._cached_get_payload_by_path[path] = payload_obj
-            return payload_obj
+                raise GitHubPollingError(
+                    f"GitHub polling GET failed for path {path}: {exc}"
+                ) from exc
 
         cmd = ["gh", "api", "--method", method_upper, path]
         stdin_payload: str | None = None
@@ -455,6 +472,15 @@ def _parse_http_response(raw: str) -> tuple[int, dict[str, str], str]:
 
     body = "\n".join(lines[body_start:])
     return status_code, headers, body
+
+
+def _preview_for_log(text: str, *, limit: int = 240) -> str:
+    compact = text.replace("\n", "\\n").strip()
+    if not compact:
+        return "<empty>"
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[:limit]}..."
 
 
 def _as_object_dict(value: object) -> dict[str, object] | None:

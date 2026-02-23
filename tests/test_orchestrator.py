@@ -27,7 +27,7 @@ from mergexo.feedback_loop import (
     compute_source_issue_redirect_token,
     parse_operator_command,
 )
-from mergexo.github_gateway import GitHubGateway
+from mergexo.github_gateway import GitHubGateway, GitHubPollingError
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -2437,6 +2437,91 @@ def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.Monke
 
     with pytest.raises(StopLoop):
         orch.run(once=False)
+
+
+def test_run_continues_after_github_polling_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    configure_logging(verbose=True)
+
+    calls = {"enqueue": 0, "sleep": 0}
+
+    def fail_enqueue(pool) -> None:  # type: ignore[no-untyped-def]
+        _ = pool
+        calls["enqueue"] += 1
+        raise GitHubPollingError("malformed response")
+
+    class StopLoop(RuntimeError):
+        pass
+
+    def stop_sleep(seconds: float) -> None:
+        _ = seconds
+        calls["sleep"] += 1
+        raise StopLoop("stop")
+
+    monkeypatch.setattr(orch, "_enqueue_new_work", fail_enqueue)
+    monkeypatch.setattr(orch, "_enqueue_implementation_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_feedback_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(time, "sleep", stop_sleep)
+
+    with pytest.raises(StopLoop, match="stop"):
+        orch.run(once=False)
+
+    assert calls["enqueue"] == 1
+    assert calls["sleep"] == 1
+    text = capsys.readouterr().err
+    assert "event=poll_step_failed" in text
+    assert "step=enqueue_new_work" in text
+    assert "error_type=GitHubPollingError" in text
+
+
+def test_run_marks_poll_error_when_multiple_poll_steps_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        enable_issue_comment_routing=True,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    configure_logging(verbose=True)
+
+    steps: list[str] = []
+
+    def fail_poll_step(*, step_name: str, fn) -> bool:  # type: ignore[no-untyped-def]
+        _ = fn
+        steps.append(step_name)
+        return False
+
+    monkeypatch.setattr(orch, "_run_poll_step", fail_poll_step)
+    monkeypatch.setattr(orch, "_wait_for_all", lambda pool: None)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+
+    orch.run(once=True)
+
+    assert "scan_operator_commands" in steps
+    assert "enqueue_implementation_work" in steps
+    assert "enqueue_pre_pr_followup_work" in steps
+    assert "enqueue_feedback_work" in steps
+    assert "scan_post_pr_source_issue_comment_redirects" in steps
+    text = capsys.readouterr().err
+    assert "event=poll_completed" in text
+    assert "poll_had_github_errors=true" in text
 
 
 def test_run_once_with_github_ops_scans_commands_twice(
