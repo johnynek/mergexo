@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import io
 import logging
@@ -89,6 +90,28 @@ def test_extract_repo_full_name_accepts_quoted_token() -> None:
 
 def test_extract_repo_full_name_keeps_invalid_json_token() -> None:
     assert observability._extract_repo_full_name(r'event=x repo_full_name="o\q/r"') == '"o\\q/r"'
+
+
+def test_logging_repo_context_is_isolated_per_thread() -> None:
+    def resolve_repo(repo_full_name: str) -> str:
+        with logging_repo_context(repo_full_name):
+            record = logging.LogRecord(
+                name="mergexo.tests.repo_threads",
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=1,
+                msg="event=probe",
+                args=(),
+                exc_info=None,
+            )
+            return observability._repo_full_name_for_record(record)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(resolve_repo, "o/one")
+        second = pool.submit(resolve_repo, "o/two")
+
+    assert first.result() == "o/one"
+    assert second.result() == "o/two"
 
 
 def test_configure_logging_low_mode_filters_to_high_signal_events(

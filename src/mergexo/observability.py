@@ -16,6 +16,10 @@ _VERBOSE_FORMAT: Final[str] = (
     "%(message)s"
 )
 _UNKNOWN_REPO_FULL_NAME: Final[str] = "<unknown>"
+# We intentionally keep repo context in a ContextVar so callers don't need to thread
+# repo_full_name through every log call (including deep helper boundaries). ContextVar
+# values are execution-context local (thread/task isolated), so this is not shared
+# mutable global state across concurrent workers.
 _REPO_CONTEXT: Final[ContextVar[str | None]] = ContextVar("mergexo_repo_full_name", default=None)
 _LOW_VERBOSITY_EVENTS: Final[frozenset[str]] = frozenset(
     {
@@ -36,6 +40,7 @@ VerboseMode = Literal["low", "high"]
 
 
 def logging_repo_context(repo_full_name: str | None) -> _LoggingRepoContext:
+    # Worker entrypoints set this once so nested log lines inherit repo metadata.
     return _LoggingRepoContext(repo_full_name)
 
 
