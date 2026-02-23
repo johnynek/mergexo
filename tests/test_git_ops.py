@@ -91,6 +91,8 @@ def test_prepare_branch_push_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pa
     def fake_run(cmd: list[str], **kwargs: object) -> str:
         _ = kwargs
         calls.append(cmd)
+        if cmd[-3:] == ["--verify", "--quiet", "refs/remotes/origin/feature"]:
+            raise CommandError("missing remote branch")
         if cmd[-3:] == ["diff", "--cached", "--name-only"]:
             return "file.py\n"
         return ""
@@ -118,6 +120,8 @@ def test_git_ops_emits_action_logs(
 
     def fake_run(cmd: list[str], **kwargs: object) -> str:
         _ = kwargs
+        if cmd[-3:] == ["--verify", "--quiet", "refs/remotes/origin/feature"]:
+            raise CommandError("missing remote branch")
         if cmd[-3:] == ["diff", "--cached", "--name-only"]:
             return "file.py\n"
         if cmd[-2:] == ["rev-parse", "HEAD"]:
@@ -164,6 +168,111 @@ def test_push_branch_logs_failed_event(
         manager.push_branch(tmp_path / "checkout", "feature")
 
     text = capsys.readouterr().err
+    assert "event=git_push_failed branch=feature" in text
+
+
+def test_create_or_reset_branch_tracks_existing_remote_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    manager.create_or_reset_branch(checkout, "feature")
+
+    assert calls == [
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/feature",
+        ],
+        ["git", "-C", str(checkout), "checkout", "-B", "feature", "origin/feature"],
+    ]
+
+
+def test_push_branch_retries_non_fast_forward_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+    push_attempts = 0
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        nonlocal push_attempts
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            push_attempts += 1
+            if push_attempts == 1:
+                raise CommandError(
+                    "Command failed\n"
+                    "cmd: git push\n"
+                    "exit: 1\n"
+                    "stdout:\n\n"
+                    "stderr:\n"
+                    "To github.com:example/repo.git\n"
+                    " ! [rejected]        feature -> feature (non-fast-forward)\n"
+                )
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    manager.push_branch(checkout, "feature")
+
+    assert push_attempts == 2
+    assert ["git", "-C", str(checkout), "fetch", "origin", "--prune", "--tags"] in calls
+    assert ["git", "-C", str(checkout), "merge", "--no-edit", "origin/feature"] in calls
+
+
+def test_push_branch_non_fast_forward_retry_failure_logs_failed_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    configure_logging(verbose=True)
+    checkout = tmp_path / "checkout"
+    push_attempts = 0
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        nonlocal push_attempts
+        _ = kwargs
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            push_attempts += 1
+            if push_attempts == 1:
+                raise CommandError(
+                    "Command failed\n"
+                    "cmd: git push\n"
+                    "exit: 1\n"
+                    "stdout:\n\n"
+                    "stderr:\nnon-fast-forward\n"
+                )
+        if cmd[-3:] == ["merge", "--no-edit", "origin/feature"]:
+            raise CommandError("merge conflict")
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError, match="merge conflict"):
+        manager.push_branch(checkout, "feature")
+
+    text = capsys.readouterr().err
+    assert "event=git_push_non_fast_forward_retry_failed branch=feature" in text
     assert "event=git_push_failed branch=feature" in text
 
 
