@@ -256,11 +256,7 @@ def test_push_branch_non_fast_forward_retry_failure_logs_failed_event(
             push_attempts += 1
             if push_attempts == 1:
                 raise CommandError(
-                    "Command failed\n"
-                    "cmd: git push\n"
-                    "exit: 1\n"
-                    "stdout:\n\n"
-                    "stderr:\nnon-fast-forward\n"
+                    "Command failed\ncmd: git push\nexit: 1\nstdout:\n\nstderr:\nnon-fast-forward\n"
                 )
         if cmd[-3:] == ["merge", "--no-edit", "origin/feature"]:
             raise CommandError("merge conflict")
@@ -273,6 +269,54 @@ def test_push_branch_non_fast_forward_retry_failure_logs_failed_event(
 
     text = capsys.readouterr().err
     assert "event=git_push_non_fast_forward_retry_failed branch=feature" in text
+    assert "event=git_push_failed branch=feature" in text
+
+
+def test_push_branch_command_error_with_empty_message_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            raise CommandError("   ")
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError):
+        manager.push_branch(checkout, "feature")
+
+    assert calls == [["git", "-C", str(checkout), "push", "-u", "origin", "feature"]]
+
+
+def test_push_branch_logs_failed_event_for_non_command_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    configure_logging(verbose=True)
+    checkout = tmp_path / "checkout"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            raise RuntimeError("unexpected")
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        manager.push_branch(checkout, "feature")
+
+    text = capsys.readouterr().err
     assert "event=git_push_failed branch=feature" in text
 
 
