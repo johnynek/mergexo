@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 from typing import Literal, cast
@@ -25,6 +25,18 @@ CompareCommitsStatus = Literal["ahead", "identical", "behind", "diverged"]
 class GitHubGateway:
     owner: str
     name: str
+    _etags_by_path: dict[str, str] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _cached_get_payload_by_path: dict[str, object] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
         deduped: dict[int, Issue] = {}
@@ -368,13 +380,81 @@ class GitHubGateway:
         )
 
     def _api_json(self, method: str, path: str, payload: dict[str, object] | None = None) -> object:
-        cmd = ["gh", "api", "--method", method, path]
+        method_upper = method.upper()
+        if method_upper == "GET":
+            cmd = ["gh", "api", "--method", method_upper]
+            etag = self._etags_by_path.get(path)
+            if etag:
+                cmd.extend(["--header", f"If-None-Match: {etag}"])
+            cmd.extend(["--include", path])
+
+            raw = run(cmd, check=False)
+            status_code, headers, body = _parse_http_response(raw)
+
+            if status_code == 304:
+                cached_payload = self._cached_get_payload_by_path.get(path)
+                if cached_payload is None:
+                    raise RuntimeError(f"GitHub returned 304 for uncached path: {path}")
+                return cached_payload
+
+            if status_code < 200 or status_code >= 300:
+                message = body.strip() or "<empty>"
+                raise RuntimeError(
+                    f"GitHub API request failed with status {status_code}: {message}"
+                )
+
+            payload_obj = json.loads(body)
+            etag = headers.get("etag")
+            if etag:
+                self._etags_by_path[path] = etag
+                self._cached_get_payload_by_path[path] = payload_obj
+            return payload_obj
+
+        cmd = ["gh", "api", "--method", method_upper, path]
         stdin_payload: str | None = None
         if payload is not None:
             cmd.extend(["--input", "-"])
             stdin_payload = json.dumps(payload)
         raw = run(cmd, input_text=stdin_payload)
         return json.loads(raw)
+
+
+def _parse_http_response(raw: str) -> tuple[int, dict[str, str], str]:
+    normalized = raw.replace("\r\n", "\n")
+    lines = normalized.split("\n")
+
+    status_line_index = -1
+    for index, line in enumerate(lines):
+        if line.startswith("HTTP/"):
+            status_line_index = index
+
+    if status_line_index < 0:
+        raise RuntimeError("Unexpected GitHub response: missing HTTP status line")
+
+    status_line = lines[status_line_index]
+    status_parts = status_line.split(" ", 2)
+    if len(status_parts) < 2:
+        raise RuntimeError(f"Unexpected GitHub response status line: {status_line!r}")
+
+    try:
+        status_code = int(status_parts[1])
+    except ValueError as exc:
+        raise RuntimeError(f"Unexpected GitHub response status line: {status_line!r}") from exc
+
+    headers: dict[str, str] = {}
+    body_start = len(lines)
+    for index in range(status_line_index + 1, len(lines)):
+        line = lines[index]
+        if line == "":
+            body_start = index + 1
+            break
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+
+    body = "\n".join(lines[body_start:])
+    return status_code, headers, body
 
 
 def _as_object_dict(value: object) -> dict[str, object] | None:

@@ -7,6 +7,7 @@ import pytest
 from mergexo.github_gateway import (
     CompareCommitsStatus,
     GitHubGateway,
+    _parse_http_response,
     _as_bool,
     _as_int,
     _as_optional_int,
@@ -378,13 +379,22 @@ def test_pull_request_related_fetch_errors(
 
 
 def test_api_json_invokes_gh_api(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[list[str], str | None]] = []
+    calls: list[tuple[list[str], str | None, bool]] = []
 
     def fake_run(
         cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
     ) -> str:
-        _ = cwd, check
-        calls.append((cmd, input_text))
+        _ = cwd
+        calls.append((cmd, input_text, check))
+        if "--include" in cmd:
+            return "\n".join(
+                (
+                    "HTTP/2.0 200 OK",
+                    'ETag: "etag-1"',
+                    "",
+                    '{"ok": true}',
+                )
+            )
         return json.dumps({"ok": True})
 
     monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
@@ -396,9 +406,117 @@ def test_api_json_invokes_gh_api(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert out_get == {"ok": True}
     assert out_post == {"ok": True}
-    assert calls[0][0] == ["gh", "api", "--method", "GET", "/path"]
+    assert calls[0][0] == ["gh", "api", "--method", "GET", "--include", "/path"]
+    assert calls[0][2] is False
     assert "--input" in calls[1][0]
     assert calls[1][1] == '{"k": "v"}'
+    assert calls[1][2] is True
+
+
+def test_api_json_get_uses_if_none_match_and_reuses_cached_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cwd, input_text
+        assert check is False
+        calls.append(cmd)
+        if len(calls) == 1:
+            return "\n".join(
+                (
+                    "HTTP/2.0 200 OK",
+                    'ETag: "etag-2"',
+                    "",
+                    '{"value": 7}',
+                )
+            )
+        assert len(calls) == 2
+        return "\n".join(("HTTP/2.0 304 Not Modified", "", ""))
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+
+    gateway = GitHubGateway("o", "r")
+    first = gateway._api_json("GET", "/path")
+    second = gateway._api_json("GET", "/path")
+
+    assert first == {"value": 7}
+    assert second == {"value": 7}
+    assert "--header" not in calls[0]
+    assert "--header" in calls[1]
+    header_index = calls[1].index("--header")
+    assert calls[1][header_index + 1] == 'If-None-Match: "etag-2"'
+
+
+def test_api_json_get_rejects_http_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        return "\n".join(
+            (
+                "HTTP/2.0 403 Forbidden",
+                "",
+                '{"message":"forbidden"}',
+            )
+        )
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(RuntimeError, match="status 403"):
+        gateway._api_json("GET", "/path")
+
+
+def test_api_json_get_rejects_not_modified_without_cached_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        return "\n".join(("HTTP/2.0 304 Not Modified", "", ""))
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+
+    gateway = GitHubGateway("o", "r")
+    gateway._etags_by_path["/path"] = '"etag-3"'
+    with pytest.raises(RuntimeError, match="uncached path"):
+        gateway._api_json("GET", "/path")
+
+
+def test_parse_http_response_handles_multiple_status_lines() -> None:
+    status, headers, body = _parse_http_response(
+        "\n".join(
+            (
+                "HTTP/2.0 301 Moved Permanently",
+                "Location: somewhere",
+                "",
+                "HTTP/2.0 200 OK",
+                'ETag: "abc"',
+                "X-Ignored",
+                "",
+                '{"ok": true}',
+            )
+        )
+    )
+
+    assert status == 200
+    assert headers == {"etag": '"abc"'}
+    assert body == '{"ok": true}'
+
+
+def test_parse_http_response_rejects_bad_status_output() -> None:
+    with pytest.raises(RuntimeError, match="missing HTTP status"):
+        _parse_http_response("not-http")
+
+    with pytest.raises(RuntimeError, match="status line"):
+        _parse_http_response("HTTP/2.0\n\n{}")
+
+    with pytest.raises(RuntimeError, match="status line"):
+        _parse_http_response("HTTP/2.0 okay\n\n{}")
 
 
 def test_gateway_emits_read_and_write_logs(

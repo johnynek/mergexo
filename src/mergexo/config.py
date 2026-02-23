@@ -35,6 +35,7 @@ class RepoConfig:
     allowed_users: frozenset[str]
     local_clone_source: str | None
     remote_url: str | None
+    required_tests: str | None = None
     operations_issue_number: int | None = None
     operator_logins: tuple[str, ...] = ()
 
@@ -243,6 +244,7 @@ def _parse_repo_config(
         allowed_users=allowed_users,
         local_clone_source=_optional_str(repo_data, "local_clone_source"),
         remote_url=_optional_str(repo_data, "remote_url"),
+        required_tests=_optional_str(repo_data, "required_tests"),
         operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
         operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
     )

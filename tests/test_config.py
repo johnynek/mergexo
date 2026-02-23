@@ -34,6 +34,7 @@ service_python = "/usr/bin/python3"
 owner = "johnynek"
 name = "repo"
 coding_guidelines_path = "docs/guidelines.md"
+required_tests = "scripts/required-tests.sh"
 local_clone_source = "/tmp/local.git"
 operations_issue_number = 99
 operator_logins = ["Alice", "bob"]
@@ -76,6 +77,7 @@ extra_args = ["--repo-mode"]
     assert loaded.repo.design_docs_dir == "docs/design"
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
+    assert loaded.repo.required_tests == "scripts/required-tests.sh"
     assert loaded.repo.operations_issue_number == 99
     assert loaded.repo.operator_logins == ("alice", "bob")
     assert loaded.repo.allowed_users == frozenset({"alice", "bob"})
@@ -257,6 +259,26 @@ name = "n"
 """.strip(),
     )
     with pytest.raises(ConfigError, match=re.escape("coding_guidelines_path is required")):
+        config.load_config(cfg_path)
+
+
+def test_load_config_rejects_invalid_required_tests_type(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+required_tests = 7
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match="required_tests must be a non-empty string if provided"):
         config.load_config(cfg_path)
 
 

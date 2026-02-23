@@ -140,6 +140,7 @@ MergeXO reads these labels from each repo config (`[repo]` or `[repo.<id>]`):
 - `bugfix_label` (direct bugfix flow)
 - `small_job_label` (direct small-job flow)
 - `coding_guidelines_path` (repo-relative file that defines coding style and required pre-PR tests for direct flows)
+- `required_tests` (optional repo-relative or absolute executable path that must pass before MergeXO pushes)
 
 When an issue has more than one trigger label, precedence is deterministic:
 
@@ -156,6 +157,7 @@ Example:
 Direct-flow PR bodies include `Fixes #<issue_number>`. Design-doc PR bodies keep `Refs #<issue_number>`.
 Bugfix flow enforces at least one staged file under `tests/` before opening a PR.
 Bugfix and small-job prompts require the agent to read and follow `coding_guidelines_path`.
+When `required_tests` is configured, MergeXO runs it before every push. If it fails on direct/implementation/feedback flows, MergeXO feeds stdout/stderr back to the agent for repair attempts; if the agent reports impossible, the PR is marked blocked with that explanation.
 
 ## Authentication allowlist
 
