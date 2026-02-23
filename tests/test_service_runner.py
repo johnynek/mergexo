@@ -25,6 +25,7 @@ def _app_config(
     restart_supported_modes: tuple[RestartMode, ...] = ("git_checkout",),
     restart_default_mode: RestartMode = "git_checkout",
     service_python: str | None = None,
+    restart_drain_timeout_seconds: int = 60,
 ) -> AppConfig:
     return AppConfig(
         runtime=RuntimeConfig(
@@ -32,7 +33,7 @@ def _app_config(
             worker_count=1,
             poll_interval_seconds=60,
             enable_github_operations=True,
-            restart_drain_timeout_seconds=60,
+            restart_drain_timeout_seconds=restart_drain_timeout_seconds,
             restart_default_mode=restart_default_mode,
             restart_supported_modes=restart_supported_modes,
             git_checkout_root=tmp_path,
@@ -143,15 +144,21 @@ def test_service_runner_returns_when_orchestrator_exits(
     cfg = _app_config(tmp_path)
     state = StateStore(tmp_path / "state.db")
     github = FakeGitHub()
-    called = {"runs": 0}
+    called = {"polls": 0}
 
     class FakeOrchestrator:
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             _ = args, kwargs
 
-        def run(self, *, once: bool) -> None:
-            _ = once
-            called["runs"] += 1
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+            called["polls"] += 1
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
     runner = ServiceRunner(
@@ -162,8 +169,8 @@ def test_service_runner_returns_when_orchestrator_exits(
         agent=cast(AgentAdapter, object()),
         startup_argv=("mergexo", "service"),
     )
-    runner.run(once=False)
-    assert called["runs"] == 1
+    runner.run(once=True)
+    assert called["polls"] == 1
 
 
 def test_service_runner_rejects_empty_repo_runtimes(tmp_path: Path) -> None:
@@ -199,9 +206,16 @@ def test_service_runner_multi_repo_once_polls_each_repo(
             repo = cast(RepoConfig, kwargs["repo"])
             self._repo_full_name = repo.full_name
 
-        def run(self, *, once: bool) -> None:
-            assert once is True
-            runs.append(self._repo_full_name)
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool
+            if allow_enqueue:
+                runs.append(self._repo_full_name)
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
     runner = ServiceRunner(
@@ -242,8 +256,14 @@ def test_service_runner_multi_repo_uses_repo_specific_agents(
             agent = kwargs["agent"]
             calls.append((repo.full_name, agent))
 
-        def run(self, *, once: bool) -> None:
-            assert once is True
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
     runner = ServiceRunner(
@@ -293,9 +313,15 @@ def test_service_runner_multi_repo_non_once_sleeps_between_polls(
             repo = cast(RepoConfig, kwargs["repo"])
             self._repo_full_name = repo.full_name
 
-        def run(self, *, once: bool) -> None:
-            assert once is True
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
             runs.append(self._repo_full_name)
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     def fake_sleep(seconds: int) -> None:
         sleep_calls.append(seconds)
@@ -327,19 +353,132 @@ def test_service_runner_multi_repo_non_once_sleeps_between_polls(
     assert sleep_calls == [cfg.runtime.poll_interval_seconds]
 
 
+def test_service_runner_multi_repo_continuous_reuses_orchestrators_and_shared_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    init_calls: list[tuple[str, int]] = []
+    poll_calls: list[tuple[str, int, bool]] = []
+
+    class StopLoop(Exception):
+        pass
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args
+            repo = cast(RepoConfig, kwargs["repo"])
+            work_limiter = kwargs["work_limiter"]
+            self._repo_full_name = repo.full_name
+            init_calls.append((self._repo_full_name, id(work_limiter)))
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            poll_calls.append((self._repo_full_name, id(pool), allow_enqueue))
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
+
+    sleep_calls: list[int] = []
+
+    def fake_sleep(seconds: int) -> None:
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 3:
+            raise StopLoop()
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr("mergexo.service_runner.time.sleep", fake_sleep)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (
+                cfg.repos[0],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+            (
+                cfg.repos[1],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+        ),
+    )
+
+    with pytest.raises(StopLoop):
+        runner.run(once=False)
+
+    assert len(init_calls) == 2
+    assert len({limiter_id for _, limiter_id in init_calls}) == 1
+    assert [call[0] for call in poll_calls[:3]] == [
+        cfg.repos[0].full_name,
+        cfg.repos[1].full_name,
+        cfg.repos[0].full_name,
+    ]
+    assert len({pool_id for _, pool_id, _ in poll_calls}) == 1
+
+
+def test_service_runner_once_drains_pending_work_with_enqueue_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    allow_enqueue_calls: list[bool] = []
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 1
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool
+            allow_enqueue_calls.append(allow_enqueue)
+            if not allow_enqueue:
+                self.pending = 0
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    runner.run(once=True)
+
+    assert allow_enqueue_calls == [True, False]
+
+
 def test_service_runner_multi_repo_restart_returns_when_handled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cfg = _multi_repo_config(tmp_path)
     state = StateStore(tmp_path / "state.db")
+    _seed_restart_command(state, command_key="77:19:2026-02-22T13:04:00Z")
 
     class FakeOrchestrator:
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             _ = args, kwargs
 
-        def run(self, *, once: bool) -> None:
-            _ = once
-            raise RestartRequested(mode="git_checkout", command_key="k")
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
     runner = ServiceRunner(
@@ -369,14 +508,20 @@ def test_service_runner_multi_repo_restart_returns_on_once_when_not_restarted(
 ) -> None:
     cfg = _multi_repo_config(tmp_path)
     state = StateStore(tmp_path / "state.db")
+    _seed_restart_command(state, command_key="77:20:2026-02-22T13:05:00Z")
 
     class FakeOrchestrator:
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             _ = args, kwargs
 
-        def run(self, *, once: bool) -> None:
-            _ = once
-            raise RestartRequested(mode="git_checkout", command_key="k")
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
     runner = ServiceRunner(
@@ -401,6 +546,72 @@ def test_service_runner_multi_repo_restart_returns_on_once_when_not_restarted(
     runner.run(once=True)
 
 
+def test_service_runner_restart_drain_waits_for_other_repo_pending_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _multi_repo_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    _seed_restart_command(state, command_key="77:22:2026-02-22T13:07:00Z")
+    poll_calls: list[tuple[str, bool]] = []
+    sleep_calls: list[int] = []
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args
+            repo = cast(RepoConfig, kwargs["repo"])
+            self._repo_full_name = repo.full_name
+            self.pending = 1 if repo.repo_id == "bosatsu" else 0
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool
+            poll_calls.append((self._repo_full_name, allow_enqueue))
+            if self._repo_full_name.endswith("/bosatsu"):
+                self.pending = 0
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+    def fake_sleep(seconds: int) -> None:
+        sleep_calls.append(seconds)
+
+    restart_calls: list[str] = []
+
+    def fake_handle_restart(self, *, requested: RestartRequested) -> bool:  # type: ignore[no-untyped-def]
+        restart_calls.append(requested.command_key)
+        return True
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr("mergexo.service_runner.time.sleep", fake_sleep)
+    monkeypatch.setattr(ServiceRunner, "_handle_restart_requested", fake_handle_restart)
+
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        repo_runtimes=(
+            (
+                cfg.repos[0],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+            (
+                cfg.repos[1],
+                cast(GitHubGateway, FakeGitHub()),
+                cast(GitRepoManager, object()),
+            ),
+        ),
+    )
+
+    runner.run(once=False)
+    assert restart_calls == ["77:22:2026-02-22T13:07:00Z"]
+    assert [repo for repo, _ in poll_calls] == [cfg.repos[0].full_name, cfg.repos[1].full_name]
+    assert sleep_calls == [cfg.runtime.poll_interval_seconds]
+
+
 def test_service_runner_restart_failure_marks_failed_and_posts_reply(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -414,9 +625,14 @@ def test_service_runner_restart_failure_marks_failed_and_posts_reply(
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             _ = args, kwargs
 
-        def run(self, *, once: bool) -> None:
-            _ = once
-            raise RestartRequested(mode="git_checkout", command_key=command_key)
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
     monkeypatch.setattr(
@@ -444,6 +660,57 @@ def test_service_runner_restart_failure_marks_failed_and_posts_reply(
     assert "status: `failed`" in github.posted[0][1]
 
 
+def test_service_runner_restart_drain_timeout_marks_failed_and_posts_reply(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, restart_drain_timeout_seconds=1)
+    state = StateStore(tmp_path / "state.db")
+    command_key = "77:23:2026-02-22T13:08:00Z"
+    _seed_restart_command(state, command_key=command_key)
+    github = FakeGitHub()
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 1, 0
+
+        def pending_work_count(self) -> int:
+            return 1
+
+    monotonic_values = iter([0.0, 2.0, 2.0, 2.0])
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        "mergexo.service_runner.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr("mergexo.service_runner.time.sleep", lambda seconds: None)
+
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    runner.run(once=True)
+
+    op = state.get_runtime_operation("restart")
+    assert op is not None
+    assert op.status == "failed"
+    command = state.get_operator_command(command_key)
+    assert command is not None
+    assert command.status == "failed"
+    assert "timed out" in command.result
+    assert len(github.posted) == 1
+    assert "status: `failed`" in github.posted[0][1]
+
+
 def test_service_runner_restart_success_updates_and_reexecs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -458,9 +725,14 @@ def test_service_runner_restart_success_updates_and_reexecs(
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             _ = args, kwargs
 
-        def run(self, *, once: bool) -> None:
-            _ = once
-            raise RestartRequested(mode="git_checkout", command_key=command_key)
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     class ExecCalled(Exception):
         pass
@@ -617,15 +889,21 @@ def test_service_runner_run_returns_when_restart_handled(
 ) -> None:
     cfg = _app_config(tmp_path)
     state = StateStore(tmp_path / "state.db")
+    _seed_restart_command(state, command_key="77:21:2026-02-22T13:06:00Z")
     github = FakeGitHub()
 
     class FakeOrchestrator:
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             _ = args, kwargs
 
-        def run(self, *, once: bool) -> None:
-            _ = once
-            raise RestartRequested(mode="git_checkout", command_key="k")
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
 
     monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
     runner = ServiceRunner(
