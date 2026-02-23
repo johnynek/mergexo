@@ -43,6 +43,7 @@ from mergexo.models import (
 from mergexo.orchestrator import (
     DirectFlowBlockedError,
     DirectFlowValidationError,
+    GlobalWorkLimiter,
     Phase1Orchestrator,
     RestartRequested,
     SlotPool,
@@ -700,6 +701,40 @@ def test_slot_pool_acquire_release(tmp_path: Path) -> None:
     pool.release(lease)
     lease2 = pool.acquire()
     assert lease2.slot == 0
+
+
+def test_global_work_limiter_guards_bounds() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        GlobalWorkLimiter(0)
+
+    limiter = GlobalWorkLimiter(1)
+    assert limiter.try_acquire() is True
+    assert limiter.try_acquire() is False
+    assert limiter.in_flight() == 1
+    assert limiter.capacity() == 1
+
+    limiter.release()
+    assert limiter.in_flight() == 0
+    with pytest.raises(RuntimeError, match="no work is in flight"):
+        limiter.release()
+
+
+def test_orchestrator_queue_count_accessors(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    running: Future[WorkResult] = Future()
+    feedback: Future[None] = Future()
+    orch._running = {1: running}
+    orch._running_feedback = {101: _FeedbackFuture(issue_number=1, future=feedback)}
+    assert orch.pending_work_count() == 2
+    assert orch.queue_counts() == (1, 1)
+    assert orch.in_flight_work_count() == 0
 
 
 @given(st.text())
@@ -1476,6 +1511,76 @@ def test_enqueue_implementation_work_paths(tmp_path: Path) -> None:
     orch._enqueue_implementation_work(pool)
     assert state.running == []
     assert pool.submitted == []
+
+
+def test_shared_global_work_limiter_caps_enqueue_across_orchestrators(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    git = FakeGitManager(tmp_path / "checkouts")
+    limiter = GlobalWorkLimiter(1)
+
+    first = Phase1Orchestrator(
+        cfg,
+        state=FakeState(allowed={1}),
+        github=FakeGitHub([_issue(1, "One")]),
+        git_manager=git,
+        agent=FakeAgent(),
+        work_limiter=limiter,
+    )
+    second = Phase1Orchestrator(
+        cfg,
+        state=FakeState(allowed={1}),
+        github=FakeGitHub([_issue(1, "One")]),
+        git_manager=git,
+        agent=FakeAgent(),
+        work_limiter=limiter,
+    )
+
+    class PendingPool:
+        def __init__(self) -> None:
+            self.submitted = 0
+            self.last_future: Future[WorkResult] | None = None
+
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, extra
+            fut: Future[WorkResult] = Future()
+            self.last_future = fut
+            self.submitted += 1
+            return fut
+
+    pool = PendingPool()
+
+    first._enqueue_new_work(pool)
+    assert pool.submitted == 1
+    second._enqueue_new_work(pool)
+    assert pool.submitted == 1
+
+    assert pool.last_future is not None
+    pool.last_future.set_result(WorkResult(issue_number=1, branch="b", pr_number=1, pr_url="u"))
+    second._enqueue_new_work(pool)
+    assert pool.submitted == 2
+
+
+def test_enqueue_new_work_releases_capacity_when_submit_fails(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    limiter = GlobalWorkLimiter(1)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(allowed={1}),
+        github=FakeGitHub([_issue(1, "One")]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+        work_limiter=limiter,
+    )
+
+    class FailingPool:
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, extra
+            raise RuntimeError("submit failed")
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        orch._enqueue_new_work(FailingPool())
+
+    assert limiter.in_flight() == 0
 
 
 def test_enqueue_new_work_uses_flow_precedence(tmp_path: Path) -> None:
@@ -2401,6 +2506,40 @@ def test_wait_for_all_calls_sleep_when_needed(
 
     orch._wait_for_all(pool=object())
     assert calls["sleep"] == 1
+
+
+def test_poll_once_respects_allow_enqueue_and_restart_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    calls = {"scan": 0, "new": 0, "impl": 0, "feedback": 0}
+
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(
+        orch, "_scan_operator_commands", lambda: calls.__setitem__("scan", calls["scan"] + 1)
+    )
+    monkeypatch.setattr(orch, "_enqueue_new_work", lambda pool: calls.__setitem__("new", 1))
+    monkeypatch.setattr(
+        orch, "_enqueue_implementation_work", lambda pool: calls.__setitem__("impl", 1)
+    )
+    monkeypatch.setattr(
+        orch, "_enqueue_feedback_work", lambda pool: calls.__setitem__("feedback", 1)
+    )
+
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=False)  # type: ignore[arg-type]
+    assert calls == {"scan": 1, "new": 0, "impl": 0, "feedback": 0}
+
+    monkeypatch.setattr(orch, "_is_restart_pending", lambda: True)
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+    assert calls == {"scan": 2, "new": 0, "impl": 0, "feedback": 0}
 
 
 def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
