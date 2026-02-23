@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from typing import cast
 
 from mergexo.agent_adapter import AgentAdapter
 from mergexo.config import AppConfig, RepoConfig
@@ -297,7 +298,9 @@ def run_service(
         config=config,
         state=state,
         agent=agent,
-        agent_by_repo_full_name=dict(agent_by_repo_full_name or {}),
+        agent_by_repo_full_name=cast(
+            dict[str, AgentAdapter], dict(agent_by_repo_full_name or {})
+        ),
         startup_argv=argv,
         github=github,
         git_manager=git_manager,

@@ -111,9 +111,10 @@ def load_config(path: Path) -> AppConfig:
 
     runtime_data = _require_table(data, "runtime")
     repo_data = _require_table(data, "repo")
-    codex_data = data.get("codex", {})
-    if not isinstance(codex_data, dict):
+    raw_codex_data = data.get("codex", {})
+    if not isinstance(raw_codex_data, dict):
         raise ConfigError("[codex] must be a TOML table")
+    codex_data = cast(dict[str, object], raw_codex_data)
     auth_data = _optional_table(data, "auth")
 
     runtime = RuntimeConfig(
