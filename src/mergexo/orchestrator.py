@@ -171,7 +171,6 @@ class Phase1Orchestrator:
                     LOGGER,
                     "poll_started",
                     once=once,
-                    feedback_loop_enabled=self._config.runtime.enable_feedback_loop,
                     github_operations_enabled=self._config.runtime.enable_github_operations,
                 )
                 self._reap_finished()
@@ -183,8 +182,7 @@ class Phase1Orchestrator:
                 if not draining_for_restart:
                     self._enqueue_new_work(pool)
                     self._enqueue_implementation_work(pool)
-                    if self._config.runtime.enable_feedback_loop:
-                        self._enqueue_feedback_work(pool)
+                    self._enqueue_feedback_work(pool)
 
                 log_event(
                     LOGGER,

@@ -552,7 +552,6 @@ def _config(
     tmp_path: Path,
     *,
     worker_count: int = 1,
-    enable_feedback_loop: bool = False,
     enable_github_operations: bool = False,
     restart_drain_timeout_seconds: int = 900,
     restart_default_mode: str = "git_checkout",
@@ -566,7 +565,6 @@ def _config(
             base_dir=tmp_path / "state",
             worker_count=worker_count,
             poll_interval_seconds=1,
-            enable_feedback_loop=enable_feedback_loop,
             enable_github_operations=enable_github_operations,
             restart_drain_timeout_seconds=restart_drain_timeout_seconds,
             restart_default_mode=cast(RestartMode, restart_default_mode),
@@ -1326,7 +1324,7 @@ def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.Monke
 def test_run_once_with_github_ops_scans_commands_twice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True, enable_github_operations=True)
+    cfg = _config(tmp_path, enable_github_operations=True)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
     agent = FakeAgent()
@@ -1389,7 +1387,7 @@ def _issue_comment(comment_id: int = 22) -> PullRequestIssueComment:
 
 
 def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -1437,7 +1435,7 @@ def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
 def test_feedback_turn_blocks_legacy_tracked_pr_when_issue_author_unauthorized(
     tmp_path: Path,
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("reviewer",))
+    cfg = _config(tmp_path, allowed_users=("reviewer",))
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue(author_login="outsider")
     github = FakeGitHub([issue])
@@ -1489,7 +1487,7 @@ def test_feedback_turn_blocks_legacy_tracked_pr_when_issue_author_unauthorized(
 def test_feedback_turn_retry_after_crash_does_not_duplicate_replies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -1562,7 +1560,7 @@ def test_feedback_turn_retry_after_crash_does_not_duplicate_replies(
 def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     git.restore_feedback_result = False
 
@@ -1619,7 +1617,7 @@ def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(
 def test_feedback_turn_blocks_on_cross_cycle_history_rewrite_and_is_comment_idempotent(
     tmp_path: Path,
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -1676,7 +1674,7 @@ def test_feedback_turn_blocks_on_cross_cycle_history_rewrite_and_is_comment_idem
 
 
 def test_feedback_turn_allows_cross_cycle_fast_forward_drift(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -1729,7 +1727,7 @@ def test_feedback_turn_allows_cross_cycle_fast_forward_drift(tmp_path: Path) -> 
 
 
 def test_feedback_turn_blocks_when_agent_rewrites_local_history(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     git.is_ancestor_results[("head-1", "rewritten-head")] = False
 
@@ -1797,7 +1795,7 @@ def test_feedback_turn_blocks_when_agent_rewrites_local_history(tmp_path: Path) 
 
 
 def test_feedback_turn_marks_closed_pr_and_stops_tracking(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -1844,10 +1842,10 @@ def test_feedback_turn_marks_closed_pr_and_stops_tracking(tmp_path: Path) -> Non
         conn.close()
 
 
-def test_run_once_invokes_feedback_enqueue_when_enabled(
+def test_run_once_invokes_feedback_enqueue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
     agent = FakeAgent()
@@ -1867,7 +1865,7 @@ def test_run_once_invokes_feedback_enqueue_when_enabled(
 
 
 def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, worker_count=3, enable_feedback_loop=True)
+    cfg = _config(tmp_path, worker_count=3)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
     agent = FakeAgent()
@@ -1954,7 +1952,7 @@ def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
 
 
 def test_feedback_turn_marks_merged_pr_and_stops_tracking(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -1992,7 +1990,7 @@ def test_feedback_turn_marks_merged_pr_and_stops_tracking(tmp_path: Path) -> Non
 
 
 def test_feedback_turn_blocks_when_session_missing(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2020,7 +2018,7 @@ def test_feedback_turn_blocks_when_session_missing(tmp_path: Path) -> None:
 def test_feedback_turn_commit_no_staged_changes_blocks_and_keeps_event_pending(
     tmp_path: Path,
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2078,7 +2076,7 @@ def test_feedback_turn_commit_no_staged_changes_blocks_and_keeps_event_pending(
 
 
 def test_feedback_turn_blocks_on_pre_finalize_remote_history_rewrite(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2155,7 +2153,7 @@ def test_feedback_turn_blocks_on_pre_finalize_remote_history_rewrite(tmp_path: P
 
 
 def test_feedback_turn_marks_merged_when_pr_merges_before_finalize(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2225,7 +2223,7 @@ def test_feedback_turn_marks_merged_when_pr_merges_before_finalize(tmp_path: Pat
 
 
 def test_feedback_turn_marks_closed_when_pr_closes_before_finalize(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2295,7 +2293,7 @@ def test_feedback_turn_marks_closed_when_pr_closes_before_finalize(tmp_path: Pat
 
 
 def test_feedback_turn_commit_unexpected_error_propagates(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2338,7 +2336,7 @@ def test_feedback_turn_commit_unexpected_error_propagates(tmp_path: Path) -> Non
 
 
 def test_feedback_turn_commit_push_marks_closed(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2392,7 +2390,7 @@ def test_feedback_turn_commit_push_marks_closed(tmp_path: Path) -> None:
 
 
 def test_feedback_turn_commit_push_marks_merged(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2448,7 +2446,7 @@ def test_feedback_turn_commit_push_marks_merged(tmp_path: Path) -> None:
 def test_feedback_turn_returns_when_expected_tokens_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2488,7 +2486,7 @@ def test_feedback_turn_returns_when_expected_tokens_missing(
 
 
 def test_normalize_filters_tokenized_comments(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
     agent = FakeAgent()
@@ -2538,7 +2536,7 @@ def test_normalize_filters_tokenized_comments(tmp_path: Path) -> None:
 
 
 def test_normalize_filters_unauthorized_comments(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("issue-author", "reviewer"))
+    cfg = _config(tmp_path, allowed_users=("issue-author", "reviewer"))
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
     agent = FakeAgent()
@@ -2582,7 +2580,7 @@ def test_normalize_filters_unauthorized_comments(tmp_path: Path) -> None:
 
 
 def test_feedback_turn_processes_only_authorized_comments(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("issue-author", "reviewer"))
+    cfg = _config(tmp_path, allowed_users=("issue-author", "reviewer"))
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2651,7 +2649,7 @@ def test_feedback_turn_processes_only_authorized_comments(tmp_path: Path) -> Non
 
 
 def test_feedback_turn_ignores_all_unauthorized_comments(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True, allowed_users=("issue-author", "reviewer"))
+    cfg = _config(tmp_path, allowed_users=("issue-author", "reviewer"))
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2715,7 +2713,7 @@ def test_feedback_turn_ignores_all_unauthorized_comments(tmp_path: Path) -> None
 
 
 def test_run_feedback_agent_with_git_ops_round_trip(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2777,7 +2775,7 @@ def test_run_feedback_agent_with_git_ops_round_trip(tmp_path: Path) -> None:
 def test_run_feedback_agent_with_git_ops_blocks_when_request_batch_too_large(
     tmp_path: Path,
 ) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2833,7 +2831,7 @@ def test_run_feedback_agent_with_git_ops_blocks_when_request_batch_too_large(
 
 
 def test_run_feedback_agent_with_git_ops_blocks_when_round_limit_exceeded(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2890,7 +2888,7 @@ def test_run_feedback_agent_with_git_ops_blocks_when_round_limit_exceeded(tmp_pa
 
 
 def test_run_feedback_agent_with_git_ops_stops_when_pr_merged_after_git_op(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -2952,7 +2950,7 @@ def test_run_feedback_agent_with_git_ops_stops_when_pr_merged_after_git_op(tmp_p
 
 
 def test_run_feedback_agent_with_git_ops_stops_when_pr_closed_after_git_op(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])
@@ -3014,7 +3012,7 @@ def test_run_feedback_agent_with_git_ops_stops_when_pr_closed_after_git_op(tmp_p
 
 
 def test_execute_feedback_git_ops_collects_success_and_failure(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
     agent = FakeAgent()
@@ -3055,7 +3053,7 @@ def test_execute_feedback_git_ops_collects_success_and_failure(tmp_path: Path) -
 
 
 def test_execute_feedback_git_op_raises_for_unsupported_request(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
     agent = FakeAgent()
@@ -3075,7 +3073,7 @@ def test_summarize_git_error_handles_empty_and_long_messages() -> None:
 
 
 def test_feedback_turn_returns_when_git_op_loop_blocks(tmp_path: Path) -> None:
-    cfg = _config(tmp_path, enable_feedback_loop=True)
+    cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
     github = FakeGitHub([issue])

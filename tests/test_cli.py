@@ -17,7 +17,6 @@ def _app_config(tmp_path: Path) -> AppConfig:
             base_dir=tmp_path / "state",
             worker_count=1,
             poll_interval_seconds=60,
-            enable_feedback_loop=False,
         ),
         repos=(
             RepoConfig(
@@ -723,7 +722,6 @@ def test_cmd_feedback_blocked_reset_requires_repo_with_pr_for_multi_repo() -> No
             base_dir=Path("/tmp/state"),
             worker_count=1,
             poll_interval_seconds=60,
-            enable_feedback_loop=False,
         ),
         repos=(
             RepoConfig(

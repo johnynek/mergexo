@@ -75,8 +75,6 @@ uv run mergexo service --config mergexo.toml
 
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
 
-The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `false`) until rollout is complete.
-
 Use `--verbose` on `init`, `run`, `service`, or `feedback` for high-signal lifecycle logs (`low` mode), or `--verbose high` for full event logs including poll internals. Verbose logs are also appended under `<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
 
 ## State schema upgrade note

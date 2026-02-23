@@ -2,7 +2,6 @@
 base_dir = "~/.local/share/mergexo"
 worker_count = 2
 poll_interval_seconds = 600
-enable_feedback_loop = true
 enable_github_operations = false
 # Restart drain timeout before pending restart is marked failed.
 restart_drain_timeout_seconds = 900
