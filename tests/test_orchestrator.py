@@ -850,11 +850,7 @@ def test_process_issue_design_flow_blocks_when_required_tests_fail(
         _ = cwd, input_text, check
         assert cmd[-1].endswith("scripts/required-tests.sh")
         raise CommandError(
-            "Command failed\n"
-            "cmd: /tmp/required-tests.sh\n"
-            "exit: 1\n"
-            "stdout:\nout\n"
-            "stderr:\nerr\n"
+            "Command failed\ncmd: /tmp/required-tests.sh\nexit: 1\nstdout:\nout\nstderr:\nerr\n"
         )
 
     monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
@@ -892,11 +888,7 @@ def test_process_issue_bugfix_blocks_when_required_tests_repair_limit_exceeded(
         run_calls += 1
         assert cmd[-1].endswith("scripts/required-tests.sh")
         raise CommandError(
-            "Command failed\n"
-            "cmd: /tmp/required-tests.sh\n"
-            "exit: 1\n"
-            "stdout:\nout\n"
-            "stderr:\nerr\n"
+            "Command failed\ncmd: /tmp/required-tests.sh\nexit: 1\nstdout:\nout\nstderr:\nerr\n"
         )
 
     monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
@@ -1587,6 +1579,58 @@ def test_required_tests_helpers_handle_exception_idempotence_and_truncation(
     assert untouched_issue is issue
 
 
+def test_save_agent_session_if_present_skips_none(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    orch._save_agent_session_if_present(issue_number=7, session=None)
+
+    assert state.saved_sessions == []
+
+
+def test_feedback_turn_required_tests_failure_truncates_and_handles_empty_output(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.changed_files = ("src/a.py",)
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    turn = FeedbackTurn(
+        turn_key="turn-key",
+        issue=issue,
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(),
+    )
+
+    truncated_turn = orch._feedback_turn_with_required_tests_failure(
+        turn=turn,
+        pull_request=github.pr_snapshot,
+        repair_round=1,
+        failure_output="x" * 13000,
+    )
+    assert "... [truncated by MergeXO]" in truncated_turn.issue_comments[-1].body
+    assert truncated_turn.changed_files == ("src/a.py",)
+
+    empty_turn = orch._feedback_turn_with_required_tests_failure(
+        turn=turn,
+        pull_request=github.pr_snapshot,
+        repair_round=2,
+        failure_output="   ",
+    )
+    assert "Failure output:\n<empty>" in empty_turn.issue_comments[-1].body
+
+
 def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -2043,9 +2087,7 @@ def test_feedback_turn_marks_closed_pr_and_stops_tracking(tmp_path: Path) -> Non
         conn.close()
 
 
-def test_run_once_invokes_feedback_enqueue(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_run_once_invokes_feedback_enqueue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
@@ -2763,11 +2805,7 @@ def test_feedback_turn_blocks_when_required_tests_reported_impossible(
         _ = cwd, input_text, check
         assert cmd[-1].endswith("scripts/required-tests.sh")
         raise CommandError(
-            "Command failed\n"
-            "cmd: /tmp/required-tests.sh\n"
-            "exit: 1\n"
-            "stdout:\nout\n"
-            "stderr:\nerr\n"
+            "Command failed\ncmd: /tmp/required-tests.sh\nexit: 1\nstdout:\nout\nstderr:\nerr\n"
         )
 
     monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
@@ -2915,11 +2953,7 @@ def test_feedback_turn_blocks_when_required_tests_repair_limit_exceeded(
         _ = cwd, input_text, check
         assert cmd[-1].endswith("scripts/required-tests.sh")
         raise CommandError(
-            "Command failed\n"
-            "cmd: /tmp/required-tests.sh\n"
-            "exit: 1\n"
-            "stdout:\nout\n"
-            "stderr:\nerr\n"
+            "Command failed\ncmd: /tmp/required-tests.sh\nexit: 1\nstdout:\nout\nstderr:\nerr\n"
         )
 
     monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
@@ -2997,11 +3031,7 @@ def test_feedback_turn_blocks_when_required_tests_repair_outcome_blocks(
         _ = cwd, input_text, check
         assert cmd[-1].endswith("scripts/required-tests.sh")
         raise CommandError(
-            "Command failed\n"
-            "cmd: /tmp/required-tests.sh\n"
-            "exit: 1\n"
-            "stdout:\nout\n"
-            "stderr:\nerr\n"
+            "Command failed\ncmd: /tmp/required-tests.sh\nexit: 1\nstdout:\nout\nstderr:\nerr\n"
         )
 
     monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
