@@ -7,6 +7,7 @@ from mergexo.feedback_loop import (
     compute_history_rewrite_token,
     compute_operator_command_token,
     compute_review_reply_token,
+    compute_source_issue_redirect_token,
     compute_turn_key,
     event_key,
     extract_action_tokens,
@@ -88,6 +89,14 @@ def test_operator_command_key_and_token_are_stable() -> None:
     token_a = compute_operator_command_token(command_key=key)
     token_b = compute_operator_command_token(command_key=key)
     assert token_a == token_b
+
+
+def test_source_issue_redirect_token_is_stable() -> None:
+    token_a = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=77)
+    token_b = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=77)
+    token_c = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=78)
+    assert token_a == token_b
+    assert token_a != token_c
 
 
 def test_parse_operator_command_valid_variants() -> None:

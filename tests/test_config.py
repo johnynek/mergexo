@@ -24,6 +24,7 @@ base_dir = "~/tmp/mergexo"
 worker_count = 2
 poll_interval_seconds = 60
 enable_github_operations = true
+enable_issue_comment_routing = true
 restart_drain_timeout_seconds = 120
 restart_default_mode = "git_checkout"
 restart_supported_modes = ["git_checkout", "pypi"]
@@ -62,6 +63,7 @@ extra_args = ["--repo-mode"]
     assert loaded.runtime.worker_count == 2
     assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
     assert loaded.runtime.enable_github_operations is True
+    assert loaded.runtime.enable_issue_comment_routing is True
     assert loaded.runtime.restart_drain_timeout_seconds == 120
     assert loaded.runtime.restart_default_mode == "git_checkout"
     assert loaded.runtime.restart_supported_modes == ("git_checkout", "pypi")
@@ -117,6 +119,7 @@ coding_guidelines_path = "docs/python_style.md"
 
     loaded = config.load_config(cfg_path)
     assert len(loaded.repos) == 2
+    assert loaded.runtime.enable_issue_comment_routing is False
 
     by_id = {repo.repo_id: repo for repo in loaded.repos}
     assert by_id["mergexo"].name == "mergexo"

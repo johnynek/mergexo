@@ -14,6 +14,7 @@ class RuntimeConfig:
     worker_count: int
     poll_interval_seconds: int
     enable_github_operations: bool = False
+    enable_issue_comment_routing: bool = False
     restart_drain_timeout_seconds: int = 900
     restart_default_mode: RestartMode = "git_checkout"
     restart_supported_modes: tuple[RestartMode, ...] = ("git_checkout",)
@@ -124,6 +125,9 @@ def load_config(path: Path) -> AppConfig:
         poll_interval_seconds=_require_int(runtime_data, "poll_interval_seconds"),
         enable_github_operations=_bool_with_default(
             runtime_data, "enable_github_operations", False
+        ),
+        enable_issue_comment_routing=_bool_with_default(
+            runtime_data, "enable_issue_comment_routing", False
         ),
         restart_drain_timeout_seconds=_int_with_default(
             runtime_data, "restart_drain_timeout_seconds", 900
