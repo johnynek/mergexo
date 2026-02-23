@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
 import os
@@ -20,6 +21,7 @@ from mergexo.git_ops import GitRepoManager
 from mergexo.models import OperatorCommandRecord, OperatorReplyStatus, RestartMode
 from mergexo.observability import log_event
 from mergexo.orchestrator import (
+    GlobalWorkLimiter,
     Phase1Orchestrator,
     RestartRequested,
     _operator_normalized_command,
@@ -33,6 +35,7 @@ from mergexo.state import StateStore
 
 LOGGER = logging.getLogger("mergexo.service_runner")
 _RESTART_OPERATION_NAME = "restart"
+_RESTART_PENDING_STATUSES = {"pending", "running"}
 
 
 @dataclass(frozen=True)
@@ -48,39 +51,13 @@ class ServiceRunner:
 
     def run(self, *, once: bool) -> None:
         runtimes = self._effective_repo_runtimes()
-        github_by_repo_full_name = {repo.full_name: github for repo, github, _ in runtimes}
         repo_count = len(runtimes)
         if repo_count < 1:
             raise RuntimeError("No repositories configured for service runner")
-
-        if repo_count == 1:
-            repo, github, git_manager = runtimes[0]
-            while True:
-                orchestrator = Phase1Orchestrator(
-                    self.config,
-                    state=self.state,
-                    github=github,
-                    git_manager=git_manager,
-                    repo=repo,
-                    github_by_repo_full_name=github_by_repo_full_name,
-                    agent=self._agent_for_repo(repo),
-                    allow_runtime_restart=True,
-                )
-                try:
-                    orchestrator.run(once=once)
-                    return
-                except RestartRequested as requested:
-                    restarted = self._handle_restart_requested(requested=requested)
-                    if restarted:
-                        return
-                    if once:
-                        return
-
-        polls_completed = 0
-        poll_index = 0
-        while True:
-            repo, github, git_manager = runtimes[poll_index]
-            orchestrator = Phase1Orchestrator(
+        github_by_repo_full_name = {repo.full_name: github for repo, github, _ in runtimes}
+        work_limiter = GlobalWorkLimiter(self.config.runtime.worker_count)
+        orchestrators = tuple(
+            Phase1Orchestrator(
                 self.config,
                 state=self.state,
                 github=github,
@@ -89,21 +66,208 @@ class ServiceRunner:
                 github_by_repo_full_name=github_by_repo_full_name,
                 agent=self._agent_for_repo(repo),
                 allow_runtime_restart=True,
+                work_limiter=work_limiter,
             )
-            try:
-                orchestrator.run(once=True)
-            except RestartRequested as requested:
-                restarted = self._handle_restart_requested(requested=requested)
-                if restarted:
+            for repo, github, git_manager in runtimes
+        )
+
+        with ThreadPoolExecutor(max_workers=self.config.runtime.worker_count) as pool:
+            if once:
+                for index, (repo, _, _) in enumerate(runtimes):
+                    self._poll_repo_once(
+                        repo=repo,
+                        orchestrator=orchestrators[index],
+                        pool=pool,
+                        work_limiter=work_limiter,
+                        allow_enqueue=True,
+                    )
+                if (
+                    self._total_pending_futures(orchestrators) == 0
+                    and not self._restart_operation_is_pending()
+                ):
                     return
-                if once:
+
+                restart_drain_started_at_monotonic: float | None = None
+                while True:
+                    for index, (repo, _, _) in enumerate(runtimes):
+                        self._poll_repo_once(
+                            repo=repo,
+                            orchestrator=orchestrators[index],
+                            pool=pool,
+                            work_limiter=work_limiter,
+                            allow_enqueue=False,
+                        )
+                    restart_drain_started_at_monotonic, should_exit = (
+                        self._process_global_restart_drain(
+                            orchestrators=orchestrators,
+                            restart_drain_started_at_monotonic=restart_drain_started_at_monotonic,
+                            exit_after_terminal=True,
+                        )
+                    )
+                    if should_exit:
+                        return
+                    if self._total_pending_futures(orchestrators) == 0:
+                        return
+                    time.sleep(0.1)
+
+            poll_index = 0
+            restart_drain_started_at_monotonic: float | None = None
+            while True:
+                repo, _, _ = runtimes[poll_index]
+                self._poll_repo_once(
+                    repo=repo,
+                    orchestrator=orchestrators[poll_index],
+                    pool=pool,
+                    work_limiter=work_limiter,
+                    allow_enqueue=not self._restart_operation_is_pending(),
+                )
+                restart_drain_started_at_monotonic, should_exit = (
+                    self._process_global_restart_drain(
+                        orchestrators=orchestrators,
+                        restart_drain_started_at_monotonic=restart_drain_started_at_monotonic,
+                        exit_after_terminal=False,
+                    )
+                )
+                if should_exit:
                     return
-            polls_completed += 1
-            if once and polls_completed >= repo_count:
-                return
-            poll_index = (poll_index + 1) % repo_count
-            if not once:
+                poll_index = (poll_index + 1) % repo_count
                 time.sleep(self.config.runtime.poll_interval_seconds)
+
+    def _poll_repo_once(
+        self,
+        *,
+        repo: RepoConfig,
+        orchestrator: Phase1Orchestrator,
+        pool: ThreadPoolExecutor,
+        work_limiter: GlobalWorkLimiter,
+        allow_enqueue: bool,
+    ) -> None:
+        orchestrator.poll_once(pool, allow_enqueue=allow_enqueue)
+        running_issue_count, running_feedback_count = orchestrator.queue_counts()
+        log_event(
+            LOGGER,
+            "service_repo_polled",
+            repo_full_name=repo.full_name,
+            allow_enqueue=allow_enqueue,
+            running_issue_count=running_issue_count,
+            running_feedback_count=running_feedback_count,
+        )
+        log_event(
+            LOGGER,
+            "service_global_capacity",
+            in_flight=work_limiter.in_flight(),
+            repo_pending_future_count=orchestrator.pending_work_count(),
+        )
+
+    def _total_pending_futures(self, orchestrators: tuple[Phase1Orchestrator, ...]) -> int:
+        return sum(orchestrator.pending_work_count() for orchestrator in orchestrators)
+
+    def _restart_operation_is_pending(self) -> bool:
+        operation = self.state.get_runtime_operation(_RESTART_OPERATION_NAME)
+        return operation is not None and operation.status in _RESTART_PENDING_STATUSES
+
+    def _process_global_restart_drain(
+        self,
+        *,
+        orchestrators: tuple[Phase1Orchestrator, ...],
+        restart_drain_started_at_monotonic: float | None,
+        exit_after_terminal: bool,
+    ) -> tuple[float | None, bool]:
+        operation = self.state.get_runtime_operation(_RESTART_OPERATION_NAME)
+        if operation is None or operation.status not in _RESTART_PENDING_STATUSES:
+            return None, False
+
+        pending_futures = self._total_pending_futures(orchestrators)
+        now = time.monotonic()
+        if restart_drain_started_at_monotonic is None:
+            restart_drain_started_at_monotonic = now
+            log_event(
+                LOGGER,
+                "service_restart_drain_started",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                mode=operation.mode,
+            )
+
+        if pending_futures == 0:
+            self.state.set_runtime_operation_status(
+                op_name=_RESTART_OPERATION_NAME,
+                status="running",
+                detail="workers drained; supervisor update running",
+            )
+            log_event(
+                LOGGER,
+                "service_restart_drain_completed",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                mode=operation.mode,
+            )
+            restarted = self._handle_restart_requested(
+                requested=RestartRequested(
+                    mode=operation.mode,
+                    command_key=operation.request_command_key,
+                    repo_full_name=operation.request_repo_full_name,
+                )
+            )
+            if restarted:
+                return None, True
+            return None, exit_after_terminal
+
+        elapsed = now - restart_drain_started_at_monotonic
+        drain_timeout = self.config.runtime.restart_drain_timeout_seconds
+        if elapsed >= drain_timeout:
+            detail = (
+                f"Restart drain timed out after {drain_timeout} seconds with "
+                f"{pending_futures} pending future(s)."
+            )
+            self.state.set_runtime_operation_status(
+                op_name=_RESTART_OPERATION_NAME,
+                status="failed",
+                detail=detail,
+            )
+            command = self.state.update_operator_command_result(
+                command_key=operation.request_command_key,
+                status="failed",
+                result=detail,
+                repo_full_name=operation.request_repo_full_name,
+            )
+            if command is not None:
+                self._post_operator_command_result(
+                    command=command,
+                    reply_status="failed",
+                    detail=detail,
+                )
+            log_event(
+                LOGGER,
+                "operator_command_failed",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                command="restart",
+                reason="drain_timeout",
+                pending_futures=pending_futures,
+                timeout_seconds=drain_timeout,
+            )
+            log_event(
+                LOGGER,
+                "service_restart_drain_timeout",
+                command_key=operation.request_command_key,
+                actor=operation.requested_by,
+                mode=operation.mode,
+                pending_futures=pending_futures,
+                timeout_seconds=drain_timeout,
+            )
+            return None, exit_after_terminal
+
+        log_event(
+            LOGGER,
+            "service_restart_drain_progress",
+            command_key=operation.request_command_key,
+            actor=operation.requested_by,
+            mode=operation.mode,
+            pending_futures=pending_futures,
+            elapsed_seconds=round(elapsed, 3),
+        )
+        return restart_drain_started_at_monotonic, False
 
     def _handle_restart_requested(self, *, requested: RestartRequested) -> bool:
         command_key = requested.command_key
