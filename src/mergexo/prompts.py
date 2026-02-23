@@ -6,6 +6,21 @@ from mergexo.agent_adapter import FeedbackTurn
 from mergexo.models import Issue
 
 
+def _coding_guidelines_task_lines(*, coding_guidelines_path: str | None) -> str:
+    if coding_guidelines_path:
+        return f"- Review and follow the coding/testing guidelines in: {coding_guidelines_path}"
+    return (
+        "- Coding/testing guidelines file is not present in this repo version.\n"
+        "- Follow a style consistent with the existing codebase and target 100% test coverage."
+    )
+
+
+def _implementation_checks_line(*, coding_guidelines_path: str | None) -> str:
+    if coding_guidelines_path:
+        return f"  - Re-run formatting and CI-required checks from {coding_guidelines_path}."
+    return "  - Re-run formatting and tests expected by this repo and target 100% test coverage."
+
+
 def build_design_prompt(
     *,
     issue: Issue,
@@ -49,15 +64,18 @@ def build_bugfix_prompt(
     issue: Issue,
     repo_full_name: str,
     default_branch: str,
-    coding_guidelines_path: str,
+    coding_guidelines_path: str | None,
 ) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
     return f"""
 You are the bugfix agent for repository {repo_full_name}.
 
 Task:
 - Resolve issue #{issue.number} directly with code changes.
 - Base branch is: {default_branch}
-- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
+{coding_guidelines_lines}
 - Reproduce the issue behavior from the report details.
 - Add or update regression tests in tests/ that fail before the fix and pass after the fix.
 
@@ -87,15 +105,18 @@ def build_small_job_prompt(
     issue: Issue,
     repo_full_name: str,
     default_branch: str,
-    coding_guidelines_path: str,
+    coding_guidelines_path: str | None,
 ) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
     return f"""
 You are the small-job agent for repository {repo_full_name}.
 
 Task:
 - Implement issue #{issue.number} directly with focused code changes.
 - Base branch is: {default_branch}
-- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
+{coding_guidelines_lines}
 - Keep scope tight to the requested job.
 
 Output requirements:
@@ -124,12 +145,18 @@ def build_implementation_prompt(
     issue: Issue,
     repo_full_name: str,
     default_branch: str,
-    coding_guidelines_path: str,
+    coding_guidelines_path: str | None,
     design_doc_path: str,
     design_doc_markdown: str,
     design_pr_number: int | None,
     design_pr_url: str | None,
 ) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    implementation_checks_line = _implementation_checks_line(
+        coding_guidelines_path=coding_guidelines_path
+    )
     design_pr_line = (
         f"- Source design PR: #{design_pr_number} ({design_pr_url})"
         if design_pr_number is not None and design_pr_url
@@ -141,7 +168,7 @@ You are the implementation agent for repository {repo_full_name}.
 Task:
 - Implement issue #{issue.number} by following the merged design doc.
 - Base branch is: {default_branch}
-- Review and follow the coding/testing guidelines in: {coding_guidelines_path}
+{coding_guidelines_lines}
 - Design doc path on base branch: {design_doc_path}
 {design_pr_line}
 
@@ -156,7 +183,7 @@ Output requirements:
   - Confirm all requested work is addressed.
   - Minimize duplication and remove confusing or unnecessary code.
   - Add concise comments around subtle logic to help future readers.
-  - Re-run formatting and CI-required checks from {coding_guidelines_path}.
+{implementation_checks_line}
   - Only finalize when those checks pass so MergeXO can commit and push confidently.
 
 Response format:
