@@ -179,7 +179,8 @@ Mitigation: idempotency keys are deterministic and independent from wording.
 Mitigation: bounded feedback queue and round robin between new issue work and feedback work.
 
 ## Rollout notes
-1. Land schema changes before enabling turn processing in production.
-2. Canary with one repository and one worker slot.
-3. Add structured logs for `issue_number`, `pr_number`, `turn_key`, `event_key`, `action_token`.
-4. Promote broadly after one week without duplicate action incidents.
+1. Ship behind `runtime.enable_feedback_loop` default false.
+2. Land schema first, then enable behavior by flag.
+3. Canary with one repository and one worker slot.
+4. Add structured logs for `issue_number`, `pr_number`, `turn_key`, `event_key`, `action_token`.
+5. Promote to default on after one week without duplicate action incidents.
