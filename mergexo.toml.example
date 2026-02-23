@@ -23,6 +23,8 @@ bugfix_label = "agent:bugfix"
 small_job_label = "agent:small-job"
 # Required path (repo-relative) to coding + testing guidelines agents should follow
 coding_guidelines_path = "docs/python_style.md"
+# Optional repo-relative or absolute path to an executable required before each push.
+# required_tests = "scripts/required-tests.sh"
 design_docs_dir = "docs/design"
 allowed_users = ["maintainer1", "maintainer2"]
 # Optional issue used for global operator commands (restart and cross-PR unblock).
@@ -38,6 +40,7 @@ operator_logins = []
 owner = "johnynek"
 name = "bosatsu"
 coding_guidelines_path = "docs/python_style.md"
+# required_tests = "scripts/required-tests.sh"
 # allowed_users omitted => defaults to ["johnynek"]
 
 # Legacy single-repo compatibility:
@@ -45,6 +48,7 @@ coding_guidelines_path = "docs/python_style.md"
 # owner = "johnynek"
 # name = "target-repo"
 # coding_guidelines_path = "docs/python_style.md"
+# required_tests = "scripts/required-tests.sh"
 # [auth]
 # allowed_users = ["maintainer1", "maintainer2"]
 

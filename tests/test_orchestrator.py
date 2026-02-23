@@ -59,6 +59,7 @@ from mergexo.orchestrator import (
     _trigger_labels,
 )
 from mergexo.observability import configure_logging
+from mergexo.shell import CommandError
 from mergexo.state import ImplementationCandidateState, StateStore, TrackedPullRequestState
 
 
@@ -559,6 +560,7 @@ def _config(
     operations_issue_number: int | None = None,
     operator_logins: tuple[str, ...] = (),
     allowed_users: tuple[str, ...] = ("issue-author", "reviewer"),
+    required_tests: str | None = None,
 ) -> AppConfig:
     return AppConfig(
         runtime=RuntimeConfig(
@@ -584,6 +586,7 @@ def _config(
                 allowed_users=frozenset(login.lower() for login in allowed_users),
                 local_clone_source=None,
                 remote_url=None,
+                required_tests=required_tests,
                 operations_issue_number=operations_issue_number,
                 operator_logins=operator_logins,
             ),
@@ -777,6 +780,55 @@ def test_process_issue_bugfix_flow_happy_path(tmp_path: Path) -> None:
         (7, "MergeXO assigned an agent and started bugfix PR work for issue #7."),
         (7, "Opened bugfix PR: https://example/pr/101"),
     ]
+
+
+def test_process_issue_bugfix_retries_when_required_tests_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    run_calls = 0
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        nonlocal run_calls
+        _ = cwd, input_text, check
+        run_calls += 1
+        assert cmd[-1].endswith("scripts/required-tests.sh")
+        if run_calls == 1:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: /tmp/required-tests.sh\n"
+                "exit: 1\n"
+                "stdout:\nfirst stdout\n"
+                "stderr:\nfirst stderr\n"
+            )
+        return ""
+
+    monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:bugfix",))
+    result = orch._process_issue(issue, "bugfix")
+
+    assert result.pr_number == 101
+    assert len(agent.bugfix_calls) == 2
+    assert "Required pre-push test command" in agent.bugfix_calls[0][0].body
+    assert "Failure output:" in agent.bugfix_calls[1][0].body
+    assert "stdout:" in agent.bugfix_calls[1][0].body
+    assert "stderr:" in agent.bugfix_calls[1][0].body
+    assert len(git.commit_calls) == 2
+    assert len(git.push_calls) == 1
+    assert run_calls == 2
 
 
 def test_process_issue_small_job_flow_uses_default_commit_message(tmp_path: Path) -> None:
@@ -2441,6 +2493,171 @@ def test_feedback_turn_commit_push_marks_merged(tmp_path: Path) -> None:
     tracked = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked)
     assert state.list_tracked_pull_requests() == ()
+
+
+def test_feedback_turn_retries_required_tests_failure_before_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_results = [
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-1"),
+            review_replies=(),
+            general_comment=None,
+            commit_message="feat: first pass",
+            git_ops=(),
+        ),
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-2"),
+            review_replies=(ReviewReply(review_comment_id=11, body="Fixed required tests"),),
+            general_comment="Required tests now pass.",
+            commit_message="feat: repair required tests",
+            git_ops=(),
+        ),
+    ]
+
+    run_calls = 0
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        nonlocal run_calls
+        _ = cwd, input_text, check
+        run_calls += 1
+        assert cmd[-1].endswith("scripts/required-tests.sh")
+        if run_calls == 1:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: /tmp/required-tests.sh\n"
+                "exit: 1\n"
+                "stdout:\nfirst stdout\n"
+                "stderr:\nfirst stderr\n"
+            )
+        return ""
+
+    monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 2
+    second_turn = agent.feedback_calls[1][1]
+    assert any(
+        "required pre-push test failed" in comment.body.lower()
+        for comment in second_turn.issue_comments
+    )
+    assert len(git.commit_calls) == 2
+    assert len(git.push_calls) == 1
+    assert run_calls == 2
+
+
+def test_feedback_turn_blocks_when_required_tests_reported_impossible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_results = [
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-1"),
+            review_replies=(),
+            general_comment=None,
+            commit_message="feat: first pass",
+            git_ops=(),
+        ),
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-2"),
+            review_replies=(),
+            general_comment="Impossible: fix would violate required invariant.",
+            commit_message=None,
+            git_ops=(),
+        ),
+    ]
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, input_text, check
+        assert cmd[-1].endswith("scripts/required-tests.sh")
+        raise CommandError(
+            "Command failed\n"
+            "cmd: /tmp/required-tests.sh\n"
+            "exit: 1\n"
+            "stdout:\nout\n"
+            "stderr:\nerr\n"
+        )
+
+    monkeypatch.setattr("mergexo.orchestrator.run", fake_run)
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 2
+    assert git.push_calls == []
+    assert any(
+        "required pre-push tests could not be satisfied" in body for _, body in github.comments
+    )
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT status, error FROM issue_runs WHERE issue_number = ?", (issue.number,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "blocked"
+        assert "Impossible: fix would violate required invariant." in str(row[1])
+    finally:
+        conn.close()
 
 
 def test_feedback_turn_returns_when_expected_tokens_missing(
