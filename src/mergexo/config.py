@@ -151,9 +151,7 @@ def load_config(path: Path) -> AppConfig:
     repos = _load_repo_configs(repo_data=repo_data, auth_data=auth_data)
 
     codex = _parse_codex_config(codex_data=codex_data)
-    codex_overrides = _load_codex_overrides(
-        codex_data=codex_data, repos=repos, defaults=codex
-    )
+    codex_overrides = _load_codex_overrides(codex_data=codex_data, repos=repos, defaults=codex)
 
     return AppConfig(
         runtime=runtime,
@@ -280,10 +278,11 @@ def _load_codex_overrides(
         raise ConfigError("[codex.repo] must be a TOML table")
     if not all(isinstance(item, str) for item in repo_data.keys()):
         raise ConfigError("[codex.repo] must have string keys")
+    normalized_repo_data = cast(dict[str, object], repo_data)
 
     configured_repo_ids = {repo.repo_id for repo in repos}
     overrides: list[tuple[str, CodexConfig]] = []
-    for repo_id, raw_value in sorted(repo_data.items()):
+    for repo_id, raw_value in sorted(normalized_repo_data.items()):
         if repo_id not in configured_repo_ids:
             available = ", ".join(sorted(configured_repo_ids))
             raise ConfigError(
