@@ -10,10 +10,11 @@ import queue
 import re
 import threading
 import time
-from typing import Literal, cast
+from typing import Callable, Literal, cast
 
 from mergexo.agent_adapter import (
     AgentAdapter,
+    DirectStartResult,
     AgentSession,
     FeedbackResult,
     FeedbackTurn,
@@ -53,6 +54,7 @@ from mergexo.models import (
     WorkResult,
 )
 from mergexo.observability import log_event
+from mergexo.shell import CommandError, run
 from mergexo.state import (
     ImplementationCandidateState,
     StateStore,
@@ -63,6 +65,8 @@ from mergexo.state import (
 LOGGER = logging.getLogger("mergexo.orchestrator")
 _MAX_FEEDBACK_GIT_OP_ROUNDS = 3
 _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
+_MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
+_REQUIRED_TEST_FAILURE_OUTPUT_LIMIT = 12000
 _ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
 _RESTART_OPERATION_NAME = "restart"
 _RESTART_PENDING_STATUSES = {"pending", "running"}
@@ -1045,6 +1049,21 @@ class Phase1Orchestrator:
         )
 
         self._git.commit_all(checkout_path, f"docs: add design for issue #{issue.number}")
+        required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+        if required_tests_error is not None:
+            required_tests_command = self._repo.required_tests or "<unset>"
+            error_summary = _summarize_git_error(required_tests_error)
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=(
+                    "MergeXO design flow could not push because the required pre-push test "
+                    f"`{required_tests_command}` failed.\n"
+                    f"Failure summary: {error_summary}"
+                ),
+            )
+            raise DirectFlowValidationError(
+                "required pre-push tests failed before pushing design branch"
+            )
         self._git.push_branch(checkout_path, branch)
 
         pr = self._github.create_pull_request(
@@ -1090,65 +1109,45 @@ class Phase1Orchestrator:
         branch = _issue_branch(flow=flow, issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
 
+        flow_label: str
+        direct_turn: Callable[[Issue], DirectStartResult]
         if flow == "bugfix":
-            start_result = self._agent.start_bugfix_from_issue(
-                issue=issue,
-                repo_full_name=self._state_repo_full_name(),
-                default_branch=self._repo.default_branch,
-                coding_guidelines_path=self._repo.coding_guidelines_path,
-                cwd=checkout_path,
-            )
             flow_label = "bugfix"
+
+            def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
+                return self._agent.start_bugfix_from_issue(
+                    issue=agent_issue,
+                    repo_full_name=self._state_repo_full_name(),
+                    default_branch=self._repo.default_branch,
+                    coding_guidelines_path=self._repo.coding_guidelines_path,
+                    cwd=checkout_path,
+                )
+
+            direct_turn = run_direct_turn
         elif flow == "small_job":
-            start_result = self._agent.start_small_job_from_issue(
-                issue=issue,
-                repo_full_name=self._state_repo_full_name(),
-                default_branch=self._repo.default_branch,
-                coding_guidelines_path=self._repo.coding_guidelines_path,
-                cwd=checkout_path,
-            )
             flow_label = "small-job"
+
+            def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
+                return self._agent.start_small_job_from_issue(
+                    issue=agent_issue,
+                    repo_full_name=self._state_repo_full_name(),
+                    default_branch=self._repo.default_branch,
+                    coding_guidelines_path=self._repo.coding_guidelines_path,
+                    cwd=checkout_path,
+                )
+
+            direct_turn = run_direct_turn
         else:
             raise DirectFlowValidationError(f"Unsupported direct flow: {flow}")
 
-        if start_result.session:
-            self._state.save_agent_session(
-                issue_number=issue.number,
-                adapter=start_result.session.adapter,
-                thread_id=start_result.session.thread_id,
-                repo_full_name=self._state_repo_full_name(),
-            )
-
-        if start_result.blocked_reason:
-            self._github.post_issue_comment(
-                issue_number=issue.number,
-                body=(
-                    f"MergeXO {flow_label} flow was blocked for issue #{issue.number}: "
-                    f"{start_result.blocked_reason}"
-                ),
-            )
-            raise DirectFlowBlockedError(
-                f"{flow_label} flow blocked: {start_result.blocked_reason}"
-            )
-
-        if flow == "bugfix":
-            staged_files = self._git.list_staged_files(checkout_path)
-            if not _has_regression_test_changes(staged_files):
-                self._github.post_issue_comment(
-                    issue_number=issue.number,
-                    body=(
-                        "MergeXO bugfix flow requires at least one staged regression test under "
-                        "`tests/`. No PR was opened."
-                    ),
-                )
-                raise DirectFlowValidationError(
-                    "Bugfix flow requires at least one staged regression test under tests/"
-                )
-
-        commit_message = start_result.commit_message or _default_commit_message(
-            flow=flow, issue_number=issue.number
+        start_result = self._run_direct_turn_with_required_tests_repair(
+            issue=issue,
+            flow_label=flow_label,
+            checkout_path=checkout_path,
+            default_commit_message=_default_commit_message(flow=flow, issue_number=issue.number),
+            require_regression_tests=(flow == "bugfix"),
+            direct_turn=direct_turn,
         )
-        self._git.commit_all(checkout_path, commit_message)
         self._git.push_branch(checkout_path, branch)
 
         pr = self._github.create_pull_request(
@@ -1242,41 +1241,29 @@ class Phase1Orchestrator:
                 )
             design_doc_markdown = design_abs_path.read_text(encoding="utf-8")
 
-            start_result = self._agent.start_implementation_from_design(
-                issue=issue,
-                repo_full_name=self._state_repo_full_name(),
-                default_branch=self._repo.default_branch,
-                coding_guidelines_path=self._repo.coding_guidelines_path,
-                design_doc_path=design_relpath,
-                design_doc_markdown=design_doc_markdown,
-                design_pr_number=candidate.design_pr_number,
-                design_pr_url=candidate.design_pr_url,
-                cwd=lease.path,
-            )
-            if start_result.session:
-                self._state.save_agent_session(
-                    issue_number=issue.number,
-                    adapter=start_result.session.adapter,
-                    thread_id=start_result.session.thread_id,
+            def run_implementation_turn(agent_issue: Issue) -> DirectStartResult:
+                return self._agent.start_implementation_from_design(
+                    issue=agent_issue,
                     repo_full_name=self._state_repo_full_name(),
+                    default_branch=self._repo.default_branch,
+                    coding_guidelines_path=self._repo.coding_guidelines_path,
+                    design_doc_path=design_relpath,
+                    design_doc_markdown=design_doc_markdown,
+                    design_pr_number=candidate.design_pr_number,
+                    design_pr_url=candidate.design_pr_url,
+                    cwd=lease.path,
                 )
 
-            if start_result.blocked_reason:
-                self._github.post_issue_comment(
-                    issue_number=issue.number,
-                    body=(
-                        f"MergeXO implementation flow was blocked for issue #{issue.number}: "
-                        f"{start_result.blocked_reason}"
-                    ),
-                )
-                raise DirectFlowBlockedError(
-                    f"implementation flow blocked: {start_result.blocked_reason}"
-                )
-
-            commit_message = start_result.commit_message or _default_commit_message(
-                flow="small_job", issue_number=issue.number
+            start_result = self._run_direct_turn_with_required_tests_repair(
+                issue=issue,
+                flow_label="implementation",
+                checkout_path=lease.path,
+                default_commit_message=_default_commit_message(
+                    flow="small_job", issue_number=issue.number
+                ),
+                require_regression_tests=False,
+                direct_turn=run_implementation_turn,
             )
-            self._git.commit_all(lease.path, commit_message)
             self._git.push_branch(lease.path, branch)
 
             design_doc_url = _design_doc_url(
@@ -1335,6 +1322,204 @@ class Phase1Orchestrator:
                 self._git.cleanup_slot(lease.path)
             finally:
                 self._slot_pool.release(lease)
+
+    def _save_agent_session_if_present(
+        self, *, issue_number: int, session: AgentSession | None
+    ) -> None:
+        if session is None:
+            return
+        self._state.save_agent_session(
+            issue_number=issue_number,
+            adapter=session.adapter,
+            thread_id=session.thread_id,
+            repo_full_name=self._state_repo_full_name(),
+        )
+
+    def _run_direct_turn_with_required_tests_repair(
+        self,
+        *,
+        issue: Issue,
+        flow_label: str,
+        checkout_path: Path,
+        default_commit_message: str,
+        require_regression_tests: bool,
+        direct_turn: Callable[[Issue], DirectStartResult],
+    ) -> DirectStartResult:
+        result = direct_turn(self._issue_with_required_tests_reminder(issue))
+        repair_round = 0
+
+        while True:
+            self._save_agent_session_if_present(issue_number=issue.number, session=result.session)
+            if result.blocked_reason:
+                self._github.post_issue_comment(
+                    issue_number=issue.number,
+                    body=(
+                        f"MergeXO {flow_label} flow was blocked for issue #{issue.number}: "
+                        f"{result.blocked_reason}"
+                    ),
+                )
+                raise DirectFlowBlockedError(f"{flow_label} flow blocked: {result.blocked_reason}")
+
+            if require_regression_tests:
+                staged_files = self._git.list_staged_files(checkout_path)
+                if not _has_regression_test_changes(staged_files):
+                    self._github.post_issue_comment(
+                        issue_number=issue.number,
+                        body=(
+                            "MergeXO bugfix flow requires at least one staged regression test "
+                            "under `tests/`. No PR was opened."
+                        ),
+                    )
+                    raise DirectFlowValidationError(
+                        "Bugfix flow requires at least one staged regression test under tests/"
+                    )
+
+            commit_message = result.commit_message or default_commit_message
+            self._git.commit_all(checkout_path, commit_message)
+
+            required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+            if required_tests_error is None:
+                return result
+
+            repair_round += 1
+            if repair_round > _MAX_REQUIRED_TEST_REPAIR_ROUNDS:
+                required_tests_command = self._repo.required_tests
+                required_tests_display = required_tests_command or "<unset>"
+                error_summary = _summarize_git_error(required_tests_error)
+                self._github.post_issue_comment(
+                    issue_number=issue.number,
+                    body=(
+                        "MergeXO could not satisfy the required pre-push test "
+                        f"`{required_tests_display}` for issue #{issue.number} after "
+                        f"{_MAX_REQUIRED_TEST_REPAIR_ROUNDS} repair attempts.\n"
+                        f"Last failure summary: {error_summary}"
+                    ),
+                )
+                raise DirectFlowValidationError(
+                    "required pre-push tests did not pass after automated repair attempts"
+                )
+
+            repair_issue = self._issue_with_required_tests_failure(
+                issue=issue,
+                failure_output=required_tests_error,
+                attempt=repair_round,
+            )
+            result = direct_turn(repair_issue)
+
+    def _run_required_tests_before_push(self, *, checkout_path: Path) -> str | None:
+        required_tests_command = self._repo.required_tests
+        if required_tests_command is None:
+            return None
+
+        executable_path = Path(required_tests_command)
+        if not executable_path.is_absolute():
+            executable_path = checkout_path / executable_path
+        argv = [str(executable_path)]
+
+        log_event(
+            LOGGER,
+            "required_tests_started",
+            issue_repo_full_name=self._state_repo_full_name(),
+            command=required_tests_command,
+            checkout_path=str(checkout_path),
+        )
+        try:
+            run(argv, cwd=checkout_path)
+        except CommandError as exc:
+            detail = str(exc)
+            log_event(
+                LOGGER,
+                "required_tests_failed",
+                issue_repo_full_name=self._state_repo_full_name(),
+                command=required_tests_command,
+                checkout_path=str(checkout_path),
+                error_summary=_summarize_git_error(detail),
+            )
+            return detail
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {exc}"
+            log_event(
+                LOGGER,
+                "required_tests_failed",
+                issue_repo_full_name=self._state_repo_full_name(),
+                command=required_tests_command,
+                checkout_path=str(checkout_path),
+                error_summary=_summarize_git_error(detail),
+            )
+            return detail
+
+        log_event(
+            LOGGER,
+            "required_tests_passed",
+            issue_repo_full_name=self._state_repo_full_name(),
+            command=required_tests_command,
+            checkout_path=str(checkout_path),
+        )
+        return None
+
+    def _issue_with_required_tests_reminder(self, issue: Issue) -> Issue:
+        required_tests_command = self._repo.required_tests
+        if required_tests_command is None:
+            return issue
+
+        reminder = (
+            "Required pre-push test command:\n"
+            f"- `{required_tests_command}`\n"
+            "Before finalizing your response, run this command and ensure it passes."
+        )
+        if reminder in issue.body:
+            return issue
+
+        body = issue.body.strip()
+        merged_body = f"{body}\n\n{reminder}" if body else reminder
+        return Issue(
+            number=issue.number,
+            title=issue.title,
+            body=merged_body,
+            html_url=issue.html_url,
+            labels=issue.labels,
+            author_login=issue.author_login,
+        )
+
+    def _issue_with_required_tests_failure(
+        self,
+        *,
+        issue: Issue,
+        failure_output: str,
+        attempt: int,
+    ) -> Issue:
+        base_issue = self._issue_with_required_tests_reminder(issue)
+        required_tests_command = self._repo.required_tests
+        if required_tests_command is None:
+            return base_issue
+
+        trimmed_output = failure_output.strip()
+        if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
+            trimmed_output = (
+                trimmed_output[:_REQUIRED_TEST_FAILURE_OUTPUT_LIMIT]
+                + "\n... [truncated by MergeXO]"
+            )
+        if not trimmed_output:
+            trimmed_output = "<empty>"
+
+        context = (
+            f"Required pre-push test failed on repair attempt {attempt}.\n"
+            "Do not disable, remove, or weaken existing tests.\n"
+            f"Repair the code so `{required_tests_command}` passes.\n"
+            "If impossible, set blocked_reason with a concrete explanation.\n\n"
+            "Failure output:\n"
+            f"{trimmed_output}"
+        )
+        body = base_issue.body.strip()
+        merged_body = f"{body}\n\n{context}" if body else context
+        return Issue(
+            number=base_issue.number,
+            title=base_issue.title,
+            body=merged_body,
+            html_url=base_issue.html_url,
+            labels=base_issue.labels,
+            author_login=base_issue.author_login,
+        )
 
     def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> None:
         lease = self._slot_pool.acquire()
@@ -1485,6 +1670,9 @@ class Phase1Orchestrator:
                 for normalized_event, comment in normalized_issue
                 if normalized_event.event_key in pending_event_key_set
             )
+            turn_issue_comments = self._append_required_tests_feedback_reminder(
+                pending_issue_comments
+            )
 
             session_row = self._state.get_agent_session(
                 tracked.issue_number,
@@ -1546,7 +1734,7 @@ class Phase1Orchestrator:
                 issue=issue,
                 pull_request=pr,
                 review_comments=pending_review_comments,
-                issue_comments=pending_issue_comments,
+                issue_comments=turn_issue_comments,
                 changed_files=changed_files,
             )
             turn_start_head = pr.head_sha
@@ -1574,67 +1762,17 @@ class Phase1Orchestrator:
                 )
                 return
 
-            if result.commit_message:
-                try:
-                    self._git.commit_all(lease.path, result.commit_message)
-                except RuntimeError as exc:
-                    if _is_no_staged_changes_error(exc):
-                        error = (
-                            "agent returned commit_message but no staged changes were found; "
-                            "feedback turn requires repo edits before posting replies"
-                        )
-                        self._state.mark_pr_status(
-                            pr_number=tracked.pr_number,
-                            issue_number=tracked.issue_number,
-                            status="blocked",
-                            last_seen_head_sha=pr.head_sha,
-                            error=error,
-                            repo_full_name=self._state_repo_full_name(),
-                        )
-                        log_event(
-                            LOGGER,
-                            "feedback_turn_blocked",
-                            issue_number=tracked.issue_number,
-                            pr_number=tracked.pr_number,
-                            reason="commit_message_without_changes",
-                        )
-                        return
-                    raise
-                else:
-                    self._git.push_branch(lease.path, tracked.branch)
-                    pr = self._github.get_pull_request(tracked.pr_number)
-                    if pr.merged:
-                        self._state.mark_pr_status(
-                            pr_number=tracked.pr_number,
-                            issue_number=tracked.issue_number,
-                            status="merged",
-                            last_seen_head_sha=pr.head_sha,
-                            repo_full_name=self._state_repo_full_name(),
-                        )
-                        log_event(
-                            LOGGER,
-                            "feedback_turn_completed",
-                            issue_number=tracked.issue_number,
-                            pr_number=tracked.pr_number,
-                            result="pr_merged",
-                        )
-                        return
-                    if pr.state.lower() != "open":
-                        self._state.mark_pr_status(
-                            pr_number=tracked.pr_number,
-                            issue_number=tracked.issue_number,
-                            status="closed",
-                            last_seen_head_sha=pr.head_sha,
-                            repo_full_name=self._state_repo_full_name(),
-                        )
-                        log_event(
-                            LOGGER,
-                            "feedback_turn_completed",
-                            issue_number=tracked.issue_number,
-                            pr_number=tracked.pr_number,
-                            result="pr_closed",
-                        )
-                        return
+            commit_outcome = self._commit_push_feedback_with_required_tests(
+                tracked=tracked,
+                checkout_path=lease.path,
+                turn=turn,
+                result=result,
+                pull_request=pr,
+                turn_start_head=turn_start_head,
+            )
+            if commit_outcome is None:
+                return
+            result, pr = commit_outcome
 
             refreshed_pr = self._github.get_pull_request(tracked.pr_number)
             if refreshed_pr.merged:
@@ -1744,6 +1882,246 @@ class Phase1Orchestrator:
                 self._git.cleanup_slot(lease.path)
             finally:
                 self._slot_pool.release(lease)
+
+    def _append_required_tests_feedback_reminder(
+        self, issue_comments: tuple[PullRequestIssueComment, ...]
+    ) -> tuple[PullRequestIssueComment, ...]:
+        required_tests_command = self._repo.required_tests
+        if required_tests_command is None:
+            return issue_comments
+
+        reminder_body = (
+            "MergeXO required pre-push test reminder:\n"
+            f"- Run `{required_tests_command}` before returning commit_message.\n"
+            "- Only finalize when that command passes."
+        )
+        reminder_comment = PullRequestIssueComment(
+            comment_id=-9000,
+            body=reminder_body,
+            user_login="mergexo-system",
+            html_url="",
+            created_at="now",
+            updated_at="now",
+        )
+        return issue_comments + (reminder_comment,)
+
+    def _feedback_turn_with_required_tests_failure(
+        self,
+        *,
+        turn: FeedbackTurn,
+        pull_request: PullRequestSnapshot,
+        repair_round: int,
+        failure_output: str,
+    ) -> FeedbackTurn:
+        required_tests_command = self._repo.required_tests or "<unset>"
+        trimmed_output = failure_output.strip()
+        if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
+            trimmed_output = (
+                trimmed_output[:_REQUIRED_TEST_FAILURE_OUTPUT_LIMIT]
+                + "\n... [truncated by MergeXO]"
+            )
+        if not trimmed_output:
+            trimmed_output = "<empty>"
+
+        failure_comment = PullRequestIssueComment(
+            comment_id=-(9100 + repair_round),
+            body=(
+                "MergeXO required pre-push test failed.\n"
+                f"- command: `{required_tests_command}`\n"
+                f"- repair_round: {repair_round}\n"
+                "- Do not disable, remove, or weaken existing tests.\n"
+                "- Repair the code so the required command passes.\n"
+                "- If impossible, set commit_message to null and explain why in "
+                "general_comment.\n\n"
+                "Failure output:\n"
+                f"{trimmed_output}"
+            ),
+            user_login="mergexo-system",
+            html_url="",
+            created_at="now",
+            updated_at="now",
+        )
+        return FeedbackTurn(
+            turn_key=turn.turn_key,
+            issue=turn.issue,
+            pull_request=pull_request,
+            review_comments=turn.review_comments,
+            issue_comments=turn.issue_comments + (failure_comment,),
+            changed_files=self._github.list_pull_request_files(pull_request.number),
+        )
+
+    def _commit_push_feedback_with_required_tests(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        checkout_path: Path,
+        turn: FeedbackTurn,
+        result: FeedbackResult,
+        pull_request: PullRequestSnapshot,
+        turn_start_head: str,
+    ) -> tuple[FeedbackResult, PullRequestSnapshot] | None:
+        current_result = result
+        current_turn = turn
+        current_pr = pull_request
+        repair_round = 0
+
+        while current_result.commit_message:
+            local_head_sha = self._git.current_head_sha(checkout_path)
+            if not self._git.is_ancestor(checkout_path, turn_start_head, local_head_sha):
+                self._block_feedback_history_rewrite(
+                    tracked=tracked,
+                    expected_head_sha=turn_start_head,
+                    observed_head_sha=local_head_sha,
+                    phase="required_tests_repair_local",
+                    transition_status="local_non_ancestor",
+                    state_head_sha=turn_start_head,
+                )
+                return None
+
+            try:
+                self._git.commit_all(checkout_path, current_result.commit_message)
+            except RuntimeError as exc:
+                if _is_no_staged_changes_error(exc):
+                    error = (
+                        "agent returned commit_message but no staged changes were found; "
+                        "feedback turn requires repo edits before posting replies"
+                    )
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="blocked",
+                        last_seen_head_sha=current_pr.head_sha,
+                        error=error,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="commit_message_without_changes",
+                    )
+                    return None
+                raise
+
+            required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+            if required_tests_error is not None:
+                repair_round += 1
+                if repair_round > _MAX_REQUIRED_TEST_REPAIR_ROUNDS:
+                    error = (
+                        "required pre-push tests failed after automated repair attempts; "
+                        f"last failure: {_summarize_git_error(required_tests_error)}"
+                    )
+                    self._github.post_issue_comment(
+                        issue_number=tracked.pr_number,
+                        body=(
+                            "MergeXO feedback automation is blocked because required pre-push "
+                            f"tests kept failing after {_MAX_REQUIRED_TEST_REPAIR_ROUNDS} repair "
+                            f"attempts.\n\n{error}"
+                        ),
+                    )
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="blocked",
+                        last_seen_head_sha=current_pr.head_sha,
+                        error=error,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="required_tests_repair_limit_exceeded",
+                    )
+                    return None
+
+                current_turn = self._feedback_turn_with_required_tests_failure(
+                    turn=current_turn,
+                    pull_request=current_pr,
+                    repair_round=repair_round,
+                    failure_output=required_tests_error,
+                )
+                repair_outcome = self._run_feedback_agent_with_git_ops(
+                    tracked=tracked,
+                    session=current_result.session,
+                    turn=current_turn,
+                    checkout_path=checkout_path,
+                    pull_request=current_pr,
+                )
+                if repair_outcome is None:
+                    return None
+
+                current_result, current_pr = repair_outcome
+                if current_result.commit_message is None:
+                    detail = (
+                        current_result.general_comment.strip()
+                        if current_result.general_comment and current_result.general_comment.strip()
+                        else "agent could not satisfy required pre-push tests"
+                    )
+                    self._github.post_issue_comment(
+                        issue_number=tracked.pr_number,
+                        body=(
+                            "MergeXO feedback automation is blocked because required pre-push "
+                            f"tests could not be satisfied:\n\n{detail}"
+                        ),
+                    )
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="blocked",
+                        last_seen_head_sha=current_pr.head_sha,
+                        error=detail,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="required_tests_reported_impossible",
+                    )
+                    return None
+                continue
+
+            self._git.push_branch(checkout_path, tracked.branch)
+            current_pr = self._github.get_pull_request(tracked.pr_number)
+            if current_pr.merged:
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="merged",
+                    last_seen_head_sha=current_pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_merged",
+                )
+                return None
+            if current_pr.state.lower() != "open":
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="closed",
+                    last_seen_head_sha=current_pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_closed",
+                )
+                return None
+            return current_result, current_pr
+
+        return current_result, current_pr
 
     def _run_feedback_agent_with_git_ops(
         self,
