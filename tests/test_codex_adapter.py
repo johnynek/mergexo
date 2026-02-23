@@ -409,6 +409,40 @@ def test_respond_to_feedback_requires_thread_id(tmp_path: Path) -> None:
         )
 
 
+def test_respond_to_feedback_logs_fault_when_final_message_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        return '{"type":"thread.started","thread_id":"thread-resumed"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    configure_logging(verbose=True)
+
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(RuntimeError, match="did not emit"):
+        adapter.respond_to_feedback(
+            session=AgentSession(adapter="codex", thread_id="thread-abc"),
+            turn=_feedback_turn(),
+            cwd=tmp_path,
+        )
+
+    stderr = capsys.readouterr().err
+    assert "event=codex_invocation_finished" in stderr
+    assert "issue_number=1" in stderr
+    assert "pr_number=8" in stderr
+    assert "mode=respond_to_review" in stderr
+    assert "status=fault" in stderr
+
+
 def test_start_design_from_issue_rejects_disabled(tmp_path: Path) -> None:
     adapter = CodexAdapter(
         CodexConfig(enabled=False, model=None, sandbox=None, profile=None, extra_args=())

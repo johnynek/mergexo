@@ -63,6 +63,7 @@ def test_build_parser_supports_commands() -> None:
 
     parsed_init = parser.parse_args(["init", "--verbose"])
     parsed_run = parser.parse_args(["run", "--once", "--verbose"])
+    parsed_run_high = parser.parse_args(["run", "--once", "--verbose", "high"])
     parsed_service = parser.parse_args(["service", "--once", "--verbose"])
     parsed_feedback_list = parser.parse_args(["feedback", "blocked", "list", "--json"])
     parsed_feedback_reset = parser.parse_args(
@@ -81,13 +82,14 @@ def test_build_parser_supports_commands() -> None:
     )
 
     assert parsed_init.command == "init"
-    assert parsed_init.verbose is True
+    assert parsed_init.verbose == "low"
     assert parsed_run.command == "run"
     assert parsed_run.once is True
-    assert parsed_run.verbose is True
+    assert parsed_run.verbose == "low"
+    assert parsed_run_high.verbose == "high"
     assert parsed_service.command == "service"
     assert parsed_service.once is True
-    assert parsed_service.verbose is True
+    assert parsed_service.verbose == "low"
     assert parsed_feedback_list.command == "feedback"
     assert parsed_feedback_list.feedback_command == "blocked"
     assert parsed_feedback_list.blocked_command == "list"
@@ -110,12 +112,15 @@ def test_main_dispatches_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
     monkeypatch.setattr(cli, "load_config", lambda p: cfg)
     monkeypatch.setattr(
-        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
     )
     monkeypatch.setattr(cli, "_cmd_init", lambda c: called.setdefault("init", c))
 
     cli.main()
     assert called["verbose"] is True
+    assert called["state_dir"] == cfg.runtime.base_dir
     assert called["init"] == cfg
 
 
@@ -130,12 +135,15 @@ def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
     monkeypatch.setattr(cli, "load_config", lambda p: cfg)
     monkeypatch.setattr(
-        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
     )
     monkeypatch.setattr(cli, "_cmd_run", lambda c, once: called.setdefault("run", (c, once)))
 
     cli.main()
     assert called["verbose"] is False
+    assert called["state_dir"] == cfg.runtime.base_dir
     assert called["run"] == (cfg, True)
 
 
@@ -157,13 +165,16 @@ def test_main_dispatches_feedback(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
     monkeypatch.setattr(cli, "load_config", lambda p: cfg)
     monkeypatch.setattr(
-        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
     )
     monkeypatch.setattr(cli, "_cmd_feedback", lambda c, a: called.setdefault("feedback", (c, a)))
 
     cli.main()
 
     assert called["verbose"] is False
+    assert called["state_dir"] == cfg.runtime.base_dir
     feedback_call = called["feedback"]
     assert isinstance(feedback_call, tuple)
     assert feedback_call[0] == cfg
@@ -186,7 +197,9 @@ def test_main_dispatches_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
     monkeypatch.setattr(cli, "load_config", lambda p: cfg)
     monkeypatch.setattr(
-        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
     )
     monkeypatch.setattr(
         cli, "_cmd_service", lambda c, once: called.setdefault("service", (c, once))
@@ -194,6 +207,7 @@ def test_main_dispatches_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 
     cli.main()
     assert called["verbose"] is True
+    assert called["state_dir"] == cfg.runtime.base_dir
     assert called["service"] == (cfg, True)
 
 
@@ -224,12 +238,15 @@ def test_main_defaults_verbose_to_false_when_missing(
     monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
     monkeypatch.setattr(cli, "load_config", lambda p: cfg)
     monkeypatch.setattr(
-        cli, "configure_logging", lambda verbose: called.setdefault("verbose", verbose)
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
     )
     monkeypatch.setattr(cli, "_cmd_init", lambda c: called.setdefault("init", c))
 
     cli.main()
-    assert called["verbose"] is False
+    assert called["verbose"] is None
+    assert called["state_dir"] == cfg.runtime.base_dir
 
 
 def test_cmd_init_creates_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

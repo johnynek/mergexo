@@ -180,6 +180,40 @@ def test_create_pull_request_rejects_non_object(monkeypatch: pytest.MonkeyPatch)
         gateway.create_pull_request("t", "h", "b", "x")
 
 
+def test_post_write_failures_emit_failed_events(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    configure_logging(verbose=True)
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, path, payload
+        if method == "POST":
+            raise RuntimeError("boom")
+        return {"ok": True}
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        gateway.post_issue_comment(7, "hello")
+    with pytest.raises(RuntimeError, match="boom"):
+        gateway.post_review_comment_reply(7, 55, "reply")
+
+    text = capsys.readouterr().err
+    assert "event=github_issue_comment_failed" in text
+    assert "issue_number=7" in text
+    assert "repo_full_name=o/r" in text
+    assert "event=github_review_reply_failed" in text
+    assert "pr_number=7" in text
+    assert "review_comment_id=55" in text
+
+
 def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway = GitHubGateway("o", "r")
 

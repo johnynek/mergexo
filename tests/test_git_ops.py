@@ -144,6 +144,30 @@ def test_git_ops_emits_action_logs(
     assert "event=git_restore_feedback_branch" in text
 
 
+def test_push_branch_logs_failed_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    configure_logging(verbose=True)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            raise CommandError("push failed")
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError, match="push failed"):
+        manager.push_branch(tmp_path / "checkout", "feature")
+
+    text = capsys.readouterr().err
+    assert "event=git_push_failed branch=feature" in text
+
+
 def test_restore_feedback_branch_retries_once_on_head_mismatch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

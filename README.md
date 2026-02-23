@@ -56,6 +56,7 @@ Verbose mode (structured stderr runtime events):
 
 ```bash
 uv run mergexo run --config mergexo.toml --once --verbose
+uv run mergexo run --config mergexo.toml --once --verbose high
 ```
 
 5. Run continuously:
@@ -76,7 +77,7 @@ Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added 
 
 The PR feedback loop is guarded by `runtime.enable_feedback_loop` (default `false`) until rollout is complete.
 
-Use `--verbose` on `init`, `run`, or `service` to print lifecycle logs for polling, worker actions, git writes, and GitHub writes.
+Use `--verbose` on `init`, `run`, `service`, or `feedback` for high-signal lifecycle logs (`low` mode), or `--verbose high` for full event logs including poll internals. Verbose logs are also appended under `<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
 
 ## State schema upgrade note
 
