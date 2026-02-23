@@ -513,6 +513,9 @@ def test_parse_http_response_rejects_bad_status_output() -> None:
         _parse_http_response("not-http")
 
     with pytest.raises(RuntimeError, match="status line"):
+        _parse_http_response("HTTP/2.0\n\n{}")
+
+    with pytest.raises(RuntimeError, match="status line"):
         _parse_http_response("HTTP/2.0 okay\n\n{}")
 
 
