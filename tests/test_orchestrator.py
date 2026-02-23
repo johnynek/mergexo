@@ -54,6 +54,7 @@ from mergexo.orchestrator import (
     _design_doc_url,
     _default_commit_message,
     _has_regression_test_changes,
+    _is_merge_conflict_error,
     _implementation_candidate_from_json_dict,
     _implementation_candidate_to_json_dict,
     _infer_pre_pr_flow_from_issue_and_error,
@@ -1120,6 +1121,100 @@ def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
     assert any(
         "requires at least one staged regression test" in body for _, body in github.comments
     )
+
+
+def test_process_issue_repairs_push_merge_conflict_with_agent(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:small-job",))
+
+    original_push = git.push_branch
+    push_attempts = 0
+
+    def push_with_merge_conflict_once(checkout_path: Path, branch: str) -> None:
+        nonlocal push_attempts
+        push_attempts += 1
+        if push_attempts == 1:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: git merge\n"
+                "exit: 1\n"
+                "stdout:\n\n"
+                "stderr:\n"
+                "CONFLICT (content): Merge conflict in src/a.py\n"
+                "Automatic merge failed; fix conflicts and then commit the result.\n"
+            )
+        original_push(checkout_path, branch)
+
+    git.push_branch = push_with_merge_conflict_once  # type: ignore[method-assign]
+
+    result = orch._process_issue(issue, "small_job")
+
+    assert result.pr_number == 101
+    assert push_attempts == 2
+    assert len(agent.small_job_calls) == 2
+    assert "merge conflict" in agent.small_job_calls[1][0].body.lower()
+    assert len(git.commit_calls) == 2
+    assert github.created_prs != []
+
+
+def test_process_issue_blocks_after_repeated_push_merge_conflicts(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:small-job",))
+
+    def push_always_conflicts(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError(
+            "Command failed\n"
+            "cmd: git merge\n"
+            "exit: 1\n"
+            "stdout:\n\n"
+            "stderr:\n"
+            "CONFLICT (content): Merge conflict in src/a.py\n"
+            "Automatic merge failed; fix conflicts and then commit the result.\n"
+        )
+
+    git.push_branch = push_always_conflicts  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="flow blocked"):
+        orch._process_issue(issue, "small_job")
+
+    assert github.created_prs == []
+    assert any(
+        "could not resolve push-time merge conflicts" in body.lower() for _, body in github.comments
+    )
+    assert len(agent.small_job_calls) == 4
+
+
+def test_process_issue_push_non_conflict_error_propagates(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=("agent:small-job",))
+
+    def push_non_conflict_failure(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError("push rejected for unrelated reason")
+
+    git.push_branch = push_non_conflict_failure  # type: ignore[method-assign]
+
+    with pytest.raises(CommandError, match="unrelated reason"):
+        orch._process_issue(issue, "small_job")
+
+    assert len(agent.small_job_calls) == 1
+    assert github.created_prs == []
 
 
 def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
@@ -2354,6 +2449,9 @@ def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
         is None
     )
     assert _is_recoverable_pre_pr_error("") is False
+    assert _is_merge_conflict_error("") is False
+    assert _is_merge_conflict_error("Automatic merge failed; fix conflicts and then commit") is True
+    assert _is_merge_conflict_error("plain push rejection") is False
     assert _is_recoverable_pre_pr_exception(DirectFlowBlockedError("x")) is True
     assert (
         _is_recoverable_pre_pr_exception(
@@ -2370,6 +2468,42 @@ def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
         pr_url="https://github.com/o/r/pull/9",
         source_comment_url="https://example/comment/1",
     )
+
+
+def test_issue_with_push_merge_conflict_helper_truncates_and_handles_empty_output(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    _write_required_tests_script(git.checkout_root)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    issue = _issue(labels=("agent:small-job",))
+    checkout_path = git.checkout_root / "worker-0"
+
+    long_output = "x" * 13000
+    with_long_output = orch._issue_with_push_merge_conflict(
+        issue=issue,
+        branch="agent/small/7-add-worker-scheduler",
+        failure_output=long_output,
+        attempt=1,
+        checkout_path=checkout_path,
+    )
+    assert "... [truncated by MergeXO]" in with_long_output.body
+
+    with_empty_output = orch._issue_with_push_merge_conflict(
+        issue=issue,
+        branch="agent/small/7-add-worker-scheduler",
+        failure_output="   \n\t",
+        attempt=2,
+        checkout_path=checkout_path,
+    )
+    assert "Merge output:\n<empty>" in with_empty_output.body
 
 
 def test_wait_for_all_calls_sleep_when_needed(
