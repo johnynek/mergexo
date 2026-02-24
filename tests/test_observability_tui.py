@@ -89,8 +89,92 @@ def test_observability_tui_helper_functions() -> None:
     active_context = tui._active_row_context(active)
     assert "Issue: 7" in active_context
     tracked_context = tui._tracked_row_context(tracked_pr)
+    assert "Repo URL: https://github.com/o/repo-a" in tracked_context
     assert "Blocked Reason:" in tracked_context
     assert "boom" in tracked_context
+    active_fields = tui._active_row_detail_fields(active)
+    assert active_fields[0].label == "Repo"
+    assert active_fields[0].url == "https://github.com/o/repo-a"
+    tracked_fields = tui._tracked_row_detail_fields(tracked_pr)
+    tracked_field_map = {field.label: field for field in tracked_fields}
+    assert tracked_field_map["Repo"].url == "https://github.com/o/repo-a"
+    assert tracked_field_map["Repo URL"].url == "https://github.com/o/repo-a"
+    assert tracked_field_map["PR"].url == "https://github.com/o/repo-a/pull/101"
+    assert tracked_field_map["Issue"].url == "https://github.com/o/repo-a/issues/7"
+    assert tracked_field_map["Branch"].url == "https://github.com/o/repo-a/tree/agent/design/7"
+    assert tracked_field_map["Last Seen Head SHA"].url == "https://github.com/o/repo-a/commit/head"
+    tracked_issue_fields = tui._tracked_row_detail_fields(tracked_issue)
+    tracked_issue_field_map = {field.label: field for field in tracked_issue_fields}
+    assert tracked_issue_field_map["PR"].value == "-"
+    assert tracked_issue_field_map["PR"].url is None
+    assert tracked_issue_field_map["Last Seen Head SHA"].value == "-"
+    assert tracked_issue_field_map["Last Seen Head SHA"].url is None
+    sort_stack: tuple[tui._TrackedSortKey, ...] = ()
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
+    assert sort_stack == (tui._TrackedSortKey(column_index=1, descending=True),)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
+    assert sort_stack == (tui._TrackedSortKey(column_index=1, descending=False),)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 5)
+    assert sort_stack == (
+        tui._TrackedSortKey(column_index=5, descending=True),
+        tui._TrackedSortKey(column_index=1, descending=False),
+    )
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
+    assert sort_stack == (
+        tui._TrackedSortKey(column_index=1, descending=True),
+        tui._TrackedSortKey(column_index=5, descending=True),
+    )
+    rows_for_sort = (
+        TrackedOrBlockedRow(
+            repo_full_name="o/repo-a",
+            pr_number=100,
+            issue_number=1,
+            status="blocked",
+            branch="agent/a",
+            last_seen_head_sha=None,
+            blocked_reason="a",
+            pending_event_count=1,
+            updated_at="2026-02-24T00:00:01.000Z",
+        ),
+        TrackedOrBlockedRow(
+            repo_full_name="o/repo-b",
+            pr_number=50,
+            issue_number=2,
+            status="blocked",
+            branch="agent/b",
+            last_seen_head_sha=None,
+            blocked_reason="b",
+            pending_event_count=1,
+            updated_at="2026-02-24T00:00:02.000Z",
+        ),
+        TrackedOrBlockedRow(
+            repo_full_name="o/repo-c",
+            pr_number=75,
+            issue_number=3,
+            status="blocked",
+            branch="agent/c",
+            last_seen_head_sha=None,
+            blocked_reason="c",
+            pending_event_count=2,
+            updated_at="2026-02-24T00:00:03.000Z",
+        ),
+    )
+    sorted_rows = tui._sort_tracked_rows(
+        rows_for_sort,
+        (
+            tui._TrackedSortKey(column_index=5, descending=True),
+            tui._TrackedSortKey(column_index=1, descending=True),
+        ),
+    )
+    assert [row.repo_full_name for row in sorted_rows] == ["o/repo-c", "o/repo-a", "o/repo-b"]
+    sorted_rows = tui._sort_tracked_rows(
+        rows_for_sort,
+        (
+            tui._TrackedSortKey(column_index=5, descending=False),
+            tui._TrackedSortKey(column_index=1, descending=True),
+        ),
+    )
+    assert [row.repo_full_name for row in sorted_rows] == ["o/repo-a", "o/repo-b", "o/repo-c"]
 
     summary = tui._summary_text(
         overview=OverviewStats(
@@ -314,9 +398,9 @@ def test_observability_app_refresh_and_keybindings(
         default_window="24h",
         row_limit=20,
     )
-    shown_details: list[tuple[str, str]] = []
+    shown_details: list[tuple[str, str, tuple[object, ...]]] = []
     app._show_detail_context = (  # type: ignore[method-assign]
-        lambda *, title, body: shown_details.append((title, body))
+        lambda *, title, body, fields=(): shown_details.append((title, body, fields))
     )
 
     async def run_app() -> None:
@@ -335,25 +419,31 @@ def test_observability_app_refresh_and_keybindings(
             active.focus()
             await _pilot.pause()
             active.move_cursor(row=0, column=0, animate=False)
-            app.action_show_detail()
+            await _pilot.press("enter")
+            await _pilot.pause()
             assert calls["issue_history"] >= 1
             assert shown_details[-1][0] == "Issue #7 Context"
             active.move_cursor(row=0, column=2, animate=False)
             issue_history_calls = calls["issue_history"]
-            app.action_show_detail()
+            await _pilot.press("enter")
+            await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
             assert calls["issue_history"] == issue_history_calls
             tracked.focus()
             await _pilot.pause()
             tracked.move_cursor(row=0, column=1, animate=False)
-            app.action_show_detail()
+            await _pilot.press("enter")
+            await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/pull/101"
             tracked.move_cursor(row=0, column=4, animate=False)
-            app.action_show_detail()
+            await _pilot.press("enter")
+            await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/tree/agent/design/7"
             tracked.move_cursor(row=0, column=6, animate=False)
-            app.action_show_detail()
+            await _pilot.press("enter")
+            await _pilot.pause()
             assert shown_details[-1][0] == "PR #101 Context"
+            assert "Repo URL: https://github.com/o/repo-a" in shown_details[-1][1]
             assert "Blocked Reason:" in shown_details[-1][1]
             app.action_refresh()
             assert tracked.cursor_column == 6
@@ -519,7 +609,7 @@ def test_app_open_external_url_shows_manual_fallback(tmp_path: Path) -> None:
     )
     shown: list[tuple[str, str]] = []
     app._show_detail_context = (  # type: ignore[method-assign]
-        lambda *, title, body: shown.append((title, body))
+        lambda *, title, body, fields=(): shown.append((title, body))
     )
     original_open = tui._open_external_url
     try:
@@ -611,6 +701,265 @@ def test_show_detail_context_pushes_modal_when_running(
             assert isinstance(modal, tui._DetailModal)
             modal.action_close()
             await pilot.pause()
+
+    asyncio.run(run_app())
+
+
+def test_detail_modal_field_navigation_opens_urls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    row = TrackedOrBlockedRow(
+        repo_full_name="o/repo-a",
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        branch="agent/design/7",
+        last_seen_head_sha="abc123",
+        blocked_reason="boom",
+        pending_event_count=1,
+        updated_at="2026-02-24T00:00:00.000Z",
+    )
+    monkeypatch.setattr(
+        tui,
+        "load_overview",
+        lambda *args, **kwargs: OverviewStats(
+            active_agents=0,
+            blocked_prs=0,
+            tracked_prs=0,
+            failures=0,
+            mean_runtime_seconds=0.0,
+            stddev_runtime_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: ())
+    monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        tui,
+        "load_metrics",
+        lambda *args, **kwargs: MetricsStats(
+            overall=RuntimeMetric(
+                repo_full_name="__all__",
+                terminal_count=0,
+                failed_count=0,
+                failure_rate=0.0,
+                mean_runtime_seconds=0.0,
+                stddev_runtime_seconds=0.0,
+            ),
+            per_repo=(),
+        ),
+    )
+    fields = tui._tracked_row_detail_fields(row)
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    opened: list[str] = []
+    app._open_external_url = lambda url: opened.append(url)  # type: ignore[method-assign]
+
+    async def run_app() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._show_detail_context(title="PR #101 Context", body="Blocked Reason:\nboom", fields=fields)
+            await pilot.pause()
+            assert isinstance(app.screen, tui._DetailModal)
+            table = app.query_one("#detail-fields-table", DataTable)
+            table.move_cursor(row=4, column=1, animate=False)  # Status has no URL
+            await pilot.press("enter")
+            await pilot.pause()
+            assert opened == []
+            table.move_cursor(row=0, column=1, animate=False)  # Repo
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(opened) == 1
+            assert opened[-1] == "https://github.com/o/repo-a"
+            table.move_cursor(row=2, column=1, animate=False)  # PR
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(opened) == 2
+            assert opened[-1] == "https://github.com/o/repo-a/pull/101"
+            table.move_cursor(row=3, column=1, animate=False)  # Issue
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(opened) == 3
+            assert opened[-1] == "https://github.com/o/repo-a/issues/7"
+            table.move_cursor(row=7, column=1, animate=False)  # SHA commit
+            await pilot.press("enter")
+            await pilot.pause()
+            assert len(opened) == 4
+            assert opened[-1] == "https://github.com/o/repo-a/commit/abc123"
+            assert isinstance(app.screen, tui._DetailModal)
+
+    asyncio.run(run_app())
+
+
+def test_tracked_header_click_sorts_with_deduped_stack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        tui,
+        "load_overview",
+        lambda *args, **kwargs: OverviewStats(
+            active_agents=0,
+            blocked_prs=0,
+            tracked_prs=3,
+            failures=0,
+            mean_runtime_seconds=0.0,
+            stddev_runtime_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: ())
+    tracked_rows = (
+        TrackedOrBlockedRow(
+            repo_full_name="o/repo-a",
+            pr_number=100,
+            issue_number=1,
+            status="blocked",
+            branch="agent/a",
+            last_seen_head_sha=None,
+            blocked_reason="a",
+            pending_event_count=1,
+            updated_at="2026-02-24T00:00:01.000Z",
+        ),
+        TrackedOrBlockedRow(
+            repo_full_name="o/repo-b",
+            pr_number=50,
+            issue_number=2,
+            status="blocked",
+            branch="agent/b",
+            last_seen_head_sha=None,
+            blocked_reason="b",
+            pending_event_count=1,
+            updated_at="2026-02-24T00:00:02.000Z",
+        ),
+        TrackedOrBlockedRow(
+            repo_full_name="o/repo-c",
+            pr_number=75,
+            issue_number=3,
+            status="blocked",
+            branch="agent/c",
+            last_seen_head_sha=None,
+            blocked_reason="c",
+            pending_event_count=2,
+            updated_at="2026-02-24T00:00:03.000Z",
+        ),
+    )
+    monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: tracked_rows)
+    monkeypatch.setattr(
+        tui,
+        "load_metrics",
+        lambda *args, **kwargs: MetricsStats(
+            overall=RuntimeMetric(
+                repo_full_name="__all__",
+                terminal_count=0,
+                failed_count=0,
+                failure_rate=0.0,
+                mean_runtime_seconds=0.0,
+                stddev_runtime_seconds=0.0,
+            ),
+            per_repo=(),
+        ),
+    )
+
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+
+    async def run_app() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one("#tracked-table", DataTable)
+
+            def row_order() -> list[str]:
+                return [str(table.get_row_at(index)[0]) for index in range(table.row_count)]
+
+            def click_header(column_index: int) -> None:
+                column = table.ordered_columns[column_index]
+                event = DataTable.HeaderSelected(table, column.key, column_index, column.label)
+                app.on_data_table_header_selected(event)
+
+            assert row_order() == ["o/repo-a", "o/repo-b", "o/repo-c"]
+            click_header(1)  # PR desc first click.
+            await pilot.pause()
+            assert row_order() == ["o/repo-a", "o/repo-c", "o/repo-b"]
+            assert app._tracked_sort_stack == (
+                tui._TrackedSortKey(column_index=1, descending=True),
+            )
+            click_header(5)  # Pending desc as new primary key.
+            await pilot.pause()
+            assert row_order() == ["o/repo-c", "o/repo-a", "o/repo-b"]
+            assert app._tracked_sort_stack == (
+                tui._TrackedSortKey(column_index=5, descending=True),
+                tui._TrackedSortKey(column_index=1, descending=True),
+            )
+            click_header(5)  # Toggle pending direction.
+            await pilot.pause()
+            assert row_order() == ["o/repo-a", "o/repo-b", "o/repo-c"]
+            assert app._tracked_sort_stack == (
+                tui._TrackedSortKey(column_index=5, descending=False),
+                tui._TrackedSortKey(column_index=1, descending=True),
+            )
+
+    asyncio.run(run_app())
+
+
+def test_refresh_data_while_modal_open_uses_base_screen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        tui,
+        "load_overview",
+        lambda *args, **kwargs: OverviewStats(
+            active_agents=0,
+            blocked_prs=1,
+            tracked_prs=2,
+            failures=0,
+            mean_runtime_seconds=0.0,
+            stddev_runtime_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: ())
+    monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        tui,
+        "load_metrics",
+        lambda *args, **kwargs: MetricsStats(
+            overall=RuntimeMetric(
+                repo_full_name="__all__",
+                terminal_count=0,
+                failed_count=0,
+                failure_rate=0.0,
+                mean_runtime_seconds=0.0,
+                stddev_runtime_seconds=0.0,
+            ),
+            per_repo=(),
+        ),
+    )
+
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+
+    async def run_app() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._show_detail_context(title="Detail", body="full body")
+            await pilot.pause()
+            assert isinstance(app.screen, tui._DetailModal)
+            app.refresh_data()
+            await pilot.pause()
+            assert isinstance(app.screen, tui._DetailModal)
+            base_screen = app.screen_stack[0]
+            summary = base_screen.query_one("#summary", Static)
+            assert "blocked=1" in str(summary.renderable)
+            assert "tracked=2" in str(summary.renderable)
 
     asyncio.run(run_app())
 

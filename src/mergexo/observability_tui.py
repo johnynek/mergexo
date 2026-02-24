@@ -9,7 +9,7 @@ import webbrowser
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from mergexo.observability_queries import (
@@ -44,10 +44,32 @@ class _DetailTarget:
     number: int
 
 
+@dataclass(frozen=True)
+class _TrackedSortKey:
+    column_index: int
+    descending: bool
+
+
+@dataclass(frozen=True)
+class _DetailField:
+    label: str
+    value: str
+    url: str | None = None
+
+
+class _DetailFieldTable(DataTable):
+    """Use DataTable Enter to activate the selected detail field."""
+
+    def action_select_cursor(self) -> None:
+        screen = self.screen
+        if isinstance(screen, _DetailModal):
+            screen.action_activate()
+
+
 class _DetailModal(ModalScreen[None]):
     BINDINGS = [
         Binding("escape", "close", "Close"),
-        Binding("enter", "close", "Close"),
+        Binding("enter", "activate", "Open"),
         Binding("q", "close", "Close"),
     ]
     CSS = """
@@ -62,6 +84,10 @@ class _DetailModal(ModalScreen[None]):
         text-style: bold;
         margin-bottom: 1;
     }
+    #detail-fields-table {
+        height: 1fr;
+        margin-bottom: 1;
+    }
     #detail-body-scroll {
         height: 1fr;
         border: round $boost;
@@ -72,20 +98,80 @@ class _DetailModal(ModalScreen[None]):
     }
     """
 
-    def __init__(self, *, title: str, body: str) -> None:
+    def __init__(
+        self,
+        *,
+        title: str,
+        body: str,
+        fields: tuple[_DetailField, ...] = (),
+    ) -> None:
         super().__init__()
         self._title = title
         self._body = body
+        self._fields = fields
 
     def compose(self) -> ComposeResult:
         with Vertical(id="detail-dialog"):
             yield Static(self._title, id="detail-title")
-            with VerticalScroll(id="detail-body-scroll"):
-                yield Static(self._body, id="detail-body")
-            yield Static("Press Esc, Enter, or q to close.", id="detail-hint")
+            if self._fields:
+                yield _DetailFieldTable(id="detail-fields-table")
+            if self._body:
+                with VerticalScroll(id="detail-body-scroll"):
+                    yield Static(self._body, id="detail-body")
+            hint = (
+                "Use arrows to select a field value; Enter opens link. Press Esc or q to close."
+                if self._fields
+                else "Press Esc, Enter, or q to close."
+            )
+            yield Static(hint, id="detail-hint")
+
+    def on_mount(self) -> None:
+        if not self._fields:
+            return
+        table = self.query_one("#detail-fields-table", DataTable)
+        table.add_columns("Field", "Value")
+        for field in self._fields:
+            table.add_row(field.label, field.value)
+        if table.row_count > 0:
+            table.move_cursor(row=0, column=1, animate=False)
+        table.focus()
+
+    def action_activate(self) -> None:
+        if not self._fields:
+            self.action_close()
+            return
+        table = self.query_one("#detail-fields-table", DataTable)
+        row_index = table.cursor_row
+        if row_index < 0 or row_index >= len(self._fields):
+            return
+        selected = self._fields[row_index]
+        if selected.url is None:
+            return
+        app = self.app
+        if isinstance(app, ObservabilityApp):
+            app._open_external_url(selected.url)
+            return
+        _open_external_url(selected.url)
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        if event.data_table.id != "detail-fields-table":
+            return
+        self.action_activate()
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+class _DetailDataTable(DataTable):
+    """Use DataTable's native Enter key binding to drive app detail actions."""
+
+    def action_select_cursor(self) -> None:
+        super().action_select_cursor()
+        if self.id not in {"active-table", "tracked-table"}:
+            return
+        app = self.app
+        if isinstance(app, ObservabilityApp):
+            app.action_show_detail()
 
 
 class ObservabilityApp(App[None]):
@@ -131,6 +217,7 @@ class ObservabilityApp(App[None]):
         self._available_repos: tuple[str, ...] = ()
         self._active_rows: tuple[ActiveAgentRow, ...] = ()
         self._tracked_rows: tuple[TrackedOrBlockedRow, ...] = ()
+        self._tracked_sort_stack: tuple[_TrackedSortKey, ...] = ()
         self._detail_target: _DetailTarget | None = None
 
     def compose(self) -> ComposeResult:
@@ -138,9 +225,9 @@ class ObservabilityApp(App[None]):
         with Vertical():
             yield Static("", id="summary")
             yield Static("Active Agents", classes="panel-title")
-            yield DataTable(id="active-table")
+            yield _DetailDataTable(id="active-table")
             yield Static("Tracked And Blocked Work", classes="panel-title")
-            yield DataTable(id="tracked-table")
+            yield _DetailDataTable(id="tracked-table")
             yield Static("History", classes="panel-title")
             yield DataTable(id="history-table")
             yield Static("Metrics", classes="panel-title")
@@ -166,6 +253,19 @@ class ObservabilityApp(App[None]):
     def action_cycle_focus(self) -> None:
         self.screen.focus_next()
 
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        if event.data_table.id != "tracked-table":
+            return
+        self._sort_tracked_by_column(event.column_index)
+
+    def _sort_tracked_by_column(self, column_index: int) -> None:
+        self._tracked_sort_stack = _next_tracked_sort_stack(self._tracked_sort_stack, column_index)
+        self._apply_tracked_sort()
+        self._refresh_tracked_table()
+
+    def _apply_tracked_sort(self) -> None:
+        self._tracked_rows = _sort_tracked_rows(self._tracked_rows, self._tracked_sort_stack)
+
     def action_show_detail(self) -> None:
         focused = self.focused
         if isinstance(focused, DataTable) and focused.id == "active-table":
@@ -180,6 +280,7 @@ class ObservabilityApp(App[None]):
                 self._show_detail_context(
                     title=f"Issue #{selected.issue_number} Context",
                     body=_active_row_context(selected),
+                    fields=_active_row_detail_fields(selected),
                 )
                 return
         elif isinstance(focused, DataTable) and focused.id == "tracked-table":
@@ -202,6 +303,7 @@ class ObservabilityApp(App[None]):
                 self._show_detail_context(
                     title=work_label,
                     body=_tracked_row_context(selected),
+                    fields=_tracked_row_detail_fields(selected),
                 )
                 return
         if self._detail_target is not None:
@@ -219,10 +321,27 @@ class ObservabilityApp(App[None]):
             ),
         )
 
-    def _show_detail_context(self, *, title: str, body: str) -> None:
+    def _show_detail_context(
+        self,
+        *,
+        title: str,
+        body: str,
+        fields: tuple[_DetailField, ...] = (),
+    ) -> None:
         if not self.is_running:
             return
-        self.push_screen(_DetailModal(title=title, body=body))
+        self.push_screen(_DetailModal(title=title, body=body, fields=fields))
+
+    def _base_screen(self) -> Screen[None]:
+        if self.screen_stack:
+            return self.screen_stack[0]
+        return self.screen
+
+    def _base_table(self, selector: str) -> DataTable:
+        return self._base_screen().query_one(selector, DataTable)
+
+    def _base_static(self, selector: str) -> Static:
+        return self._base_screen().query_one(selector, Static)
 
     def refresh_data(self) -> None:
         overview = load_overview(self._db_path, self._repo_filter, self._window)
@@ -236,9 +355,10 @@ class ObservabilityApp(App[None]):
             self._repo_filter,
             limit=self._row_limit,
         )
+        self._apply_tracked_sort()
         metrics = load_metrics(self._db_path, self._repo_filter, self._window)
         self._available_repos = tuple(sorted({row.repo_full_name for row in metrics.per_repo}))
-        self.query_one("#summary", Static).update(
+        self._base_static("#summary").update(
             _summary_text(overview=overview, repo_filter=self._repo_filter, window=self._window)
         )
         self._refresh_active_table()
@@ -247,10 +367,10 @@ class ObservabilityApp(App[None]):
         self._refresh_history_table()
 
     def _init_tables(self) -> None:
-        active = self.query_one("#active-table", DataTable)
-        tracked = self.query_one("#tracked-table", DataTable)
-        history = self.query_one("#history-table", DataTable)
-        metrics = self.query_one("#metrics-table", DataTable)
+        active = self._base_table("#active-table")
+        tracked = self._base_table("#tracked-table")
+        history = self._base_table("#history-table")
+        metrics = self._base_table("#metrics-table")
         active.add_columns("Repo", "Run", "Issue", "PR", "Flow", "Branch", "Started", "Elapsed")
         tracked.add_columns(
             "Repo",
@@ -266,7 +386,7 @@ class ObservabilityApp(App[None]):
         metrics.add_columns("Repo", "Terminal", "Failed", "Failure Rate", "Mean", "StdDev")
 
     def _refresh_active_table(self) -> None:
-        table = self.query_one("#active-table", DataTable)
+        table = self._base_table("#active-table")
         selected = self._active_row_selection()
         previous_run_id = selected.run_id if selected is not None else None
         previous_column = table.cursor_column if table.row_count > 0 else 0
@@ -285,7 +405,7 @@ class ObservabilityApp(App[None]):
         self._restore_active_selection(previous_run_id, previous_column)
 
     def _refresh_tracked_table(self) -> None:
-        table = self.query_one("#tracked-table", DataTable)
+        table = self._base_table("#tracked-table")
         selected = self._tracked_row_selection()
         previous_key = _tracked_row_key(selected) if selected is not None else None
         previous_column = table.cursor_column if table.row_count > 0 else 0
@@ -304,7 +424,7 @@ class ObservabilityApp(App[None]):
         self._restore_tracked_selection(previous_key, previous_column)
 
     def _refresh_metrics_table(self, metrics: MetricsStats) -> None:
-        table = self.query_one("#metrics-table", DataTable)
+        table = self._base_table("#metrics-table")
         table.clear(columns=False)
         overall = metrics.overall
         table.add_row(
@@ -326,7 +446,7 @@ class ObservabilityApp(App[None]):
             )
 
     def _refresh_history_table(self) -> None:
-        table = self.query_one("#history-table", DataTable)
+        table = self._base_table("#history-table")
         table.clear(columns=False)
         target = self._detail_target
         if target is None:
@@ -350,7 +470,7 @@ class ObservabilityApp(App[None]):
         _fill_pr_history(table, rows)
 
     def _active_row_selection(self) -> ActiveAgentRow | None:
-        table = self.query_one("#active-table", DataTable)
+        table = self._base_table("#active-table")
         if table.row_count < 1:
             return None
         index = table.cursor_row
@@ -359,7 +479,7 @@ class ObservabilityApp(App[None]):
         return self._active_rows[index]
 
     def _tracked_row_selection(self) -> TrackedOrBlockedRow | None:
-        table = self.query_one("#tracked-table", DataTable)
+        table = self._base_table("#tracked-table")
         if table.row_count < 1:
             return None
         index = table.cursor_row
@@ -368,7 +488,7 @@ class ObservabilityApp(App[None]):
         return self._tracked_rows[index]
 
     def _restore_active_selection(self, previous_run_id: str | None, previous_column: int) -> None:
-        table = self.query_one("#active-table", DataTable)
+        table = self._base_table("#active-table")
         if table.row_count < 1:
             return
         row_index = 0
@@ -389,7 +509,7 @@ class ObservabilityApp(App[None]):
         previous_key: tuple[str, int | None, int, str] | None,
         previous_column: int,
     ) -> None:
-        table = self.query_one("#tracked-table", DataTable)
+        table = self._base_table("#tracked-table")
         if table.row_count < 1:
             return
         row_index = 0
@@ -506,23 +626,141 @@ def _tracked_row_key(row: TrackedOrBlockedRow) -> tuple[str, int | None, int, st
     return (row.repo_full_name, row.pr_number, row.issue_number, row.status)
 
 
+def _next_tracked_sort_stack(
+    current: tuple[_TrackedSortKey, ...],
+    column_index: int,
+) -> tuple[_TrackedSortKey, ...]:
+    for item in current:
+        if item.column_index != column_index:
+            continue
+        toggled = _TrackedSortKey(column_index=column_index, descending=not item.descending)
+        remaining = tuple(entry for entry in current if entry.column_index != column_index)
+        return (toggled, *remaining)
+    return (_TrackedSortKey(column_index=column_index, descending=True), *current)
+
+
+def _sort_tracked_rows(
+    rows: tuple[TrackedOrBlockedRow, ...],
+    sort_stack: tuple[_TrackedSortKey, ...],
+) -> tuple[TrackedOrBlockedRow, ...]:
+    if len(rows) < 2 or not sort_stack:
+        return rows
+    sorted_rows = list(rows)
+    for sort_key in reversed(sort_stack):
+        sorted_rows.sort(
+            key=lambda row, column_index=sort_key.column_index: _tracked_sort_value(
+                row,
+                column_index,
+            ),
+            reverse=sort_key.descending,
+        )
+    return tuple(sorted_rows)
+
+
+def _tracked_sort_value(row: TrackedOrBlockedRow, column_index: int) -> str | int:
+    if column_index == 0:
+        return row.repo_full_name.casefold()
+    if column_index == 1:
+        if row.pr_number is None:
+            return -1
+        return row.pr_number
+    if column_index == 2:
+        return row.issue_number
+    if column_index == 3:
+        return row.status.casefold()
+    if column_index == 4:
+        return row.branch.casefold()
+    if column_index == 5:
+        return row.pending_event_count
+    if column_index == 6:
+        return (row.blocked_reason or "").casefold()
+    if column_index == 7:
+        return row.updated_at
+    return ""
+
+
+def _repo_url(repo_full_name: str) -> str:
+    return f"https://github.com/{repo_full_name}"
+
+
+def _issue_url(repo_full_name: str, issue_number: int) -> str:
+    return f"{_repo_url(repo_full_name)}/issues/{issue_number}"
+
+
+def _pr_url(repo_full_name: str, pr_number: int) -> str:
+    return f"{_repo_url(repo_full_name)}/pull/{pr_number}"
+
+
+def _branch_url(repo_full_name: str, branch: str) -> str:
+    return f"{_repo_url(repo_full_name)}/tree/{branch}"
+
+
+def _commit_url(repo_full_name: str, sha: str) -> str:
+    return f"{_repo_url(repo_full_name)}/commit/{sha}"
+
+
+def _active_row_detail_fields(row: ActiveAgentRow) -> tuple[_DetailField, ...]:
+    branch_value = row.branch or "-"
+    branch_link = None
+    if row.branch and row.branch != "-":
+        branch_link = _branch_url(row.repo_full_name, row.branch)
+    pr_value = str(row.pr_number) if row.pr_number is not None else "-"
+    pr_link = _pr_url(row.repo_full_name, row.pr_number) if row.pr_number is not None else None
+    repo_link = _repo_url(row.repo_full_name)
+    return (
+        _DetailField("Repo", row.repo_full_name, repo_link),
+        _DetailField("Repo URL", repo_link, repo_link),
+        _DetailField("Issue", str(row.issue_number), _issue_url(row.repo_full_name, row.issue_number)),
+        _DetailField("PR", pr_value, pr_link),
+        _DetailField("Flow", row.flow or "-"),
+        _DetailField("Branch", branch_value, branch_link),
+        _DetailField("Started", row.started_at),
+        _DetailField("Elapsed", _render_seconds(row.elapsed_seconds)),
+    )
+
+
+def _tracked_row_detail_fields(row: TrackedOrBlockedRow) -> tuple[_DetailField, ...]:
+    branch_value = row.branch or "-"
+    branch_link = None
+    if row.branch and row.branch != "-":
+        branch_link = _branch_url(row.repo_full_name, row.branch)
+    pr_value = str(row.pr_number) if row.pr_number is not None else "-"
+    pr_link = _pr_url(row.repo_full_name, row.pr_number) if row.pr_number is not None else None
+    sha_value = row.last_seen_head_sha or "-"
+    sha_link = None
+    if row.last_seen_head_sha:
+        sha_link = _commit_url(row.repo_full_name, row.last_seen_head_sha)
+    repo_link = _repo_url(row.repo_full_name)
+    return (
+        _DetailField("Repo", row.repo_full_name, repo_link),
+        _DetailField("Repo URL", repo_link, repo_link),
+        _DetailField("PR", pr_value, pr_link),
+        _DetailField("Issue", str(row.issue_number), _issue_url(row.repo_full_name, row.issue_number)),
+        _DetailField("Status", row.status),
+        _DetailField("Branch", branch_value, branch_link),
+        _DetailField("Pending Events", str(row.pending_event_count)),
+        _DetailField("Last Seen Head SHA", sha_value, sha_link),
+        _DetailField("Updated", row.updated_at),
+    )
+
+
 def _url_for_active_row(row: ActiveAgentRow, column: int) -> str | None:
     if column == _ACTIVE_COL_ISSUE:
-        return f"https://github.com/{row.repo_full_name}/issues/{row.issue_number}"
+        return _issue_url(row.repo_full_name, row.issue_number)
     if column == _ACTIVE_COL_PR and row.pr_number is not None:
-        return f"https://github.com/{row.repo_full_name}/pull/{row.pr_number}"
+        return _pr_url(row.repo_full_name, row.pr_number)
     if column == _ACTIVE_COL_BRANCH and row.branch and row.branch != "-":
-        return f"https://github.com/{row.repo_full_name}/tree/{row.branch}"
+        return _branch_url(row.repo_full_name, row.branch)
     return None
 
 
 def _url_for_tracked_row(row: TrackedOrBlockedRow, column: int) -> str | None:
     if column == _TRACKED_COL_PR and row.pr_number is not None:
-        return f"https://github.com/{row.repo_full_name}/pull/{row.pr_number}"
+        return _pr_url(row.repo_full_name, row.pr_number)
     if column == _TRACKED_COL_ISSUE:
-        return f"https://github.com/{row.repo_full_name}/issues/{row.issue_number}"
+        return _issue_url(row.repo_full_name, row.issue_number)
     if column == _TRACKED_COL_BRANCH and row.branch and row.branch != "-":
-        return f"https://github.com/{row.repo_full_name}/tree/{row.branch}"
+        return _branch_url(row.repo_full_name, row.branch)
     return None
 
 
@@ -557,9 +795,11 @@ def _active_row_context(row: ActiveAgentRow) -> str:
 
 
 def _tracked_row_context(row: TrackedOrBlockedRow) -> str:
+    repo_url = _repo_url(row.repo_full_name)
     return "\n".join(
         [
             f"Repo: {row.repo_full_name}",
+            f"Repo URL: {repo_url}",
             f"PR: {row.pr_number if row.pr_number is not None else '-'}",
             f"Issue: {row.issue_number}",
             f"Status: {row.status}",
