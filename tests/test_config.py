@@ -25,6 +25,8 @@ worker_count = 2
 poll_interval_seconds = 60
 enable_github_operations = true
 enable_issue_comment_routing = true
+enable_pr_actions_monitoring = true
+pr_actions_log_tail_lines = 250
 restart_drain_timeout_seconds = 120
 restart_default_mode = "git_checkout"
 restart_supported_modes = ["git_checkout", "pypi"]
@@ -68,6 +70,8 @@ extra_args = ["--repo-mode"]
     assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
     assert loaded.runtime.enable_github_operations is True
     assert loaded.runtime.enable_issue_comment_routing is True
+    assert loaded.runtime.enable_pr_actions_monitoring is True
+    assert loaded.runtime.pr_actions_log_tail_lines == 250
     assert loaded.runtime.restart_drain_timeout_seconds == 120
     assert loaded.runtime.restart_default_mode == "git_checkout"
     assert loaded.runtime.restart_supported_modes == ("git_checkout", "pypi")
@@ -129,6 +133,8 @@ coding_guidelines_path = "docs/python_style.md"
     loaded = config.load_config(cfg_path)
     assert len(loaded.repos) == 2
     assert loaded.runtime.enable_issue_comment_routing is False
+    assert loaded.runtime.enable_pr_actions_monitoring is False
+    assert loaded.runtime.pr_actions_log_tail_lines == 500
     assert loaded.runtime.observability_refresh_seconds == 2
     assert loaded.runtime.observability_default_window == "24h"
     assert loaded.runtime.observability_row_limit == 200
@@ -483,6 +489,36 @@ name = "n"
 coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "[codex] must be a TOML table",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+pr_actions_log_tail_lines = 0
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "pr_actions_log_tail_lines",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+pr_actions_log_tail_lines = 6001
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "pr_actions_log_tail_lines",
         ),
         (
             """
