@@ -95,8 +95,23 @@ def _seed_state(store: StateStore) -> None:
         pr_number=None,
         flow="small_job",
         branch="agent/small/5",
-        meta_json='{"last_prompt":"Active run prompt"}',
+        meta_json=(
+            '{"codex_active":true,"codex_mode":"small-job","codex_session_id":"thread-123",'
+            '"codex_invocation_started_at":"2026-02-24T00:02:00.000Z",'
+            '"last_prompt":"Active run prompt"}'
+        ),
         started_at=_iso(now - timedelta(minutes=2)),
+        repo_full_name="o/repo-a",
+    )
+    store.record_agent_run_start(
+        run_id="run-active-poll-only",
+        run_kind="feedback_turn",
+        issue_number=15,
+        pr_number=1515,
+        flow=None,
+        branch="agent/feedback/15",
+        meta_json='{"codex_active":false,"last_prompt":"poll only"}',
+        started_at=_iso(now - timedelta(minutes=1)),
         repo_full_name="o/repo-a",
     )
 
@@ -173,6 +188,9 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert active_rows[0].issue_number == 5
     assert active_rows[0].elapsed_seconds >= 0
     assert active_rows[0].prompt == "Active run prompt"
+    assert active_rows[0].codex_mode == "small-job"
+    assert active_rows[0].codex_session_id == "thread-123"
+    assert active_rows[0].codex_invocation_started_at == "2026-02-24T00:02:00.000Z"
 
     tracked_rows = oq.load_tracked_and_blocked(db_path, limit=20)
     assert len(tracked_rows) == 3
@@ -309,6 +327,18 @@ def test_observability_query_validation_paths(tmp_path: Path) -> None:
     assert oq._prompt_from_meta_json('{"other":"x"}') is None
     assert oq._prompt_from_meta_json("[]") is None
     assert oq._prompt_from_meta_json("not-json") is None
+    active_meta = oq._active_run_meta_from_json(
+        '{"codex_active":true,"codex_mode":"bugfix","codex_session_id":"thread-xyz",'
+        '"codex_invocation_started_at":"2026-02-24T00:00:00.000Z","last_prompt":"hello"}'
+    )
+    assert active_meta.codex_active is True
+    assert active_meta.codex_mode == "bugfix"
+    assert active_meta.codex_session_id == "thread-xyz"
+    assert active_meta.codex_invocation_started_at == "2026-02-24T00:00:00.000Z"
+    assert active_meta.prompt == "hello"
+    inactive_meta = oq._active_run_meta_from_json("not-json")
+    assert inactive_meta.codex_active is False
+    assert inactive_meta.prompt is None
 
     metric = oq._build_metric(
         repo_full_name="all",

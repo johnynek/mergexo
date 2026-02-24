@@ -885,6 +885,9 @@ def _active_row_detail_fields(row: ActiveAgentRow) -> tuple[_DetailField, ...]:
         _DetailField("Branch", branch_value, branch_link),
         _DetailField("Started", row.started_at),
         _DetailField("Elapsed", _render_seconds(row.elapsed_seconds)),
+        _DetailField("Codex Mode", row.codex_mode or "-"),
+        _DetailField("Codex Session ID", row.codex_session_id or "-"),
+        _DetailField("Codex Invocation Started", row.codex_invocation_started_at or "-"),
     )
 
 
@@ -962,6 +965,9 @@ def _active_row_context(row: ActiveAgentRow) -> str:
             f"Branch: {row.branch or '-'}",
             f"Started: {row.started_at}",
             f"Elapsed: {_render_seconds(row.elapsed_seconds)}",
+            f"Codex Mode: {row.codex_mode or '-'}",
+            f"Codex Session ID: {row.codex_session_id or '-'}",
+            f"Codex Invocation Started: {row.codex_invocation_started_at or '-'}",
             "",
             "Last Prompt:",
             prompt_value,

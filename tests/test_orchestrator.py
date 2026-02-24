@@ -1620,6 +1620,34 @@ def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
     ]
 
 
+def test_process_implementation_candidate_marks_codex_finished_on_agent_exception(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent(fail=True)
+    state = FakeState()
+
+    checkout_path = git.ensure_checkout(0)
+    design_doc = checkout_path / "docs/design/7-add-worker-scheduler.md"
+    design_doc.parent.mkdir(parents=True, exist_ok=True)
+    design_doc.write_text("# Design\n\nImplement queue scheduler.", encoding="utf-8")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    with pytest.raises(RuntimeError, match="codex failed"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            )
+        )
+
+    assert len(agent.implementation_calls) == 1
+
+
 def test_process_implementation_candidate_rejects_unauthorized_author(tmp_path: Path) -> None:
     cfg = _config(tmp_path, allowed_users=("reviewer",))
     git = FakeGitManager(tmp_path / "checkouts")
@@ -2105,6 +2133,10 @@ def test_active_run_id_helpers_and_prompt_recording(
 
     assert orch._active_run_id_for_issue(7) == "run-issue"
     assert orch._active_run_id_for_pr(70) == "run-feedback"
+    assert orch._active_run_id_for_pr_now(70) == "run-feedback"
+    assert orch._active_run_id_for_pr_now(999) is None
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    assert orch._active_run_id_for_pr(999) is None
 
     recorded_meta: list[tuple[str, str]] = []
 
@@ -2123,6 +2155,30 @@ def test_active_run_id_helpers_and_prompt_recording(
     assert recorded_meta == [("run-issue", '{"last_prompt": "Prompt text"}')]
 
 
+def test_update_run_meta_clears_cache_when_update_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._initialize_run_meta_cache("run-1")
+    assert "run-1" in orch._run_meta_cache
+
+    def fake_update_agent_run_meta(*, run_id: str, meta_json: str) -> bool:
+        _ = run_id, meta_json
+        return False
+
+    monkeypatch.setattr(
+        orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
+    )
+
+    orch._update_run_meta("run-1", last_prompt="meta")
+    assert "run-1" not in orch._run_meta_cache
+
+
 def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -2139,6 +2195,28 @@ def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:
     # Slot should have been released; re-acquire should not block and should return slot 0.
     lease = orch._slot_pool.acquire()
     assert lease.slot == 0
+
+
+@pytest.mark.parametrize(
+    ("flow", "branch"), [("bugfix", "agent/bugfix/7"), ("small_job", "agent/small/7")]
+)
+def test_process_direct_issue_marks_codex_finished_on_agent_exception(
+    tmp_path: Path, flow: IssueFlow, branch: str
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent(fail=True)
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(RuntimeError, match="codex failed"):
+        orch._process_direct_issue(
+            issue=_issue(),
+            flow=flow,
+            checkout_path=tmp_path,
+            branch=branch,
+        )
 
 
 def test_enqueue_new_work_paths(tmp_path: Path) -> None:
@@ -5898,6 +5976,74 @@ def test_run_feedback_agent_with_git_ops_round_trip(tmp_path: Path) -> None:
     second_turn = agent.feedback_calls[1][1]
     assert len(second_turn.issue_comments) == 1
     assert "fetch_origin: ok (ok)" in second_turn.issue_comments[0].body
+
+
+def test_run_feedback_agent_with_git_ops_marks_codex_finished_on_agent_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=issue.number,
+        branch="agent/design/7-add-worker-scheduler",
+        status="awaiting_feedback",
+        last_seen_head_sha="headsha",
+    )
+    turn = FeedbackTurn(
+        turn_key="turn-key",
+        issue=issue,
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(),
+    )
+    running_future: Future[str] = Future()
+    orch._running_feedback[tracked.pr_number] = _FeedbackFuture(
+        issue_number=tracked.issue_number,
+        run_id="run-feedback",
+        future=running_future,
+    )
+    orch._initialize_run_meta_cache("run-feedback")
+
+    recorded_meta: list[dict[str, object]] = []
+
+    def fake_update_agent_run_meta(*, run_id: str, meta_json: str) -> bool:
+        assert run_id == "run-feedback"
+        recorded_meta.append(cast(dict[str, object], json.loads(meta_json)))
+        return True
+
+    monkeypatch.setattr(
+        orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
+    )
+
+    def raise_feedback_error(
+        *, session: AgentSession, turn: FeedbackTurn, cwd: Path
+    ) -> FeedbackResult:
+        _ = session, turn, cwd
+        raise RuntimeError("feedback agent crashed")
+
+    monkeypatch.setattr(agent, "respond_to_feedback", raise_feedback_error)
+
+    with pytest.raises(RuntimeError, match="feedback agent crashed"):
+        orch._run_feedback_agent_with_git_ops(
+            tracked=tracked,
+            session=AgentSession(adapter="codex", thread_id="thread-0"),
+            turn=turn,
+            checkout_path=tmp_path,
+            pull_request=github.pr_snapshot,
+        )
+
+    assert len(recorded_meta) == 2
+    assert recorded_meta[0]["codex_active"] is True
+    assert recorded_meta[1]["codex_active"] is False
+    assert recorded_meta[1]["codex_session_id"] == "thread-0"
 
 
 def test_run_feedback_agent_with_git_ops_blocks_when_request_batch_too_large(

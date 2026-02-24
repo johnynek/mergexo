@@ -45,6 +45,9 @@ def test_observability_tui_helper_functions() -> None:
         started_at="2026-02-24T00:00:00.000Z",
         elapsed_seconds=12.0,
         prompt="Prompt for active run",
+        codex_mode="bugfix",
+        codex_session_id="thread-123",
+        codex_invocation_started_at="2026-02-24T00:00:10.000Z",
     )
     tracked_pr = TrackedOrBlockedRow(
         repo_full_name="o/repo-a",
@@ -91,6 +94,8 @@ def test_observability_tui_helper_functions() -> None:
 
     active_context = tui._active_row_context(active)
     assert "Issue: 7" in active_context
+    assert "Codex Mode: bugfix" in active_context
+    assert "Codex Session ID: thread-123" in active_context
     assert "Last Prompt:" in active_context
     assert "Prompt for active run" in active_context
     tracked_context = tui._tracked_row_context(tracked_pr)
@@ -100,6 +105,9 @@ def test_observability_tui_helper_functions() -> None:
     active_fields = tui._active_row_detail_fields(active)
     assert active_fields[0].label == "Repo"
     assert active_fields[0].url == "https://github.com/o/repo-a"
+    active_field_map = {field.label: field for field in active_fields}
+    assert active_field_map["Codex Mode"].value == "bugfix"
+    assert active_field_map["Codex Session ID"].value == "thread-123"
     tracked_fields = tui._tracked_row_detail_fields(tracked_pr)
     tracked_field_map = {field.label: field for field in tracked_fields}
     assert tracked_field_map["Repo"].url == "https://github.com/o/repo-a"
@@ -375,6 +383,9 @@ def test_observability_app_refresh_and_keybindings(
             started_at="2026-02-24T00:00:00.000Z",
             elapsed_seconds=12.0,
             prompt="Current active prompt",
+            codex_mode="small-job",
+            codex_session_id="thread-123",
+            codex_invocation_started_at="2026-02-24T00:00:10.000Z",
         ),
     )
     tracked_rows = (

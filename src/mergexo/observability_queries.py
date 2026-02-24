@@ -32,6 +32,9 @@ class ActiveAgentRow:
     started_at: str
     elapsed_seconds: float
     prompt: str | None = None
+    codex_mode: str | None = None
+    codex_session_id: str | None = None
+    codex_invocation_started_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,15 +112,19 @@ def load_overview(
     with _connect(db_path) as conn:
         repo_clause, repo_params = _repo_filter_sql(repo_filter)
         issue_repo_clause, issue_repo_params = _repo_filter_sql(repo_filter, prefix="i")
-        active_agents = _fetch_int(
-            conn,
+        active_rows = conn.execute(
             f"""
-            SELECT COUNT(*)
+            SELECT meta_json
             FROM agent_run_history
             WHERE finished_at IS NULL
               {repo_clause}
             """,
             repo_params,
+        ).fetchall()
+        active_agents = sum(
+            1
+            for row in active_rows
+            if _active_run_meta_from_json(_as_str(row[0], "meta_json")).codex_active
         )
         blocked_prs = _fetch_int(
             conn,
@@ -184,15 +191,9 @@ def load_active_agents(
     now_iso = now_value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     with _connect(db_path) as conn:
         repo_clause, repo_params = _repo_filter_sql(repo_filter)
-        limit_clause = ""
-        params: tuple[object, ...]
         if limit is not None:
             if limit < 1:
                 raise ValueError("limit must be >= 1")
-            limit_clause = "LIMIT ?"
-            params = (now_iso, *repo_params, limit)
-        else:
-            params = (now_iso, *repo_params)
         rows = conn.execute(
             f"""
             SELECT
@@ -210,11 +211,10 @@ def load_active_agents(
             WHERE finished_at IS NULL
               {repo_clause}
             ORDER BY started_at ASC, repo_full_name ASC, issue_number ASC
-            {limit_clause}
             """,
-            params,
+            (now_iso, *repo_params),
         ).fetchall()
-    return tuple(
+    active_rows = tuple(
         ActiveAgentRow(
             run_id=_as_str(row[0], "run_id"),
             repo_full_name=_as_str(row[1], "repo_full_name"),
@@ -225,10 +225,18 @@ def load_active_agents(
             branch=_as_optional_str(row[6], "branch"),
             started_at=_as_str(row[7], "started_at"),
             elapsed_seconds=_as_float(row[8], "elapsed_seconds"),
-            prompt=_prompt_from_meta_json(_as_str(row[9], "meta_json")),
+            prompt=meta.prompt,
+            codex_mode=meta.codex_mode,
+            codex_session_id=meta.codex_session_id,
+            codex_invocation_started_at=meta.codex_invocation_started_at,
         )
         for row in rows
+        for meta in (_active_run_meta_from_json(_as_str(row[9], "meta_json")),)
+        if meta.codex_active
     )
+    if limit is None:
+        return active_rows
+    return active_rows[:limit]
 
 
 def load_tracked_and_blocked(
@@ -671,17 +679,41 @@ def _as_optional_float(value: object, field: str) -> float | None:
     raise RuntimeError(f"Invalid {field} value in observability query result")
 
 
-def _prompt_from_meta_json(meta_json: str) -> str | None:
+@dataclass(frozen=True)
+class _ActiveRunMeta:
+    codex_active: bool
+    prompt: str | None
+    codex_mode: str | None
+    codex_session_id: str | None
+    codex_invocation_started_at: str | None
+
+
+def _active_run_meta_from_json(meta_json: str) -> _ActiveRunMeta:
     try:
         payload = json.loads(meta_json)
     except json.JSONDecodeError:
-        return None
+        payload = None
     if not isinstance(payload, dict):
+        payload = {}
+    return _ActiveRunMeta(
+        codex_active=payload.get("codex_active") is True,
+        prompt=_normalized_meta_text(payload.get("last_prompt")),
+        codex_mode=_normalized_meta_text(payload.get("codex_mode")),
+        codex_session_id=_normalized_meta_text(payload.get("codex_session_id")),
+        codex_invocation_started_at=_normalized_meta_text(
+            payload.get("codex_invocation_started_at")
+        ),
+    )
+
+
+def _normalized_meta_text(value: object) -> str | None:
+    if not isinstance(value, str):
         return None
-    prompt = payload.get("last_prompt")
-    if not isinstance(prompt, str):
-        return None
-    normalized = prompt.strip()
+    normalized = value.strip()
     if not normalized:
         return None
     return normalized
+
+
+def _prompt_from_meta_json(meta_json: str) -> str | None:
+    return _active_run_meta_from_json(meta_json).prompt
