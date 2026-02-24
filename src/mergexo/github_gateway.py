@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 import json
 import logging
@@ -12,6 +13,8 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    WorkflowJobSnapshot,
+    WorkflowRunSnapshot,
 )
 from mergexo.observability import log_event
 from mergexo.shell import run
@@ -19,6 +22,7 @@ from mergexo.shell import run
 
 LOGGER = logging.getLogger("mergexo.github_gateway")
 CompareCommitsStatus = Literal["ahead", "identical", "behind", "diverged"]
+_ACTIONS_GREEN_CONCLUSIONS = {"success", "neutral", "skipped"}
 
 
 class GitHubPollingError(RuntimeError):
@@ -243,6 +247,141 @@ class GitHubGateway:
         )
         return status
 
+    def list_workflow_runs_for_head(
+        self, pr_number: int, head_sha: str
+    ) -> tuple[WorkflowRunSnapshot, ...]:
+        query = urlencode(
+            {
+                "event": "pull_request",
+                "head_sha": head_sha,
+                "per_page": "100",
+            }
+        )
+        path = f"/repos/{self.owner}/{self.name}/actions/runs?{query}"
+        payload = self._api_json("GET", path)
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for workflow runs")
+        runs_payload = payload_obj.get("workflow_runs")
+        if not isinstance(runs_payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected workflow_runs list")
+
+        runs: list[WorkflowRunSnapshot] = []
+        for item in runs_payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+
+            pull_requests_payload = item_obj.get("pull_requests")
+            if isinstance(pull_requests_payload, list) and pull_requests_payload:
+                linked_numbers = {
+                    _as_int(pr_obj.get("number"), field="number")
+                    for raw in pull_requests_payload
+                    if (pr_obj := _as_object_dict(raw)) is not None and "number" in pr_obj
+                }
+                if pr_number not in linked_numbers:
+                    continue
+
+            conclusion = _normalize_optional_lower_str(item_obj.get("conclusion"))
+            runs.append(
+                WorkflowRunSnapshot(
+                    run_id=_as_int(item_obj.get("id"), field="id"),
+                    name=_as_string(item_obj.get("name")),
+                    status=_as_string(item_obj.get("status")).strip().lower(),
+                    conclusion=conclusion,
+                    html_url=_as_string(item_obj.get("html_url")),
+                    head_sha=_as_string(item_obj.get("head_sha")),
+                    created_at=_as_string(item_obj.get("created_at")),
+                    updated_at=_as_string(item_obj.get("updated_at")),
+                )
+            )
+
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="workflow_runs",
+            pr_number=pr_number,
+            head_sha=head_sha,
+            count=len(runs),
+        )
+        return tuple(sorted(runs, key=lambda run: run.run_id))
+
+    def list_workflow_jobs(self, run_id: int) -> tuple[WorkflowJobSnapshot, ...]:
+        path = f"/repos/{self.owner}/{self.name}/actions/runs/{run_id}/jobs?per_page=100"
+        payload = self._api_json("GET", path)
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for workflow jobs")
+        jobs_payload = payload_obj.get("jobs")
+        if not isinstance(jobs_payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected jobs list")
+
+        jobs: list[WorkflowJobSnapshot] = []
+        for item in jobs_payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            jobs.append(
+                WorkflowJobSnapshot(
+                    job_id=_as_int(item_obj.get("id"), field="id"),
+                    name=_as_string(item_obj.get("name")),
+                    status=_as_string(item_obj.get("status")).strip().lower(),
+                    conclusion=_normalize_optional_lower_str(item_obj.get("conclusion")),
+                    html_url=_as_string(item_obj.get("html_url")),
+                )
+            )
+
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="workflow_jobs",
+            run_id=run_id,
+            count=len(jobs),
+        )
+        return tuple(sorted(jobs, key=lambda job: job.job_id))
+
+    def get_failed_run_log_tails(
+        self,
+        run_id: int,
+        tail_lines_per_action: int = 500,
+    ) -> dict[str, str | None]:
+        if tail_lines_per_action < 1:
+            raise ValueError("tail_lines_per_action must be >= 1")
+
+        jobs = self.list_workflow_jobs(run_id)
+        failed_jobs = [
+            job
+            for job in jobs
+            if job.status == "completed" and job.conclusion not in _ACTIONS_GREEN_CONCLUSIONS
+        ]
+        if not failed_jobs:
+            return {}
+
+        base_names = [_normalized_action_name(job.name) for job in failed_jobs]
+        name_counts = Counter(base_names)
+        log_tails: dict[str, str | None] = {}
+        for job, base_name in zip(failed_jobs, base_names, strict=True):
+            action_name = (
+                base_name if name_counts[base_name] == 1 else f"{base_name} [job {job.job_id}]"
+            )
+            path = f"/repos/{self.owner}/{self.name}/actions/jobs/{job.job_id}/logs"
+            try:
+                raw_log = self._api_text("GET", path)
+                log_tails[action_name] = _tail_lines(raw_log, max_lines=tail_lines_per_action)
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    "actions_failure_logs_unavailable",
+                    run_id=run_id,
+                    job_id=job.job_id,
+                    action_name=action_name,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                log_tails[action_name] = None
+
+        return log_tails
+
     def list_pull_request_files(self, pr_number: int) -> tuple[str, ...]:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/files?per_page=100"
         payload = self._api_json("GET", path)
@@ -383,6 +522,31 @@ class GitHubGateway:
             review_comment_id=review_comment_id,
         )
 
+    def _api_text(self, method: str, path: str) -> str:
+        method_upper = method.upper()
+        if method_upper != "GET":
+            raise ValueError("_api_text currently only supports GET")
+        cmd = ["gh", "api", "--method", method_upper, "--include", path]
+        raw = run(cmd, check=False)
+        try:
+            status_code, _headers, body = _parse_http_response(raw)
+            if status_code < 200 or status_code >= 300:
+                message = body.strip() or "<empty>"
+                raise RuntimeError(
+                    f"GitHub API text request failed with status {status_code}: {message}"
+                )
+            return body
+        except Exception as exc:
+            log_event(
+                LOGGER,
+                "github_poll_get_failed",
+                path=path,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                raw_preview=_preview_for_log(raw),
+            )
+            raise GitHubPollingError(f"GitHub polling GET failed for path {path}: {exc}") from exc
+
     def _api_json(self, method: str, path: str, payload: dict[str, object] | None = None) -> object:
         method_upper = method.upper()
         if method_upper == "GET":
@@ -481,6 +645,30 @@ def _preview_for_log(text: str, *, limit: int = 240) -> str:
     if len(compact) <= limit:
         return compact
     return f"{compact[:limit]}..."
+
+
+def _normalize_optional_lower_str(value: object) -> str | None:
+    raw = _as_optional_str(value)
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    return normalized or None
+
+
+def _normalized_action_name(raw_name: str) -> str:
+    normalized = raw_name.strip()
+    return normalized or "unnamed-action"
+
+
+def _tail_lines(raw_text: str, *, max_lines: int) -> str:
+    if max_lines < 1:
+        raise ValueError("max_lines must be >= 1")
+    lines = raw_text.splitlines()
+    if not lines:
+        return "<empty>"
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(lines[-max_lines:])
 
 
 def _as_object_dict(value: object) -> dict[str, object] | None:

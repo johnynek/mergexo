@@ -168,6 +168,28 @@ Recommended rollout:
    - issue comment after PR exists (redirect only).
 3. Expand once stable.
 
+## GitHub Actions feedback monitoring
+
+Enable PR Actions monitoring with:
+
+- `runtime.enable_pr_actions_monitoring = true`
+- optional `runtime.pr_actions_log_tail_lines = 500`
+
+Behavior:
+
+1. MergeXO scans tracked `awaiting_feedback` PRs and checks workflow runs for the current PR head SHA.
+2. If any run is still active, MergeXO only logs monitoring state and waits.
+3. When all runs are terminal and at least one run is non-green (anything except `success`, `neutral`, `skipped`), MergeXO enqueues deterministic `actions` feedback events keyed by run id + `updated_at`.
+4. On the next feedback turn, MergeXO revalidates those events against the current head/run state:
+   - stale events (run now green, run no longer on current head, or run updated) are auto-resolved;
+   - actionable events inject synthetic CI context into the agent turn, including failed action names and `last N log lines` tails for each failed action.
+5. If no PR review/issue comments exist, CI context alone can trigger a feedback remediation turn.
+
+Notes:
+
+- This feature is currently GitHub Actions only.
+- Remote CI status does not replace required local pre-push checks; configured `required_tests` still gate pushes.
+
 ## GitHub operator commands
 
 Enable GitHub operations with:

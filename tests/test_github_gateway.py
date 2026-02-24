@@ -8,16 +8,18 @@ from mergexo.github_gateway import (
     CompareCommitsStatus,
     GitHubGateway,
     GitHubPollingError,
-    _preview_for_log,
-    _parse_http_response,
     _as_bool,
     _as_int,
     _as_optional_int,
     _as_optional_str,
     _as_object_dict,
     _as_string,
+    _normalize_optional_lower_str,
+    _parse_http_response,
+    _preview_for_log,
+    _tail_lines,
 )
-from mergexo.models import Issue
+from mergexo.models import Issue, WorkflowJobSnapshot
 from mergexo.observability import configure_logging
 
 
@@ -354,6 +356,203 @@ def test_compare_commits_rejects_bad_payload_and_status(monkeypatch: pytest.Monk
         gateway.compare_commits("a", "b")
 
 
+def test_list_workflow_runs_for_head_parses_and_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        assert method == "GET"
+        assert "/actions/runs?" in path
+        assert "event=pull_request" in path
+        assert "head_sha=head123" in path
+        return {
+            "workflow_runs": [
+                {
+                    "id": 101,
+                    "name": "ci",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "html_url": "https://example/runs/101",
+                    "head_sha": "head123",
+                    "created_at": "t1",
+                    "updated_at": "t2",
+                    "pull_requests": [{"number": 7}],
+                },
+                {
+                    "id": 102,
+                    "name": "other",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "html_url": "https://example/runs/102",
+                    "head_sha": "head123",
+                    "created_at": "t1",
+                    "updated_at": "t2",
+                    "pull_requests": [{"number": 999}],
+                },
+            ]
+        }
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    runs = gateway.list_workflow_runs_for_head(7, "head123")
+    assert len(runs) == 1
+    assert runs[0].run_id == 101
+    assert runs[0].conclusion == "failure"
+
+
+def test_list_workflow_runs_for_head_rejects_bad_payload_and_skips_non_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+    with pytest.raises(RuntimeError, match="expected object for workflow runs"):
+        gateway.list_workflow_runs_for_head(7, "head123")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: {})
+    with pytest.raises(RuntimeError, match="expected workflow_runs list"):
+        gateway.list_workflow_runs_for_head(7, "head123")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"workflow_runs": ["skip"]},
+    )
+    assert gateway.list_workflow_runs_for_head(7, "head123") == ()
+
+
+def test_list_workflow_jobs_parses(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        assert method == "GET"
+        assert path.endswith("/actions/runs/101/jobs?per_page=100")
+        return {
+            "jobs": [
+                {
+                    "id": 201,
+                    "name": "lint",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "html_url": "https://example/jobs/201",
+                },
+                {
+                    "id": 202,
+                    "name": "tests",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "html_url": "https://example/jobs/202",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    jobs = gateway.list_workflow_jobs(101)
+    assert len(jobs) == 2
+    assert jobs[1].job_id == 202
+    assert jobs[1].conclusion == "failure"
+
+
+def test_list_workflow_jobs_rejects_bad_payload_and_skips_non_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+    with pytest.raises(RuntimeError, match="expected object for workflow jobs"):
+        gateway.list_workflow_jobs(101)
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: {})
+    with pytest.raises(RuntimeError, match="expected jobs list"):
+        gateway.list_workflow_jobs(101)
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"jobs": ["skip"]},
+    )
+    assert gateway.list_workflow_jobs(101) == ()
+
+
+def test_get_failed_run_log_tails_extracts_tails_and_handles_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_jobs(self: GitHubGateway, run_id: int) -> tuple[WorkflowJobSnapshot, ...]:
+        _ = self, run_id
+        return (
+            WorkflowJobSnapshot(
+                job_id=10,
+                name="tests",
+                status="completed",
+                conclusion="failure",
+                html_url="https://example/jobs/10",
+            ),
+            WorkflowJobSnapshot(
+                job_id=11,
+                name="tests",
+                status="completed",
+                conclusion="timed_out",
+                html_url="https://example/jobs/11",
+            ),
+            WorkflowJobSnapshot(
+                job_id=12,
+                name="lint",
+                status="completed",
+                conclusion="success",
+                html_url="https://example/jobs/12",
+            ),
+        )
+
+    def fake_api_text(self: GitHubGateway, method: str, path: str) -> str:
+        _ = self
+        assert method == "GET"
+        if path.endswith("/actions/jobs/10/logs"):
+            return "a\nb\nc\nd"
+        raise RuntimeError("logs unavailable")
+
+    monkeypatch.setattr(GitHubGateway, "list_workflow_jobs", fake_jobs)
+    monkeypatch.setattr(GitHubGateway, "_api_text", fake_api_text)
+
+    tails = gateway.get_failed_run_log_tails(101, tail_lines_per_action=2)
+    assert tails == {
+        "tests [job 10]": "c\nd",
+        "tests [job 11]": None,
+    }
+    with pytest.raises(ValueError, match="tail_lines_per_action"):
+        gateway.get_failed_run_log_tails(101, tail_lines_per_action=0)
+
+
+def test_get_failed_run_log_tails_returns_empty_when_no_failed_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "list_workflow_jobs",
+        lambda self, run_id: (
+            WorkflowJobSnapshot(
+                job_id=10,
+                name="lint",
+                status="completed",
+                conclusion="success",
+                html_url="https://example/jobs/10",
+            ),
+        ),
+    )
+    assert gateway.get_failed_run_log_tails(101, tail_lines_per_action=50) == {}
+
+
 @pytest.mark.parametrize(
     "method_name, bad_payload, expected",
     [
@@ -513,6 +712,29 @@ def test_api_json_get_rejects_not_modified_without_cached_payload(
         gateway._api_json("GET", "/path")
 
 
+def test_api_text_get_success_and_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cwd, input_text
+        calls.append(cmd)
+        assert check is False
+        if len(calls) == 1:
+            return "\n".join(("HTTP/2.0 200 OK", "", "line1\nline2"))
+        return "\n".join(("HTTP/2.0 404 Not Found", "", "missing"))
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(ValueError, match="only supports GET"):
+        gateway._api_text("POST", "/path")
+    assert gateway._api_text("GET", "/path") == "line1\nline2"
+    with pytest.raises(GitHubPollingError, match="GitHub polling GET failed for path /path"):
+        gateway._api_text("GET", "/path")
+
+
 def test_parse_http_response_handles_multiple_status_lines() -> None:
     status, headers, body = _parse_http_response(
         "\n".join(
@@ -636,3 +858,13 @@ def test_helper_conversion_functions() -> None:
     assert _as_bool(True) is True
     with pytest.raises(RuntimeError, match="bool"):
         _as_bool("x")
+
+    assert _normalize_optional_lower_str(" FAILure  ") == "failure"
+    assert _normalize_optional_lower_str("   ") is None
+    assert _normalize_optional_lower_str(None) is None
+
+    assert _tail_lines("a\nb\nc", max_lines=2) == "b\nc"
+    assert _tail_lines("a\nb", max_lines=2) == "a\nb"
+    assert _tail_lines("", max_lines=2) == "<empty>"
+    with pytest.raises(ValueError, match="max_lines"):
+        _tail_lines("x", max_lines=0)

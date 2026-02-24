@@ -41,6 +41,27 @@ class PullRequestSnapshot:
 
 
 @dataclass(frozen=True)
+class WorkflowRunSnapshot:
+    run_id: int
+    name: str
+    status: str
+    conclusion: str | None
+    html_url: str
+    head_sha: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class WorkflowJobSnapshot:
+    job_id: int
+    name: str
+    status: str
+    conclusion: str | None
+    html_url: str
+
+
+@dataclass(frozen=True)
 class PullRequestReviewComment:
     comment_id: int
     body: str

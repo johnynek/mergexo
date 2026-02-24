@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +54,8 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestSnapshot,
     PullRequestReviewComment,
+    WorkflowJobSnapshot,
+    WorkflowRunSnapshot,
     WorkResult,
 )
 from mergexo.observability import log_event, logging_repo_context
@@ -60,6 +63,7 @@ from mergexo.shell import CommandError, run
 from mergexo.state import (
     AgentRunFailureClass,
     ImplementationCandidateState,
+    PendingFeedbackEvent,
     PrePrFollowupState,
     StateStore,
     TrackedPullRequestState,
@@ -73,6 +77,8 @@ _MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
 _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS = 3
 _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT = 12000
 _ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
+_ACTIONS_ACTIVE_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
+_ACTIONS_GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 _RESTART_OPERATION_NAME = "restart"
 _RESTART_PENDING_STATUSES = {"pending", "running"}
 _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
@@ -325,6 +331,12 @@ class Phase1Orchestrator:
                     if not self._run_poll_step(
                         step_name="enqueue_pre_pr_followup_work",
                         fn=lambda: self._enqueue_pre_pr_followup_work(pool),
+                    ):
+                        poll_had_github_errors = True
+                if self._config.runtime.enable_pr_actions_monitoring:
+                    if not self._run_poll_step(
+                        step_name="monitor_pr_actions",
+                        fn=self._monitor_pr_actions,
                     ):
                         poll_had_github_errors = True
                 if not self._run_poll_step(
@@ -784,6 +796,83 @@ class Phase1Orchestrator:
             finally:
                 if capacity_reserved:
                     self._work_limiter.release()
+
+    def _monitor_pr_actions(self) -> None:
+        tracked_prs = self._state.list_tracked_pull_requests(
+            repo_full_name=self._state_repo_full_name()
+        )
+        log_event(
+            LOGGER,
+            "actions_monitor_scan_started",
+            tracked_pr_count=len(tracked_prs),
+        )
+        for tracked in tracked_prs:
+            pr = self._github.get_pull_request(tracked.pr_number)
+            if pr.merged or pr.state.lower() != "open":
+                continue
+
+            runs = self._github.list_workflow_runs_for_head(tracked.pr_number, pr.head_sha)
+            non_terminal_runs = tuple(run for run in runs if run.status != "completed")
+            if non_terminal_runs:
+                log_event(
+                    LOGGER,
+                    "actions_monitor_active_runs_detected",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    head_sha=pr.head_sha,
+                    active_run_count=len(non_terminal_runs),
+                )
+                continue
+
+            failed_runs = tuple(
+                run
+                for run in runs
+                if run.status == "completed" and run.conclusion not in _ACTIONS_GREEN_CONCLUSIONS
+            )
+            if not failed_runs:
+                continue
+
+            feedback_events = tuple(
+                self._actions_feedback_event_for_run(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    run=run,
+                )
+                for run in failed_runs
+            )
+            self._state.ingest_feedback_events(
+                feedback_events,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            log_event(
+                LOGGER,
+                "actions_failure_events_enqueued",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                head_sha=pr.head_sha,
+                failed_run_count=len(failed_runs),
+            )
+
+    def _actions_feedback_event_for_run(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        run: WorkflowRunSnapshot,
+    ) -> FeedbackEventRecord:
+        return FeedbackEventRecord(
+            event_key=event_key(
+                pr_number=pr_number,
+                kind="actions",
+                comment_id=run.run_id,
+                updated_at=run.updated_at,
+            ),
+            pr_number=pr_number,
+            issue_number=issue_number,
+            kind="actions",
+            comment_id=run.run_id,
+            updated_at=run.updated_at,
+        )
 
     def _scan_post_pr_source_issue_comment_redirects(self) -> None:
         redirect_targets: dict[int, int] = {}
@@ -2969,7 +3058,39 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 pending_count=len(pending_events),
             )
-            if not pending_events:
+            pending_review_events, pending_issue_events, pending_actions_events = (
+                self._partition_pending_feedback_events(pending_events)
+            )
+            (
+                actionable_actions_events,
+                actions_synthetic_comments,
+                stale_action_event_keys,
+            ) = self._resolve_actions_feedback_events(
+                pr_number=tracked.pr_number,
+                head_sha=pr.head_sha,
+                action_events=pending_actions_events,
+            )
+
+            pending_event_key_set = {
+                event.event_key
+                for event in pending_review_events
+                + pending_issue_events
+                + actionable_actions_events
+            }
+            if stale_action_event_keys:
+                self._state.mark_feedback_events_processed(
+                    event_keys=stale_action_event_keys,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "actions_failure_event_stale_resolved",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    stale_event_count=len(stale_action_event_keys),
+                )
+
+            if not pending_event_key_set:
                 log_event(
                     LOGGER,
                     "feedback_turn_completed",
@@ -2979,8 +3100,12 @@ class Phase1Orchestrator:
                 )
                 return "completed"
 
-            pending_event_keys = tuple(event.event_key for event in pending_events)
-            pending_event_key_set = set(pending_event_keys)
+            pending_event_keys = tuple(
+                event.event_key
+                for event in pending_review_events
+                + pending_issue_events
+                + actionable_actions_events
+            )
             pending_review_comments = tuple(
                 comment
                 for normalized_event, comment in normalized_review
@@ -2992,7 +3117,7 @@ class Phase1Orchestrator:
                 if normalized_event.event_key in pending_event_key_set
             )
             turn_issue_comments = self._append_required_tests_feedback_reminder(
-                pending_issue_comments,
+                pending_issue_comments + actions_synthetic_comments,
                 checkout_path=lease.path,
             )
 
@@ -3225,6 +3350,162 @@ class Phase1Orchestrator:
         if state.status in {"blocked", "merged", "closed"}:
             return state.status
         return "completed"
+
+    def _partition_pending_feedback_events(
+        self,
+        pending_events: tuple[PendingFeedbackEvent, ...],
+    ) -> tuple[
+        tuple[PendingFeedbackEvent, ...],
+        tuple[PendingFeedbackEvent, ...],
+        tuple[PendingFeedbackEvent, ...],
+    ]:
+        review_events: list[PendingFeedbackEvent] = []
+        issue_events: list[PendingFeedbackEvent] = []
+        actions_events: list[PendingFeedbackEvent] = []
+        for pending in pending_events:
+            if pending.kind == "review":
+                review_events.append(pending)
+            elif pending.kind == "issue":
+                issue_events.append(pending)
+            elif pending.kind == "actions":
+                actions_events.append(pending)
+        return tuple(review_events), tuple(issue_events), tuple(actions_events)
+
+    def _resolve_actions_feedback_events(
+        self,
+        *,
+        pr_number: int,
+        head_sha: str,
+        action_events: tuple[PendingFeedbackEvent, ...],
+    ) -> tuple[
+        tuple[PendingFeedbackEvent, ...],
+        tuple[PullRequestIssueComment, ...],
+        tuple[str, ...],
+    ]:
+        if not action_events:
+            return (), (), ()
+
+        runs = self._github.list_workflow_runs_for_head(pr_number, head_sha)
+        runs_by_id = {run.run_id: run for run in runs}
+
+        stale_event_keys: list[str] = []
+        actionable_events: list[PendingFeedbackEvent] = []
+        actionable_runs: list[WorkflowRunSnapshot] = []
+        for event in action_events:
+            run = runs_by_id.get(event.comment_id)
+            # Revalidate against current run snapshot so reruns/head changes do not trigger
+            # remediation for stale failures.
+            if run is None:
+                stale_event_keys.append(event.event_key)
+                continue
+            if run.updated_at != event.updated_at:
+                stale_event_keys.append(event.event_key)
+                continue
+            if run.status != "completed":
+                stale_event_keys.append(event.event_key)
+                continue
+            if run.conclusion in _ACTIONS_GREEN_CONCLUSIONS:
+                stale_event_keys.append(event.event_key)
+                continue
+            actionable_events.append(event)
+            actionable_runs.append(run)
+
+        synthetic_comments, failed_action_count = self._build_actions_failure_context_comments(
+            actionable_runs
+        )
+        if actionable_runs:
+            log_event(
+                LOGGER,
+                "actions_failure_context_loaded",
+                pr_number=pr_number,
+                head_sha=head_sha,
+                failed_run_count=len(actionable_runs),
+                failed_action_count=failed_action_count,
+            )
+
+        return tuple(actionable_events), synthetic_comments, tuple(stale_event_keys)
+
+    def _build_actions_failure_context_comments(
+        self,
+        runs: list[WorkflowRunSnapshot],
+    ) -> tuple[tuple[PullRequestIssueComment, ...], int]:
+        if not runs:
+            return (), 0
+
+        tail_lines = self._config.runtime.pr_actions_log_tail_lines
+        synthetic_comments: list[PullRequestIssueComment] = []
+        failed_action_count = 0
+        for index, run in enumerate(sorted(runs, key=lambda candidate: candidate.run_id), start=1):
+            jobs = self._github.list_workflow_jobs(run.run_id)
+            failed_jobs = tuple(
+                job
+                for job in jobs
+                if job.status == "completed" and job.conclusion not in _ACTIONS_GREEN_CONCLUSIONS
+            )
+            failed_action_count += len(failed_jobs)
+            log_tails_by_action = self._github.get_failed_run_log_tails(
+                run.run_id,
+                tail_lines_per_action=tail_lines,
+            )
+            synthetic_comments.append(
+                PullRequestIssueComment(
+                    comment_id=-(9200 + index),
+                    body=self._render_actions_failure_context_comment(
+                        run=run,
+                        failed_jobs=failed_jobs,
+                        log_tails_by_action=log_tails_by_action,
+                        tail_lines=tail_lines,
+                    ),
+                    user_login="mergexo-system",
+                    html_url=run.html_url,
+                    created_at=run.updated_at or "now",
+                    updated_at=run.updated_at or "now",
+                )
+            )
+
+        return tuple(synthetic_comments), failed_action_count
+
+    def _render_actions_failure_context_comment(
+        self,
+        *,
+        run: WorkflowRunSnapshot,
+        failed_jobs: tuple[WorkflowJobSnapshot, ...],
+        log_tails_by_action: dict[str, str | None],
+        tail_lines: int,
+    ) -> str:
+        lines = [
+            "MergeXO GitHub Actions failure context:",
+            f"- workflow run: {run.name}",
+            f"- run_id: {run.run_id}",
+            f"- status: {run.status}",
+            f"- conclusion: {run.conclusion or '<none>'}",
+            f"- run_url: {run.html_url}",
+            f"- run_updated_at: {run.updated_at}",
+            "",
+        ]
+        if not failed_jobs:
+            lines.append("No failed actions were returned by the jobs API for this run.")
+            return "\n".join(lines)
+
+        job_name_counts = Counter(_normalized_actions_job_name(job.name) for job in failed_jobs)
+        lines.append("Failed actions:")
+        for job in failed_jobs:
+            action_name = _actions_log_key_for_job(job=job, job_name_counts=job_name_counts)
+            log_tail = log_tails_by_action.get(action_name)
+            lines.extend(
+                (
+                    f"- action: {action_name}",
+                    f"  conclusion: {job.conclusion or '<none>'}",
+                    f"  action_url: {job.html_url}",
+                    f"  last {tail_lines} log lines (truncated tail):",
+                )
+            )
+            if log_tail is None:
+                lines.append("  <logs unavailable for this action>")
+                continue
+            for tail_line in log_tail.splitlines() or ("<empty>",):
+                lines.append(f"  {tail_line}")
+        return "\n".join(lines)
 
     def _append_required_tests_feedback_reminder(
         self,
@@ -4280,6 +4561,18 @@ def _flow_label_from_branch(branch: str) -> str:
     if branch.startswith("agent/impl/"):
         return "implementation"
     return "small-job"
+
+
+def _normalized_actions_job_name(raw_name: str) -> str:
+    normalized = raw_name.strip()
+    return normalized or "unnamed-action"
+
+
+def _actions_log_key_for_job(*, job: WorkflowJobSnapshot, job_name_counts: Counter[str]) -> str:
+    base_name = _normalized_actions_job_name(job.name)
+    if job_name_counts[base_name] == 1:
+        return base_name
+    return f"{base_name} [job {job.job_id}]"
 
 
 def _render_git_op_result_comment(*, outcomes: list[_GitOpOutcome], round_number: int) -> str:

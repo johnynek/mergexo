@@ -266,6 +266,10 @@ Return JSON only with this object shape:
 
 Rules:
 - Primary objective: resolve review feedback by editing repository files, then provide commit_message.
+- If CI failure context from GitHub Actions is present, reproduce those failures locally before finalizing.
+- Repair code/tests until local required pre-push checks pass before returning commit_message.
+- A non-null commit_message is the ready-to-push signal.
+- If blocked, set commit_message to null and explain the blocker concretely in general_comment.
 - For comments on design docs (for example `docs/design/*.md`), prefer updating the doc directly over explanatory discussion-only replies.
 - If a comment can be addressed by a concrete file change, make that change in this turn.
 - Reply to specific review comments using their exact review_comment_id.

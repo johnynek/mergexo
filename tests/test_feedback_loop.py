@@ -23,6 +23,13 @@ from mergexo.feedback_loop import (
 def test_event_key_and_turn_key_are_stable() -> None:
     key = event_key(pr_number=12, kind="review", comment_id=33, updated_at="2026-02-21T01:02:03Z")
     assert key == "12:review:33:2026-02-21T01:02:03Z"
+    actions_key = event_key(
+        pr_number=12,
+        kind="actions",
+        comment_id=44,
+        updated_at="2026-02-21T01:02:04Z",
+    )
+    assert actions_key == "12:actions:44:2026-02-21T01:02:04Z"
 
     turn_a = compute_turn_key(
         pr_number=12,
