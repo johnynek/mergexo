@@ -1840,7 +1840,7 @@ class Phase1Orchestrator:
             title=f"Design doc for #{issue.number}: {generated.title}",
             head=branch,
             base=self._repo.default_branch,
-            body=(f"Design doc for issue #{issue.number}.\n\nRefs #{issue.number}"),
+            body=(f"Design doc.\n\nRefs #{issue.number}"),
         )
 
         self._github.post_issue_comment(
