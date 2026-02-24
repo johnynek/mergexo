@@ -8,22 +8,14 @@ touch_paths:
   - src/mergexo/service_runner.py
   - src/mergexo/config.py
   - src/mergexo/cli.py
-  - src/mergexo/observability_web.py
-  - src/mergexo/observability_api.py
-  - src/mergexo/static/observability/index.html
-  - src/mergexo/static/observability/assets/*
-  - web/observability-frontend/package.json
-  - web/observability-frontend/tsconfig.json
-  - web/observability-frontend/vite.config.ts
-  - web/observability-frontend/src/main.tsx
-  - web/observability-frontend/src/App.tsx
-  - web/observability-frontend/src/components/ActiveAgentsTable.tsx
-  - web/observability-frontend/src/components/MetricsPanel.tsx
-  - web/observability-frontend/src/styles.css
+  - src/mergexo/observability_queries.py
+  - src/mergexo/observability_tui.py
+  - pyproject.toml
   - tests/test_state.py
   - tests/test_orchestrator.py
   - tests/test_service_runner.py
-  - tests/test_observability_web.py
+  - tests/test_observability_queries.py
+  - tests/test_observability_tui.py
   - mergexo.toml.example
   - README.md
 depends_on:
@@ -38,93 +30,74 @@ _Issue: #65 (https://github.com/johnynek/mergexo/issues/65)_
 
 ## Summary
 
-Add an observability dashboard that is hosted by the existing Python MergeXO process. TypeScript is used only for the frontend UI. The backend API stays in Python and reads/writes the existing SQLite state, so operators deploy one service, not two.
+Rescope issue #65 to a Python terminal UI (TUI) MVP instead of a browser dashboard. The goal is an `htop`/`btop`-style observability experience that operators can use over SSH without deploying a second service.
 
-The dashboard provides:
-1. Active issue/PR agents and elapsed runtime.
+This design provides:
+1. Active issue/PR agents and runtime duration.
 2. Failures and blocked work.
-3. Open tracked PRs/issues and queue state.
-4. History for issues and PRs.
+3. Tracked/open PR and issue state.
+4. Issue and PR history.
 5. Metrics: mean runtime, runtime std-dev, and failure rate (global and per repo).
 
-## Key decision from PR feedback
+## Decision from PR feedback
 
-1. No standalone TypeScript backend service.
-2. No Hono sidecar process.
-3. Python hosts API and static frontend assets.
-4. TypeScript is frontend-only.
+1. Do not ship a separate web backend.
+2. Do not require TypeScript frontend for MVP.
+3. Build an all-Python terminal experience first.
+4. Keep architecture compatible with a future web UI if needed later.
 
-This addresses deployment overhead and keeps all observability data access in the same runtime that already owns state transitions.
+## Which Python TUI libraries fit best?
 
-## Context
+### Shortlist
 
-Current MergeXO state already includes real-time operational data:
-1. `issue_runs` for issue lifecycle status.
-2. `pr_feedback_state` for tracked and blocked PRs.
-3. `feedback_events`, `operator_commands`, `runtime_operations`, and `agent_sessions`.
+1. `textual`
+- Best feature fit for `htop`/`btop`-like dashboards.
+- Rich layout system, tables, keybindings, periodic refresh, async-friendly.
+- Good developer ergonomics and active ecosystem.
 
-Gap:
-1. Existing tables are mainly current-state snapshots.
-2. We need durable run-history records for accurate timeline and metrics (mean/std-dev/failure rate).
+2. `rich` + `Live`
+- Very good for simple read-only live panels.
+- Less suitable for multi-screen navigation and complex interaction.
+
+3. `urwid`
+- Mature and capable.
+- Older API style; steeper path for modern dashboard UX.
+
+4. `prompt_toolkit`
+- Excellent for command-driven shells.
+- Weaker fit for dense, panel-based monitoring UI.
+
+### Recommendation
+
+Use `textual` for MVP. It gives the right interaction model for an `htop`/`btop`-style console while keeping implementation in Python.
 
 ## Goals
 
-1. Ship a local web dashboard for observability.
-2. Keep deployment as a single Python service.
-3. Keep frontend in TypeScript.
-4. Preserve multi-repo support.
-5. Add durable history for issue/PR run analytics.
+1. Provide a terminal observability console runnable on the same host as MergeXO.
+2. Require only Python runtime in production.
+3. Show active agents, blocked failures, tracked work, and history.
+4. Provide global and per-repo metrics.
+5. Keep multi-repo support first-class.
 
 ## Non-goals
 
-1. Building a second deployable backend service.
-2. Replacing GitHub as source of truth.
-3. Building distributed telemetry infrastructure.
-4. Enabling write actions in MVP (read-only first).
+1. Browser-based dashboard in this phase.
+2. Distributed telemetry backend.
+3. Write operations from TUI in MVP (read-only first).
+4. Replacing GitHub as the system of record.
 
 ## Proposed architecture
 
 ### 1. Process model
 
-1. `mergexo service` starts an optional observability HTTP server in-process (background thread).
-2. HTTP server exposes:
-- JSON API endpoints under `/api/observability/v1/*`
-- static frontend bundle under `/observability`.
-3. Server reads SQLite in WAL-safe read mode.
-4. ServiceRunner shutdown stops the HTTP server cleanly.
+1. Add a new CLI command, for example `mergexo top --config mergexo.toml`.
+2. Command opens a local terminal dashboard and reads `state.db` directly.
+3. TUI runs independently from `mergexo service` process (same host, same DB).
+4. Operator can SSH into host and run the TUI safely in read-only mode.
 
-Outcome:
-1. One deployed process.
-2. One state DB.
-3. No extra backend runtime to operate.
+### 2. Data model additions for durable history
 
-### 2. Python web/API implementation
-
-New Python modules:
-1. `src/mergexo/observability_api.py`
-- pure query/aggregation functions returning immutable DTOs.
-2. `src/mergexo/observability_web.py`
-- HTTP routing and static file serving.
-
-Framework approach:
-1. Prefer Python stdlib (`http.server` + `ThreadingHTTPServer`) for MVP to avoid new runtime dependencies.
-2. Endpoints return JSON only.
-3. Frontend bundle served from `src/mergexo/static/observability/`.
-
-### 3. TypeScript frontend implementation
-
-Frontend lives in `web/observability-frontend`:
-1. React + TypeScript + Vite.
-2. Polls Python JSON endpoints every 5s (configurable).
-3. Build output copied into `src/mergexo/static/observability/`.
-
-Deployment model:
-1. Node toolchain required for frontend development/build.
-2. Runtime production service is Python-only.
-
-### 4. Durable observability data model additions
-
-Additive SQLite tables in `StateStore`:
+Current tables are mostly snapshot state; we add history tables for timelines and metrics:
 
 `agent_run_history`
 1. `run_id TEXT PRIMARY KEY`
@@ -162,132 +135,131 @@ Indexes:
 1. `(repo_full_name, pr_number, changed_at)`
 2. `(repo_full_name, changed_at)`
 
-### 5. Instrumentation points in orchestrator/service
+### 3. Instrumentation points in orchestrator/service
 
-1. On enqueue (`issue`, `implementation`, `pre_pr_followup`, `feedback`): insert `agent_run_history` start row and store `run_id` in in-memory running metadata.
-2. On terminal reap in `_reap_finished`: finalize `run_id` with terminal status, error class, and duration.
-3. On PR status changes: append `pr_status_history` transition rows.
-4. On startup: mark stale unfinished runs as `interrupted`.
+1. On enqueue (`issue`, `implementation`, `pre_pr_followup`, `feedback`), write `agent_run_history` start row and keep `run_id` in memory metadata.
+2. In `_reap_finished`, finalize `run_id` with terminal status, duration, and failure class.
+3. On PR status updates, append `pr_status_history` transitions.
+4. On startup, reconcile stale unfinished runs to `interrupted`.
 
-### 6. API endpoints (MVP)
+### 4. Query layer
 
-1. `GET /api/observability/v1/health`
-2. `GET /api/observability/v1/repos`
-3. `GET /api/observability/v1/overview?repo=<repo|all>&window=24h`
-4. `GET /api/observability/v1/active-agents?repo=...`
-5. `GET /api/observability/v1/tracked?repo=...`
-6. `GET /api/observability/v1/blocked?repo=...`
-7. `GET /api/observability/v1/history/issues/:issueNumber?repo=...&limit=...`
-8. `GET /api/observability/v1/history/prs/:prNumber?repo=...&limit=...`
-9. `GET /api/observability/v1/metrics?repo=...&window=7d`
+Add `src/mergexo/observability_queries.py` with pure read functions:
+1. `load_overview(repo_filter, window)`
+2. `load_active_agents(repo_filter)`
+3. `load_tracked_and_blocked(repo_filter)`
+4. `load_issue_history(repo_filter, issue_number, limit)`
+5. `load_pr_history(repo_filter, pr_number, limit)`
+6. `load_metrics(repo_filter, window)`
 
-### 7. Metrics definitions
+All query outputs are typed dataclasses/tuples and immutable-by-convention.
 
-1. Terminal sample set: `agent_run_history` rows with `finished_at IS NOT NULL` and terminal status in (`completed`, `failed`, `blocked`, `interrupted`).
+### 5. TUI layout and interaction model
+
+Implement with Textual in `src/mergexo/observability_tui.py`.
+
+Main panels:
+1. Top summary bar: active agents, blocked PRs, tracked PRs, failures (24h), mean/std-dev runtime.
+2. Active agents table: repo, run kind, issue, PR, branch, started_at, elapsed.
+3. Blocked/tracked panel: blocked reason, pending event count, status.
+4. History panel: issue/PR timeline for selected row.
+5. Metrics panel: per-repo failure rate and runtime stats.
+
+Keybindings (MVP):
+1. `r`: manual refresh.
+2. `f`: set repo filter.
+3. `w`: set time window (`1h`, `24h`, `7d`, `30d`).
+4. `tab`: cycle focused panel.
+5. `enter`: open detail view for selected issue/PR.
+6. `q`: quit.
+
+Refresh behavior:
+1. Auto-refresh every 2s by default (configurable).
+2. Full-screen redraw with stable row selection where possible.
+
+### 6. Metrics definitions
+
+1. Terminal sample set: rows with `finished_at IS NOT NULL` and terminal status in (`completed`, `failed`, `blocked`, `interrupted`).
 2. Mean runtime: `AVG(duration_seconds)`.
-3. Std-dev runtime: `sqrt(AVG(x^2) - AVG(x)^2)`, with `0` for sample size < 2.
+3. Runtime std-dev: `sqrt(AVG(x^2) - AVG(x)^2)`, return `0` when sample size < 2.
 4. Failure rate: `failed_count / terminal_count`.
-5. Repo breakdown: same formulas grouped by `repo_full_name`.
-
-## Dashboard scope
-
-### 1. Overview page
-
-1. Active agents count.
-2. Blocked PR count.
-3. Tracked PR count.
-4. Recent failures.
-5. Mean/std-dev runtime.
-
-### 2. Active agents page
-
-1. Repo, run kind, issue, PR, branch.
-2. Start timestamp and elapsed runtime.
-3. Sort by longest-running.
-
-### 3. Tracked and blocked page
-
-1. Tracked PR table.
-2. Blocked PR table with reason and pending event count.
-
-### 4. History page
-
-1. Issue history timeline.
-2. PR history timeline.
-3. Operator/restart events where relevant.
-
-### 5. Metrics page
-
-1. Global metrics.
-2. Per-repo breakdown.
-3. Time window filters.
+5. Per-repo breakdown: same formulas grouped by `repo_full_name`.
 
 ## Implementation plan
 
-1. Clean and keep one frontmatter/document body for this design doc.
-2. Add observability config block (`enabled`, `host`, `port`, `poll_seconds`, `retention_days`).
-3. Add new history tables + indexes in `StateStore._init_schema`.
-4. Add `StateStore` methods for run start/finish and PR status transition append.
-5. Extend orchestrator running metadata with `run_id`.
-6. Instrument enqueue/reap/status transition paths.
-7. Add Python HTTP server lifecycle into `ServiceRunner`.
-8. Add frontend project and static build output wiring.
-9. Add README and config docs.
-10. Add retention/pruning of history rows.
+1. Add Textual dependency in `pyproject.toml`.
+2. Add TUI runtime config fields (refresh interval, default window, optional row limit).
+3. Add history tables + indexes in `StateStore._init_schema`.
+4. Add run-history/transition write APIs to `StateStore`.
+5. Instrument orchestrator/service paths for run lifecycle writes.
+6. Implement read query module (`observability_queries.py`).
+7. Implement Textual app (`observability_tui.py`) and CLI entrypoint in `cli.py`.
+8. Document command usage in README and sample config.
+9. Add retention/pruning policy for history tables.
 
 ## Testing plan
 
-Python tests:
-1. `tests/test_state.py`: schema, run start/finish, stale-run interruption, transition history.
-2. `tests/test_orchestrator.py`: enqueue creates run rows; reap finalizes exactly once; classification correctness.
-3. `tests/test_service_runner.py`: observability server start/stop integration.
-4. `tests/test_observability_web.py`: endpoint payloads, filtering, metrics formula correctness.
+1. `tests/test_state.py`
+- schema creation for history tables.
+- run start/finish and stale-run reconciliation.
+- PR transition history append behavior.
 
-Frontend tests:
-1. API contract tests against fixture payloads.
-2. UI smoke tests for active agents and metrics rendering.
+2. `tests/test_orchestrator.py`
+- enqueue writes run start rows.
+- terminal completion writes final rows exactly once.
+- failure class mapping coverage.
+
+3. `tests/test_observability_queries.py`
+- repo/time-window filters.
+- metric math correctness (mean, std-dev, failure rate).
+
+4. `tests/test_observability_tui.py`
+- panel rendering with fixture datasets.
+- keybinding behavior and selection flow.
+
+5. `tests/test_service_runner.py`
+- no behavior regressions from instrumentation hooks.
 
 ## Acceptance criteria
 
-1. Observability dashboard is reachable from the Python MergeXO service process.
-2. No second backend service is required in deployment.
-3. TypeScript is used only for frontend UI assets.
-4. Dashboard shows active issue/PR agents with elapsed runtime.
-5. Dashboard shows tracked and blocked PRs with reasons and pending event counts.
-6. Dashboard shows issue and PR history from durable run/transition records.
-7. Dashboard reports mean runtime, std-dev runtime, and failure rate globally and per repo.
-8. Metrics formulas are explicitly documented and match API output.
-9. Multi-repo filters work across all dashboard views.
-10. Startup reconciles stale unfinished runs to `interrupted`.
-11. DB changes are additive and do not require destructive reset.
+1. Operators can SSH into host and run the observability TUI with one command.
+2. TUI shows all active issue and feedback agents with elapsed runtime.
+3. TUI shows blocked and tracked PRs with reasons and pending events.
+4. TUI shows issue and PR history timelines from durable history tables.
+5. TUI reports mean runtime, std-dev runtime, and failure rate globally and per repo.
+6. Repo filter and time-window filter work across all panels.
+7. Metrics formulas are documented and match query outputs.
+8. Stale unfinished runs are reconciled to `interrupted` after restart.
+9. DB changes are additive and do not require destructive reset.
+10. README documents the new TUI operation workflow.
 
 ## Risks and mitigations
 
-1. Risk: HTTP server complexity in existing service loop.
-Mitigation: isolate in `observability_web.py` with explicit start/stop lifecycle and tests.
+1. Risk: TUI dependency footprint and compatibility.
+Mitigation: pin Textual version; keep fallback path for plain CLI summaries.
 
-2. Risk: SQLite contention.
-Mitigation: WAL mode, short read queries, query indexes, read-only endpoint semantics.
+2. Risk: SQLite read contention with running service.
+Mitigation: WAL mode, short read transactions, indexed queries.
 
 3. Risk: History table growth.
-Mitigation: retention policy and periodic prune.
+Mitigation: retention window and periodic prune.
 
-4. Risk: Frontend/backend API drift.
-Mitigation: typed response schemas and contract tests.
+4. Risk: Terminal rendering differences across SSH environments.
+Mitigation: test with common TERM settings; fallback non-interactive summary mode.
 
-5. Risk: Sensitive local data exposure.
-Mitigation: default bind `127.0.0.1`, optional auth token for non-local binds, explicit redaction rules.
+5. Risk: Complex TUI interaction increases implementation time.
+Mitigation: ship a simple read-only panel set first; defer advanced actions.
 
 ## Rollout notes
 
-1. Land DB and Python instrumentation first.
-2. Enable observability server behind config flag.
-3. Canary on one repo and validate parity with CLI/state queries.
-4. Roll out across multi-repo deployments after one stable week.
-5. Keep write actions out of MVP; evaluate later behind auth and explicit config.
+1. Land state schema + instrumentation first.
+2. Add query layer and CLI command returning non-interactive summary output.
+3. Add full-screen Textual TUI.
+4. Canary with one repo and compare values against direct SQL/CLI checks.
+5. Roll out to multi-repo operators after stability window.
 
 ## Open questions
 
-1. Default retention window (`30`, `90`, `180` days)?
-2. Should blocked attempts be part of top-level failure KPI or shown as separate KPI only?
-3. Should non-local observability access be allowed at all in MVP, or strictly localhost-only?
+1. Should blocked attempts be included in top-level failure KPI or always shown separately?
+2. Default history retention window: `30`, `90`, or `180` days?
+3. Do we want a read-only MVP only, or minimal operator actions (`unblock`, `restart`) in TUI v1?
