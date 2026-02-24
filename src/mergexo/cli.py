@@ -4,11 +4,13 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
 import time
 
 from mergexo.agent_adapter import AgentAdapter
 from mergexo.codex_adapter import CodexAdapter
 from mergexo.config import AppConfig, RepoConfig, load_config
+from mergexo.default_mode import run_default_mode
 from mergexo.git_ops import GitRepoManager
 from mergexo.github_gateway import GitHubGateway
 from mergexo.observability import configure_logging
@@ -18,9 +20,19 @@ from mergexo.service_runner import run_service
 from mergexo.state import StateStore
 
 
+_DEFAULT_COMMAND = "console"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mergexo")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    console_parser = subparsers.add_parser(
+        "console",
+        help="Run service, observability dashboard, and file logging together",
+    )
+    console_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
+    _add_verbose_argument(console_parser)
 
     init_parser = subparsers.add_parser(
         "init", help="Initialize state DB, mirror, and worker checkouts"
@@ -134,9 +146,14 @@ def _add_verbose_argument(parser: argparse.ArgumentParser) -> None:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args(_argv_with_default_command(tuple(sys.argv[1:])))
     config = load_config(args.config)
-    configure_logging(getattr(args, "verbose", None), state_dir=config.runtime.base_dir)
+    configure_logging(_effective_verbose_mode(args), state_dir=config.runtime.base_dir)
+
+    if args.command == "console":
+        _cmd_console(config)
+        return
 
     if args.command == "init":
         _cmd_init(config)
@@ -155,6 +172,41 @@ def main() -> None:
         return
 
     raise RuntimeError(f"Unknown command: {args.command}")
+
+
+def _argv_with_default_command(argv: tuple[str, ...]) -> tuple[str, ...]:
+    if len(argv) == 0:
+        return (_DEFAULT_COMMAND,)
+    if argv[0] in {"-h", "--help"}:
+        return argv
+    if argv[0].startswith("-"):
+        return (_DEFAULT_COMMAND, *argv)
+    return argv
+
+
+def _effective_verbose_mode(args: argparse.Namespace) -> bool | str | None:
+    verbose = getattr(args, "verbose", None)
+    if args.command == _DEFAULT_COMMAND and verbose is None:
+        return "low"
+    return verbose
+
+
+def _cmd_console(config: AppConfig) -> None:
+    config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
+    state = StateStore(_state_db_path(config))
+    state.reconcile_unfinished_agent_runs()
+    state.prune_observability_history(
+        retention_days=config.runtime.observability_history_retention_days
+    )
+    agents_by_repo_full_name = _build_codex_agents_by_repo(config)
+    default_agent = agents_by_repo_full_name[config.repo.full_name]
+    run_default_mode(
+        config=config,
+        state=state,
+        agent=default_agent,
+        agent_by_repo_full_name=agents_by_repo_full_name,
+        repo_runtimes=_build_repo_runtimes(config),
+    )
 
 
 def _cmd_init(config: AppConfig) -> None:

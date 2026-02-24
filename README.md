@@ -69,7 +69,19 @@ uv run mergexo run --config mergexo.toml --once --verbose high
 uv run mergexo run --config mergexo.toml
 ```
 
-For GitHub-operated restart/update workflows, run supervisor mode instead:
+Run the default console mode (service + TUI + file logging):
+
+```bash
+uv run mergexo --config mergexo.toml
+```
+
+Equivalent explicit command:
+
+```bash
+uv run mergexo console --config mergexo.toml
+```
+
+For non-interactive environments and GitHub-operated restart/update workflows, run supervisor mode instead:
 
 ```bash
 uv run mergexo service --config mergexo.toml
@@ -108,7 +120,10 @@ Runtime settings for dashboard and retention:
 
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
 
-Use `--verbose` on `init`, `run`, `service`, or `feedback` for high-signal lifecycle logs (`low` mode), or `--verbose high` for full event logs including poll internals. Verbose logs are also appended under `<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
+`console` defaults to `--verbose low`, so it writes lifecycle logs to stderr and
+`<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
+
+Use `--verbose` on `init`, `run`, `service`, `top`, `feedback`, or `console` for high-signal lifecycle logs (`low` mode), or `--verbose high` for full event logs including poll internals.
 
 ## State schema upgrade note
 
