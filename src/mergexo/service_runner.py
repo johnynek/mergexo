@@ -180,6 +180,9 @@ class ServiceRunner:
 
         with logging_repo_context(operation.request_repo_full_name):
             pending_futures = self._total_pending_futures(orchestrators)
+            # Each orchestrator poll reaps finished futures and writes terminal worker state
+            # into sqlite. Waiting for this global count to reach zero gives us a safe
+            # restart boundary with no in-flight worker state left uncheckpointed.
             now = time.monotonic()
             if restart_drain_started_at_monotonic is None:
                 restart_drain_started_at_monotonic = now
