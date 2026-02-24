@@ -304,7 +304,8 @@ test_file_regex = '^tests/.*\\.py$'
     )
 
     loaded = config.load_config(cfg_path)
-    assert loaded.repo.test_file_regex == ("^tests/.*\\.py$",)
+    assert loaded.repo.test_file_regex is not None
+    assert tuple(pattern.pattern for pattern in loaded.repo.test_file_regex) == ("^tests/.*\\.py$",)
 
 
 def test_load_config_accepts_test_file_regex_as_list(tmp_path: Path) -> None:
@@ -325,7 +326,11 @@ test_file_regex = ['^tests/.*\\.py$', '^integration/.*\\.scala$']
     )
 
     loaded = config.load_config(cfg_path)
-    assert loaded.repo.test_file_regex == ("^tests/.*\\.py$", "^integration/.*\\.scala$")
+    assert loaded.repo.test_file_regex is not None
+    assert tuple(pattern.pattern for pattern in loaded.repo.test_file_regex) == (
+        "^tests/.*\\.py$",
+        "^integration/.*\\.scala$",
+    )
 
 
 def test_load_config_rejects_invalid_test_file_regex_type(tmp_path: Path) -> None:
@@ -594,11 +599,12 @@ def test_helper_numeric_bool_and_tuple() -> None:
         config._optional_str_with_default({"k": ""}, "k", "d")
 
     assert config._optional_regex_list({}, "k") is None
-    assert config._optional_regex_list({"k": "^tests/"}, "k") == ("^tests/",)
-    assert config._optional_regex_list({"k": ["^tests/", "^integration/"]}, "k") == (
-        "^tests/",
-        "^integration/",
-    )
+    compiled = config._optional_regex_list({"k": "^tests/"}, "k")
+    assert compiled is not None
+    assert tuple(pattern.pattern for pattern in compiled) == ("^tests/",)
+    compiled_list = config._optional_regex_list({"k": ["^tests/", "^integration/"]}, "k")
+    assert compiled_list is not None
+    assert tuple(pattern.pattern for pattern in compiled_list) == ("^tests/", "^integration/")
     with pytest.raises(ConfigError, match="non-empty string or list of non-empty strings"):
         config._optional_regex_list({"k": []}, "k")
     with pytest.raises(ConfigError, match="non-empty string or list of non-empty strings"):

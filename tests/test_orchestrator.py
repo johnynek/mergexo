@@ -76,6 +76,7 @@ from mergexo.orchestrator import (
     _render_source_issue_redirect_comment,
     _render_design_doc,
     _render_operator_command_result,
+    _render_regex_patterns,
     _recovery_pr_payload_for_issue,
     _resolve_issue_flow,
     _summarize_git_error,
@@ -614,6 +615,11 @@ def _config(
     required_tests: str | None = None,
     test_file_regex: tuple[str, ...] | None = None,
 ) -> AppConfig:
+    compiled_test_file_regex = (
+        tuple(re.compile(pattern) for pattern in test_file_regex)
+        if test_file_regex is not None
+        else None
+    )
     return AppConfig(
         runtime=RuntimeConfig(
             base_dir=tmp_path / "state",
@@ -640,7 +646,7 @@ def _config(
                 local_clone_source=None,
                 remote_url=None,
                 required_tests=required_tests,
-                test_file_regex=test_file_regex,
+                test_file_regex=compiled_test_file_regex,
                 operations_issue_number=operations_issue_number,
                 operator_logins=operator_logins,
             ),
@@ -804,14 +810,28 @@ def test_flow_helpers() -> None:
         )
         is None
     )
-    assert _has_regression_test_changes(("tests/test_a.py", "src/a.py"), (r"^tests/",)) is True
-    assert _has_regression_test_changes(("src/a.py",), (r"^tests/",)) is False
+    assert (
+        _has_regression_test_changes(("tests/test_a.py", "src/a.py"), (re.compile(r"^tests/"),))
+        is True
+    )
+    assert _has_regression_test_changes(("src/a.py",), (re.compile(r"^tests/"),)) is False
     assert (
         _has_regression_test_changes(
             ("integration/FooSpec.scala",),
-            (r"^tests/", r"^integration/"),
+            (re.compile(r"^tests/"), re.compile(r"^integration/")),
         )
         is True
+    )
+    assert _render_regex_patterns(()) == "<none>"
+    assert _render_regex_patterns((re.compile(r"^tests/"),)) == "`^tests/`"
+    assert _render_regex_patterns((re.compile(r"^tests/"), re.compile(r"^integration/"))) == (
+        "`^tests/` or `^integration/`"
+    )
+    assert (
+        _render_regex_patterns(
+            (re.compile(r"^tests/"), re.compile(r"^integration/"), re.compile(r"\.scala$"))
+        )
+        == "`^tests/`, `^integration/`, or `\\.scala$`"
     )
     assert _design_branch_slug("agent/design/7-x") == "7-x"
     assert _design_branch_slug("agent/small/7-x") is None

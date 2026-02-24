@@ -38,7 +38,7 @@ class RepoConfig:
     local_clone_source: str | None
     remote_url: str | None
     required_tests: str | None = None
-    test_file_regex: tuple[str, ...] | None = None
+    test_file_regex: tuple[re.Pattern[str], ...] | None = None
     operations_issue_number: int | None = None
     operator_logins: tuple[str, ...] = ()
 
@@ -360,7 +360,7 @@ def _optional_str_with_default(
     return _optional_str(data, key)
 
 
-def _optional_regex_list(data: dict[str, object], key: str) -> tuple[str, ...] | None:
+def _optional_regex_list(data: dict[str, object], key: str) -> tuple[re.Pattern[str], ...] | None:
     value = data.get(key)
     if value is None:
         return None
@@ -378,12 +378,13 @@ def _optional_regex_list(data: dict[str, object], key: str) -> tuple[str, ...] |
     else:
         raise ConfigError(f"{key} must be a non-empty string or list of non-empty strings")
 
+    compiled: list[re.Pattern[str]] = []
     for pattern in patterns:
         try:
-            re.compile(pattern)
+            compiled.append(re.compile(pattern))
         except re.error as exc:
             raise ConfigError(f"{key} contains invalid regex {pattern!r}: {exc}") from exc
-    return patterns
+    return tuple(compiled)
 
 
 def _require_int(data: dict[str, object], key: str) -> int:

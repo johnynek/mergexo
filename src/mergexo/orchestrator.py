@@ -2159,7 +2159,7 @@ class Phase1Orchestrator:
         flow_label: str,
         checkout_path: Path,
         default_commit_message: str,
-        regression_test_file_regex: tuple[str, ...] | None,
+        regression_test_file_regex: tuple[re.Pattern[str], ...] | None,
         direct_turn: Callable[[Issue], DirectStartResult],
     ) -> DirectStartResult:
         result = direct_turn(
@@ -2182,9 +2182,7 @@ class Phase1Orchestrator:
             if regression_test_file_regex is not None:
                 staged_files = self._git.list_staged_files(checkout_path)
                 if not _has_regression_test_changes(staged_files, regression_test_file_regex):
-                    rendered_patterns = ", ".join(
-                        f"`{pattern}`" for pattern in regression_test_file_regex
-                    )
+                    rendered_patterns = _render_regex_patterns(regression_test_file_regex)
                     self._github.post_issue_comment(
                         issue_number=issue.number,
                         body=(
@@ -3823,9 +3821,21 @@ def _is_mergexo_status_comment(body: str) -> bool:
     return normalized.startswith("mergexo ")
 
 
-def _has_regression_test_changes(paths: tuple[str, ...], test_file_regex: tuple[str, ...]) -> bool:
-    patterns = tuple(re.compile(pattern) for pattern in test_file_regex)
-    return any(compiled.search(path) for path in paths for compiled in patterns)
+def _has_regression_test_changes(
+    paths: tuple[str, ...], test_file_regex: tuple[re.Pattern[str], ...]
+) -> bool:
+    return any(compiled.search(path) for path in paths for compiled in test_file_regex)
+
+
+def _render_regex_patterns(patterns: tuple[re.Pattern[str], ...]) -> str:
+    rendered = tuple(f"`{pattern.pattern}`" for pattern in patterns)
+    if not rendered:
+        return "<none>"
+    if len(rendered) == 1:
+        return rendered[0]
+    if len(rendered) == 2:
+        return f"{rendered[0]} or {rendered[1]}"
+    return f"{', '.join(rendered[:-1])}, or {rendered[-1]}"
 
 
 def _is_no_staged_changes_error(exc: RuntimeError) -> bool:
