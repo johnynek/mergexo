@@ -154,7 +154,7 @@ In `_reap_finished`:
 3. preserve current cursor advancement behavior for consumed source comments.
 
 ### Follow-up resume plumbing
-Update follow-up enqueue and worker call signatures to carry stored branch explicitly so retries always restore from checkpoint branch state.
+Update follow-up enqueue and worker call signatures to carry stored branch explicitly so retries always restore from checkpoint branch state. A follow-up retry is triggered only by qualifying source-issue comments from allowed users (consistent with `repo.allowed_users` and existing non-bot filtering).
 
 ## Git and Comment Helper Changes
 
