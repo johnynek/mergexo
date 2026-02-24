@@ -612,6 +612,7 @@ def _config(
     operator_logins: tuple[str, ...] = (),
     allowed_users: tuple[str, ...] = ("issue-author", "reviewer"),
     required_tests: str | None = None,
+    test_file_regex: tuple[str, ...] | None = None,
 ) -> AppConfig:
     return AppConfig(
         runtime=RuntimeConfig(
@@ -639,6 +640,7 @@ def _config(
                 local_clone_source=None,
                 remote_url=None,
                 required_tests=required_tests,
+                test_file_regex=test_file_regex,
                 operations_issue_number=operations_issue_number,
                 operator_logins=operator_logins,
             ),
@@ -802,8 +804,15 @@ def test_flow_helpers() -> None:
         )
         is None
     )
-    assert _has_regression_test_changes(("tests/test_a.py", "src/a.py")) is True
-    assert _has_regression_test_changes(("src/a.py",)) is False
+    assert _has_regression_test_changes(("tests/test_a.py", "src/a.py"), (r"^tests/",)) is True
+    assert _has_regression_test_changes(("src/a.py",), (r"^tests/",)) is False
+    assert (
+        _has_regression_test_changes(
+            ("integration/FooSpec.scala",),
+            (r"^tests/", r"^integration/"),
+        )
+        is True
+    )
     assert _design_branch_slug("agent/design/7-x") == "7-x"
     assert _design_branch_slug("agent/small/7-x") is None
     assert _design_branch_slug("agent/design/   ") is None
@@ -1155,7 +1164,7 @@ def test_process_issue_small_job_flow_uses_default_commit_message(tmp_path: Path
 
 
 def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
-    cfg = _config(tmp_path)
+    cfg = _config(tmp_path, test_file_regex=(r"^tests/",))
     git = FakeGitManager(tmp_path / "checkouts")
     git.staged_files = ("src/a.py",)
     github = FakeGitHub(issues=[])
@@ -1172,6 +1181,24 @@ def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
     assert any(
         "requires at least one staged regression test" in body for _, body in github.comments
     )
+
+
+def test_process_issue_bugfix_without_test_file_regex_allows_non_test_changes(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.staged_files = ("src/a.py",)
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    result = orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert result.branch.startswith("agent/bugfix/7-")
+    assert git.commit_calls != []
+    assert github.created_prs != []
 
 
 def test_process_issue_repairs_push_merge_conflict_with_agent(tmp_path: Path) -> None:

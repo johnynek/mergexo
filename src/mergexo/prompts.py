@@ -77,7 +77,7 @@ Task:
 - Base branch is: {default_branch}
 {coding_guidelines_lines}
 - Reproduce the issue behavior from the report details.
-- Add or update regression tests in tests/ that fail before the fix and pass after the fix.
+- Add or update regression tests that fail before the fix and pass after the fix.
 
 Output requirements:
 - Implement the fix and any required supporting updates.
