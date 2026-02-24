@@ -27,6 +27,11 @@ small_job_label = "agent:small-job"
 coding_guidelines_path = "docs/python_style.md"
 # Optional repo-relative or absolute path to an executable required before each push.
 required_tests = "scripts/test.sh"
+# Optional bugfix-only staged regression-test gate.
+# Accepts either a single regex string or a list (OR semantics across patterns).
+# If omitted, MergeXO does not enforce staged test-file matching before bugfix PR creation.
+# test_file_regex = "^tests/.*\\.py$"
+# test_file_regex = ["^tests/.*\\.py$", "^integration/.*\\.scala$"]
 design_docs_dir = "docs/design"
 allowed_users = ["maintainer1", "maintainer2"]
 # Optional issue used for global operator commands (restart and cross-PR unblock).
@@ -43,6 +48,7 @@ owner = "johnynek"
 name = "bosatsu"
 coding_guidelines_path = "docs/python_style.md"
 # required_tests = "scripts/required-tests.sh"
+# test_file_regex = ["^test/.*\\.scala$", "^integration/.*\\.scala$"]
 # allowed_users omitted => defaults to ["johnynek"]
 
 # Legacy single-repo compatibility:

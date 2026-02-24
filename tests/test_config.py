@@ -80,6 +80,7 @@ extra_args = ["--repo-mode"]
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
     assert loaded.repo.required_tests == "scripts/required-tests.sh"
+    assert loaded.repo.test_file_regex is None
     assert loaded.repo.operations_issue_number == 99
     assert loaded.repo.operator_logins == ("alice", "bob")
     assert loaded.repo.allowed_users == frozenset({"alice", "bob"})
@@ -282,6 +283,97 @@ required_tests = 7
 """.strip(),
     )
     with pytest.raises(ConfigError, match="required_tests must be a non-empty string if provided"):
+        config.load_config(cfg_path)
+
+
+def test_load_config_accepts_test_file_regex_as_string(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "ok.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+test_file_regex = '^tests/.*\\.py$'
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+    assert loaded.repo.test_file_regex is not None
+    assert tuple(pattern.pattern for pattern in loaded.repo.test_file_regex) == ("^tests/.*\\.py$",)
+
+
+def test_load_config_accepts_test_file_regex_as_list(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "ok.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+test_file_regex = ['^tests/.*\\.py$', '^integration/.*\\.scala$']
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+    assert loaded.repo.test_file_regex is not None
+    assert tuple(pattern.pattern for pattern in loaded.repo.test_file_regex) == (
+        "^tests/.*\\.py$",
+        "^integration/.*\\.scala$",
+    )
+
+
+def test_load_config_rejects_invalid_test_file_regex_type(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+test_file_regex = 7
+""".strip(),
+    )
+
+    with pytest.raises(
+        ConfigError, match="test_file_regex must be a non-empty string or list of non-empty strings"
+    ):
+        config.load_config(cfg_path)
+
+
+def test_load_config_rejects_invalid_test_file_regex_pattern(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+test_file_regex = "["
+""".strip(),
+    )
+
+    with pytest.raises(ConfigError, match="test_file_regex contains invalid regex"):
         config.load_config(cfg_path)
 
 
@@ -505,6 +597,20 @@ def test_helper_numeric_bool_and_tuple() -> None:
     assert config._optional_str_with_default({"k": "v"}, "k", "d") == "v"
     with pytest.raises(ConfigError, match="non-empty string"):
         config._optional_str_with_default({"k": ""}, "k", "d")
+
+    assert config._optional_regex_list({}, "k") is None
+    compiled = config._optional_regex_list({"k": "^tests/"}, "k")
+    assert compiled is not None
+    assert tuple(pattern.pattern for pattern in compiled) == ("^tests/",)
+    compiled_list = config._optional_regex_list({"k": ["^tests/", "^integration/"]}, "k")
+    assert compiled_list is not None
+    assert tuple(pattern.pattern for pattern in compiled_list) == ("^tests/", "^integration/")
+    with pytest.raises(ConfigError, match="non-empty string or list of non-empty strings"):
+        config._optional_regex_list({"k": []}, "k")
+    with pytest.raises(ConfigError, match="non-empty string or list of non-empty strings"):
+        config._optional_regex_list({"k": ["^tests/", 3]}, "k")
+    with pytest.raises(ConfigError, match="contains invalid regex"):
+        config._optional_regex_list({"k": "["}, "k")
 
     assert config._tuple_of_str({}, "k") == ()
     assert config._tuple_of_str({"k": ["a", "b"]}, "k") == ("a", "b")

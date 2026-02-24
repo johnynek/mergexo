@@ -76,6 +76,7 @@ from mergexo.orchestrator import (
     _render_source_issue_redirect_comment,
     _render_design_doc,
     _render_operator_command_result,
+    _render_regex_patterns,
     _recovery_pr_payload_for_issue,
     _resolve_issue_flow,
     _summarize_git_error,
@@ -612,7 +613,13 @@ def _config(
     operator_logins: tuple[str, ...] = (),
     allowed_users: tuple[str, ...] = ("issue-author", "reviewer"),
     required_tests: str | None = None,
+    test_file_regex: tuple[str, ...] | None = None,
 ) -> AppConfig:
+    compiled_test_file_regex = (
+        tuple(re.compile(pattern) for pattern in test_file_regex)
+        if test_file_regex is not None
+        else None
+    )
     return AppConfig(
         runtime=RuntimeConfig(
             base_dir=tmp_path / "state",
@@ -639,6 +646,7 @@ def _config(
                 local_clone_source=None,
                 remote_url=None,
                 required_tests=required_tests,
+                test_file_regex=compiled_test_file_regex,
                 operations_issue_number=operations_issue_number,
                 operator_logins=operator_logins,
             ),
@@ -802,8 +810,29 @@ def test_flow_helpers() -> None:
         )
         is None
     )
-    assert _has_regression_test_changes(("tests/test_a.py", "src/a.py")) is True
-    assert _has_regression_test_changes(("src/a.py",)) is False
+    assert (
+        _has_regression_test_changes(("tests/test_a.py", "src/a.py"), (re.compile(r"^tests/"),))
+        is True
+    )
+    assert _has_regression_test_changes(("src/a.py",), (re.compile(r"^tests/"),)) is False
+    assert (
+        _has_regression_test_changes(
+            ("integration/FooSpec.scala",),
+            (re.compile(r"^tests/"), re.compile(r"^integration/")),
+        )
+        is True
+    )
+    assert _render_regex_patterns(()) == "<none>"
+    assert _render_regex_patterns((re.compile(r"^tests/"),)) == "`^tests/`"
+    assert _render_regex_patterns((re.compile(r"^tests/"), re.compile(r"^integration/"))) == (
+        "`^tests/` or `^integration/`"
+    )
+    assert (
+        _render_regex_patterns(
+            (re.compile(r"^tests/"), re.compile(r"^integration/"), re.compile(r"\.scala$"))
+        )
+        == "`^tests/`, `^integration/`, or `\\.scala$`"
+    )
     assert _design_branch_slug("agent/design/7-x") == "7-x"
     assert _design_branch_slug("agent/small/7-x") is None
     assert _design_branch_slug("agent/design/   ") is None
@@ -1155,7 +1184,7 @@ def test_process_issue_small_job_flow_uses_default_commit_message(tmp_path: Path
 
 
 def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
-    cfg = _config(tmp_path)
+    cfg = _config(tmp_path, test_file_regex=(r"^tests/",))
     git = FakeGitManager(tmp_path / "checkouts")
     git.staged_files = ("src/a.py",)
     github = FakeGitHub(issues=[])
@@ -1172,6 +1201,24 @@ def test_process_issue_bugfix_requires_regression_tests(tmp_path: Path) -> None:
     assert any(
         "requires at least one staged regression test" in body for _, body in github.comments
     )
+
+
+def test_process_issue_bugfix_without_test_file_regex_allows_non_test_changes(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.staged_files = ("src/a.py",)
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    result = orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert result.branch.startswith("agent/bugfix/7-")
+    assert git.commit_calls != []
+    assert github.created_prs != []
 
 
 def test_process_issue_repairs_push_merge_conflict_with_agent(tmp_path: Path) -> None:

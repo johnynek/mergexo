@@ -205,7 +205,7 @@ def test_start_bugfix_from_issue_happy_path(
     ) -> str:
         _ = cwd, check
         assert input_text is not None
-        assert "regression tests in tests/" in input_text
+        assert "regression tests that fail before the fix and pass after the fix" in input_text
         assert "docs/python_style.md" in input_text
         idx = cmd.index("--output-last-message")
         Path(cmd[idx + 1]).write_text(

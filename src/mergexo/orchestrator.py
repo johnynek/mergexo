@@ -1809,7 +1809,7 @@ class Phase1Orchestrator:
             flow_label=flow_label,
             checkout_path=checkout_path,
             default_commit_message=default_commit_message,
-            require_regression_tests=(flow == "bugfix"),
+            regression_test_file_regex=(self._repo.test_file_regex if flow == "bugfix" else None),
             direct_turn=direct_turn,
         )
         self._push_branch_with_merge_conflict_repair(
@@ -1943,7 +1943,7 @@ class Phase1Orchestrator:
                 flow_label="implementation",
                 checkout_path=lease.path,
                 default_commit_message=default_commit_message,
-                require_regression_tests=False,
+                regression_test_file_regex=None,
                 direct_turn=run_implementation_turn,
             )
             self._push_branch_with_merge_conflict_repair(
@@ -2100,7 +2100,7 @@ class Phase1Orchestrator:
                     flow_label=flow_label,
                     checkout_path=checkout_path,
                     default_commit_message=default_commit_message,
-                    require_regression_tests=False,
+                    regression_test_file_regex=None,
                     direct_turn=direct_turn,
                 )
 
@@ -2159,7 +2159,7 @@ class Phase1Orchestrator:
         flow_label: str,
         checkout_path: Path,
         default_commit_message: str,
-        require_regression_tests: bool,
+        regression_test_file_regex: tuple[re.Pattern[str], ...] | None,
         direct_turn: Callable[[Issue], DirectStartResult],
     ) -> DirectStartResult:
         result = direct_turn(
@@ -2179,18 +2179,21 @@ class Phase1Orchestrator:
                 )
                 raise DirectFlowBlockedError(f"{flow_label} flow blocked: {result.blocked_reason}")
 
-            if require_regression_tests:
+            if regression_test_file_regex is not None:
                 staged_files = self._git.list_staged_files(checkout_path)
-                if not _has_regression_test_changes(staged_files):
+                if not _has_regression_test_changes(staged_files, regression_test_file_regex):
+                    rendered_patterns = _render_regex_patterns(regression_test_file_regex)
                     self._github.post_issue_comment(
                         issue_number=issue.number,
                         body=(
                             "MergeXO bugfix flow requires at least one staged regression test "
-                            "under `tests/`. No PR was opened."
+                            "file matching `repo.test_file_regex`. "
+                            f"Configured patterns: {rendered_patterns}. No PR was opened."
                         ),
                     )
                     raise DirectFlowValidationError(
-                        "Bugfix flow requires at least one staged regression test under tests/"
+                        "Bugfix flow requires at least one staged regression test file matching "
+                        "repo.test_file_regex"
                     )
 
             commit_message = result.commit_message or default_commit_message
@@ -3818,8 +3821,21 @@ def _is_mergexo_status_comment(body: str) -> bool:
     return normalized.startswith("mergexo ")
 
 
-def _has_regression_test_changes(paths: tuple[str, ...]) -> bool:
-    return any(path == "tests" or path.startswith("tests/") for path in paths)
+def _has_regression_test_changes(
+    paths: tuple[str, ...], test_file_regex: tuple[re.Pattern[str], ...]
+) -> bool:
+    return any(compiled.search(path) for path in paths for compiled in test_file_regex)
+
+
+def _render_regex_patterns(patterns: tuple[re.Pattern[str], ...]) -> str:
+    rendered = tuple(f"`{pattern.pattern}`" for pattern in patterns)
+    if not rendered:
+        return "<none>"
+    if len(rendered) == 1:
+        return rendered[0]
+    if len(rendered) == 2:
+        return f"{rendered[0]} or {rendered[1]}"
+    return f"{', '.join(rendered[:-1])}, or {rendered[-1]}"
 
 
 def _is_no_staged_changes_error(exc: RuntimeError) -> bool:

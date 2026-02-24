@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import tomllib
 from typing import cast
 
@@ -37,6 +38,7 @@ class RepoConfig:
     local_clone_source: str | None
     remote_url: str | None
     required_tests: str | None = None
+    test_file_regex: tuple[re.Pattern[str], ...] | None = None
     operations_issue_number: int | None = None
     operator_logins: tuple[str, ...] = ()
 
@@ -249,6 +251,7 @@ def _parse_repo_config(
         local_clone_source=_optional_str(repo_data, "local_clone_source"),
         remote_url=_optional_str(repo_data, "remote_url"),
         required_tests=_optional_str(repo_data, "required_tests"),
+        test_file_regex=_optional_regex_list(repo_data, "test_file_regex"),
         operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
         operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
     )
@@ -355,6 +358,33 @@ def _optional_str_with_default(
     if key not in data:
         return default
     return _optional_str(data, key)
+
+
+def _optional_regex_list(data: dict[str, object], key: str) -> tuple[re.Pattern[str], ...] | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        patterns = (value,)
+    elif isinstance(value, list):
+        if not value:
+            raise ConfigError(f"{key} must be a non-empty string or list of non-empty strings")
+        parsed: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item:
+                raise ConfigError(f"{key} must be a non-empty string or list of non-empty strings")
+            parsed.append(item)
+        patterns = tuple(parsed)
+    else:
+        raise ConfigError(f"{key} must be a non-empty string or list of non-empty strings")
+
+    compiled: list[re.Pattern[str]] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as exc:
+            raise ConfigError(f"{key} contains invalid regex {pattern!r}: {exc}") from exc
+    return tuple(compiled)
 
 
 def _require_int(data: dict[str, object], key: str) -> int:

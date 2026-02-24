@@ -190,7 +190,7 @@ def test_build_bugfix_prompt_requires_regression_tests() -> None:
         coding_guidelines_path="docs/python_style.md",
     )
 
-    assert "regression tests in tests/" in prompt
+    assert "regression tests that fail before the fix and pass after the fix" in prompt
     assert "docs/python_style.md" in prompt
     assert "blocked_reason" in prompt
     assert "issue #21" in prompt.lower()
