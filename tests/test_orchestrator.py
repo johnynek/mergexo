@@ -551,6 +551,12 @@ class FakeState:
         _ = repo_full_name
         return 0
 
+    def reconcile_stale_running_issue_runs_with_followups(
+        self, *, repo_full_name: str | None = None
+    ) -> int:
+        _ = repo_full_name
+        return 0
+
     def prune_observability_history(
         self, *, retention_days: int, repo_full_name: str | None = None
     ) -> tuple[int, int]:
@@ -1028,6 +1034,12 @@ def test_ensure_poll_setup_logs_when_stale_runs_reconciled(tmp_path: Path) -> No
 
     class ReconState(FakeState):
         def reconcile_unfinished_agent_runs(self, *, repo_full_name: str | None = None) -> int:
+            _ = repo_full_name
+            return 1
+
+        def reconcile_stale_running_issue_runs_with_followups(
+            self, *, repo_full_name: str | None = None
+        ) -> int:
             _ = repo_full_name
             return 1
 

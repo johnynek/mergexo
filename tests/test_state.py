@@ -268,6 +268,68 @@ def test_state_store_reconcile_and_prune_observability_history(tmp_path: Path) -
         store.prune_observability_history(retention_days=0)
 
 
+def test_reconcile_stale_running_issue_runs_with_followups(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_awaiting_issue_followup(
+        issue_number=1,
+        flow="bugfix",
+        branch="agent/bugfix/1-worker",
+        context_json='{"flow":"bugfix"}',
+        waiting_reason="bugfix flow blocked: waiting for steps to reproduce",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_running(1, repo_full_name="o/repo-a")
+
+    store.mark_awaiting_issue_followup(
+        issue_number=2,
+        flow="small_job",
+        branch="agent/small/2-worker",
+        context_json='{"flow":"small_job"}',
+        waiting_reason="small-job flow blocked: waiting for acceptance criteria",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_running(2, repo_full_name="o/repo-a")
+    store.record_agent_run_start(
+        run_kind="pre_pr_followup",
+        issue_number=2,
+        pr_number=None,
+        flow="small_job",
+        branch="agent/small/2-worker",
+        run_id="run-2-active",
+        started_at="2026-02-24T00:00:00.000Z",
+        repo_full_name="o/repo-a",
+    )
+
+    store.mark_awaiting_issue_followup(
+        issue_number=3,
+        flow="implementation",
+        branch="agent/impl/3-worker",
+        context_json='{"flow":"implementation"}',
+        waiting_reason="implementation flow blocked: waiting on source issue context",
+        repo_full_name="o/repo-b",
+    )
+    store.mark_running(3, repo_full_name="o/repo-b")
+
+    store.mark_running(4, repo_full_name="o/repo-a")
+
+    assert store.reconcile_stale_running_issue_runs_with_followups(repo_full_name="o/repo-a") == 1
+    assert _get_row(db_path, 1)[0] == "awaiting_issue_followup"
+    assert _get_row(db_path, 1)[4] == "bugfix flow blocked: waiting for steps to reproduce"
+    assert _get_row(db_path, 2)[0] == "running"
+    assert _get_row(db_path, 3)[0] == "running"
+    assert _get_row(db_path, 4)[0] == "running"
+
+    assert store.finish_agent_run(run_id="run-2-active", terminal_status="interrupted")
+    assert store.reconcile_stale_running_issue_runs_with_followups() == 2
+    assert _get_row(db_path, 2)[0] == "awaiting_issue_followup"
+    assert _get_row(db_path, 2)[4] == "small-job flow blocked: waiting for acceptance criteria"
+    assert _get_row(db_path, 3)[0] == "awaiting_issue_followup"
+    assert _get_row(db_path, 3)[4] == "implementation flow blocked: waiting on source issue context"
+    assert _get_row(db_path, 4)[0] == "running"
+
+
 def test_state_store_pr_status_history_and_pull_request_status_lookup(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
