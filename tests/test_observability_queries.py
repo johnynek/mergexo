@@ -124,6 +124,14 @@ def _seed_state(store: StateStore) -> None:
     store.mark_completed(
         11, "agent/design/11", 1111, "https://example/pr/1111", repo_full_name="o/repo-b"
     )
+    store.mark_awaiting_issue_followup(
+        issue_number=12,
+        flow="small_job",
+        branch="agent/small/12",
+        context_json='{"source":"issue_comment"}',
+        waiting_reason="waiting for reporter clarification",
+        repo_full_name="o/repo-b",
+    )
 
 
 def test_observability_queries_end_to_end(tmp_path: Path) -> None:
@@ -133,7 +141,7 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
 
     overview = oq.load_overview(db_path, window="24h")
     assert overview.active_agents == 1
-    assert overview.blocked_prs == 1
+    assert overview.blocked_prs == 2
     assert overview.tracked_prs == 1
     assert overview.failures == 1
     assert overview.mean_runtime_seconds > 0
@@ -146,9 +154,16 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert active_rows[0].elapsed_seconds >= 0
 
     tracked_rows = oq.load_tracked_and_blocked(db_path, limit=20)
-    assert [row.status for row in tracked_rows] == ["blocked", "awaiting_feedback"]
+    assert [row.status for row in tracked_rows] == [
+        "blocked",
+        "awaiting_issue_followup",
+        "awaiting_feedback",
+    ]
     assert tracked_rows[0].pending_event_count == 1
     assert tracked_rows[0].blocked_reason == "rewrite"
+    assert tracked_rows[1].pr_number is None
+    assert tracked_rows[1].issue_number == 12
+    assert tracked_rows[1].blocked_reason == "waiting for reporter clarification"
 
     issue_history = oq.load_issue_history(db_path, None, issue_number=2, limit=10)
     assert len(issue_history) == 1

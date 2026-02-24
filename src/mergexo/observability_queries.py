@@ -35,7 +35,7 @@ class ActiveAgentRow:
 @dataclass(frozen=True)
 class TrackedOrBlockedRow:
     repo_full_name: str
-    pr_number: int
+    pr_number: int | None
     issue_number: int
     status: str
     branch: str
@@ -96,6 +96,7 @@ def load_overview(
 ) -> OverviewStats:
     with _connect(db_path) as conn:
         repo_clause, repo_params = _repo_filter_sql(repo_filter)
+        issue_repo_clause, issue_repo_params = _repo_filter_sql(repo_filter, prefix="i")
         active_agents = _fetch_int(
             conn,
             f"""
@@ -109,12 +110,22 @@ def load_overview(
         blocked_prs = _fetch_int(
             conn,
             f"""
-            SELECT COUNT(*)
-            FROM pr_feedback_state
-            WHERE status = 'blocked'
-              {repo_clause}
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM pr_feedback_state
+                    WHERE status = 'blocked'
+                      {repo_clause}
+                )
+                +
+                (
+                    SELECT COUNT(*)
+                    FROM issue_runs AS i
+                    WHERE i.status = 'awaiting_issue_followup'
+                      {issue_repo_clause}
+                )
             """,
-            repo_params,
+            (*repo_params, *issue_repo_params),
         )
         tracked_prs = _fetch_int(
             conn,
@@ -213,52 +224,90 @@ def load_tracked_and_blocked(
     limit: int | None = None,
 ) -> tuple[TrackedOrBlockedRow, ...]:
     with _connect(db_path) as conn:
-        repo_clause, repo_params = _repo_filter_sql(repo_filter, prefix="p")
+        pr_repo_clause, pr_repo_params = _repo_filter_sql(repo_filter, prefix="p")
+        issue_repo_clause, issue_repo_params = _repo_filter_sql(repo_filter, prefix="i")
         limit_clause = ""
         params: tuple[object, ...]
         if limit is not None:
             if limit < 1:
                 raise ValueError("limit must be >= 1")
             limit_clause = "LIMIT ?"
-            params = (*repo_params, limit)
+            params = (*pr_repo_params, *issue_repo_params, limit)
         else:
-            params = repo_params
+            params = (*pr_repo_params, *issue_repo_params)
         rows = conn.execute(
             f"""
+            WITH tracked_work AS (
+                SELECT
+                    p.repo_full_name AS repo_full_name,
+                    p.pr_number AS pr_number,
+                    p.issue_number AS issue_number,
+                    p.status AS status,
+                    COALESCE(p.branch, '-') AS branch,
+                    p.last_seen_head_sha AS last_seen_head_sha,
+                    CASE WHEN p.status = 'blocked' THEN r.error ELSE NULL END AS blocked_reason,
+                    COUNT(e.event_key) AS pending_event_count,
+                    p.updated_at AS updated_at
+                FROM pr_feedback_state AS p
+                LEFT JOIN issue_runs AS r
+                    ON r.repo_full_name = p.repo_full_name
+                   AND r.issue_number = p.issue_number
+                LEFT JOIN feedback_events AS e
+                    ON e.repo_full_name = p.repo_full_name
+                   AND e.pr_number = p.pr_number
+                   AND e.processed_at IS NULL
+                WHERE p.status IN ('awaiting_feedback', 'blocked')
+                  {pr_repo_clause}
+                GROUP BY
+                    p.repo_full_name,
+                    p.pr_number,
+                    p.issue_number,
+                    p.status,
+                    p.branch,
+                    p.last_seen_head_sha,
+                    r.error,
+                    p.updated_at
+
+                UNION ALL
+
+                SELECT
+                    i.repo_full_name AS repo_full_name,
+                    NULL AS pr_number,
+                    i.issue_number AS issue_number,
+                    i.status AS status,
+                    COALESCE(i.branch, f.branch, '-') AS branch,
+                    NULL AS last_seen_head_sha,
+                    COALESCE(f.waiting_reason, i.error) AS blocked_reason,
+                    0 AS pending_event_count,
+                    i.updated_at AS updated_at
+                FROM issue_runs AS i
+                LEFT JOIN pre_pr_followup_state AS f
+                    ON f.repo_full_name = i.repo_full_name
+                   AND f.issue_number = i.issue_number
+                WHERE i.status = 'awaiting_issue_followup'
+                  {issue_repo_clause}
+            )
             SELECT
-                p.repo_full_name,
-                p.pr_number,
-                p.issue_number,
-                p.status,
-                p.branch,
-                p.last_seen_head_sha,
-                r.error,
-                COUNT(e.event_key) AS pending_event_count,
-                p.updated_at
-            FROM pr_feedback_state AS p
-            LEFT JOIN issue_runs AS r
-                ON r.repo_full_name = p.repo_full_name
-               AND r.issue_number = p.issue_number
-            LEFT JOIN feedback_events AS e
-                ON e.repo_full_name = p.repo_full_name
-               AND e.pr_number = p.pr_number
-               AND e.processed_at IS NULL
-            WHERE p.status IN ('awaiting_feedback', 'blocked')
-              {repo_clause}
-            GROUP BY
-                p.repo_full_name,
-                p.pr_number,
-                p.issue_number,
-                p.status,
-                p.branch,
-                p.last_seen_head_sha,
-                r.error,
-                p.updated_at
+                repo_full_name,
+                pr_number,
+                issue_number,
+                status,
+                branch,
+                last_seen_head_sha,
+                blocked_reason,
+                pending_event_count,
+                updated_at
+            FROM tracked_work
             ORDER BY
-                CASE p.status WHEN 'blocked' THEN 0 ELSE 1 END,
-                p.updated_at DESC,
-                p.repo_full_name ASC,
-                p.pr_number ASC
+                CASE status
+                    WHEN 'blocked' THEN 0
+                    WHEN 'awaiting_issue_followup' THEN 1
+                    ELSE 2
+                END,
+                updated_at DESC,
+                repo_full_name ASC,
+                issue_number ASC,
+                COALESCE(pr_number, 0) ASC
             {limit_clause}
             """,
             params,
@@ -266,7 +315,7 @@ def load_tracked_and_blocked(
     return tuple(
         TrackedOrBlockedRow(
             repo_full_name=_as_str(row[0], "repo_full_name"),
-            pr_number=_as_int(row[1], "pr_number"),
+            pr_number=_as_optional_int(row[1], "pr_number"),
             issue_number=_as_int(row[2], "issue_number"),
             status=_as_str(row[3], "status"),
             branch=_as_str(row[4], "branch"),

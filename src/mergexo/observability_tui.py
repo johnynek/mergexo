@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import webbrowser
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -25,6 +26,12 @@ from mergexo.observability_queries import (
 
 
 _WINDOW_OPTIONS: tuple[str, ...] = ("1h", "24h", "7d", "30d")
+_ACTIVE_COL_ISSUE = 2
+_ACTIVE_COL_PR = 3
+_ACTIVE_COL_BRANCH = 5
+_TRACKED_COL_PR = 1
+_TRACKED_COL_ISSUE = 2
+_TRACKED_COL_BRANCH = 4
 
 
 @dataclass(frozen=True)
@@ -84,7 +91,7 @@ class ObservabilityApp(App[None]):
             yield Static("", id="summary")
             yield Static("Active Agents", classes="panel-title")
             yield DataTable(id="active-table")
-            yield Static("Tracked And Blocked PRs", classes="panel-title")
+            yield Static("Tracked And Blocked Work", classes="panel-title")
             yield DataTable(id="tracked-table")
             yield Static("History", classes="panel-title")
             yield DataTable(id="history-table")
@@ -116,11 +123,22 @@ class ObservabilityApp(App[None]):
         if isinstance(focused, DataTable) and focused.id == "active-table":
             selected = self._active_row_selection()
             if selected is not None:
+                active_url = _url_for_active_row(selected, focused.cursor_column)
+                if active_url is not None:
+                    webbrowser.open(active_url)
+                    return
                 self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
         elif isinstance(focused, DataTable) and focused.id == "tracked-table":
             selected = self._tracked_row_selection()
             if selected is not None:
-                self._detail_target = _DetailTarget(kind="pr", number=selected.pr_number)
+                tracked_url = _url_for_tracked_row(selected, focused.cursor_column)
+                if tracked_url is not None:
+                    webbrowser.open(tracked_url)
+                    return
+                if selected.pr_number is None:
+                    self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
+                else:
+                    self._detail_target = _DetailTarget(kind="pr", number=selected.pr_number)
         if self._detail_target is not None:
             self._refresh_history_table()
 
@@ -168,7 +186,8 @@ class ObservabilityApp(App[None]):
     def _refresh_active_table(self) -> None:
         table = self.query_one("#active-table", DataTable)
         selected = self._active_row_selection()
-        previous_issue = selected.issue_number if selected is not None else None
+        previous_run_id = selected.run_id if selected is not None else None
+        previous_column = table.cursor_column if table.row_count > 0 else 0
         table.clear(columns=False)
         for row in self._active_rows:
             table.add_row(
@@ -181,17 +200,18 @@ class ObservabilityApp(App[None]):
                 row.started_at,
                 _render_seconds(row.elapsed_seconds),
             )
-        self._restore_active_selection(previous_issue)
+        self._restore_active_selection(previous_run_id, previous_column)
 
     def _refresh_tracked_table(self) -> None:
         table = self.query_one("#tracked-table", DataTable)
         selected = self._tracked_row_selection()
-        previous_pr = selected.pr_number if selected is not None else None
+        previous_key = _tracked_row_key(selected) if selected is not None else None
+        previous_column = table.cursor_column if table.row_count > 0 else 0
         table.clear(columns=False)
         for row in self._tracked_rows:
             table.add_row(
                 row.repo_full_name,
-                str(row.pr_number),
+                str(row.pr_number) if row.pr_number is not None else "",
                 str(row.issue_number),
                 row.status,
                 row.branch,
@@ -199,7 +219,7 @@ class ObservabilityApp(App[None]):
                 row.blocked_reason or "-",
                 row.updated_at,
             )
-        self._restore_tracked_selection(previous_pr)
+        self._restore_tracked_selection(previous_key, previous_column)
 
     def _refresh_metrics_table(self, metrics: MetricsStats) -> None:
         table = self.query_one("#metrics-table", DataTable)
@@ -265,29 +285,43 @@ class ObservabilityApp(App[None]):
             return None
         return self._tracked_rows[index]
 
-    def _restore_active_selection(self, previous_issue: int | None) -> None:
+    def _restore_active_selection(self, previous_run_id: str | None, previous_column: int) -> None:
         table = self.query_one("#active-table", DataTable)
         if table.row_count < 1:
             return
         row_index = 0
-        if previous_issue is not None:
+        if previous_run_id is not None:
             for idx, row in enumerate(self._active_rows):
-                if row.issue_number == previous_issue:
+                if row.run_id == previous_run_id:
                     row_index = idx
                     break
-        table.move_cursor(row=row_index, column=0, animate=False)
+        max_column = max(0, len(table.columns) - 1)
+        table.move_cursor(
+            row=row_index,
+            column=min(max(previous_column, 0), max_column),
+            animate=False,
+        )
 
-    def _restore_tracked_selection(self, previous_pr: int | None) -> None:
+    def _restore_tracked_selection(
+        self,
+        previous_key: tuple[str, int | None, int, str] | None,
+        previous_column: int,
+    ) -> None:
         table = self.query_one("#tracked-table", DataTable)
         if table.row_count < 1:
             return
         row_index = 0
-        if previous_pr is not None:
+        if previous_key is not None:
             for idx, row in enumerate(self._tracked_rows):
-                if row.pr_number == previous_pr:
+                if _tracked_row_key(row) == previous_key:
                     row_index = idx
                     break
-        table.move_cursor(row=row_index, column=0, animate=False)
+        max_column = max(0, len(table.columns) - 1)
+        table.move_cursor(
+            row=row_index,
+            column=min(max(previous_column, 0), max_column),
+            animate=False,
+        )
 
 
 def run_observability_tui(
@@ -349,7 +383,7 @@ def _summary_text(*, overview: OverviewStats, repo_filter: str | None, window: s
                 f"stddev={_render_seconds(overview.stddev_runtime_seconds)}",
             ]
         )
-        + "\nKeys: r refresh | f repo filter | w window | tab focus | enter details | q quit"
+        + "\nKeys: r refresh | f repo filter | w window | tab focus | enter open/details | q quit"
     )
 
 
@@ -384,3 +418,27 @@ def _render_seconds(value: float) -> str:
 
 def _render_ratio(value: float) -> str:
     return f"{value * 100.0:.1f}%"
+
+
+def _tracked_row_key(row: TrackedOrBlockedRow) -> tuple[str, int | None, int, str]:
+    return (row.repo_full_name, row.pr_number, row.issue_number, row.status)
+
+
+def _url_for_active_row(row: ActiveAgentRow, column: int) -> str | None:
+    if column == _ACTIVE_COL_ISSUE:
+        return f"https://github.com/{row.repo_full_name}/issues/{row.issue_number}"
+    if column == _ACTIVE_COL_PR and row.pr_number is not None:
+        return f"https://github.com/{row.repo_full_name}/pull/{row.pr_number}"
+    if column == _ACTIVE_COL_BRANCH and row.branch and row.branch != "-":
+        return f"https://github.com/{row.repo_full_name}/tree/{row.branch}"
+    return None
+
+
+def _url_for_tracked_row(row: TrackedOrBlockedRow, column: int) -> str | None:
+    if column == _TRACKED_COL_PR and row.pr_number is not None:
+        return f"https://github.com/{row.repo_full_name}/pull/{row.pr_number}"
+    if column == _TRACKED_COL_ISSUE:
+        return f"https://github.com/{row.repo_full_name}/issues/{row.issue_number}"
+    if column == _TRACKED_COL_BRANCH and row.branch and row.branch != "-":
+        return f"https://github.com/{row.repo_full_name}/tree/{row.branch}"
+    return None

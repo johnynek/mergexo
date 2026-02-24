@@ -4287,6 +4287,32 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
     assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
 
 
+def test_reap_finished_keeps_feedback_tracked_on_github_polling_error(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    polling_failure: Future[str] = Future()
+    polling_failure.set_exception(GitHubPollingError("GitHub polling GET failed for path /x: boom"))
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-poll", future=polling_failure)
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
+    assert state.run_finishes == [
+        (
+            "run-poll",
+            "failed",
+            "github_error",
+            "GitHub polling GET failed for path /x: boom",
+        )
+    ]
+
+
 def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")

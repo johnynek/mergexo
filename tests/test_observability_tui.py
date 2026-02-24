@@ -32,6 +32,54 @@ def test_observability_tui_helper_functions() -> None:
     assert tui._render_seconds(7200.0).endswith("h")
     assert tui._render_ratio(0.125) == "12.5%"
 
+    active = ActiveAgentRow(
+        run_id="run-1",
+        repo_full_name="o/repo-a",
+        run_kind="issue_flow",
+        issue_number=7,
+        pr_number=101,
+        flow="design_doc",
+        branch="agent/design/7",
+        started_at="2026-02-24T00:00:00.000Z",
+        elapsed_seconds=12.0,
+    )
+    tracked_pr = TrackedOrBlockedRow(
+        repo_full_name="o/repo-a",
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        branch="agent/design/7",
+        last_seen_head_sha="head",
+        blocked_reason="boom",
+        pending_event_count=1,
+        updated_at="2026-02-24T00:00:00.000Z",
+    )
+    tracked_issue = TrackedOrBlockedRow(
+        repo_full_name="o/repo-a",
+        pr_number=None,
+        issue_number=8,
+        status="awaiting_issue_followup",
+        branch="agent/small/8",
+        last_seen_head_sha=None,
+        blocked_reason="needs details",
+        pending_event_count=0,
+        updated_at="2026-02-24T00:00:00.000Z",
+    )
+
+    assert tui._url_for_active_row(active, 2) == "https://github.com/o/repo-a/issues/7"
+    assert tui._url_for_active_row(active, 3) == "https://github.com/o/repo-a/pull/101"
+    assert tui._url_for_active_row(active, 5) == "https://github.com/o/repo-a/tree/agent/design/7"
+    assert tui._url_for_active_row(active, 0) is None
+    assert tui._url_for_tracked_row(tracked_pr, 1) == "https://github.com/o/repo-a/pull/101"
+    assert tui._url_for_tracked_row(tracked_pr, 2) == "https://github.com/o/repo-a/issues/7"
+    assert (
+        tui._url_for_tracked_row(tracked_pr, 4) == "https://github.com/o/repo-a/tree/agent/design/7"
+    )
+    assert tui._url_for_tracked_row(tracked_issue, 1) is None
+    assert tui._url_for_tracked_row(tracked_issue, 2) == "https://github.com/o/repo-a/issues/8"
+    assert tui._tracked_row_key(tracked_pr) == ("o/repo-a", 101, 7, "blocked")
+    assert tui._tracked_row_key(tracked_issue) == ("o/repo-a", None, 8, "awaiting_issue_followup")
+
     summary = tui._summary_text(
         overview=OverviewStats(
             active_agents=1,
@@ -234,6 +282,8 @@ def test_observability_app_refresh_and_keybindings(
     monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: active_rows)
     monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: tracked_rows)
     monkeypatch.setattr(tui, "load_metrics", lambda *args, **kwargs: metrics)
+    opened_urls: list[str] = []
+    monkeypatch.setattr(tui.webbrowser, "open", lambda url: opened_urls.append(url))
 
     def fake_issue_history(*args, **kwargs):  # type: ignore[no-untyped-def]
         calls["issue_history"] += 1
@@ -267,9 +317,25 @@ def test_observability_app_refresh_and_keybindings(
             app.action_cycle_repo_filter()
             assert app._repo_filter == "o/repo-a"
             active.focus()
+            await _pilot.pause()
             active.move_cursor(row=0, column=0, animate=False)
             app.action_show_detail()
             assert calls["issue_history"] >= 1
+            active.move_cursor(row=0, column=2, animate=False)
+            issue_history_calls = calls["issue_history"]
+            app.action_show_detail()
+            assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
+            assert calls["issue_history"] == issue_history_calls
+            tracked.focus()
+            await _pilot.pause()
+            tracked.move_cursor(row=0, column=1, animate=False)
+            app.action_show_detail()
+            assert opened_urls[-1] == "https://github.com/o/repo-a/pull/101"
+            tracked.move_cursor(row=0, column=4, animate=False)
+            app.action_show_detail()
+            assert opened_urls[-1] == "https://github.com/o/repo-a/tree/agent/design/7"
+            app.action_refresh()
+            assert tracked.cursor_column == 4
             app._detail_target = tui._DetailTarget(kind="pr", number=101)
             app._refresh_history_table()
             assert calls["pr_history"] >= 1
@@ -280,8 +346,8 @@ def test_observability_app_refresh_and_keybindings(
             assert app._tracked_row_selection() is None
             active.clear(columns=False)
             tracked.clear(columns=False)
-            app._restore_active_selection(None)
-            app._restore_tracked_selection(None)
+            app._restore_active_selection(None, 0)
+            app._restore_tracked_selection(None, 0)
             app.action_cycle_focus()
             app.action_refresh()
 
@@ -322,4 +388,41 @@ def test_action_show_detail_uses_tracked_focus_branch(tmp_path: Path) -> None:
     assert app._detail_target is not None
     assert app._detail_target.kind == "pr"
     assert app._detail_target.number == 101
+    assert app.refreshed is True
+
+
+def test_action_show_detail_uses_issue_detail_for_tracked_row_without_pr(tmp_path: Path) -> None:
+    class FocusApp(tui.ObservabilityApp):
+        def __init__(self, *, db_path: Path) -> None:
+            super().__init__(
+                db_path=db_path, refresh_seconds=60, default_window="24h", row_limit=20
+            )
+            self._forced_focus = DataTable(id="tracked-table")
+            self.refreshed = False
+
+        @property
+        def focused(self):  # type: ignore[override]
+            return self._forced_focus
+
+        def _tracked_row_selection(self) -> TrackedOrBlockedRow | None:
+            return TrackedOrBlockedRow(
+                repo_full_name="o/repo-a",
+                pr_number=None,
+                issue_number=8,
+                status="awaiting_issue_followup",
+                branch="agent/small/8",
+                last_seen_head_sha=None,
+                blocked_reason="needs follow-up",
+                pending_event_count=0,
+                updated_at="now",
+            )
+
+        def _refresh_history_table(self) -> None:
+            self.refreshed = True
+
+    app = FocusApp(db_path=tmp_path / "state.db")
+    app.action_show_detail()
+    assert app._detail_target is not None
+    assert app._detail_target.kind == "issue"
+    assert app._detail_target.number == 8
     assert app.refreshed is True

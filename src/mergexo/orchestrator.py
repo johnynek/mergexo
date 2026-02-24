@@ -1644,6 +1644,33 @@ class Phase1Orchestrator:
                         pr_number=pr_number,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    if isinstance(exc, GitHubPollingError):
+                        # Polling errors are recoverable transport/API failures; keep PRs tracked
+                        # so the next poll retries feedback instead of requiring manual unblock.
+                        self._state.mark_pr_status(
+                            pr_number=pr_number,
+                            issue_number=handle.issue_number,
+                            status="awaiting_feedback",
+                            error=None,
+                            reason="github_polling_retry",
+                            detail=str(exc),
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_retry",
+                            issue_number=handle.issue_number,
+                            pr_number=pr_number,
+                            reason="github_polling_error",
+                        )
+                        self._state.finish_agent_run(
+                            run_id=handle.run_id,
+                            terminal_status="failed",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=str(exc),
+                        )
+                        continue
+
                     self._state.mark_pr_status(
                         pr_number=pr_number,
                         issue_number=handle.issue_number,
