@@ -33,8 +33,8 @@ _WINDOW_OPTIONS: tuple[str, ...] = ("1h", "24h", "7d", "30d")
 _ACTIVE_COL_ISSUE = 2
 _ACTIVE_COL_PR = 3
 _ACTIVE_COL_BRANCH = 5
-_TRACKED_COL_PR = 1
-_TRACKED_COL_ISSUE = 2
+_TRACKED_COL_ISSUE = 1
+_TRACKED_COL_PR = 2
 _TRACKED_COL_BRANCH = 4
 _BLOCKED_REASON_MAX_CHARS = 36
 
@@ -375,8 +375,8 @@ class ObservabilityApp(App[None]):
         active.add_columns("Repo", "Run", "Issue", "PR", "Flow", "Branch", "Started", "Elapsed")
         tracked.add_columns(
             "Repo",
-            "PR",
             "Issue",
+            "PR",
             "Status",
             "Branch",
             "Pending",
@@ -414,8 +414,8 @@ class ObservabilityApp(App[None]):
         for row in self._tracked_rows:
             table.add_row(
                 row.repo_full_name,
-                str(row.pr_number) if row.pr_number is not None else "",
                 str(row.issue_number),
+                str(row.pr_number) if row.pr_number is not None else "",
                 row.status,
                 row.branch,
                 str(row.pending_event_count),
@@ -662,11 +662,11 @@ def _tracked_sort_value(row: TrackedOrBlockedRow, column_index: int) -> str | in
     if column_index == 0:
         return row.repo_full_name.casefold()
     if column_index == 1:
+        return row.issue_number
+    if column_index == 2:
         if row.pr_number is None:
             return -1
         return row.pr_number
-    if column_index == 2:
-        return row.issue_number
     if column_index == 3:
         return row.status.casefold()
     if column_index == 4:
@@ -737,10 +737,10 @@ def _tracked_row_detail_fields(row: TrackedOrBlockedRow) -> tuple[_DetailField, 
     return (
         _DetailField("Repo", row.repo_full_name, repo_link),
         _DetailField("Repo URL", repo_link, repo_link),
-        _DetailField("PR", pr_value, pr_link),
         _DetailField(
             "Issue", str(row.issue_number), _issue_url(row.repo_full_name, row.issue_number)
         ),
+        _DetailField("PR", pr_value, pr_link),
         _DetailField("Status", row.status),
         _DetailField("Branch", branch_value, branch_link),
         _DetailField("Pending Events", str(row.pending_event_count)),
@@ -805,8 +805,8 @@ def _tracked_row_context(row: TrackedOrBlockedRow) -> str:
         [
             f"Repo: {row.repo_full_name}",
             f"Repo URL: {repo_url}",
-            f"PR: {row.pr_number if row.pr_number is not None else '-'}",
             f"Issue: {row.issue_number}",
+            f"PR: {row.pr_number if row.pr_number is not None else '-'}",
             f"Status: {row.status}",
             f"Branch: {row.branch}",
             f"Pending Events: {row.pending_event_count}",
