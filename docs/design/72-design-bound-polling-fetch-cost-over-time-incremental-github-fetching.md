@@ -26,36 +26,6 @@ _Issue: #72 (https://github.com/johnynek/mergexo/issues/72)_
 
 ## Summary
 
-Full design doc content for issue #72, including invariants, schema, incremental fetch algorithm, lifecycle semantics, migration, observability, tests, risks, rollout, and acceptance criteria.
-
----
-issue: 72
-priority: 1
-touch_paths:
-  - docs/design/72-design-bound-polling-fetch-cost-over-time-incremental-github-fetching.md
-  - src/mergexo/github_gateway.py
-  - src/mergexo/state.py
-  - src/mergexo/orchestrator.py
-  - src/mergexo/feedback_loop.py
-  - src/mergexo/config.py
-  - src/mergexo/cli.py
-  - mergexo.toml.example
-  - README.md
-  - tests/test_github_gateway.py
-  - tests/test_state.py
-  - tests/test_orchestrator.py
-  - tests/test_config.py
-depends_on: []
-estimated_size: L
-generated_at: 2026-02-24T00:00:00Z
----
-
-# Design: bound polling fetch cost over time (incremental GitHub fetching)
-
-_Issue: #72 (https://github.com/johnynek/mergexo/issues/72)_
-
-## Summary
-
 Make all GitHub comment polling incremental and cursor-driven so steady-state work scales with active monitored objects plus new or edited comments, not with lifetime comment history. The design covers feedback polling, source-issue routing, operator-command scans, and action-token reconciliation.
 
 ## Goals
@@ -72,6 +42,17 @@ Make all GitHub comment polling incremental and cursor-driven so steady-state wo
 2. Replacing deterministic event-key dedupe with a new feedback identity model.
 3. Redesigning Git history rewrite safeguards.
 4. Reprocessing old historical comments after a PR has been explicitly stopped.
+
+## Runtime mode compatibility (console + service + top)
+
+Main now supports `mergexo console`, which runs service polling and the observability TUI together in one process (`run_service` on a background thread plus TUI in the foreground), while `mergexo service` remains the supervisor-oriented non-interactive mode.
+
+Design implications for issue #72:
+
+1. Incremental GitHub polling remains owned by orchestrator/service paths only.
+2. TUI (`top` or console-integrated) remains sqlite read-only and must not trigger GitHub fetch paths.
+3. `console` mode should produce the same bounded fetch profile as `service` mode for the same tracked workload.
+4. No algorithm change is needed for the incremental cursor model; rollout and tests must validate both runtime modes.
 
 ## Target invariants
 
@@ -388,13 +369,20 @@ SLO targets:
 7. Closed/merged terminal behavior unchanged.
 8. Reopened PR behavior matches explicit policy.
 
-### 4. Property or invariant tests
+### 4. Runtime-mode integration tests
+
+1. In `service` mode, verify bounded polling behavior and cursor advancement under steady-state load.
+2. In `console` mode (service + TUI together), verify bounded polling behavior is identical to `service` mode for the same tracked workload.
+3. Verify TUI refresh activity does not increase GitHub API call volume.
+4. Verify graceful console shutdown does not regress cursor durability or event-ingestion correctness.
+
+### 5. Property or invariant tests
 
 1. Generate random streams of comment creates/edits with random page boundaries.
 2. Assert that final ingested event-key set equals reference full-scan event-key set.
 3. Assert no duplicate processing side effects for identical input streams.
 
-### 5. Long-thread scenarios
+### 6. Long-thread scenarios
 
 1. PR with 100 comments, 1000 comments, and 10000 comments.
 2. Verify steady-state polling cost remains flat after bootstrap.
@@ -412,14 +400,17 @@ SLO targets:
    Mitigation: gateway-level contract tests per endpoint and fallback feature flag.
 5. Risk: reopened PR expectations differ across teams.
    Mitigation: explicit README policy and optional explicit resume command.
+6. Risk: concurrent TUI reads in `console` mode hide or distort polling regressions.
+   Mitigation: include per-surface API-call metrics and canary assertions in both `service` and `console` modes.
 
 ## Rollout notes
 
 1. Start with feature flag off in production.
 2. Enable on one repository and run for at least one week.
 3. During canary, sample-compare incremental event ingestion against legacy full-scan in shadow mode for tracked PRs.
-4. Promote to all repos only after bounded-growth metrics and correctness checks pass.
-5. Keep fallback to legacy mode for one release after global enable.
+4. Run canary validation in both runtime entrypoints: `mergexo service` and `mergexo console`.
+5. Promote to all repos only after bounded-growth metrics and correctness checks pass in both modes.
+6. Keep fallback to legacy mode for one release after global enable.
 
 ## Acceptance criteria
 
@@ -433,5 +424,6 @@ SLO targets:
 8. Test plan covers boundary cases, edits, long threads, outage recovery, and reopened PR semantics.
 9. Empirical success metric: with a PR containing at least 1000 historical comments and no new activity, steady-state fetched comment count per poll remains constant over time and independent of total history size.
 10. Empirical success metric: for N active tracked PRs and M blocked/operator issue threads, API calls per poll remain linear in N+M plus pages for newly changed comments only.
-11. No regression to feedback correctness is introduced in canary validation.
-12. README/operator docs are updated for any behavior changes introduced by this design.
+11. The above growth metrics hold in both `mergexo service` and `mergexo console` modes.
+12. No regression to feedback correctness is introduced in canary validation.
+13. README/operator docs are updated for any behavior changes introduced by this design.
