@@ -96,6 +96,7 @@ class LegacyFailedIssueRunState:
 
 
 @dataclass(frozen=True)
+# TODO remove migration after updates
 class LegacyRunningIssueRunState:
     issue_number: int
     branch: str | None
@@ -566,6 +567,7 @@ class StateStore:
     def list_legacy_running_issue_runs_without_pr(
         self, *, repo_full_name: str | None = None
     ) -> tuple[LegacyRunningIssueRunState, ...]:
+        # TODO remove migration after updates
         repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
         with self._lock, self._connect() as conn:
             if repo_key is None:

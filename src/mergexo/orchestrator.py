@@ -281,6 +281,7 @@ class Phase1Orchestrator:
             enqueue_allowed = allow_enqueue and not restart_pending
 
             if enqueue_allowed:
+                # TODO remove migration after updates
                 if not self._run_poll_step(
                     step_name="repair_stale_running_runs",
                     fn=self._repair_stale_running_runs,
@@ -823,6 +824,7 @@ class Phase1Orchestrator:
                 reason="legacy_failed_run_adopted",
             )
 
+    # TODO remove migration after updates
     def _repair_failed_no_staged_change_runs(self) -> None:
         failed_runs = self._state.list_legacy_failed_issue_runs_without_pr(
             repo_full_name=self._state_repo_full_name()
@@ -835,6 +837,7 @@ class Phase1Orchestrator:
                 continue
             self._recover_missing_pr_branch(issue_number=failed.issue_number, branch=branch)
 
+    # TODO remove migration after updates
     def _repair_stale_running_runs(self) -> None:
         running_runs = self._state.list_legacy_running_issue_runs_without_pr(
             repo_full_name=self._state_repo_full_name()
@@ -849,6 +852,7 @@ class Phase1Orchestrator:
                 continue
             self._recover_missing_pr_branch(issue_number=running.issue_number, branch=branch)
 
+    # TODO remove migration after updates
     def _recover_missing_pr_branch(self, *, issue_number: int, branch: str) -> None:
         issue = self._github.get_issue(issue_number)
         if not self._is_issue_author_allowed(
