@@ -2754,7 +2754,7 @@ def test_poll_once_respects_allow_enqueue_and_restart_pending(
 
     monkeypatch.setattr(orch, "_is_restart_pending", lambda: True)
     orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
-    assert calls == {"scan": 2, "new": 0, "impl": 0, "feedback": 0}
+    assert calls == {"scan": 1, "new": 0, "impl": 0, "feedback": 0}
 
 
 def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

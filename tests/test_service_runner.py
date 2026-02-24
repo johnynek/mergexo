@@ -609,6 +609,7 @@ def test_service_runner_restart_drain_waits_for_other_repo_pending_work(
     runner.run(once=False)
     assert restart_calls == ["77:22:2026-02-22T13:07:00Z"]
     assert [repo for repo, _ in poll_calls] == [cfg.repos[0].full_name, cfg.repos[1].full_name]
+    assert [allow_enqueue for _, allow_enqueue in poll_calls] == [False, False]
     assert sleep_calls == [cfg.runtime.poll_interval_seconds]
 
 

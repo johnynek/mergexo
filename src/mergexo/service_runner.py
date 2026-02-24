@@ -114,6 +114,10 @@ class ServiceRunner:
             restart_drain_started_at_monotonic: float | None = None
             while True:
                 repo, _, _ = runtimes[poll_index]
+                # When restart is pending we disable enqueue for every repo. We still call
+                # poll_once so each orchestrator can reap finished futures and checkpoint
+                # worker terminal state. That gives us a drain loop with no new GitHub work
+                # ingestion while preserving state consistency before supervisor re-exec.
                 self._poll_repo_once(
                     repo=repo,
                     orchestrator=orchestrators[poll_index],
@@ -180,6 +184,11 @@ class ServiceRunner:
 
         with logging_repo_context(operation.request_repo_full_name):
             pending_futures = self._total_pending_futures(orchestrators)
+            # Each orchestrator poll reaps finished futures and writes terminal worker state
+            # into sqlite. During this drain phase, operator command scans and work enqueue are
+            # already paused by restart-pending gates in the orchestrators, so we are not
+            # consuming new messages. Waiting for this global count to reach zero gives us a
+            # safe restart boundary with no in-flight worker state left uncheckpointed.
             now = time.monotonic()
             if restart_drain_started_at_monotonic is None:
                 restart_drain_started_at_monotonic = now
