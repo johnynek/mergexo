@@ -91,8 +91,8 @@ def test_prepare_branch_push_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pa
     def fake_run(cmd: list[str], **kwargs: object) -> str:
         _ = kwargs
         calls.append(cmd)
-        if cmd[-3:] == ["--verify", "--quiet", "refs/remotes/origin/feature"]:
-            raise CommandError("missing remote branch")
+        if cmd[-2:] == ["--verify", "refs/remotes/origin/feature"]:
+            return ""
         if cmd[-3:] == ["diff", "--cached", "--name-only"]:
             return "file.py\n"
         return ""
@@ -120,8 +120,8 @@ def test_git_ops_emits_action_logs(
 
     def fake_run(cmd: list[str], **kwargs: object) -> str:
         _ = kwargs
-        if cmd[-3:] == ["--verify", "--quiet", "refs/remotes/origin/feature"]:
-            raise CommandError("missing remote branch")
+        if cmd[-2:] == ["--verify", "refs/remotes/origin/feature"]:
+            return ""
         if cmd[-3:] == ["diff", "--cached", "--name-only"]:
             return "file.py\n"
         if cmd[-2:] == ["rev-parse", "HEAD"]:
@@ -182,6 +182,8 @@ def test_create_or_reset_branch_tracks_existing_remote_branch(
     def fake_run(cmd: list[str], **kwargs: object) -> str:
         _ = kwargs
         calls.append(cmd)
+        if cmd[-2:] == ["--verify", "refs/remotes/origin/feature"]:
+            return "abc123 refs/remotes/origin/feature\n"
         return ""
 
     monkeypatch.setattr("mergexo.git_ops.run", fake_run)
@@ -195,7 +197,6 @@ def test_create_or_reset_branch_tracks_existing_remote_branch(
             str(checkout),
             "show-ref",
             "--verify",
-            "--quiet",
             "refs/remotes/origin/feature",
         ],
         ["git", "-C", str(checkout), "checkout", "-B", "feature", "origin/feature"],

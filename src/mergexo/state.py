@@ -95,6 +95,15 @@ class LegacyFailedIssueRunState:
     repo_full_name: str = ""
 
 
+@dataclass(frozen=True)
+# TODO remove migration after updates
+class LegacyRunningIssueRunState:
+    issue_number: int
+    branch: str | None
+    updated_at: str
+    repo_full_name: str = ""
+
+
 class StateStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -553,6 +562,52 @@ class StateStore:
                 error=str(error) if isinstance(error, str) else None,
             )
             for row_repo_full_name, issue_number, branch, error in rows
+        )
+
+    def list_legacy_running_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[LegacyRunningIssueRunState, ...]:
+        # TODO remove migration after updates
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        r.repo_full_name,
+                        r.issue_number,
+                        r.branch,
+                        r.updated_at
+                    FROM issue_runs AS r
+                    WHERE r.status = 'running'
+                      AND r.pr_number IS NULL
+                    ORDER BY r.updated_at ASC, r.repo_full_name ASC, r.issue_number ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        r.repo_full_name,
+                        r.issue_number,
+                        r.branch,
+                        r.updated_at
+                    FROM issue_runs AS r
+                    WHERE r.status = 'running'
+                      AND r.pr_number IS NULL
+                      AND r.repo_full_name = ?
+                    ORDER BY r.updated_at ASC, r.issue_number ASC
+                    """,
+                    (repo_key,),
+                ).fetchall()
+        return tuple(
+            LegacyRunningIssueRunState(
+                repo_full_name=str(row_repo_full_name),
+                issue_number=int(issue_number),
+                branch=str(branch) if isinstance(branch, str) else None,
+                updated_at=str(updated_at),
+            )
+            for row_repo_full_name, issue_number, branch, updated_at in rows
         )
 
     def get_issue_comment_cursor(

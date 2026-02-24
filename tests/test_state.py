@@ -192,6 +192,27 @@ def test_list_legacy_failed_issue_runs_without_pr_filters_rows(tmp_path: Path) -
     assert "flow blocked" in (legacy[0].error or "")
 
 
+def test_list_legacy_running_issue_runs_without_pr_filters_rows(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+
+    store.mark_awaiting_issue_followup(
+        issue_number=1,
+        flow="design_doc",
+        branch="agent/design/1-foo",
+        context_json='{"flow":"design_doc"}',
+        waiting_reason="temporary",
+    )
+    store.mark_running(1)
+
+    store.mark_completed(2, "agent/design/2-bar", 101, "https://example/pr/101")
+    store.mark_running(2)
+
+    running = store.list_legacy_running_issue_runs_without_pr()
+    assert len(running) == 1
+    assert running[0].issue_number == 1
+    assert running[0].branch == "agent/design/1-foo"
+
+
 def test_mark_pr_status_updates_run_and_tracking_rows(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
