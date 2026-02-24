@@ -1840,11 +1840,7 @@ class Phase1Orchestrator:
             title=f"Design doc for #{issue.number}: {generated.title}",
             head=branch,
             base=self._repo.default_branch,
-            body=(
-                f"Design doc for issue #{issue.number}.\n\n"
-                f"Refs #{issue.number}\n\n"
-                f"Source issue: {issue.html_url}"
-            ),
+            body=(f"Design doc for issue #{issue.number}.\n\nRefs #{issue.number}"),
         )
 
         self._github.post_issue_comment(
@@ -1940,11 +1936,7 @@ class Phase1Orchestrator:
             title=start_result.pr_title,
             head=branch,
             base=self._repo.default_branch,
-            body=(
-                f"{start_result.pr_summary}\n\n"
-                f"Fixes #{issue.number}\n\n"
-                f"Source issue: {issue.html_url}"
-            ),
+            body=(f"{start_result.pr_summary}\n\nFixes #{issue.number}"),
         )
 
         self._github.post_issue_comment(
@@ -2088,8 +2080,7 @@ class Phase1Orchestrator:
                     f"{start_result.pr_summary}\n\n"
                     f"Fixes #{issue.number}\n\n"
                     f"Implements design doc: [{design_relpath}]({design_doc_url})\n\n"
-                    f"{design_pr_line}"
-                    f"Source issue: {issue.html_url}"
+                    + design_pr_line.rstrip()
                 ),
             )
 
@@ -4012,15 +4003,10 @@ def _is_no_staged_changes_error_text(error: str) -> bool:
 
 def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, str, str]:
     flow = _flow_label_from_branch(branch)
-    source_line = f"Source issue: {issue.html_url}"
     if flow == "design":
         return (
             f"Design doc for #{issue.number}: {issue.title}",
-            (
-                "Recovered design PR from a previously pushed branch.\n\n"
-                f"Refs #{issue.number}\n\n"
-                f"{source_line}"
-            ),
+            (f"Recovered design PR from a previously pushed branch.\n\nRefs #{issue.number}"),
             flow,
         )
     if flow == "implementation":
@@ -4028,28 +4014,19 @@ def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, s
             f"Implementation for #{issue.number}: {issue.title}",
             (
                 "Recovered implementation PR from a previously pushed branch.\n\n"
-                f"Fixes #{issue.number}\n\n"
-                f"{source_line}"
+                f"Fixes #{issue.number}"
             ),
             flow,
         )
     if flow == "bugfix":
         return (
             f"Bugfix for #{issue.number}: {issue.title}",
-            (
-                "Recovered bugfix PR from a previously pushed branch.\n\n"
-                f"Fixes #{issue.number}\n\n"
-                f"{source_line}"
-            ),
+            (f"Recovered bugfix PR from a previously pushed branch.\n\nFixes #{issue.number}"),
             flow,
         )
     return (
         issue.title,
-        (
-            "Recovered small-job PR from a previously pushed branch.\n\n"
-            f"Fixes #{issue.number}\n\n"
-            f"{source_line}"
-        ),
+        (f"Recovered small-job PR from a previously pushed branch.\n\nFixes #{issue.number}"),
         flow,
     )
 
