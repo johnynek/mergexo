@@ -6,8 +6,9 @@ import logging
 import os
 from pathlib import Path
 import sys
+from threading import Event
 import time
-from typing import cast
+from typing import Callable, Literal, cast
 
 from mergexo.agent_adapter import AgentAdapter
 from mergexo.config import AppConfig, RepoConfig
@@ -38,6 +39,21 @@ _RESTART_OPERATION_NAME = "restart"
 _RESTART_PENDING_STATUSES = {"pending", "running"}
 
 
+ServiceSignalKind = Literal[
+    "poll_completed",
+    "work_reaped",
+    "restart_drain_state_changed",
+    "fatal_error",
+]
+
+
+@dataclass(frozen=True)
+class ServiceSignal:
+    kind: ServiceSignalKind
+    repo_full_name: str | None = None
+    detail: str | None = None
+
+
 @dataclass(frozen=True)
 class ServiceRunner:
     config: AppConfig
@@ -48,94 +64,127 @@ class ServiceRunner:
     github: GitHubGateway | None = None
     git_manager: GitRepoManager | None = None
     repo_runtimes: tuple[tuple[RepoConfig, GitHubGateway, GitRepoManager], ...] = ()
+    stop_event: Event | None = None
+    signal_sink: Callable[[ServiceSignal], None] | None = None
 
     def run(self, *, once: bool) -> None:
-        runtimes = self._effective_repo_runtimes()
-        repo_count = len(runtimes)
-        if repo_count < 1:
-            raise RuntimeError("No repositories configured for service runner")
-        github_by_repo_full_name = {repo.full_name: github for repo, github, _ in runtimes}
-        work_limiter = GlobalWorkLimiter(self.config.runtime.worker_count)
-        orchestrators = tuple(
-            Phase1Orchestrator(
-                self.config,
-                state=self.state,
-                github=github,
-                git_manager=git_manager,
-                repo=repo,
-                github_by_repo_full_name=github_by_repo_full_name,
-                agent=self._agent_for_repo(repo),
-                allow_runtime_restart=True,
-                work_limiter=work_limiter,
+        try:
+            runtimes = self._effective_repo_runtimes()
+            repo_count = len(runtimes)
+            if repo_count < 1:
+                raise RuntimeError("No repositories configured for service runner")
+            github_by_repo_full_name = {repo.full_name: github for repo, github, _ in runtimes}
+            work_limiter = GlobalWorkLimiter(self.config.runtime.worker_count)
+            orchestrators = tuple(
+                Phase1Orchestrator(
+                    self.config,
+                    state=self.state,
+                    github=github,
+                    git_manager=git_manager,
+                    repo=repo,
+                    github_by_repo_full_name=github_by_repo_full_name,
+                    agent=self._agent_for_repo(repo),
+                    allow_runtime_restart=True,
+                    work_limiter=work_limiter,
+                )
+                for repo, github, git_manager in runtimes
             )
-            for repo, github, git_manager in runtimes
-        )
 
-        with ThreadPoolExecutor(max_workers=self.config.runtime.worker_count) as pool:
-            if once:
-                for index, (repo, _, _) in enumerate(runtimes):
-                    self._poll_repo_once(
-                        repo=repo,
-                        orchestrator=orchestrators[index],
-                        pool=pool,
-                        work_limiter=work_limiter,
-                        allow_enqueue=True,
-                    )
-                if (
-                    self._total_pending_futures(orchestrators) == 0
-                    and not self._restart_operation_is_pending()
-                ):
-                    return
-
-                restart_drain_started_at_monotonic: float | None = None
-                while True:
+            with ThreadPoolExecutor(max_workers=self.config.runtime.worker_count) as pool:
+                if once:
                     for index, (repo, _, _) in enumerate(runtimes):
+                        if self._should_stop():
+                            return
                         self._poll_repo_once(
                             repo=repo,
                             orchestrator=orchestrators[index],
                             pool=pool,
                             work_limiter=work_limiter,
-                            allow_enqueue=False,
+                            allow_enqueue=True,
                         )
+                    if (
+                        self._total_pending_futures(orchestrators) == 0
+                        and not self._restart_operation_is_pending()
+                    ):
+                        return
+
+                    restart_drain_started_at_monotonic: float | None = None
+                    while True:
+                        if self._should_stop():
+                            return
+                        for index, (repo, _, _) in enumerate(runtimes):
+                            if self._should_stop():
+                                return
+                            self._poll_repo_once(
+                                repo=repo,
+                                orchestrator=orchestrators[index],
+                                pool=pool,
+                                work_limiter=work_limiter,
+                                allow_enqueue=False,
+                            )
+                        restart_drain_started_at_monotonic, should_exit = (
+                            self._process_global_restart_drain(
+                                orchestrators=orchestrators,
+                                restart_drain_started_at_monotonic=restart_drain_started_at_monotonic,
+                                exit_after_terminal=True,
+                            )
+                        )
+                        if should_exit:
+                            return
+                        if self._total_pending_futures(orchestrators) == 0:
+                            return
+                        if self._wait_for_stop(0.1):
+                            return
+
+                poll_index = 0
+                restart_drain_started_at_monotonic: float | None = None
+                while True:
+                    if self._should_stop():
+                        return
+                    repo, _, _ = runtimes[poll_index]
+                    # When restart is pending we disable enqueue for every repo. We still call
+                    # poll_once so each orchestrator can reap finished futures and checkpoint
+                    # worker terminal state. That gives us a drain loop with no new GitHub work
+                    # ingestion while preserving state consistency before supervisor re-exec.
+                    self._poll_repo_once(
+                        repo=repo,
+                        orchestrator=orchestrators[poll_index],
+                        pool=pool,
+                        work_limiter=work_limiter,
+                        allow_enqueue=not self._restart_operation_is_pending(),
+                    )
                     restart_drain_started_at_monotonic, should_exit = (
                         self._process_global_restart_drain(
                             orchestrators=orchestrators,
                             restart_drain_started_at_monotonic=restart_drain_started_at_monotonic,
-                            exit_after_terminal=True,
+                            exit_after_terminal=False,
                         )
                     )
                     if should_exit:
                         return
-                    if self._total_pending_futures(orchestrators) == 0:
+                    poll_index = (poll_index + 1) % repo_count
+                    if self._wait_for_stop(self.config.runtime.poll_interval_seconds):
                         return
-                    time.sleep(0.1)
+        except Exception as exc:
+            self._emit_signal(ServiceSignal(kind="fatal_error", detail=str(exc)))
+            raise
 
-            poll_index = 0
-            restart_drain_started_at_monotonic: float | None = None
-            while True:
-                repo, _, _ = runtimes[poll_index]
-                # When restart is pending we disable enqueue for every repo. We still call
-                # poll_once so each orchestrator can reap finished futures and checkpoint
-                # worker terminal state. That gives us a drain loop with no new GitHub work
-                # ingestion while preserving state consistency before supervisor re-exec.
-                self._poll_repo_once(
-                    repo=repo,
-                    orchestrator=orchestrators[poll_index],
-                    pool=pool,
-                    work_limiter=work_limiter,
-                    allow_enqueue=not self._restart_operation_is_pending(),
-                )
-                restart_drain_started_at_monotonic, should_exit = (
-                    self._process_global_restart_drain(
-                        orchestrators=orchestrators,
-                        restart_drain_started_at_monotonic=restart_drain_started_at_monotonic,
-                        exit_after_terminal=False,
-                    )
-                )
-                if should_exit:
-                    return
-                poll_index = (poll_index + 1) % repo_count
-                time.sleep(self.config.runtime.poll_interval_seconds)
+    def _wait_for_stop(self, timeout_seconds: float) -> bool:
+        if self.stop_event is None:
+            time.sleep(timeout_seconds)
+            return False
+        return self.stop_event.wait(timeout_seconds)
+
+    def _should_stop(self) -> bool:
+        return self.stop_event.is_set() if self.stop_event is not None else False
+
+    def _emit_signal(self, signal: ServiceSignal) -> None:
+        if self.signal_sink is None:
+            return
+        try:
+            self.signal_sink(signal)
+        except Exception:
+            LOGGER.exception("service_signal_sink_failed")
 
     def _poll_repo_once(
         self,
@@ -147,7 +196,9 @@ class ServiceRunner:
         allow_enqueue: bool,
     ) -> None:
         with logging_repo_context(repo.full_name):
+            pending_before = orchestrator.pending_work_count()
             orchestrator.poll_once(pool, allow_enqueue=allow_enqueue)
+            pending_after = orchestrator.pending_work_count()
             running_issue_count, running_feedback_count = orchestrator.queue_counts()
             log_event(
                 LOGGER,
@@ -161,8 +212,11 @@ class ServiceRunner:
                 LOGGER,
                 "service_global_capacity",
                 in_flight=work_limiter.in_flight(),
-                repo_pending_future_count=orchestrator.pending_work_count(),
+                repo_pending_future_count=pending_after,
             )
+            self._emit_signal(ServiceSignal(kind="poll_completed", repo_full_name=repo.full_name))
+            if pending_after < pending_before:
+                self._emit_signal(ServiceSignal(kind="work_reaped", repo_full_name=repo.full_name))
 
     def _total_pending_futures(self, orchestrators: tuple[Phase1Orchestrator, ...]) -> int:
         return sum(orchestrator.pending_work_count() for orchestrator in orchestrators)
@@ -192,6 +246,13 @@ class ServiceRunner:
             now = time.monotonic()
             if restart_drain_started_at_monotonic is None:
                 restart_drain_started_at_monotonic = now
+                self._emit_signal(
+                    ServiceSignal(
+                        kind="restart_drain_state_changed",
+                        repo_full_name=operation.request_repo_full_name,
+                        detail="started",
+                    )
+                )
                 log_event(
                     LOGGER,
                     "service_restart_drain_started",
@@ -201,6 +262,13 @@ class ServiceRunner:
                 )
 
             if pending_futures == 0:
+                self._emit_signal(
+                    ServiceSignal(
+                        kind="restart_drain_state_changed",
+                        repo_full_name=operation.request_repo_full_name,
+                        detail="completed",
+                    )
+                )
                 self.state.set_runtime_operation_status(
                     op_name=_RESTART_OPERATION_NAME,
                     status="running",
@@ -227,6 +295,13 @@ class ServiceRunner:
             elapsed = now - restart_drain_started_at_monotonic
             drain_timeout = self.config.runtime.restart_drain_timeout_seconds
             if elapsed >= drain_timeout:
+                self._emit_signal(
+                    ServiceSignal(
+                        kind="restart_drain_state_changed",
+                        repo_full_name=operation.request_repo_full_name,
+                        detail="failed",
+                    )
+                )
                 detail = (
                     f"Restart drain timed out after {drain_timeout} seconds with "
                     f"{pending_futures} pending future(s)."
@@ -470,6 +545,8 @@ def run_service(
     git_manager: GitRepoManager | None = None,
     repo_runtimes: tuple[tuple[RepoConfig, GitHubGateway, GitRepoManager], ...] | None = None,
     startup_argv: tuple[str, ...] | None = None,
+    stop_event: Event | None = None,
+    signal_sink: Callable[[ServiceSignal], None] | None = None,
 ) -> None:
     argv = startup_argv or tuple(sys.argv)
     runner = ServiceRunner(
@@ -481,5 +558,7 @@ def run_service(
         github=github,
         git_manager=git_manager,
         repo_runtimes=repo_runtimes or (),
+        stop_event=stop_event,
+        signal_sink=signal_sink,
     )
     runner.run(once=once)

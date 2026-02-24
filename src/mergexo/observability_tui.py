@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import platform
+from queue import Empty, SimpleQueue
 import subprocess
-from typing import Any
+import time
+from typing import Any, Callable
 import webbrowser
 
 from textual.app import App, ComposeResult
@@ -27,6 +29,7 @@ from mergexo.observability_queries import (
     load_pr_history,
     load_tracked_and_blocked,
 )
+from mergexo.service_runner import ServiceSignal
 
 
 _WINDOW_OPTIONS: tuple[str, ...] = ("1h", "24h", "7d", "30d")
@@ -37,6 +40,8 @@ _TRACKED_COL_PR = 1
 _TRACKED_COL_ISSUE = 2
 _TRACKED_COL_BRANCH = 4
 _BLOCKED_REASON_MAX_CHARS = 36
+_SERVICE_SIGNAL_DRAIN_SECONDS = 0.2
+_SERVICE_SIGNAL_REFRESH_DEBOUNCE_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -208,6 +213,8 @@ class ObservabilityApp(App[None]):
         refresh_seconds: int = 2,
         default_window: str = "24h",
         row_limit: int | None = 200,
+        service_signal_queue: SimpleQueue[ServiceSignal] | None = None,
+        on_shutdown: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._db_path = db_path
@@ -220,6 +227,12 @@ class ObservabilityApp(App[None]):
         self._tracked_rows: tuple[TrackedOrBlockedRow, ...] = ()
         self._tracked_sort_stack: tuple[_TrackedSortKey, ...] = ()
         self._detail_target: _DetailTarget | None = None
+        self._service_signal_queue = service_signal_queue
+        self._on_shutdown = on_shutdown
+        self._shutdown_notified = False
+        self._signal_refresh_pending = False
+        self._last_refresh_at_monotonic = 0.0
+        self._fatal_service_error: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -239,6 +252,12 @@ class ObservabilityApp(App[None]):
         self._init_tables()
         self.refresh_data()
         self.set_interval(self._refresh_seconds, self.refresh_data)
+        if self._service_signal_queue is not None:
+            self.set_interval(_SERVICE_SIGNAL_DRAIN_SECONDS, self._drain_service_signals)
+
+    @property
+    def fatal_service_error(self) -> str | None:
+        return self._fatal_service_error
 
     def action_refresh(self) -> None:
         self.refresh_data()
@@ -253,6 +272,10 @@ class ObservabilityApp(App[None]):
 
     def action_cycle_focus(self) -> None:
         self.screen.focus_next()
+
+    async def action_quit(self) -> None:
+        self._notify_shutdown()
+        await super().action_quit()
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
         if event.data_table.id != "tracked-table":
@@ -366,6 +389,56 @@ class ObservabilityApp(App[None]):
         self._refresh_tracked_table()
         self._refresh_metrics_table(metrics)
         self._refresh_history_table()
+        self._last_refresh_at_monotonic = time.monotonic()
+        self._signal_refresh_pending = False
+
+    def _drain_service_signals(self) -> None:
+        if self._service_signal_queue is None:
+            return
+
+        requested_refresh = False
+        while True:
+            try:
+                signal = self._service_signal_queue.get_nowait()
+            except Empty:
+                break
+
+            if signal.kind == "fatal_error":
+                detail = signal.detail or "Service runner failed."
+                if self._fatal_service_error is None:
+                    self._fatal_service_error = detail
+                self._notify_shutdown()
+                self.exit()
+                return
+            requested_refresh = True
+
+        if requested_refresh:
+            self._request_refresh_from_signal()
+            return
+        self._maybe_refresh_from_pending_signal()
+
+    def _request_refresh_from_signal(self) -> None:
+        elapsed_seconds = time.monotonic() - self._last_refresh_at_monotonic
+        if elapsed_seconds >= _SERVICE_SIGNAL_REFRESH_DEBOUNCE_SECONDS:
+            self.refresh_data()
+            return
+        self._signal_refresh_pending = True
+
+    def _maybe_refresh_from_pending_signal(self) -> None:
+        if not self._signal_refresh_pending:
+            return
+        elapsed_seconds = time.monotonic() - self._last_refresh_at_monotonic
+        if elapsed_seconds < _SERVICE_SIGNAL_REFRESH_DEBOUNCE_SECONDS:
+            return
+        self.refresh_data()
+
+    def _notify_shutdown(self) -> None:
+        if self._shutdown_notified:
+            return
+        self._shutdown_notified = True
+        if self._on_shutdown is None:
+            return
+        self._on_shutdown()
 
     def _init_tables(self) -> None:
         active = self._base_table("#active-table")
@@ -533,14 +606,20 @@ def run_observability_tui(
     refresh_seconds: int,
     default_window: str,
     row_limit: int | None,
+    service_signal_queue: SimpleQueue[ServiceSignal] | None = None,
+    on_shutdown: Callable[[], None] | None = None,
 ) -> None:
     app = ObservabilityApp(
         db_path=db_path,
         refresh_seconds=refresh_seconds,
         default_window=default_window,
         row_limit=row_limit,
+        service_signal_queue=service_signal_queue,
+        on_shutdown=on_shutdown,
     )
     app.run()
+    if app.fatal_service_error is not None:
+        raise RuntimeError(app.fatal_service_error)
 
 
 def _fill_issue_history(table: DataTable, rows: tuple[IssueHistoryRow, ...]) -> None:

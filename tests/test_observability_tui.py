@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from queue import SimpleQueue
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from mergexo.observability_queries import (
     RuntimeMetric,
     TrackedOrBlockedRow,
 )
+from mergexo.service_runner import ServiceSignal
 
 
 def test_observability_tui_helper_functions() -> None:
@@ -267,6 +269,7 @@ def test_run_observability_tui_runs_app(monkeypatch: pytest.MonkeyPatch, tmp_pat
     class FakeApp:
         def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
             called["kwargs"] = kwargs
+            self.fatal_service_error: str | None = None
 
         def run(self) -> None:
             called["ran"] = True
@@ -284,6 +287,204 @@ def test_run_observability_tui_runs_app(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert kwargs["refresh_seconds"] == 3
     assert kwargs["default_window"] == "7d"
     assert kwargs["row_limit"] == 10
+
+
+def test_run_observability_tui_raises_on_fatal_service_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeApp:
+        def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = kwargs
+            self.fatal_service_error = "fatal boom"
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(tui, "ObservabilityApp", FakeApp)
+    with pytest.raises(RuntimeError, match="fatal boom"):
+        tui.run_observability_tui(
+            db_path=tmp_path / "state.db",
+            refresh_seconds=3,
+            default_window="24h",
+            row_limit=10,
+        )
+
+
+def test_service_signal_queue_refresh_is_debounced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+    )
+    refresh_calls: list[float] = []
+    clock = [0.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: clock[0])
+
+    def fake_refresh_data() -> None:
+        refresh_calls.append(clock[0])
+        app._last_refresh_at_monotonic = clock[0]
+        app._signal_refresh_pending = False
+
+    app.refresh_data = fake_refresh_data  # type: ignore[method-assign]
+    app._last_refresh_at_monotonic = 10.0
+
+    clock[0] = 10.05
+    queue.put(ServiceSignal(kind="poll_completed", repo_full_name="o/a"))
+    app._drain_service_signals()
+    assert refresh_calls == []
+    assert app._signal_refresh_pending is True
+
+    clock[0] = 10.35
+    app._drain_service_signals()
+    assert refresh_calls == [10.35]
+    assert app._signal_refresh_pending is False
+
+
+def test_service_signal_queue_can_refresh_immediately(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+    )
+    refresh_calls: list[float] = []
+    clock = [0.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: clock[0])
+
+    def fake_refresh_data() -> None:
+        refresh_calls.append(clock[0])
+        app._last_refresh_at_monotonic = clock[0]
+        app._signal_refresh_pending = False
+
+    app.refresh_data = fake_refresh_data  # type: ignore[method-assign]
+    app._last_refresh_at_monotonic = 1.0
+    clock[0] = 5.0
+    queue.put(ServiceSignal(kind="work_reaped", repo_full_name="o/a"))
+    app._drain_service_signals()
+    assert refresh_calls == [5.0]
+
+
+def test_service_signal_fatal_error_exits_app(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    shutdown_calls: list[str] = []
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+        on_shutdown=lambda: shutdown_calls.append("shutdown"),
+    )
+    exit_calls: list[bool] = []
+    monkeypatch.setattr(app, "exit", lambda: exit_calls.append(True))
+
+    queue.put(ServiceSignal(kind="fatal_error", detail="fatal-service-error"))
+    app._drain_service_signals()
+    queue.put(ServiceSignal(kind="fatal_error", detail="ignored-second-fatal"))
+    app._drain_service_signals()
+
+    assert app.fatal_service_error == "fatal-service-error"
+    assert shutdown_calls == ["shutdown"]
+    assert exit_calls == [True, True]
+
+
+def test_action_quit_calls_shutdown_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    shutdown_calls: list[str] = []
+    super_calls: list[str] = []
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        on_shutdown=lambda: shutdown_calls.append("shutdown"),
+    )
+
+    async def fake_action_quit(self) -> None:  # type: ignore[no-untyped-def]
+        super_calls.append("quit")
+
+    monkeypatch.setattr(tui.App, "action_quit", fake_action_quit)
+
+    asyncio.run(app.action_quit())
+    asyncio.run(app.action_quit())
+
+    assert shutdown_calls == ["shutdown"]
+    assert super_calls == ["quit", "quit"]
+
+
+def test_on_mount_registers_service_signal_interval(tmp_path: Path) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+    )
+    intervals: list[float] = []
+    app._init_tables = lambda: None  # type: ignore[method-assign]
+    app.refresh_data = lambda: None  # type: ignore[method-assign]
+    app.set_interval = lambda seconds, callback: intervals.append(seconds)  # type: ignore[method-assign]
+
+    app.on_mount()
+    assert intervals == [60, tui._SERVICE_SIGNAL_DRAIN_SECONDS]
+
+
+def test_drain_service_signals_returns_without_queue(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    app._drain_service_signals()
+
+
+def test_pending_signal_refresh_waits_for_debounce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    refresh_calls: list[float] = []
+    clock = [0.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: clock[0])
+    app.refresh_data = lambda: refresh_calls.append(clock[0])  # type: ignore[method-assign]
+
+    app._signal_refresh_pending = False
+    app._maybe_refresh_from_pending_signal()
+    assert refresh_calls == []
+
+    app._signal_refresh_pending = True
+    app._last_refresh_at_monotonic = 10.0
+    clock[0] = 10.05
+    app._maybe_refresh_from_pending_signal()
+    assert refresh_calls == []
+
+
+def test_notify_shutdown_without_callback_marks_notified(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    assert app._shutdown_notified is False
+    app._notify_shutdown()
+    assert app._shutdown_notified is True
 
 
 def test_observability_app_refresh_and_keybindings(
