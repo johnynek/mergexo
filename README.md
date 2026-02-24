@@ -75,6 +75,35 @@ For GitHub-operated restart/update workflows, run supervisor mode instead:
 uv run mergexo service --config mergexo.toml
 ```
 
+6. Run the observability dashboard:
+
+```bash
+uv run mergexo top --config mergexo.toml
+```
+
+The dashboard is read-only and pulls directly from `state.db`. Keybindings:
+
+- `r`: refresh now
+- `f`: cycle repo filter
+- `w`: cycle window (`1h`, `24h`, `7d`, `30d`)
+- `tab`: cycle focused panel
+- `enter`: show detail history for selected issue/PR row
+- `q`: quit
+
+Metrics definitions:
+
+- terminal sample set: finished runs with terminal status in `completed`, `failed`, `blocked`, `interrupted`
+- mean runtime: `AVG(duration_seconds)`
+- std-dev runtime: `sqrt(AVG(x^2) - AVG(x)^2)` (returns `0` when sample size < 2)
+- failure rate: `failed_count / terminal_count`
+
+Runtime settings for dashboard and retention:
+
+- `runtime.observability_refresh_seconds`
+- `runtime.observability_default_window`
+- `runtime.observability_row_limit`
+- `runtime.observability_history_retention_days`
+
 ## Notes on polling
 
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.

@@ -30,6 +30,10 @@ restart_default_mode = "git_checkout"
 restart_supported_modes = ["git_checkout", "pypi"]
 git_checkout_root = "~/code/mergexo"
 service_python = "/usr/bin/python3"
+observability_refresh_seconds = 3
+observability_default_window = "7d"
+observability_row_limit = 150
+observability_history_retention_days = 120
 
 [repo]
 owner = "johnynek"
@@ -70,6 +74,10 @@ extra_args = ["--repo-mode"]
     assert loaded.runtime.git_checkout_root is not None
     assert loaded.runtime.git_checkout_root.as_posix().endswith("/code/mergexo")
     assert loaded.runtime.service_python == "/usr/bin/python3"
+    assert loaded.runtime.observability_refresh_seconds == 3
+    assert loaded.runtime.observability_default_window == "7d"
+    assert loaded.runtime.observability_row_limit == 150
+    assert loaded.runtime.observability_history_retention_days == 120
     assert loaded.repo.repo_id == "repo"
     assert loaded.repo.full_name == "johnynek/repo"
     assert loaded.repo.default_branch == "main"
@@ -121,6 +129,10 @@ coding_guidelines_path = "docs/python_style.md"
     loaded = config.load_config(cfg_path)
     assert len(loaded.repos) == 2
     assert loaded.runtime.enable_issue_comment_routing is False
+    assert loaded.runtime.observability_refresh_seconds == 2
+    assert loaded.runtime.observability_default_window == "24h"
+    assert loaded.runtime.observability_row_limit == 200
+    assert loaded.runtime.observability_history_retention_days == 90
 
     by_id = {repo.repo_id: repo for repo in loaded.repos}
     assert by_id["mergexo"].name == "mergexo"
@@ -493,6 +505,36 @@ coding_guidelines_path = "docs/python_style.md"
 base_dir = "/tmp/x"
 worker_count = 1
 poll_interval_seconds = 5
+observability_refresh_seconds = 0
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "observability_refresh_seconds",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+observability_history_retention_days = 0
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "observability_history_retention_days",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
 restart_default_mode = "pypi"
 restart_supported_modes = ["git_checkout"]
 
@@ -625,6 +667,14 @@ def test_helper_numeric_bool_and_tuple() -> None:
     assert config._optional_positive_int({"k": 2}, "k") == 2
     with pytest.raises(ConfigError, match="integer >= 1"):
         config._optional_positive_int({"k": 0}, "k")
+    assert config._optional_positive_int_with_default({}, "k", 9) == 9
+    assert config._optional_positive_int_with_default({"k": 3}, "k", 9) == 3
+    with pytest.raises(ConfigError, match="integer >= 1"):
+        config._optional_positive_int_with_default({"k": 0}, "k", 9)
+    assert config._window_with_default({}, "w", "24h") == "24h"
+    assert config._window_with_default({"w": "7d"}, "w", "24h") == "7d"
+    with pytest.raises(ConfigError, match="must be one of"):
+        config._window_with_default({"w": "2h"}, "w", "24h")
 
     assert config._optional_path({}, "k") is None
     assert config._optional_path({"k": "~/tmp"}, "k") is not None

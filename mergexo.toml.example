@@ -15,6 +15,14 @@ restart_supported_modes = ["git_checkout"]
 # git_checkout_root = "/Users/oscar/code/mergexo"
 # Required for pypi mode.
 # service_python = "/usr/bin/python3"
+# Observability dashboard refresh cadence (seconds).
+observability_refresh_seconds = 2
+# Default dashboard metrics window.
+observability_default_window = "24h"
+# Optional row cap per panel. Set to null to disable.
+observability_row_limit = 200
+# History retention for observability tables.
+observability_history_retention_days = 90
 
 [repo.mergexo]
 owner = "johnynek"

@@ -12,6 +12,7 @@ from mergexo.config import AppConfig, RepoConfig, load_config
 from mergexo.git_ops import GitRepoManager
 from mergexo.github_gateway import GitHubGateway
 from mergexo.observability import configure_logging
+from mergexo.observability_tui import run_observability_tui
 from mergexo.orchestrator import Phase1Orchestrator
 from mergexo.service_runner import run_service
 from mergexo.state import StateStore
@@ -45,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--once", action="store_true", help="Poll once and wait for active workers"
     )
     _add_verbose_argument(service_parser)
+
+    top_parser = subparsers.add_parser(
+        "top",
+        help="Run an interactive observability dashboard from local state.db",
+    )
+    top_parser.add_argument("--config", type=Path, default=Path("mergexo.toml"))
+    _add_verbose_argument(top_parser)
 
     feedback_parser = subparsers.add_parser(
         "feedback",
@@ -139,6 +147,9 @@ def main() -> None:
     if args.command == "service":
         _cmd_service(config, once=bool(args.once))
         return
+    if args.command == "top":
+        _cmd_top(config)
+        return
     if args.command == "feedback":
         _cmd_feedback(config, args)
         return
@@ -210,6 +221,21 @@ def _cmd_service(config: AppConfig, *, once: bool) -> None:
         agent=default_agent,
         agent_by_repo_full_name=agents_by_repo_full_name,
         once=once,
+    )
+
+
+def _cmd_top(config: AppConfig) -> None:
+    config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
+    state = StateStore(_state_db_path(config))
+    state.reconcile_unfinished_agent_runs()
+    state.prune_observability_history(
+        retention_days=config.runtime.observability_history_retention_days
+    )
+    run_observability_tui(
+        db_path=_state_db_path(config),
+        refresh_seconds=config.runtime.observability_refresh_seconds,
+        default_window=config.runtime.observability_default_window,
+        row_limit=config.runtime.observability_row_limit,
     )
 
 
