@@ -55,6 +55,7 @@ from mergexo.orchestrator import (
     _design_branch_slug,
     _design_doc_url,
     _default_commit_message,
+    _flow_label_from_branch,
     _has_regression_test_changes,
     _is_mergexo_status_comment,
     _is_merge_conflict_error,
@@ -75,6 +76,7 @@ from mergexo.orchestrator import (
     _render_source_issue_redirect_comment,
     _render_design_doc,
     _render_operator_command_result,
+    _recovery_pr_payload_for_issue,
     _resolve_issue_flow,
     _summarize_git_error,
     _slugify,
@@ -1966,6 +1968,7 @@ def test_is_mergexo_status_comment_detects_prefixed_status_messages() -> None:
         is True
     )
     assert _is_mergexo_status_comment("Please retry after rebasing on main.") is False
+    assert _is_mergexo_status_comment("   ") is False
 
 
 def test_repair_failed_no_staged_change_run_opens_recovery_pr(tmp_path: Path) -> None:
@@ -2008,6 +2011,45 @@ def test_repair_failed_no_staged_change_run_opens_recovery_pr(tmp_path: Path) ->
     assert any("Opened recovered small-job PR" in comment for _, comment in github.comments)
 
 
+def test_repair_failed_no_staged_change_runs_skips_non_recoverable_rows(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(number=7), _issue(number=8), _issue(number=9)])
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+
+    # Empty branch -> skipped.
+    state.mark_failed(7, "No staged changes to commit", repo_full_name=cfg.repo.full_name)
+
+    # Non-matching error -> skipped even with branch.
+    state.mark_awaiting_issue_followup(
+        issue_number=8,
+        flow="small_job",
+        branch="agent/small/8-one",
+        context_json='{"flow":"small_job"}',
+        waiting_reason="placeholder",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_failed(8, "push rejected", repo_full_name=cfg.repo.full_name)
+
+    # Recoverable row -> repaired.
+    state.mark_awaiting_issue_followup(
+        issue_number=9,
+        flow="small_job",
+        branch="agent/small/9-two",
+        context_json='{"flow":"small_job"}',
+        waiting_reason="placeholder",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_failed(9, "No staged changes to commit", repo_full_name=cfg.repo.full_name)
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._repair_failed_no_staged_change_runs()
+
+    assert len(github.created_prs) == 1
+    assert github.created_prs[0][1] == "agent/small/9-two"
+
+
 def test_repair_stale_running_run_opens_recovery_pr(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -2042,6 +2084,130 @@ def test_repair_stale_running_run_opens_recovery_pr(tmp_path: Path) -> None:
     assert row[3] == "https://example/pr/101"
     assert row[4] is None
     assert any("Opened recovered design PR" in comment for _, comment in github.comments)
+
+
+def test_repair_stale_running_runs_skips_active_and_empty_branch_rows(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue1 = _issue(number=1)
+    issue2 = _issue(number=2)
+    issue3 = _issue(number=3)
+    github = FakeGitHub([issue1, issue2, issue3])
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+
+    state.mark_awaiting_issue_followup(
+        issue_number=1,
+        flow="design_doc",
+        branch="agent/design/1-one",
+        context_json='{"flow":"design_doc"}',
+        waiting_reason="placeholder",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_running(1, repo_full_name=cfg.repo.full_name)
+
+    # Empty branch.
+    state.mark_running(2, repo_full_name=cfg.repo.full_name)
+
+    state.mark_awaiting_issue_followup(
+        issue_number=3,
+        flow="design_doc",
+        branch="agent/design/3-three",
+        context_json='{"flow":"design_doc"}',
+        waiting_reason="placeholder",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_running(3, repo_full_name=cfg.repo.full_name)
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    active: Future[WorkResult] = Future()
+    orch._running = {1: active}
+
+    orch._repair_stale_running_runs()
+
+    assert len(github.created_prs) == 1
+    assert github.created_prs[0][1] == "agent/design/3-three"
+
+
+def test_recover_missing_pr_branch_returns_for_unauthorized_issue_author(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, allowed_users=("reviewer",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(number=7, author_login="outsider")])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    orch._recover_missing_pr_branch(issue_number=7, branch="agent/small/7-one")
+
+    assert github.created_prs == []
+    assert state.completed == []
+
+
+def test_recover_missing_pr_branch_handles_pr_create_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(number=7)])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    def fail_create(*args: object, **kwargs: object) -> PullRequest:
+        _ = args, kwargs
+        raise RuntimeError("boom")
+
+    github.create_pull_request = fail_create  # type: ignore[method-assign]
+
+    orch._recover_missing_pr_branch(issue_number=7, branch="agent/small/7-one")
+
+    assert state.completed == []
+
+
+def test_recover_missing_pr_branch_tolerates_issue_comment_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(number=7)
+    github = FakeGitHub([issue])
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    def fail_comment(issue_number: int, body: str) -> None:
+        _ = issue_number, body
+        raise RuntimeError("comment failed")
+
+    github.post_issue_comment = fail_comment  # type: ignore[method-assign]
+
+    orch._recover_missing_pr_branch(issue_number=7, branch="agent/small/7-one")
+
+    row = _issue_run_row(tmp_path / "state.db", 7)
+    assert row[0] == "awaiting_feedback"
+    assert row[1] == "agent/small/7-one"
+    assert row[2] == 101
+    assert row[3] == "https://example/pr/101"
+
+
+def test_recovery_payload_covers_impl_and_bugfix_branches() -> None:
+    issue = _issue(number=11, title="Handle edge case")
+
+    impl_title, impl_body, impl_flow = _recovery_pr_payload_for_issue(
+        issue=issue,
+        branch="agent/impl/11-handle-edge-case",
+    )
+    bug_title, bug_body, bug_flow = _recovery_pr_payload_for_issue(
+        issue=issue,
+        branch="agent/bugfix/11-handle-edge-case",
+    )
+
+    assert impl_flow == "implementation"
+    assert impl_title.startswith("Implementation for #11:")
+    assert "Recovered implementation PR from a previously pushed branch." in impl_body
+
+    assert bug_flow == "bugfix"
+    assert bug_title.startswith("Bugfix for #11:")
+    assert "Recovered bugfix PR from a previously pushed branch." in bug_body
+
+    assert _flow_label_from_branch("agent/impl/11-handle-edge-case") == "implementation"
+    assert _flow_label_from_branch("agent/bugfix/11-handle-edge-case") == "bugfix"
 
 
 def test_enqueue_pre_pr_followup_work_enqueues_pending_comments_in_order(
