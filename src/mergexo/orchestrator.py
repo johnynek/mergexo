@@ -264,9 +264,11 @@ class Phase1Orchestrator:
 
             poll_had_github_errors = False
             restart_pending = self._is_restart_pending()
-            # Restart drain mode should not ingest any new GitHub commands/messages in this
-            # process. Once restart is pending we only reap worker completions so terminal
-            # state is checkpointed in sqlite before supervisor handoff/re-exec.
+            # Restart drain mode is a hard ingestion stop for this process. Once restart is
+            # pending we skip operator-command scans and all enqueue paths so no new GitHub
+            # messages are consumed while draining. The only remaining work here is reaping
+            # finished futures so terminal state is checkpointed in sqlite before supervisor
+            # handoff/re-exec.
             if self._config.runtime.enable_github_operations and not restart_pending:
                 if not self._run_poll_step(
                     step_name="scan_operator_commands",
@@ -1054,8 +1056,10 @@ class Phase1Orchestrator:
                         continue
 
                     # This sqlite row is the single-flight restart gate shared across repos.
-                    # As soon as it flips to pending, subsequent polls run in restart-drain
-                    # mode: no new commands or work enqueue, only worker reaping/checkpointing.
+                    # As soon as it flips to pending, every orchestrator poll enters
+                    # restart-drain mode: no new command scans, no new work enqueue, only
+                    # worker reaping/checkpointing. ServiceRunner waits for the global pending
+                    # future count to reach zero before invoking restart/update.
                     operation, created = self._state.request_runtime_restart(
                         requested_by=comment.user_login,
                         request_command_key=command_key,
