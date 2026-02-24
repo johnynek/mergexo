@@ -213,10 +213,23 @@ Mitigation: detect non-interactive terminal in coordinator and fail fast with gu
 
 ## Rollout notes
 
-1. Land in two steps:
-   - step 1: coordinator, CLI default alias, and stop-aware service hooks
-   - step 2: event-hint queue and TUI reactive refresh
-2. Keep `mergexo service` and `mergexo top` available during rollout as fallback operations.
-3. Canary on one repo with normal operator workflow for at least one day.
-4. Validate log file creation, UI responsiveness under active work, clean shutdown on `q`, and restart command path.
-5. After canary, update team runbooks to treat bare `mergexo` as the standard operator entrypoint.
+1. Land in two separate PRs so operational behavior can be validated before adding reactive UI signaling.
+2. Step 1 PR scope (foundational default mode):
+   - add `console` command and make bare `mergexo` dispatch to it
+   - add `default_mode` coordinator that runs service in a background thread and TUI on the main thread
+   - add stop-aware hooks in `service_runner` so TUI quit cleanly stops service
+   - set console-mode default verbosity to `low` for stderr + file logging
+   - add lifecycle tests for CLI dispatch and coordinated shutdown
+3. After step 1, still missing:
+   - no event-hint queue between service and TUI yet
+   - TUI refresh behavior is still purely interval-based (correct but not event-reactive)
+   - fatal service errors are surfaced through existing process failure paths, not a dedicated UI signal lane
+4. Step 2 PR scope (reactive event integration):
+   - add optional thread-safe signal queue from service runner to TUI
+   - add debounced hint-triggered refresh in `observability_tui` while keeping interval fallback
+   - add dedicated fatal-error signal handling in the UI path
+   - extend tests for queue-driven refresh and signal handling
+5. Keep `mergexo service` and `mergexo top` available during rollout as fallback operations.
+6. Canary on one repo with normal operator workflow for at least one day.
+7. Validate log file creation, UI responsiveness under active work, clean shutdown on `q`, and restart command path.
+8. After canary, update team runbooks to treat bare `mergexo` as the standard operator entrypoint.
