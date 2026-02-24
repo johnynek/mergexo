@@ -1844,6 +1844,28 @@ class StateStore:
             for event_key, kind, comment_id, updated_at in rows
         )
 
+    def mark_feedback_events_processed(
+        self,
+        *,
+        event_keys: tuple[str, ...],
+        repo_full_name: str | None = None,
+    ) -> None:
+        if not event_keys:
+            return
+        placeholders = ",".join("?" for _ in event_keys)
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE feedback_events
+                SET processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND event_key IN ({placeholders})
+                  AND processed_at IS NULL
+                """,
+                (repo_key, *event_keys),
+            )
+
     def finalize_feedback_turn(
         self,
         *,

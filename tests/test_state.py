@@ -376,6 +376,14 @@ def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:
             comment_id=2,
             updated_at="2026-02-21T00:00:01Z",
         ),
+        FeedbackEventRecord(
+            event_key="100:actions:3001:2026-02-21T00:00:02Z",
+            pr_number=100,
+            issue_number=7,
+            kind="actions",
+            comment_id=3001,
+            updated_at="2026-02-21T00:00:02Z",
+        ),
     )
     store.ingest_feedback_events(events)
     # Duplicate ingest should be ignored.
@@ -385,6 +393,7 @@ def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:
     assert {event.event_key for event in pending} == {
         "100:review:1:2026-02-21T00:00:00Z",
         "100:issue:2:2026-02-21T00:00:01Z",
+        "100:actions:3001:2026-02-21T00:00:02Z",
     }
 
     store.finalize_feedback_turn(
@@ -406,9 +415,43 @@ def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:
             "SELECT COUNT(*) FROM feedback_events WHERE processed_at IS NOT NULL AND pr_number = 100"
         ).fetchone()
         assert processed_count is not None
-        assert int(processed_count[0]) == 2
+        assert int(processed_count[0]) == 3
     finally:
         conn.close()
+
+
+def test_mark_feedback_events_processed_marks_subset(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100")
+    store.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="100:review:1:2026-02-21T00:00:00Z",
+                pr_number=100,
+                issue_number=7,
+                kind="review",
+                comment_id=1,
+                updated_at="2026-02-21T00:00:00Z",
+            ),
+            FeedbackEventRecord(
+                event_key="100:actions:3001:2026-02-21T00:00:02Z",
+                pr_number=100,
+                issue_number=7,
+                kind="actions",
+                comment_id=3001,
+                updated_at="2026-02-21T00:00:02Z",
+            ),
+        )
+    )
+
+    store.mark_feedback_events_processed(
+        event_keys=("100:actions:3001:2026-02-21T00:00:02Z",),
+    )
+    store.mark_feedback_events_processed(event_keys=())
+    pending = store.list_pending_feedback_events(100)
+    assert len(pending) == 1
+    assert pending[0].event_key == "100:review:1:2026-02-21T00:00:00Z"
 
 
 def test_pre_pr_followup_state_and_issue_comment_cursors(tmp_path: Path) -> None:

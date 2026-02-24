@@ -24,6 +24,7 @@ from mergexo.agent_adapter import (
 )
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import (
+    FeedbackEventRecord,
     ParsedOperatorCommand,
     compute_pre_pr_checkpoint_token,
     compute_source_issue_redirect_token,
@@ -40,6 +41,8 @@ from mergexo.models import (
     PullRequestReviewComment,
     PullRequestSnapshot,
     RestartMode,
+    WorkflowJobSnapshot,
+    WorkflowRunSnapshot,
     WorkResult,
 )
 from mergexo.orchestrator import (
@@ -92,6 +95,7 @@ from mergexo.observability import configure_logging
 from mergexo.shell import CommandError
 from mergexo.state import (
     ImplementationCandidateState,
+    PendingFeedbackEvent,
     PrePrFollowupState,
     StateStore,
     TrackedPullRequestState,
@@ -213,6 +217,10 @@ class FakeGitHub:
         self._next_comment_id = 1000
         self.compare_calls: list[tuple[str, str]] = []
         self.compare_statuses: dict[tuple[str, str], str] = {}
+        self.workflow_runs_by_head: dict[tuple[int, str], tuple[WorkflowRunSnapshot, ...]] = {}
+        self.workflow_jobs_by_run_id: dict[int, tuple[WorkflowJobSnapshot, ...]] = {}
+        self.failed_run_log_tails: dict[int, dict[str, str | None]] = {}
+        self.failed_log_tail_calls: list[tuple[int, int]] = []
 
     def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
         self.requested_labels = labels
@@ -278,6 +286,20 @@ class FakeGitHub:
     def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
         _ = issue_number
         return list(self.issue_comments)
+
+    def list_workflow_runs_for_head(
+        self, pr_number: int, head_sha: str
+    ) -> tuple[WorkflowRunSnapshot, ...]:
+        return self.workflow_runs_by_head.get((pr_number, head_sha), ())
+
+    def list_workflow_jobs(self, run_id: int) -> tuple[WorkflowJobSnapshot, ...]:
+        return self.workflow_jobs_by_run_id.get(run_id, ())
+
+    def get_failed_run_log_tails(
+        self, run_id: int, tail_lines_per_action: int = 500
+    ) -> dict[str, str | None]:
+        self.failed_log_tail_calls.append((run_id, tail_lines_per_action))
+        return dict(self.failed_run_log_tails.get(run_id, {}))
 
     def post_review_comment_reply(self, pr_number: int, review_comment_id: int, body: str) -> None:
         self.review_replies.append((pr_number, review_comment_id, body))
@@ -669,6 +691,14 @@ class FakeState:
         _ = pr_number, repo_full_name
         return ()
 
+    def mark_feedback_events_processed(
+        self,
+        *,
+        event_keys: tuple[str, ...],
+        repo_full_name: str | None = None,
+    ) -> None:
+        _ = event_keys, repo_full_name
+
     def finalize_feedback_turn(
         self,
         *,
@@ -688,6 +718,8 @@ def _config(
     worker_count: int = 1,
     enable_github_operations: bool = False,
     enable_issue_comment_routing: bool = False,
+    enable_pr_actions_monitoring: bool = False,
+    pr_actions_log_tail_lines: int = 500,
     restart_drain_timeout_seconds: int = 900,
     restart_default_mode: str = "git_checkout",
     restart_supported_modes: tuple[str, ...] = ("git_checkout",),
@@ -709,6 +741,8 @@ def _config(
             poll_interval_seconds=1,
             enable_github_operations=enable_github_operations,
             enable_issue_comment_routing=enable_issue_comment_routing,
+            enable_pr_actions_monitoring=enable_pr_actions_monitoring,
+            pr_actions_log_tail_lines=pr_actions_log_tail_lines,
             restart_drain_timeout_seconds=restart_drain_timeout_seconds,
             restart_default_mode=cast(RestartMode, restart_default_mode),
             restart_supported_modes=cast(tuple[RestartMode, ...], restart_supported_modes),
@@ -3805,6 +3839,64 @@ def test_poll_once_respects_allow_enqueue_and_restart_pending(
     assert calls == {"scan": 1, "new": 0, "impl": 0, "feedback": 0}
 
 
+def test_poll_once_runs_actions_monitor_before_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_pr_actions_monitoring=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    order: list[str] = []
+
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(orch, "_enqueue_new_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_implementation_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_monitor_pr_actions", lambda: order.append("monitor"))
+    monkeypatch.setattr(orch, "_enqueue_feedback_work", lambda pool: order.append("feedback"))
+
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+    assert order == ["monitor", "feedback"]
+
+
+def test_poll_once_records_error_when_actions_monitor_step_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _config(tmp_path, enable_pr_actions_monitoring=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    configure_logging(verbose=True)
+
+    steps: list[str] = []
+
+    def fake_run_poll_step(*, step_name: str, fn) -> bool:  # type: ignore[no-untyped-def]
+        _ = fn
+        steps.append(step_name)
+        return step_name != "monitor_pr_actions"
+
+    monkeypatch.setattr(orch, "_run_poll_step", fake_run_poll_step)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+    assert "monitor_pr_actions" in steps
+    assert "enqueue_feedback_work" in steps
+    text = capsys.readouterr().err
+    assert "event=poll_completed" in text
+    assert "poll_had_github_errors=true" in text
+
+
 def test_run_once_and_continuous_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -3988,6 +4080,43 @@ def _issue_comment(comment_id: int = 22) -> PullRequestIssueComment:
         html_url=f"https://example/issue-comment/{comment_id}",
         created_at="2026-02-21T00:00:00Z",
         updated_at="2026-02-21T00:00:00Z",
+    )
+
+
+def _workflow_run(
+    *,
+    run_id: int,
+    status: str,
+    conclusion: str | None,
+    updated_at: str,
+    name: str = "CI",
+    head_sha: str = "head-1",
+) -> WorkflowRunSnapshot:
+    return WorkflowRunSnapshot(
+        run_id=run_id,
+        name=name,
+        status=status,
+        conclusion=conclusion,
+        html_url=f"https://example/runs/{run_id}",
+        head_sha=head_sha,
+        created_at="2026-02-21T00:00:00Z",
+        updated_at=updated_at,
+    )
+
+
+def _workflow_job(
+    *,
+    job_id: int,
+    name: str,
+    conclusion: str,
+    status: str = "completed",
+) -> WorkflowJobSnapshot:
+    return WorkflowJobSnapshot(
+        job_id=job_id,
+        name=name,
+        status=status,
+        conclusion=conclusion,
+        html_url=f"https://example/jobs/{job_id}",
     )
 
 
@@ -4217,6 +4346,453 @@ def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
     tracked_again = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked_again)
     assert len(agent.feedback_calls) == 1
+
+
+def test_monitor_pr_actions_skips_enqueue_while_runs_active(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_pr_actions_monitoring=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7001,
+            status="in_progress",
+            conclusion=None,
+            updated_at="2026-02-21T01:00:00Z",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._monitor_pr_actions()
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+
+
+def test_monitor_pr_actions_enqueues_failed_runs_once_per_update(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_pr_actions_monitoring=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7001,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T01:00:00Z",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._monitor_pr_actions()
+    orch._monitor_pr_actions()
+    pending_once = state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name)
+    assert len(pending_once) == 1
+    assert pending_once[0].event_key == "101:actions:7001:2026-02-21T01:00:00Z"
+
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7001,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T01:10:00Z",
+        ),
+    )
+    orch._monitor_pr_actions()
+    pending_twice = state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name)
+    assert {event.event_key for event in pending_twice} == {
+        "101:actions:7001:2026-02-21T01:00:00Z",
+        "101:actions:7001:2026-02-21T01:10:00Z",
+    }
+
+
+def test_monitor_pr_actions_skips_when_runs_are_green(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_pr_actions_monitoring=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7001,
+            status="completed",
+            conclusion="success",
+            updated_at="2026-02-21T01:00:00Z",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._monitor_pr_actions()
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+
+
+def test_monitor_pr_actions_skips_closed_or_merged_prs(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_pr_actions_monitoring=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="closed",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7001,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T01:00:00Z",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._monitor_pr_actions()
+
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+
+
+def test_feedback_turn_resolves_stale_actions_events_without_agent(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7001,
+            status="completed",
+            conclusion="success",
+            updated_at="2026-02-21T01:10:00Z",
+        ),
+    )
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:actions:7001:2026-02-21T01:00:00Z",
+                pr_number=101,
+                issue_number=issue.number,
+                kind="actions",
+                comment_id=7001,
+                updated_at="2026-02-21T01:00:00Z",
+            ),
+        ),
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert agent.feedback_calls == []
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+    assert len(state.list_tracked_pull_requests(repo_full_name=cfg.repo.full_name)) == 1
+
+
+def test_resolve_actions_feedback_events_marks_all_stale_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+        _workflow_run(
+            run_id=7003,
+            status="in_progress",
+            conclusion=None,
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+        _workflow_run(
+            run_id=7004,
+            status="completed",
+            conclusion="success",
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+    )
+    github.workflow_jobs_by_run_id[7002] = (
+        _workflow_job(job_id=8001, name="tests", conclusion="failure"),
+    )
+    github.failed_run_log_tails[7002] = {"tests": "tail"}
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    actionable, synthetic_comments, stale_keys = orch._resolve_actions_feedback_events(
+        pr_number=101,
+        head_sha="head-1",
+        action_events=(
+            PendingFeedbackEvent(
+                event_key="missing",
+                kind="actions",
+                comment_id=7001,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+            PendingFeedbackEvent(
+                event_key="updated-mismatch",
+                kind="actions",
+                comment_id=7002,
+                updated_at="2026-02-21T01:59:00Z",
+            ),
+            PendingFeedbackEvent(
+                event_key="still-running",
+                kind="actions",
+                comment_id=7003,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+            PendingFeedbackEvent(
+                event_key="now-green",
+                kind="actions",
+                comment_id=7004,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+            PendingFeedbackEvent(
+                event_key="actionable",
+                kind="actions",
+                comment_id=7002,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+        ),
+    )
+
+    assert tuple(event.event_key for event in actionable) == ("actionable",)
+    assert set(stale_keys) == {"missing", "updated-mismatch", "still-running", "now-green"}
+    assert len(synthetic_comments) == 1
+
+
+def test_feedback_turn_includes_actions_failure_context_without_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:00:00Z",
+            name="CI",
+        ),
+    )
+    github.workflow_jobs_by_run_id[7002] = (
+        _workflow_job(job_id=8001, name="tests", conclusion="failure"),
+        _workflow_job(job_id=8003, name="tests", conclusion="failure"),
+        _workflow_job(job_id=8002, name="lint", conclusion="success"),
+    )
+    github.failed_run_log_tails[7002] = {"tests [job 8001]": "line a\nline b"}
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:actions:7002:2026-02-21T02:00:00Z",
+                pr_number=101,
+                issue_number=issue.number,
+                kind="actions",
+                comment_id=7002,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+        ),
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 1
+    turn = agent.feedback_calls[0][1]
+    assert turn.review_comments == ()
+    assert len(turn.issue_comments) == 1
+    assert "MergeXO GitHub Actions failure context" in turn.issue_comments[0].body
+    assert "action: tests [job 8001]" in turn.issue_comments[0].body
+    assert "<logs unavailable for this action>" in turn.issue_comments[0].body
+    assert "last 500 log lines" in turn.issue_comments[0].body
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+    assert github.failed_log_tail_calls == [(7002, 500)]
+
+
+def test_feedback_turn_actions_context_handles_missing_failed_jobs(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7004,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:05:00Z",
+        ),
+    )
+    github.workflow_jobs_by_run_id[7004] = (
+        _workflow_job(job_id=8101, name="lint", conclusion="success"),
+    )
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:actions:7004:2026-02-21T02:05:00Z",
+                pr_number=101,
+                issue_number=issue.number,
+                kind="actions",
+                comment_id=7004,
+                updated_at="2026-02-21T02:05:00Z",
+            ),
+        ),
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 1
+    turn = agent.feedback_calls[0][1]
+    assert (
+        "No failed actions were returned by the jobs API for this run."
+        in turn.issue_comments[0].body
+    )
 
 
 def test_feedback_turn_blocks_legacy_tracked_pr_when_issue_author_unauthorized(

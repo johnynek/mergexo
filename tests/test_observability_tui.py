@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from queue import SimpleQueue
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from mergexo.observability_queries import (
     TerminalIssueOutcomeRow,
     TrackedOrBlockedRow,
 )
+from mergexo.service_runner import ServiceSignal
 
 
 def test_observability_tui_helper_functions() -> None:
@@ -76,13 +78,13 @@ def test_observability_tui_helper_functions() -> None:
     assert tui._url_for_active_row(active, 3) == "https://github.com/o/repo-a/pull/101"
     assert tui._url_for_active_row(active, 5) == "https://github.com/o/repo-a/tree/agent/design/7"
     assert tui._url_for_active_row(active, 0) is None
-    assert tui._url_for_tracked_row(tracked_pr, 1) == "https://github.com/o/repo-a/pull/101"
-    assert tui._url_for_tracked_row(tracked_pr, 2) == "https://github.com/o/repo-a/issues/7"
+    assert tui._url_for_tracked_row(tracked_pr, 1) == "https://github.com/o/repo-a/issues/7"
+    assert tui._url_for_tracked_row(tracked_pr, 2) == "https://github.com/o/repo-a/pull/101"
     assert (
         tui._url_for_tracked_row(tracked_pr, 4) == "https://github.com/o/repo-a/tree/agent/design/7"
     )
-    assert tui._url_for_tracked_row(tracked_issue, 1) is None
-    assert tui._url_for_tracked_row(tracked_issue, 2) == "https://github.com/o/repo-a/issues/8"
+    assert tui._url_for_tracked_row(tracked_issue, 1) == "https://github.com/o/repo-a/issues/8"
+    assert tui._url_for_tracked_row(tracked_issue, 2) is None
     assert tui._tracked_row_key(tracked_pr) == ("o/repo-a", 101, 7, "blocked")
     assert tui._tracked_row_key(tracked_issue) == ("o/repo-a", None, 8, "awaiting_issue_followup")
     assert tui._render_context_snippet(None, max_chars=10) == "-"
@@ -185,18 +187,18 @@ def test_observability_tui_helper_functions() -> None:
     assert no_pr_history_field_map["PR"].value == "-"
     assert no_pr_history_field_map["PR"].url is None
     sort_stack: tuple[tui._TrackedSortKey, ...] = ()
-    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
-    assert sort_stack == (tui._TrackedSortKey(column_index=1, descending=True),)
-    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
-    assert sort_stack == (tui._TrackedSortKey(column_index=1, descending=False),)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
+    assert sort_stack == (tui._TrackedSortKey(column_index=2, descending=True),)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
+    assert sort_stack == (tui._TrackedSortKey(column_index=2, descending=False),)
     sort_stack = tui._next_tracked_sort_stack(sort_stack, 5)
     assert sort_stack == (
         tui._TrackedSortKey(column_index=5, descending=True),
-        tui._TrackedSortKey(column_index=1, descending=False),
+        tui._TrackedSortKey(column_index=2, descending=False),
     )
-    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
     assert sort_stack == (
-        tui._TrackedSortKey(column_index=1, descending=True),
+        tui._TrackedSortKey(column_index=2, descending=True),
         tui._TrackedSortKey(column_index=5, descending=True),
     )
     rows_for_sort = (
@@ -238,7 +240,7 @@ def test_observability_tui_helper_functions() -> None:
         rows_for_sort,
         (
             tui._TrackedSortKey(column_index=5, descending=True),
-            tui._TrackedSortKey(column_index=1, descending=True),
+            tui._TrackedSortKey(column_index=2, descending=True),
         ),
     )
     assert [row.repo_full_name for row in sorted_rows] == ["o/repo-c", "o/repo-a", "o/repo-b"]
@@ -246,7 +248,7 @@ def test_observability_tui_helper_functions() -> None:
         rows_for_sort,
         (
             tui._TrackedSortKey(column_index=5, descending=False),
-            tui._TrackedSortKey(column_index=1, descending=True),
+            tui._TrackedSortKey(column_index=2, descending=True),
         ),
     )
     assert [row.repo_full_name for row in sorted_rows] == ["o/repo-a", "o/repo-b", "o/repo-c"]
@@ -341,6 +343,7 @@ def test_run_observability_tui_runs_app(monkeypatch: pytest.MonkeyPatch, tmp_pat
     class FakeApp:
         def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
             called["kwargs"] = kwargs
+            self.fatal_service_error: str | None = None
 
         def run(self) -> None:
             called["ran"] = True
@@ -358,6 +361,204 @@ def test_run_observability_tui_runs_app(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert kwargs["refresh_seconds"] == 3
     assert kwargs["default_window"] == "7d"
     assert kwargs["row_limit"] == 10
+
+
+def test_run_observability_tui_raises_on_fatal_service_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeApp:
+        def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = kwargs
+            self.fatal_service_error = "fatal boom"
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(tui, "ObservabilityApp", FakeApp)
+    with pytest.raises(RuntimeError, match="fatal boom"):
+        tui.run_observability_tui(
+            db_path=tmp_path / "state.db",
+            refresh_seconds=3,
+            default_window="24h",
+            row_limit=10,
+        )
+
+
+def test_service_signal_queue_refresh_is_debounced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+    )
+    refresh_calls: list[float] = []
+    clock = [0.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: clock[0])
+
+    def fake_refresh_data() -> None:
+        refresh_calls.append(clock[0])
+        app._last_refresh_at_monotonic = clock[0]
+        app._signal_refresh_pending = False
+
+    app.refresh_data = fake_refresh_data  # type: ignore[method-assign]
+    app._last_refresh_at_monotonic = 10.0
+
+    clock[0] = 10.05
+    queue.put(ServiceSignal(kind="poll_completed", repo_full_name="o/a"))
+    app._drain_service_signals()
+    assert refresh_calls == []
+    assert app._signal_refresh_pending is True
+
+    clock[0] = 10.35
+    app._drain_service_signals()
+    assert refresh_calls == [10.35]
+    assert app._signal_refresh_pending is False
+
+
+def test_service_signal_queue_can_refresh_immediately(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+    )
+    refresh_calls: list[float] = []
+    clock = [0.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: clock[0])
+
+    def fake_refresh_data() -> None:
+        refresh_calls.append(clock[0])
+        app._last_refresh_at_monotonic = clock[0]
+        app._signal_refresh_pending = False
+
+    app.refresh_data = fake_refresh_data  # type: ignore[method-assign]
+    app._last_refresh_at_monotonic = 1.0
+    clock[0] = 5.0
+    queue.put(ServiceSignal(kind="work_reaped", repo_full_name="o/a"))
+    app._drain_service_signals()
+    assert refresh_calls == [5.0]
+
+
+def test_service_signal_fatal_error_exits_app(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    shutdown_calls: list[str] = []
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+        on_shutdown=lambda: shutdown_calls.append("shutdown"),
+    )
+    exit_calls: list[bool] = []
+    monkeypatch.setattr(app, "exit", lambda: exit_calls.append(True))
+
+    queue.put(ServiceSignal(kind="fatal_error", detail="fatal-service-error"))
+    app._drain_service_signals()
+    queue.put(ServiceSignal(kind="fatal_error", detail="ignored-second-fatal"))
+    app._drain_service_signals()
+
+    assert app.fatal_service_error == "fatal-service-error"
+    assert shutdown_calls == ["shutdown"]
+    assert exit_calls == [True, True]
+
+
+def test_action_quit_calls_shutdown_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    shutdown_calls: list[str] = []
+    super_calls: list[str] = []
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        on_shutdown=lambda: shutdown_calls.append("shutdown"),
+    )
+
+    async def fake_action_quit(self) -> None:  # type: ignore[no-untyped-def]
+        super_calls.append("quit")
+
+    monkeypatch.setattr(tui.App, "action_quit", fake_action_quit)
+
+    asyncio.run(app.action_quit())
+    asyncio.run(app.action_quit())
+
+    assert shutdown_calls == ["shutdown"]
+    assert super_calls == ["quit", "quit"]
+
+
+def test_on_mount_registers_service_signal_interval(tmp_path: Path) -> None:
+    queue: SimpleQueue[ServiceSignal] = SimpleQueue()
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+        service_signal_queue=queue,
+    )
+    intervals: list[float] = []
+    app._init_tables = lambda: None  # type: ignore[method-assign]
+    app.refresh_data = lambda: None  # type: ignore[method-assign]
+    app.set_interval = lambda seconds, callback: intervals.append(seconds)  # type: ignore[method-assign]
+
+    app.on_mount()
+    assert intervals == [60, tui._SERVICE_SIGNAL_DRAIN_SECONDS]
+
+
+def test_drain_service_signals_returns_without_queue(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    app._drain_service_signals()
+
+
+def test_pending_signal_refresh_waits_for_debounce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    refresh_calls: list[float] = []
+    clock = [0.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: clock[0])
+    app.refresh_data = lambda: refresh_calls.append(clock[0])  # type: ignore[method-assign]
+
+    app._signal_refresh_pending = False
+    app._maybe_refresh_from_pending_signal()
+    assert refresh_calls == []
+
+    app._signal_refresh_pending = True
+    app._last_refresh_at_monotonic = 10.0
+    clock[0] = 10.05
+    app._maybe_refresh_from_pending_signal()
+    assert refresh_calls == []
+
+
+def test_notify_shutdown_without_callback_marks_notified(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    assert app._shutdown_notified is False
+    app._notify_shutdown()
+    assert app._shutdown_notified is True
 
 
 def test_observability_app_refresh_and_keybindings(
@@ -496,6 +697,10 @@ def test_observability_app_refresh_and_keybindings(
             tracked.focus()
             await _pilot.pause()
             tracked.move_cursor(row=0, column=1, animate=False)
+            await _pilot.press("enter")
+            await _pilot.pause()
+            assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
+            tracked.move_cursor(row=0, column=2, animate=False)
             await _pilot.press("enter")
             await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/pull/101"
@@ -842,16 +1047,16 @@ def test_detail_modal_field_navigation_opens_urls(
             await pilot.pause()
             assert len(opened) == 1
             assert opened[-1] == "https://github.com/o/repo-a"
-            table.move_cursor(row=2, column=1, animate=False)  # PR
+            table.move_cursor(row=2, column=1, animate=False)  # Issue
             await pilot.press("enter")
             await pilot.pause()
             assert len(opened) == 2
-            assert opened[-1] == "https://github.com/o/repo-a/pull/101"
-            table.move_cursor(row=3, column=1, animate=False)  # Issue
+            assert opened[-1] == "https://github.com/o/repo-a/issues/7"
+            table.move_cursor(row=3, column=1, animate=False)  # PR
             await pilot.press("enter")
             await pilot.pause()
             assert len(opened) == 3
-            assert opened[-1] == "https://github.com/o/repo-a/issues/7"
+            assert opened[-1] == "https://github.com/o/repo-a/pull/101"
             table.move_cursor(row=7, column=1, animate=False)  # SHA commit
             await pilot.press("enter")
             await pilot.pause()
@@ -952,25 +1157,25 @@ def test_tracked_header_click_sorts_with_deduped_stack(
                 app.on_data_table_header_selected(event)
 
             assert row_order() == ["o/repo-a", "o/repo-b", "o/repo-c"]
-            click_header(1)  # PR desc first click.
+            click_header(2)  # PR desc first click.
             await pilot.pause()
             assert row_order() == ["o/repo-a", "o/repo-c", "o/repo-b"]
             assert app._tracked_sort_stack == (
-                tui._TrackedSortKey(column_index=1, descending=True),
+                tui._TrackedSortKey(column_index=2, descending=True),
             )
             click_header(5)  # Pending desc as new primary key.
             await pilot.pause()
             assert row_order() == ["o/repo-c", "o/repo-a", "o/repo-b"]
             assert app._tracked_sort_stack == (
                 tui._TrackedSortKey(column_index=5, descending=True),
-                tui._TrackedSortKey(column_index=1, descending=True),
+                tui._TrackedSortKey(column_index=2, descending=True),
             )
             click_header(5)  # Toggle pending direction.
             await pilot.pause()
             assert row_order() == ["o/repo-a", "o/repo-b", "o/repo-c"]
             assert app._tracked_sort_stack == (
                 tui._TrackedSortKey(column_index=5, descending=False),
-                tui._TrackedSortKey(column_index=1, descending=True),
+                tui._TrackedSortKey(column_index=2, descending=True),
             )
 
     asyncio.run(run_app())
@@ -1347,9 +1552,9 @@ def test_tracked_sort_value_branches() -> None:
         updated_at="2026-02-24T00:01:00.000Z",
     )
     assert tui._tracked_sort_value(row, 0) == "o/repo-a"
-    assert tui._tracked_sort_value(row, 1) == 101
-    assert tui._tracked_sort_value(row_without_pr, 1) == -1
-    assert tui._tracked_sort_value(row, 2) == 7
+    assert tui._tracked_sort_value(row, 1) == 7
+    assert tui._tracked_sort_value(row, 2) == 101
+    assert tui._tracked_sort_value(row_without_pr, 2) == -1
     assert tui._tracked_sort_value(row, 3) == "blocked"
     assert tui._tracked_sort_value(row, 4) == "agent/design/7"
     assert tui._tracked_sort_value(row, 5) == 2

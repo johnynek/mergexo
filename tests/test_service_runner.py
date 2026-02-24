@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+from threading import Event
 from typing import cast
 
 import pytest
@@ -15,7 +16,7 @@ from mergexo.github_gateway import GitHubGateway
 from mergexo.git_ops import GitRepoManager
 from mergexo.models import PullRequestIssueComment, RestartMode
 from mergexo.orchestrator import RestartRequested
-from mergexo.service_runner import ServiceRunner, run_service
+from mergexo.service_runner import ServiceRunner, ServiceSignal, run_service
 from mergexo.state import StateStore
 
 
@@ -351,6 +352,286 @@ def test_service_runner_multi_repo_non_once_sleeps_between_polls(
         runner.run(once=False)
     assert runs == [cfg.repos[0].full_name]
     assert sleep_calls == [cfg.runtime.poll_interval_seconds]
+
+
+def test_service_runner_stop_event_interrupts_continuous_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    stop_event = Event()
+    polls: list[bool] = []
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool
+            polls.append(allow_enqueue)
+            stop_event.set()
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        "mergexo.service_runner.time.sleep",
+        lambda seconds: (_ for _ in ()).throw(AssertionError(f"unexpected sleep: {seconds}")),
+    )
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        stop_event=stop_event,
+    )
+    runner.run(once=False)
+    assert polls == [True]
+
+
+def test_service_runner_signal_sink_receives_poll_reap_and_restart_hints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    _seed_restart_command(state, command_key="77:24:2026-02-24T10:00:00Z")
+    signals: list[ServiceSignal] = []
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 1
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+            self.pending = 0
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(ServiceRunner, "_handle_restart_requested", lambda self, requested: False)
+
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        signal_sink=signals.append,
+    )
+    runner.run(once=True)
+
+    kinds = [signal.kind for signal in signals]
+    assert "poll_completed" in kinds
+    assert "work_reaped" in kinds
+    restart_details = [
+        signal.detail for signal in signals if signal.kind == "restart_drain_state_changed"
+    ]
+    assert restart_details == ["started", "completed"]
+
+
+def test_service_runner_signal_sink_failure_is_swallowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: list[str] = []
+    runner = ServiceRunner(
+        config=_app_config(tmp_path),
+        state=StateStore(tmp_path / "state.db"),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        signal_sink=lambda signal: (_ for _ in ()).throw(RuntimeError(signal.kind)),
+    )
+    monkeypatch.setattr(
+        "mergexo.service_runner.LOGGER.exception", lambda message: captured.append(message)
+    )
+    runner._emit_signal(ServiceSignal(kind="poll_completed"))
+    assert captured == ["service_signal_sink_failed"]
+
+
+def test_service_runner_once_returns_when_stop_event_set_before_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    stop_event = Event()
+    stop_event.set()
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+            raise AssertionError("poll_once should not run when stop_event is set")
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        stop_event=stop_event,
+    )
+    runner.run(once=True)
+
+
+def test_service_runner_once_returns_when_stop_event_set_before_drain_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    stop_event = Event()
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 1
+            self.calls = 0
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+            self.calls += 1
+            if self.calls == 1:
+                stop_event.set()
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        stop_event=stop_event,
+    )
+    runner.run(once=True)
+
+
+def test_service_runner_once_returns_when_stop_requested_mid_drain_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 1
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    should_stop = iter((False, False, True))
+    monkeypatch.setattr(ServiceRunner, "_should_stop", lambda self: next(should_stop))
+    runner.run(once=True)
+
+
+def test_service_runner_once_returns_when_stop_wait_is_triggered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 1
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    monkeypatch.setattr(ServiceRunner, "_wait_for_stop", lambda self, timeout_seconds: True)
+    runner.run(once=True)
+
+
+def test_service_runner_continuous_returns_when_stop_event_set_before_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    stop_event = Event()
+    stop_event.set()
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+            raise AssertionError("poll_once should not run when stop_event is set")
+
+        def queue_counts(self) -> tuple[int, int]:
+            return 0, 0
+
+        def pending_work_count(self) -> int:
+            return 0
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+        stop_event=stop_event,
+    )
+    runner.run(once=False)
 
 
 def test_service_runner_multi_repo_continuous_reuses_orchestrators_and_shared_pool(

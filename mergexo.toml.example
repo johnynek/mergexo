@@ -5,6 +5,10 @@ poll_interval_seconds = 600
 enable_github_operations = false
 # Enable pre-PR issue comment routing (queued retries before PR creation + post-PR redirects).
 enable_issue_comment_routing = false
+# Monitor GitHub Actions runs for tracked PR heads and enqueue CI remediation feedback events.
+enable_pr_actions_monitoring = false
+# Tail size per failed GitHub Actions job injected into CI feedback context.
+pr_actions_log_tail_lines = 500
 # Restart drain timeout before pending restart is marked failed.
 restart_drain_timeout_seconds = 900
 # Default restart mode when /mergexo restart omits mode=...
