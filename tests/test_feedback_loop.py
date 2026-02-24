@@ -6,6 +6,7 @@ from mergexo.feedback_loop import (
     compute_general_comment_token,
     compute_history_rewrite_token,
     compute_operator_command_token,
+    compute_pre_pr_checkpoint_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
     compute_turn_key,
@@ -95,6 +96,14 @@ def test_source_issue_redirect_token_is_stable() -> None:
     token_a = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=77)
     token_b = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=77)
     token_c = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=78)
+    assert token_a == token_b
+    assert token_a != token_c
+
+
+def test_pre_pr_checkpoint_token_is_stable() -> None:
+    token_a = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="abc123")
+    token_b = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="abc123")
+    token_c = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="def456")
     assert token_a == token_b
     assert token_a != token_c
 

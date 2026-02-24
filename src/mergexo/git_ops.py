@@ -217,6 +217,47 @@ class GitRepoManager:
             )
             raise
 
+    def persist_checkpoint_branch(
+        self,
+        checkout_path: Path,
+        branch: str,
+        *,
+        commit_message: str,
+    ) -> str:
+        log_event(
+            LOGGER,
+            "git_checkpoint_started",
+            checkout_path=str(checkout_path),
+            branch=branch,
+        )
+        staged_files = self.list_staged_files(checkout_path)
+        if staged_files:
+            run(["git", "-C", str(checkout_path), "commit", "-m", commit_message])
+            log_event(
+                LOGGER,
+                "git_checkpoint_committed",
+                checkout_path=str(checkout_path),
+                branch=branch,
+                staged_file_count=len(staged_files),
+            )
+        else:
+            log_event(
+                LOGGER,
+                "git_checkpoint_noop_commit",
+                checkout_path=str(checkout_path),
+                branch=branch,
+            )
+        self.push_branch(checkout_path, branch)
+        head_sha = self.current_head_sha(checkout_path)
+        log_event(
+            LOGGER,
+            "git_checkpoint_pushed",
+            checkout_path=str(checkout_path),
+            branch=branch,
+            head_sha=head_sha,
+        )
+        return head_sha
+
     def fetch_origin(self, checkout_path: Path) -> None:
         log_event(
             LOGGER,

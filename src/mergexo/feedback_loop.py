@@ -93,6 +93,11 @@ def compute_source_issue_redirect_token(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def compute_pre_pr_checkpoint_token(*, issue_number: int, checkpoint_sha: str) -> str:
+    payload = f"pre_pr_checkpoint:{issue_number}:{checkpoint_sha}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def append_action_token(*, body: str, token: str) -> str:
     marker = f"<!-- mergexo-action:{token} -->"
     stripped = body.strip()
