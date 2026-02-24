@@ -71,13 +71,13 @@ def test_observability_tui_helper_functions() -> None:
     assert tui._url_for_active_row(active, 3) == "https://github.com/o/repo-a/pull/101"
     assert tui._url_for_active_row(active, 5) == "https://github.com/o/repo-a/tree/agent/design/7"
     assert tui._url_for_active_row(active, 0) is None
-    assert tui._url_for_tracked_row(tracked_pr, 1) == "https://github.com/o/repo-a/pull/101"
-    assert tui._url_for_tracked_row(tracked_pr, 2) == "https://github.com/o/repo-a/issues/7"
+    assert tui._url_for_tracked_row(tracked_pr, 1) == "https://github.com/o/repo-a/issues/7"
+    assert tui._url_for_tracked_row(tracked_pr, 2) == "https://github.com/o/repo-a/pull/101"
     assert (
         tui._url_for_tracked_row(tracked_pr, 4) == "https://github.com/o/repo-a/tree/agent/design/7"
     )
-    assert tui._url_for_tracked_row(tracked_issue, 1) is None
-    assert tui._url_for_tracked_row(tracked_issue, 2) == "https://github.com/o/repo-a/issues/8"
+    assert tui._url_for_tracked_row(tracked_issue, 1) == "https://github.com/o/repo-a/issues/8"
+    assert tui._url_for_tracked_row(tracked_issue, 2) is None
     assert tui._tracked_row_key(tracked_pr) == ("o/repo-a", 101, 7, "blocked")
     assert tui._tracked_row_key(tracked_issue) == ("o/repo-a", None, 8, "awaiting_issue_followup")
     assert tui._render_context_snippet(None, max_chars=10) == "-"
@@ -111,18 +111,18 @@ def test_observability_tui_helper_functions() -> None:
     assert tracked_issue_field_map["Last Seen Head SHA"].value == "-"
     assert tracked_issue_field_map["Last Seen Head SHA"].url is None
     sort_stack: tuple[tui._TrackedSortKey, ...] = ()
-    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
-    assert sort_stack == (tui._TrackedSortKey(column_index=1, descending=True),)
-    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
-    assert sort_stack == (tui._TrackedSortKey(column_index=1, descending=False),)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
+    assert sort_stack == (tui._TrackedSortKey(column_index=2, descending=True),)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
+    assert sort_stack == (tui._TrackedSortKey(column_index=2, descending=False),)
     sort_stack = tui._next_tracked_sort_stack(sort_stack, 5)
     assert sort_stack == (
         tui._TrackedSortKey(column_index=5, descending=True),
-        tui._TrackedSortKey(column_index=1, descending=False),
+        tui._TrackedSortKey(column_index=2, descending=False),
     )
-    sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
+    sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
     assert sort_stack == (
-        tui._TrackedSortKey(column_index=1, descending=True),
+        tui._TrackedSortKey(column_index=2, descending=True),
         tui._TrackedSortKey(column_index=5, descending=True),
     )
     rows_for_sort = (
@@ -164,7 +164,7 @@ def test_observability_tui_helper_functions() -> None:
         rows_for_sort,
         (
             tui._TrackedSortKey(column_index=5, descending=True),
-            tui._TrackedSortKey(column_index=1, descending=True),
+            tui._TrackedSortKey(column_index=2, descending=True),
         ),
     )
     assert [row.repo_full_name for row in sorted_rows] == ["o/repo-c", "o/repo-a", "o/repo-b"]
@@ -172,7 +172,7 @@ def test_observability_tui_helper_functions() -> None:
         rows_for_sort,
         (
             tui._TrackedSortKey(column_index=5, descending=False),
-            tui._TrackedSortKey(column_index=1, descending=True),
+            tui._TrackedSortKey(column_index=2, descending=True),
         ),
     )
     assert [row.repo_full_name for row in sorted_rows] == ["o/repo-a", "o/repo-b", "o/repo-c"]
@@ -433,6 +433,10 @@ def test_observability_app_refresh_and_keybindings(
             tracked.focus()
             await _pilot.pause()
             tracked.move_cursor(row=0, column=1, animate=False)
+            await _pilot.press("enter")
+            await _pilot.pause()
+            assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
+            tracked.move_cursor(row=0, column=2, animate=False)
             await _pilot.press("enter")
             await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/pull/101"
@@ -777,16 +781,16 @@ def test_detail_modal_field_navigation_opens_urls(
             await pilot.pause()
             assert len(opened) == 1
             assert opened[-1] == "https://github.com/o/repo-a"
-            table.move_cursor(row=2, column=1, animate=False)  # PR
+            table.move_cursor(row=2, column=1, animate=False)  # Issue
             await pilot.press("enter")
             await pilot.pause()
             assert len(opened) == 2
-            assert opened[-1] == "https://github.com/o/repo-a/pull/101"
-            table.move_cursor(row=3, column=1, animate=False)  # Issue
+            assert opened[-1] == "https://github.com/o/repo-a/issues/7"
+            table.move_cursor(row=3, column=1, animate=False)  # PR
             await pilot.press("enter")
             await pilot.pause()
             assert len(opened) == 3
-            assert opened[-1] == "https://github.com/o/repo-a/issues/7"
+            assert opened[-1] == "https://github.com/o/repo-a/pull/101"
             table.move_cursor(row=7, column=1, animate=False)  # SHA commit
             await pilot.press("enter")
             await pilot.pause()
@@ -886,25 +890,25 @@ def test_tracked_header_click_sorts_with_deduped_stack(
                 app.on_data_table_header_selected(event)
 
             assert row_order() == ["o/repo-a", "o/repo-b", "o/repo-c"]
-            click_header(1)  # PR desc first click.
+            click_header(2)  # PR desc first click.
             await pilot.pause()
             assert row_order() == ["o/repo-a", "o/repo-c", "o/repo-b"]
             assert app._tracked_sort_stack == (
-                tui._TrackedSortKey(column_index=1, descending=True),
+                tui._TrackedSortKey(column_index=2, descending=True),
             )
             click_header(5)  # Pending desc as new primary key.
             await pilot.pause()
             assert row_order() == ["o/repo-c", "o/repo-a", "o/repo-b"]
             assert app._tracked_sort_stack == (
                 tui._TrackedSortKey(column_index=5, descending=True),
-                tui._TrackedSortKey(column_index=1, descending=True),
+                tui._TrackedSortKey(column_index=2, descending=True),
             )
             click_header(5)  # Toggle pending direction.
             await pilot.pause()
             assert row_order() == ["o/repo-a", "o/repo-b", "o/repo-c"]
             assert app._tracked_sort_stack == (
                 tui._TrackedSortKey(column_index=5, descending=False),
-                tui._TrackedSortKey(column_index=1, descending=True),
+                tui._TrackedSortKey(column_index=2, descending=True),
             )
 
     asyncio.run(run_app())
@@ -1095,9 +1099,9 @@ def test_tracked_sort_value_branches() -> None:
         updated_at="2026-02-24T00:01:00.000Z",
     )
     assert tui._tracked_sort_value(row, 0) == "o/repo-a"
-    assert tui._tracked_sort_value(row, 1) == 101
-    assert tui._tracked_sort_value(row_without_pr, 1) == -1
-    assert tui._tracked_sort_value(row, 2) == 7
+    assert tui._tracked_sort_value(row, 1) == 7
+    assert tui._tracked_sort_value(row, 2) == 101
+    assert tui._tracked_sort_value(row_without_pr, 2) == -1
     assert tui._tracked_sort_value(row, 3) == "blocked"
     assert tui._tracked_sort_value(row, 4) == "agent/design/7"
     assert tui._tracked_sort_value(row, 5) == 2
