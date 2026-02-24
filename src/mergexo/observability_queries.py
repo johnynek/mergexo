@@ -76,6 +76,16 @@ class PrHistoryRow:
 
 
 @dataclass(frozen=True)
+class TerminalIssueOutcomeRow:
+    repo_full_name: str
+    issue_number: int
+    pr_number: int | None
+    status: str
+    branch: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class RuntimeMetric:
     repo_full_name: str
     terminal_count: int
@@ -418,6 +428,54 @@ def load_pr_history(
             reason=_as_optional_str(row[6], "reason"),
             detail=_as_optional_str(row[7], "detail"),
             changed_at=_as_str(row[8], "changed_at"),
+        )
+        for row in rows
+    )
+
+
+def load_terminal_issue_outcomes(
+    db_path: Path,
+    repo_filter: str | None,
+    *,
+    limit: int,
+    offset: int = 0,
+) -> tuple[TerminalIssueOutcomeRow, ...]:
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    with _connect(db_path) as conn:
+        repo_clause, repo_params = _repo_filter_sql(repo_filter, prefix="i")
+        rows = conn.execute(
+            f"""
+            SELECT
+                i.repo_full_name,
+                i.issue_number,
+                i.pr_number,
+                i.status,
+                i.branch,
+                i.updated_at
+            FROM issue_runs AS i
+            WHERE i.status IN ('merged', 'closed')
+              {repo_clause}
+            ORDER BY
+                i.updated_at DESC,
+                i.repo_full_name ASC,
+                i.issue_number ASC,
+                COALESCE(i.pr_number, 0) ASC
+            LIMIT ?
+            OFFSET ?
+            """,
+            (*repo_params, limit, offset),
+        ).fetchall()
+    return tuple(
+        TerminalIssueOutcomeRow(
+            repo_full_name=_as_str(row[0], "repo_full_name"),
+            issue_number=_as_int(row[1], "issue_number"),
+            pr_number=_as_optional_int(row[2], "pr_number"),
+            status=_as_str(row[3], "status"),
+            branch=_as_optional_str(row[4], "branch"),
+            updated_at=_as_str(row[5], "updated_at"),
         )
         for row in rows
     )

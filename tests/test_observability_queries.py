@@ -133,6 +133,24 @@ def _seed_state(store: StateStore) -> None:
         waiting_reason="waiting for reporter clarification",
         repo_full_name="o/repo-b",
     )
+    store.mark_completed(
+        13, "agent/design/13", 1313, "https://example/pr/1313", repo_full_name="o/repo-a"
+    )
+    store.mark_pr_status(
+        pr_number=1313,
+        issue_number=13,
+        status="merged",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_completed(
+        14, "agent/design/14", 1414, "https://example/pr/1414", repo_full_name="o/repo-b"
+    )
+    store.mark_pr_status(
+        pr_number=1414,
+        issue_number=14,
+        status="closed",
+        repo_full_name="o/repo-b",
+    )
 
 
 def test_observability_queries_end_to_end(tmp_path: Path) -> None:
@@ -185,6 +203,17 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert pr_history[0].to_status == "blocked"
     assert pr_history[1].to_status == "awaiting_feedback"
 
+    terminal_outcomes = oq.load_terminal_issue_outcomes(db_path, None, limit=10)
+    assert len(terminal_outcomes) == 2
+    assert {row.status for row in terminal_outcomes} == {"merged", "closed"}
+    assert [row.updated_at for row in terminal_outcomes] == sorted(
+        (row.updated_at for row in terminal_outcomes),
+        reverse=True,
+    )
+    assert oq.load_terminal_issue_outcomes(db_path, "o/repo-a", limit=10)[0].status == "merged"
+    paged_outcomes = oq.load_terminal_issue_outcomes(db_path, None, limit=1, offset=1)
+    assert len(paged_outcomes) == 1
+
     metrics = oq.load_metrics(db_path, window="24h")
     assert metrics.overall.terminal_count == 3
     assert metrics.overall.failed_count == 1
@@ -215,6 +244,7 @@ def test_observability_queries_empty_state(tmp_path: Path) -> None:
     assert oq.load_tracked_and_blocked(db_path) == ()
     assert oq.load_issue_history(db_path, None, issue_number=1, limit=1) == ()
     assert oq.load_pr_history(db_path, None, pr_number=1, limit=1) == ()
+    assert oq.load_terminal_issue_outcomes(db_path, None, limit=1) == ()
 
 
 def test_observability_query_validation_paths(tmp_path: Path) -> None:
@@ -231,6 +261,10 @@ def test_observability_query_validation_paths(tmp_path: Path) -> None:
         oq.load_issue_history(db_path, None, issue_number=1, limit=0)
     with pytest.raises(ValueError, match="limit"):
         oq.load_pr_history(db_path, None, pr_number=1, limit=0)
+    with pytest.raises(ValueError, match="limit"):
+        oq.load_terminal_issue_outcomes(db_path, None, limit=0)
+    with pytest.raises(ValueError, match="offset"):
+        oq.load_terminal_issue_outcomes(db_path, None, limit=1, offset=-1)
 
     assert oq._window_modifier("1h") == "-1 hours"
     assert oq._window_modifier("24h") == "-24 hours"
