@@ -135,9 +135,44 @@ def test_observability_tui_helper_functions() -> None:
         branch="agent/design/9",
         updated_at="2026-02-24T00:02:00.000Z",
     )
+    no_pr_outcome = TerminalIssueOutcomeRow(
+        repo_full_name="o/repo-a",
+        issue_number=10,
+        pr_number=None,
+        status="closed",
+        branch=None,
+        updated_at="2026-02-24T00:03:00.000Z",
+    )
     assert tui._terminal_issue_outcome_label(merged_outcome) == "completed"
     assert tui._terminal_issue_outcome_label(closed_outcome) == "abandoned"
     assert tui._terminal_issue_outcome_label(other_outcome) == "blocked"
+    assert tui._history_row_key(merged_outcome) == (
+        "o/repo-a",
+        7,
+        101,
+        "merged",
+        "2026-02-24T00:00:00.000Z",
+    )
+    assert tui._terminal_history_title(merged_outcome) == "Issue #7 Completed"
+    history_context = tui._terminal_history_context(merged_outcome)
+    assert "Repo URL: https://github.com/o/repo-a" in history_context
+    assert "Issue URL: https://github.com/o/repo-a/issues/7" in history_context
+    assert "PR URL: https://github.com/o/repo-a/pull/101" in history_context
+    history_fields = tui._terminal_history_detail_fields(merged_outcome)
+    history_field_map = {field.label: field for field in history_fields}
+    assert history_field_map["Repo"].url == "https://github.com/o/repo-a"
+    assert history_field_map["Issue"].url == "https://github.com/o/repo-a/issues/7"
+    assert history_field_map["PR"].url == "https://github.com/o/repo-a/pull/101"
+    assert history_field_map["Branch"].url == "https://github.com/o/repo-a/tree/agent/design/7"
+    closed_history_fields = tui._terminal_history_detail_fields(closed_outcome)
+    closed_history_field_map = {field.label: field for field in closed_history_fields}
+    assert closed_history_field_map["Outcome"].value == "abandoned"
+    no_pr_context = tui._terminal_history_context(no_pr_outcome)
+    assert "PR: -" in no_pr_context
+    no_pr_history_fields = tui._terminal_history_detail_fields(no_pr_outcome)
+    no_pr_history_field_map = {field.label: field for field in no_pr_history_fields}
+    assert no_pr_history_field_map["PR"].value == "-"
+    assert no_pr_history_field_map["PR"].url is None
     sort_stack: tuple[tui._TrackedSortKey, ...] = ()
     sort_stack = tui._next_tracked_sort_stack(sort_stack, 1)
     assert sort_stack == (tui._TrackedSortKey(column_index=1, descending=True),)
@@ -460,6 +495,17 @@ def test_observability_app_refresh_and_keybindings(
             assert "Blocked Reason:" in shown_details[-1][1]
             app.action_refresh()
             assert tracked.cursor_column == 6
+            history.focus()
+            await _pilot.pause()
+            history.move_cursor(row=1, column=3, animate=False)
+            await _pilot.press("enter")
+            await _pilot.pause()
+            assert shown_details[-1][0] == "Issue #7 Completed"
+            assert "Repo URL: https://github.com/o/repo-a" in shown_details[-1][1]
+            assert "PR URL: https://github.com/o/repo-a/pull/101" in shown_details[-1][1]
+            app.action_refresh()
+            assert history.cursor_row == 1
+            assert history.cursor_column == 3
             app._refresh_history_table(reset=True)
             assert history.row_count == 2
             # Defensive selection paths when table/model counts are out of sync.
@@ -467,10 +513,14 @@ def test_observability_app_refresh_and_keybindings(
             assert app._active_row_selection() is None
             app._tracked_rows = ()
             assert app._tracked_row_selection() is None
+            app._history_rows = ()
+            assert app._history_row_selection() is None
             active.clear(columns=False)
             tracked.clear(columns=False)
+            history.clear(columns=False)
             app._restore_active_selection(None, 0)
             app._restore_tracked_selection(None, 0)
+            app._restore_history_selection(None, 1, 2)
             app.action_cycle_focus()
             app.action_refresh()
 
@@ -1216,7 +1266,7 @@ def test_detail_modal_activate_falls_back_to_module_open(monkeypatch: pytest.Mon
 
 
 def test_detail_data_table_ignores_non_target_ids(monkeypatch: pytest.MonkeyPatch) -> None:
-    table = tui._DetailDataTable(id="history-table")
+    table = tui._DetailDataTable(id="metrics-table")
     monkeypatch.setattr(DataTable, "action_select_cursor", lambda self: None)
     table.action_select_cursor()
 

@@ -169,7 +169,7 @@ class _DetailDataTable(DataTable):
 
     def action_select_cursor(self) -> None:
         super().action_select_cursor()
-        if self.id not in {"active-table", "tracked-table"}:
+        if self.id not in {"active-table", "tracked-table", "history-table"}:
             return
         app = self.app
         if isinstance(app, ObservabilityApp):
@@ -235,7 +235,7 @@ class ObservabilityApp(App[None]):
             yield Static("Tracked And Blocked Work", classes="panel-title")
             yield _DetailDataTable(id="tracked-table")
             yield Static("History", classes="panel-title")
-            yield DataTable(id="history-table")
+            yield _DetailDataTable(id="history-table")
             yield Static("Metrics", classes="panel-title")
             yield DataTable(id="metrics-table")
         yield Footer()
@@ -325,6 +325,15 @@ class ObservabilityApp(App[None]):
                     title=work_label,
                     body=_tracked_row_context(selected),
                     fields=_tracked_row_detail_fields(selected),
+                )
+                return
+        elif isinstance(focused, DataTable) and focused.id == "history-table":
+            selected = self._history_row_selection()
+            if selected is not None:
+                self._show_detail_context(
+                    title=_terminal_history_title(selected),
+                    body=_terminal_history_context(selected),
+                    fields=_terminal_history_detail_fields(selected),
                 )
                 return
 
@@ -466,12 +475,21 @@ class ObservabilityApp(App[None]):
 
     def _refresh_history_table(self, *, reset: bool = False) -> None:
         table = self._base_table("#history-table")
+        previous_key: tuple[str, int, int | None, str, str] | None = None
+        previous_row = 0
+        previous_column = 0
         if reset:
+            selected = self._history_row_selection()
+            previous_key = _history_row_key(selected) if selected is not None else None
+            previous_row = table.cursor_row if table.row_count > 0 else 0
+            previous_column = table.cursor_column if table.row_count > 0 else 0
             table.clear(columns=False)
             self._history_rows = ()
             self._history_offset = 0
             self._history_has_more = True
         self._load_more_history_rows()
+        if reset:
+            self._restore_history_selection(previous_key, previous_row, previous_column)
 
     def _load_more_history_rows(self) -> None:
         if self._history_loading or not self._history_has_more:
@@ -532,6 +550,15 @@ class ObservabilityApp(App[None]):
             return None
         return self._tracked_rows[index]
 
+    def _history_row_selection(self) -> TerminalIssueOutcomeRow | None:
+        table = self._base_table("#history-table")
+        if table.row_count < 1:
+            return None
+        index = table.cursor_row
+        if index < 0 or index >= len(self._history_rows):
+            return None
+        return self._history_rows[index]
+
     def _restore_active_selection(self, previous_run_id: str | None, previous_column: int) -> None:
         table = self._base_table("#active-table")
         if table.row_count < 1:
@@ -561,6 +588,28 @@ class ObservabilityApp(App[None]):
         if previous_key is not None:
             for idx, row in enumerate(self._tracked_rows):
                 if _tracked_row_key(row) == previous_key:
+                    row_index = idx
+                    break
+        max_column = max(0, len(table.columns) - 1)
+        table.move_cursor(
+            row=row_index,
+            column=min(max(previous_column, 0), max_column),
+            animate=False,
+        )
+
+    def _restore_history_selection(
+        self,
+        previous_key: tuple[str, int, int | None, str, str] | None,
+        previous_row: int,
+        previous_column: int,
+    ) -> None:
+        table = self._base_table("#history-table")
+        if table.row_count < 1:
+            return
+        row_index = min(max(previous_row, 0), table.row_count - 1)
+        if previous_key is not None:
+            for idx, row in enumerate(self._history_rows):
+                if _history_row_key(row) == previous_key:
                     row_index = idx
                     break
         max_column = max(0, len(table.columns) - 1)
@@ -671,12 +720,77 @@ def _tracked_row_key(row: TrackedOrBlockedRow) -> tuple[str, int | None, int, st
     return (row.repo_full_name, row.pr_number, row.issue_number, row.status)
 
 
+def _history_row_key(row: TerminalIssueOutcomeRow) -> tuple[str, int, int | None, str, str]:
+    return (
+        row.repo_full_name,
+        row.issue_number,
+        row.pr_number,
+        row.status,
+        row.updated_at,
+    )
+
+
 def _terminal_issue_outcome_label(row: TerminalIssueOutcomeRow) -> str:
     if row.status == "merged":
         return "completed"
     if row.status == "closed":
         return "abandoned"
     return row.status
+
+
+def _terminal_history_title(row: TerminalIssueOutcomeRow) -> str:
+    outcome = _terminal_issue_outcome_label(row).capitalize()
+    return f"Issue #{row.issue_number} {outcome}"
+
+
+def _terminal_history_context(row: TerminalIssueOutcomeRow) -> str:
+    repo_url = _repo_url(row.repo_full_name)
+    issue_url = _issue_url(row.repo_full_name, row.issue_number)
+    lines = [
+        f"Repo: {row.repo_full_name}",
+        f"Repo URL: {repo_url}",
+        f"Issue: {row.issue_number}",
+        f"Issue URL: {issue_url}",
+    ]
+    if row.pr_number is not None:
+        pr_url = _pr_url(row.repo_full_name, row.pr_number)
+        lines.extend(
+            [
+                f"PR: {row.pr_number}",
+                f"PR URL: {pr_url}",
+            ]
+        )
+    else:
+        lines.append("PR: -")
+    lines.extend(
+        [
+            f"Outcome: {_terminal_issue_outcome_label(row)}",
+            f"Status: {row.status}",
+            f"Branch: {row.branch or '-'}",
+            f"Updated At: {row.updated_at}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _terminal_history_detail_fields(row: TerminalIssueOutcomeRow) -> tuple[_DetailField, ...]:
+    repo_url = _repo_url(row.repo_full_name)
+    issue_url = _issue_url(row.repo_full_name, row.issue_number)
+    pr_value = str(row.pr_number) if row.pr_number is not None else "-"
+    pr_url = _pr_url(row.repo_full_name, row.pr_number) if row.pr_number is not None else None
+    branch_value = row.branch or "-"
+    branch_url = _branch_url(row.repo_full_name, row.branch) if row.branch else None
+    return (
+        _DetailField("Repo", row.repo_full_name, repo_url),
+        _DetailField("Repo URL", repo_url, repo_url),
+        _DetailField("Issue", str(row.issue_number), issue_url),
+        _DetailField("Issue URL", issue_url, issue_url),
+        _DetailField("PR", pr_value, pr_url),
+        _DetailField("Outcome", _terminal_issue_outcome_label(row)),
+        _DetailField("Status", row.status),
+        _DetailField("Branch", branch_value, branch_url),
+        _DetailField("Updated At", row.updated_at),
+    )
 
 
 def _next_tracked_sort_stack(
