@@ -59,6 +59,13 @@ from mergexo.models import (
     WorkResult,
 )
 from mergexo.observability import log_event, logging_repo_context
+from mergexo.prompts import (
+    build_bugfix_prompt,
+    build_design_prompt,
+    build_feedback_prompt,
+    build_implementation_prompt,
+    build_small_job_prompt,
+)
 from mergexo.shell import CommandError, run
 from mergexo.state import (
     AgentRunFailureClass,
@@ -88,6 +95,16 @@ _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "new_issue_comments_pending",
 )
 _PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(r"(bugfix|small-job|implementation) flow blocked:")
+_DEFAULT_RUN_META_JSON = json.dumps(
+    {
+        "codex_active": False,
+        "codex_invocation_started_at": None,
+        "codex_mode": None,
+        "codex_session_id": None,
+        "last_prompt": None,
+    },
+    sort_keys=True,
+)
 
 PrePrFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
 
@@ -242,6 +259,7 @@ class Phase1Orchestrator:
         self._running: dict[int, Future[WorkResult]] = {}
         self._running_issue_metadata: dict[int, _RunningIssueMetadata] = {}
         self._running_feedback: dict[int, _FeedbackFuture] = {}
+        self._run_meta_cache: dict[str, dict[str, object]] = {}
         self._running_lock = threading.Lock()
         self._poll_setup_done = False
         self._restart_drain_started_at_monotonic: float | None = None
@@ -496,8 +514,10 @@ class Phase1Orchestrator:
                     pr_number=None,
                     flow=flow,
                     branch=branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_issue_worker,
                     issue,
@@ -581,8 +601,10 @@ class Phase1Orchestrator:
                     pr_number=None,
                     flow="implementation",
                     branch=branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_implementation_candidate_worker,
                     candidate,
@@ -646,8 +668,10 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     flow=None,
                     branch=tracked.branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(self._process_feedback_turn_worker, tracked)
                 fut.add_done_callback(lambda _: self._work_limiter.release())
                 capacity_reserved = False
@@ -745,8 +769,10 @@ class Phase1Orchestrator:
                     pr_number=None,
                     flow=followup.flow,
                     branch=branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                self._initialize_run_meta_cache(run_id)
                 log_event(
                     LOGGER,
                     "pre_pr_followup_resumed",
@@ -1874,6 +1900,9 @@ class Phase1Orchestrator:
                             failure_class=_failure_class_for_exception(exc),
                             error=str(exc),
                         )
+                finally:
+                    if metadata is not None:
+                        self._run_meta_cache.pop(metadata.run_id, None)
 
             for pr_number in finished_pr_numbers:
                 handle = self._running_feedback.pop(pr_number)
@@ -1940,6 +1969,8 @@ class Phase1Orchestrator:
                         failure_class=_failure_class_for_exception(exc),
                         error=str(exc),
                     )
+                finally:
+                    self._run_meta_cache.pop(handle.run_id, None)
 
     def _wait_for_all(self, pool: ThreadPoolExecutor) -> None:
         while True:
@@ -2056,12 +2087,33 @@ class Phase1Orchestrator:
             issue_number=issue.number,
             branch=branch,
         )
-        start_result = self._agent.start_design_from_issue(
+        run_id = self._active_run_id_for_issue(issue.number)
+        design_prompt = build_design_prompt(
             issue=issue,
             repo_full_name=self._state_repo_full_name(),
             design_doc_path=design_relpath,
             default_branch=self._repo.default_branch,
-            cwd=checkout_path,
+        )
+        self._mark_codex_invocation_started(
+            run_id=run_id,
+            mode="writing_doc",
+            prompt=design_prompt,
+            session_id=None,
+        )
+        try:
+            start_result = self._agent.start_design_from_issue(
+                issue=issue,
+                repo_full_name=self._state_repo_full_name(),
+                design_doc_path=design_relpath,
+                default_branch=self._repo.default_branch,
+                cwd=checkout_path,
+            )
+        except Exception:
+            self._mark_codex_invocation_finished(run_id=run_id)
+            raise
+        self._mark_codex_invocation_finished(
+            run_id=run_id,
+            session_id=start_result.session.thread_id if start_result.session else None,
         )
         log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
         generated = start_result.design
@@ -2143,6 +2195,8 @@ class Phase1Orchestrator:
         coding_guidelines_path = self._coding_guidelines_path_for_checkout(
             checkout_path=checkout_path
         )
+        repo_full_name = self._state_repo_full_name()
+        run_id = self._active_run_id_for_issue(issue.number)
 
         flow_label: str
         direct_turn: Callable[[Issue], DirectStartResult]
@@ -2150,26 +2204,68 @@ class Phase1Orchestrator:
             flow_label = "bugfix"
 
             def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
-                return self._agent.start_bugfix_from_issue(
+                prompt = build_bugfix_prompt(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
-                    cwd=checkout_path,
                 )
+                self._mark_codex_invocation_started(
+                    run_id=run_id,
+                    mode="bugfix",
+                    prompt=prompt,
+                    session_id=None,
+                )
+                try:
+                    result = self._agent.start_bugfix_from_issue(
+                        issue=agent_issue,
+                        repo_full_name=repo_full_name,
+                        default_branch=self._repo.default_branch,
+                        coding_guidelines_path=coding_guidelines_path,
+                        cwd=checkout_path,
+                    )
+                except Exception:
+                    self._mark_codex_invocation_finished(run_id=run_id)
+                    raise
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=result.session.thread_id if result.session else None,
+                )
+                return result
 
             direct_turn = run_direct_turn
         elif flow == "small_job":
             flow_label = "small-job"
 
             def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
-                return self._agent.start_small_job_from_issue(
+                prompt = build_small_job_prompt(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
-                    cwd=checkout_path,
                 )
+                self._mark_codex_invocation_started(
+                    run_id=run_id,
+                    mode="small-job",
+                    prompt=prompt,
+                    session_id=None,
+                )
+                try:
+                    result = self._agent.start_small_job_from_issue(
+                        issue=agent_issue,
+                        repo_full_name=repo_full_name,
+                        default_branch=self._repo.default_branch,
+                        coding_guidelines_path=coding_guidelines_path,
+                        cwd=checkout_path,
+                    )
+                except Exception:
+                    self._mark_codex_invocation_finished(run_id=run_id)
+                    raise
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=result.session.thread_id if result.session else None,
+                )
+                return result
 
             direct_turn = run_direct_turn
         else:
@@ -2290,19 +2386,46 @@ class Phase1Orchestrator:
             coding_guidelines_path = self._coding_guidelines_path_for_checkout(
                 checkout_path=lease.path
             )
+            repo_full_name = self._state_repo_full_name()
+            run_id = self._active_run_id_for_issue(issue.number)
 
             def run_implementation_turn(agent_issue: Issue) -> DirectStartResult:
-                return self._agent.start_implementation_from_design(
+                prompt = build_implementation_prompt(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                     design_doc_path=design_relpath,
                     design_doc_markdown=design_doc_markdown,
                     design_pr_number=candidate.design_pr_number,
                     design_pr_url=candidate.design_pr_url,
-                    cwd=lease.path,
                 )
+                self._mark_codex_invocation_started(
+                    run_id=run_id,
+                    mode="implementation",
+                    prompt=prompt,
+                    session_id=None,
+                )
+                try:
+                    result = self._agent.start_implementation_from_design(
+                        issue=agent_issue,
+                        repo_full_name=repo_full_name,
+                        default_branch=self._repo.default_branch,
+                        coding_guidelines_path=coding_guidelines_path,
+                        design_doc_path=design_relpath,
+                        design_doc_markdown=design_doc_markdown,
+                        design_pr_number=candidate.design_pr_number,
+                        design_pr_url=candidate.design_pr_url,
+                        cwd=lease.path,
+                    )
+                except Exception:
+                    self._mark_codex_invocation_finished(run_id=run_id)
+                    raise
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=result.session.thread_id if result.session else None,
+                )
+                return result
 
             default_commit_message = _default_commit_message(
                 flow="small_job", issue_number=issue.number
@@ -2418,6 +2541,88 @@ class Phase1Orchestrator:
     def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> str:
         with logging_repo_context(self._repo.full_name):
             return self._process_feedback_turn(tracked)
+
+    def _active_run_id_for_issue(self, issue_number: int) -> str | None:
+        for _ in range(20):
+            with self._running_lock:
+                metadata = self._running_issue_metadata.get(issue_number)
+                if metadata is not None:
+                    return metadata.run_id
+            time.sleep(0.01)
+        return None
+
+    def _active_run_id_for_pr(self, pr_number: int) -> str | None:
+        for _ in range(20):
+            with self._running_lock:
+                feedback = self._running_feedback.get(pr_number)
+                if feedback is not None:
+                    return feedback.run_id
+            time.sleep(0.01)
+        return None
+
+    def _active_run_id_for_pr_now(self, pr_number: int) -> str | None:
+        with self._running_lock:
+            feedback = self._running_feedback.get(pr_number)
+            if feedback is None:
+                return None
+            return feedback.run_id
+
+    def _initialize_run_meta_cache(self, run_id: str) -> None:
+        self._run_meta_cache[run_id] = json.loads(_DEFAULT_RUN_META_JSON)
+
+    def _update_run_meta(self, run_id: str | None, **updates: object) -> None:
+        if run_id is None:
+            return
+        current = dict(self._run_meta_cache.get(run_id, {}))
+        current.update(updates)
+        self._run_meta_cache[run_id] = current
+        updated = self._state.update_agent_run_meta(
+            run_id=run_id,
+            meta_json=json.dumps(current, sort_keys=True),
+        )
+        if not updated:
+            self._run_meta_cache.pop(run_id, None)
+
+    def _record_run_prompt(self, run_id: str | None, prompt: str) -> None:
+        if run_id is None:
+            return
+        self._update_run_meta(
+            run_id,
+            last_prompt=prompt,
+        )
+
+    def _mark_codex_invocation_started(
+        self,
+        *,
+        run_id: str | None,
+        mode: str,
+        prompt: str,
+        session_id: str | None,
+    ) -> None:
+        self._update_run_meta(
+            run_id,
+            codex_active=True,
+            codex_invocation_started_at=datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            ),
+            codex_mode=mode,
+            codex_session_id=session_id,
+            last_prompt=prompt,
+        )
+
+    def _mark_codex_invocation_finished(
+        self,
+        *,
+        run_id: str | None,
+        session_id: str | None = None,
+    ) -> None:
+        updates: dict[str, object] = {
+            "codex_active": False,
+            "codex_invocation_started_at": None,
+        }
+        if session_id is not None:
+            updates["codex_session_id"] = session_id
+        self._update_run_meta(run_id, **updates)
 
     def _save_agent_session_if_present(
         self, *, issue_number: int, session: AgentSession | None
@@ -3767,6 +3972,8 @@ class Phase1Orchestrator:
         round_number = 0
 
         while True:
+            run_id = self._active_run_id_for_pr_now(tracked.pr_number)
+            prompt = build_feedback_prompt(turn=current_turn)
             log_event(
                 LOGGER,
                 "feedback_agent_call_started",
@@ -3774,10 +3981,27 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 turn_key=current_turn.turn_key,
             )
-            result = self._agent.respond_to_feedback(
-                session=current_session,
-                turn=current_turn,
-                cwd=checkout_path,
+            self._mark_codex_invocation_started(
+                run_id=run_id,
+                mode="respond_to_review",
+                prompt=prompt,
+                session_id=current_session.thread_id,
+            )
+            try:
+                result = self._agent.respond_to_feedback(
+                    session=current_session,
+                    turn=current_turn,
+                    cwd=checkout_path,
+                )
+            except Exception:
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=current_session.thread_id,
+                )
+                raise
+            self._mark_codex_invocation_finished(
+                run_id=run_id,
+                session_id=result.session.thread_id,
             )
             log_event(
                 LOGGER,

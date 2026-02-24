@@ -138,11 +138,23 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         started_at="2026-02-24T00:00:00.000Z",
     )
     assert run_id == "run-42"
+    assert store.update_agent_run_meta(run_id=run_id, meta_json='{"last_prompt":"hello"}')
+    conn = sqlite3.connect(db_path)
+    try:
+        updated_meta = conn.execute(
+            "SELECT meta_json FROM agent_run_history WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert updated_meta is not None
+    assert updated_meta[0] == '{"last_prompt":"hello"}'
     assert store.finish_agent_run(
         run_id=run_id,
         terminal_status="completed",
         finished_at="2026-02-24T00:01:40.000Z",
     )
+    assert store.update_agent_run_meta(run_id=run_id, meta_json='{"last_prompt":"late"}') is False
     assert (
         store.finish_agent_run(
             run_id=run_id,

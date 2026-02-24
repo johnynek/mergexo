@@ -21,12 +21,12 @@ from mergexo.observability_queries import (
     MetricsStats,
     OverviewStats,
     PrHistoryRow,
+    TerminalIssueOutcomeRow,
     TrackedOrBlockedRow,
     load_active_agents,
-    load_issue_history,
     load_metrics,
     load_overview,
-    load_pr_history,
+    load_terminal_issue_outcomes,
     load_tracked_and_blocked,
 )
 from mergexo.service_runner import ServiceSignal
@@ -40,6 +40,7 @@ _TRACKED_COL_ISSUE = 1
 _TRACKED_COL_PR = 2
 _TRACKED_COL_BRANCH = 4
 _BLOCKED_REASON_MAX_CHARS = 36
+_HISTORY_SCROLL_LOAD_THRESHOLD = 5
 _SERVICE_SIGNAL_DRAIN_SECONDS = 0.2
 _SERVICE_SIGNAL_REFRESH_DEBOUNCE_SECONDS = 0.2
 
@@ -173,7 +174,7 @@ class _DetailDataTable(DataTable):
 
     def action_select_cursor(self) -> None:
         super().action_select_cursor()
-        if self.id not in {"active-table", "tracked-table"}:
+        if self.id not in {"active-table", "tracked-table", "history-table"}:
             return
         app = self.app
         if isinstance(app, ObservabilityApp):
@@ -226,6 +227,10 @@ class ObservabilityApp(App[None]):
         self._active_rows: tuple[ActiveAgentRow, ...] = ()
         self._tracked_rows: tuple[TrackedOrBlockedRow, ...] = ()
         self._tracked_sort_stack: tuple[_TrackedSortKey, ...] = ()
+        self._history_rows: tuple[TerminalIssueOutcomeRow, ...] = ()
+        self._history_offset: int = 0
+        self._history_has_more: bool = True
+        self._history_loading: bool = False
         self._detail_target: _DetailTarget | None = None
         self._service_signal_queue = service_signal_queue
         self._on_shutdown = on_shutdown
@@ -243,7 +248,7 @@ class ObservabilityApp(App[None]):
             yield Static("Tracked And Blocked Work", classes="panel-title")
             yield _DetailDataTable(id="tracked-table")
             yield Static("History", classes="panel-title")
-            yield DataTable(id="history-table")
+            yield _DetailDataTable(id="history-table")
             yield Static("Metrics", classes="panel-title")
             yield DataTable(id="metrics-table")
         yield Footer()
@@ -282,6 +287,18 @@ class ObservabilityApp(App[None]):
             return
         self._sort_tracked_by_column(event.column_index)
 
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "history-table":
+            return
+        if event.cursor_row < 0:
+            return
+        if not self._history_has_more or self._history_loading:
+            return
+        remaining = event.data_table.row_count - event.cursor_row - 1
+        if remaining > _HISTORY_SCROLL_LOAD_THRESHOLD:
+            return
+        self._load_more_history_rows()
+
     def _sort_tracked_by_column(self, column_index: int) -> None:
         self._tracked_sort_stack = _next_tracked_sort_stack(self._tracked_sort_stack, column_index)
         self._apply_tracked_sort()
@@ -289,6 +306,11 @@ class ObservabilityApp(App[None]):
 
     def _apply_tracked_sort(self) -> None:
         self._tracked_rows = _sort_tracked_rows(self._tracked_rows, self._tracked_sort_stack)
+
+    def _history_page_size(self) -> int:
+        if self._row_limit is None:
+            return 200
+        return max(1, self._row_limit)
 
     def action_show_detail(self) -> None:
         focused = self.focused
@@ -300,7 +322,6 @@ class ObservabilityApp(App[None]):
                     self._open_external_url(active_url)
                     return
                 self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
-                self._refresh_history_table()
                 self._show_detail_context(
                     title=f"Issue #{selected.issue_number} Context",
                     body=_active_row_context(selected),
@@ -318,7 +339,6 @@ class ObservabilityApp(App[None]):
                     self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
                 else:
                     self._detail_target = _DetailTarget(kind="pr", number=selected.pr_number)
-                self._refresh_history_table()
                 work_label = (
                     f"PR #{selected.pr_number} Context"
                     if selected.pr_number is not None
@@ -330,8 +350,15 @@ class ObservabilityApp(App[None]):
                     fields=_tracked_row_detail_fields(selected),
                 )
                 return
-        if self._detail_target is not None:
-            self._refresh_history_table()
+        elif isinstance(focused, DataTable) and focused.id == "history-table":
+            selected = self._history_row_selection()
+            if selected is not None:
+                self._show_detail_context(
+                    title=_terminal_history_title(selected),
+                    body=_terminal_history_context(selected),
+                    fields=_terminal_history_detail_fields(selected),
+                )
+                return
 
     def _open_external_url(self, url: str) -> None:
         if _open_external_url(url):
@@ -388,7 +415,7 @@ class ObservabilityApp(App[None]):
         self._refresh_active_table()
         self._refresh_tracked_table()
         self._refresh_metrics_table(metrics)
-        self._refresh_history_table()
+        self._refresh_history_table(reset=True)
         self._last_refresh_at_monotonic = time.monotonic()
         self._signal_refresh_pending = False
 
@@ -456,7 +483,7 @@ class ObservabilityApp(App[None]):
             "Blocked Reason",
             "Updated",
         )
-        history.add_columns("Time", "Type", "From", "To", "Detail")
+        history.add_columns("Time", "Outcome", "Repo", "Issue", "PR", "Status")
         metrics.add_columns("Repo", "Terminal", "Failed", "Failure Rate", "Mean", "StdDev")
 
     def _refresh_active_table(self) -> None:
@@ -519,29 +546,64 @@ class ObservabilityApp(App[None]):
                 _render_seconds(row.stddev_runtime_seconds),
             )
 
-    def _refresh_history_table(self) -> None:
+    def _refresh_history_table(self, *, reset: bool = False) -> None:
         table = self._base_table("#history-table")
-        table.clear(columns=False)
-        target = self._detail_target
-        if target is None:
-            table.add_row("-", "hint", "-", "-", "Press Enter on active/tracked rows for details")
+        previous_key: tuple[str, int, int | None, str, str] | None = None
+        previous_row = 0
+        previous_column = 0
+        if reset:
+            selected = self._history_row_selection()
+            previous_key = _history_row_key(selected) if selected is not None else None
+            previous_row = table.cursor_row if table.row_count > 0 else 0
+            previous_column = table.cursor_column if table.row_count > 0 else 0
+            table.clear(columns=False)
+            self._history_rows = ()
+            self._history_offset = 0
+            self._history_has_more = True
+        self._load_more_history_rows()
+        if reset:
+            self._restore_history_selection(previous_key, previous_row, previous_column)
+
+    def _load_more_history_rows(self) -> None:
+        if self._history_loading or not self._history_has_more:
             return
-        if target.kind == "issue":
-            rows = load_issue_history(
+        self._history_loading = True
+        try:
+            page_size = self._history_page_size()
+            rows = load_terminal_issue_outcomes(
                 self._db_path,
                 self._repo_filter,
-                target.number,
-                limit=self._row_limit or 200,
+                limit=page_size,
+                offset=self._history_offset,
             )
-            _fill_issue_history(table, rows)
+            self._history_rows = (*self._history_rows, *rows)
+            self._history_offset += len(rows)
+            if len(rows) < page_size:
+                self._history_has_more = False
+            self._render_history_rows(rows)
+        finally:
+            self._history_loading = False
+
+    def _render_history_rows(self, rows: tuple[TerminalIssueOutcomeRow, ...]) -> None:
+        table = self._base_table("#history-table")
+        if not self._history_rows:
+            table.clear(columns=False)
+            table.add_row("-", "-", "-", "-", "-", "No terminal issue outcomes found")
             return
-        rows = load_pr_history(
-            self._db_path,
-            self._repo_filter,
-            target.number,
-            limit=self._row_limit or 200,
-        )
-        _fill_pr_history(table, rows)
+        if (
+            table.row_count == 1
+            and str(table.get_row_at(0)[5]) == "No terminal issue outcomes found"
+        ):
+            table.clear(columns=False)
+        for row in rows:
+            table.add_row(
+                row.updated_at,
+                _terminal_issue_outcome_label(row),
+                row.repo_full_name,
+                str(row.issue_number),
+                str(row.pr_number) if row.pr_number is not None else "-",
+                row.status,
+            )
 
     def _active_row_selection(self) -> ActiveAgentRow | None:
         table = self._base_table("#active-table")
@@ -560,6 +622,15 @@ class ObservabilityApp(App[None]):
         if index < 0 or index >= len(self._tracked_rows):
             return None
         return self._tracked_rows[index]
+
+    def _history_row_selection(self) -> TerminalIssueOutcomeRow | None:
+        table = self._base_table("#history-table")
+        if table.row_count < 1:
+            return None
+        index = table.cursor_row
+        if index < 0 or index >= len(self._history_rows):
+            return None
+        return self._history_rows[index]
 
     def _restore_active_selection(self, previous_run_id: str | None, previous_column: int) -> None:
         table = self._base_table("#active-table")
@@ -590,6 +661,28 @@ class ObservabilityApp(App[None]):
         if previous_key is not None:
             for idx, row in enumerate(self._tracked_rows):
                 if _tracked_row_key(row) == previous_key:
+                    row_index = idx
+                    break
+        max_column = max(0, len(table.columns) - 1)
+        table.move_cursor(
+            row=row_index,
+            column=min(max(previous_column, 0), max_column),
+            animate=False,
+        )
+
+    def _restore_history_selection(
+        self,
+        previous_key: tuple[str, int, int | None, str, str] | None,
+        previous_row: int,
+        previous_column: int,
+    ) -> None:
+        table = self._base_table("#history-table")
+        if table.row_count < 1:
+            return
+        row_index = min(max(previous_row, 0), table.row_count - 1)
+        if previous_key is not None:
+            for idx, row in enumerate(self._history_rows):
+                if _history_row_key(row) == previous_key:
                     row_index = idx
                     break
         max_column = max(0, len(table.columns) - 1)
@@ -706,6 +799,79 @@ def _tracked_row_key(row: TrackedOrBlockedRow) -> tuple[str, int | None, int, st
     return (row.repo_full_name, row.pr_number, row.issue_number, row.status)
 
 
+def _history_row_key(row: TerminalIssueOutcomeRow) -> tuple[str, int, int | None, str, str]:
+    return (
+        row.repo_full_name,
+        row.issue_number,
+        row.pr_number,
+        row.status,
+        row.updated_at,
+    )
+
+
+def _terminal_issue_outcome_label(row: TerminalIssueOutcomeRow) -> str:
+    if row.status == "merged":
+        return "completed"
+    if row.status == "closed":
+        return "abandoned"
+    return row.status
+
+
+def _terminal_history_title(row: TerminalIssueOutcomeRow) -> str:
+    outcome = _terminal_issue_outcome_label(row).capitalize()
+    return f"Issue #{row.issue_number} {outcome}"
+
+
+def _terminal_history_context(row: TerminalIssueOutcomeRow) -> str:
+    repo_url = _repo_url(row.repo_full_name)
+    issue_url = _issue_url(row.repo_full_name, row.issue_number)
+    lines = [
+        f"Repo: {row.repo_full_name}",
+        f"Repo URL: {repo_url}",
+        f"Issue: {row.issue_number}",
+        f"Issue URL: {issue_url}",
+    ]
+    if row.pr_number is not None:
+        pr_url = _pr_url(row.repo_full_name, row.pr_number)
+        lines.extend(
+            [
+                f"PR: {row.pr_number}",
+                f"PR URL: {pr_url}",
+            ]
+        )
+    else:
+        lines.append("PR: -")
+    lines.extend(
+        [
+            f"Outcome: {_terminal_issue_outcome_label(row)}",
+            f"Status: {row.status}",
+            f"Branch: {row.branch or '-'}",
+            f"Updated At: {row.updated_at}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _terminal_history_detail_fields(row: TerminalIssueOutcomeRow) -> tuple[_DetailField, ...]:
+    repo_url = _repo_url(row.repo_full_name)
+    issue_url = _issue_url(row.repo_full_name, row.issue_number)
+    pr_value = str(row.pr_number) if row.pr_number is not None else "-"
+    pr_url = _pr_url(row.repo_full_name, row.pr_number) if row.pr_number is not None else None
+    branch_value = row.branch or "-"
+    branch_url = _branch_url(row.repo_full_name, row.branch) if row.branch else None
+    return (
+        _DetailField("Repo", row.repo_full_name, repo_url),
+        _DetailField("Repo URL", repo_url, repo_url),
+        _DetailField("Issue", str(row.issue_number), issue_url),
+        _DetailField("Issue URL", issue_url, issue_url),
+        _DetailField("PR", pr_value, pr_url),
+        _DetailField("Outcome", _terminal_issue_outcome_label(row)),
+        _DetailField("Status", row.status),
+        _DetailField("Branch", branch_value, branch_url),
+        _DetailField("Updated At", row.updated_at),
+    )
+
+
 def _next_tracked_sort_stack(
     current: tuple[_TrackedSortKey, ...],
     column_index: int,
@@ -798,6 +964,9 @@ def _active_row_detail_fields(row: ActiveAgentRow) -> tuple[_DetailField, ...]:
         _DetailField("Branch", branch_value, branch_link),
         _DetailField("Started", row.started_at),
         _DetailField("Elapsed", _render_seconds(row.elapsed_seconds)),
+        _DetailField("Codex Mode", row.codex_mode or "-"),
+        _DetailField("Codex Session ID", row.codex_session_id or "-"),
+        _DetailField("Codex Invocation Started", row.codex_invocation_started_at or "-"),
     )
 
 
@@ -864,6 +1033,7 @@ def _render_context_snippet(value: str | None, *, max_chars: int) -> str:
 
 
 def _active_row_context(row: ActiveAgentRow) -> str:
+    prompt_value = row.prompt or "-"
     return "\n".join(
         [
             f"Repo: {row.repo_full_name}",
@@ -874,6 +1044,12 @@ def _active_row_context(row: ActiveAgentRow) -> str:
             f"Branch: {row.branch or '-'}",
             f"Started: {row.started_at}",
             f"Elapsed: {_render_seconds(row.elapsed_seconds)}",
+            f"Codex Mode: {row.codex_mode or '-'}",
+            f"Codex Session ID: {row.codex_session_id or '-'}",
+            f"Codex Invocation Started: {row.codex_invocation_started_at or '-'}",
+            "",
+            "Last Prompt:",
+            prompt_value,
         ]
     )
 

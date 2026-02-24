@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from math import sqrt
 from pathlib import Path
 import sqlite3
@@ -30,6 +31,10 @@ class ActiveAgentRow:
     branch: str | None
     started_at: str
     elapsed_seconds: float
+    prompt: str | None = None
+    codex_mode: str | None = None
+    codex_session_id: str | None = None
+    codex_invocation_started_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,16 @@ class PrHistoryRow:
 
 
 @dataclass(frozen=True)
+class TerminalIssueOutcomeRow:
+    repo_full_name: str
+    issue_number: int
+    pr_number: int | None
+    status: str
+    branch: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class RuntimeMetric:
     repo_full_name: str
     terminal_count: int
@@ -97,15 +112,19 @@ def load_overview(
     with _connect(db_path) as conn:
         repo_clause, repo_params = _repo_filter_sql(repo_filter)
         issue_repo_clause, issue_repo_params = _repo_filter_sql(repo_filter, prefix="i")
-        active_agents = _fetch_int(
-            conn,
+        active_rows = conn.execute(
             f"""
-            SELECT COUNT(*)
+            SELECT meta_json
             FROM agent_run_history
             WHERE finished_at IS NULL
               {repo_clause}
             """,
             repo_params,
+        ).fetchall()
+        active_agents = sum(
+            1
+            for row in active_rows
+            if _active_run_meta_from_json(_as_str(row[0], "meta_json")).codex_active
         )
         blocked_prs = _fetch_int(
             conn,
@@ -172,15 +191,9 @@ def load_active_agents(
     now_iso = now_value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     with _connect(db_path) as conn:
         repo_clause, repo_params = _repo_filter_sql(repo_filter)
-        limit_clause = ""
-        params: tuple[object, ...]
         if limit is not None:
             if limit < 1:
                 raise ValueError("limit must be >= 1")
-            limit_clause = "LIMIT ?"
-            params = (now_iso, *repo_params, limit)
-        else:
-            params = (now_iso, *repo_params)
         rows = conn.execute(
             f"""
             SELECT
@@ -192,16 +205,16 @@ def load_active_agents(
                 flow,
                 branch,
                 started_at,
-                MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS elapsed_seconds
+                MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS elapsed_seconds,
+                meta_json
             FROM agent_run_history
             WHERE finished_at IS NULL
               {repo_clause}
             ORDER BY started_at ASC, repo_full_name ASC, issue_number ASC
-            {limit_clause}
             """,
-            params,
+            (now_iso, *repo_params),
         ).fetchall()
-    return tuple(
+    active_rows = tuple(
         ActiveAgentRow(
             run_id=_as_str(row[0], "run_id"),
             repo_full_name=_as_str(row[1], "repo_full_name"),
@@ -212,9 +225,18 @@ def load_active_agents(
             branch=_as_optional_str(row[6], "branch"),
             started_at=_as_str(row[7], "started_at"),
             elapsed_seconds=_as_float(row[8], "elapsed_seconds"),
+            prompt=meta.prompt,
+            codex_mode=meta.codex_mode,
+            codex_session_id=meta.codex_session_id,
+            codex_invocation_started_at=meta.codex_invocation_started_at,
         )
         for row in rows
+        for meta in (_active_run_meta_from_json(_as_str(row[9], "meta_json")),)
+        if meta.codex_active
     )
+    if limit is None:
+        return active_rows
+    return active_rows[:limit]
 
 
 def load_tracked_and_blocked(
@@ -423,6 +445,54 @@ def load_pr_history(
     )
 
 
+def load_terminal_issue_outcomes(
+    db_path: Path,
+    repo_filter: str | None,
+    *,
+    limit: int,
+    offset: int = 0,
+) -> tuple[TerminalIssueOutcomeRow, ...]:
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    with _connect(db_path) as conn:
+        repo_clause, repo_params = _repo_filter_sql(repo_filter, prefix="i")
+        rows = conn.execute(
+            f"""
+            SELECT
+                i.repo_full_name,
+                i.issue_number,
+                i.pr_number,
+                i.status,
+                i.branch,
+                i.updated_at
+            FROM issue_runs AS i
+            WHERE i.status IN ('merged', 'closed')
+              {repo_clause}
+            ORDER BY
+                i.updated_at DESC,
+                i.repo_full_name ASC,
+                i.issue_number ASC,
+                COALESCE(i.pr_number, 0) ASC
+            LIMIT ?
+            OFFSET ?
+            """,
+            (*repo_params, limit, offset),
+        ).fetchall()
+    return tuple(
+        TerminalIssueOutcomeRow(
+            repo_full_name=_as_str(row[0], "repo_full_name"),
+            issue_number=_as_int(row[1], "issue_number"),
+            pr_number=_as_optional_int(row[2], "pr_number"),
+            status=_as_str(row[3], "status"),
+            branch=_as_optional_str(row[4], "branch"),
+            updated_at=_as_str(row[5], "updated_at"),
+        )
+        for row in rows
+    )
+
+
 def load_metrics(
     db_path: Path, repo_filter: str | None = None, window: str = "24h"
 ) -> MetricsStats:
@@ -444,6 +514,7 @@ def _load_metrics(
             AVG(duration_seconds * duration_seconds) AS mean_runtime_sq
         FROM agent_run_history
         WHERE finished_at IS NOT NULL
+          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup')
           AND terminal_status IN ('completed', 'failed', 'blocked', 'interrupted')
           AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
           {repo_clause}
@@ -470,6 +541,7 @@ def _load_metrics(
             AVG(duration_seconds * duration_seconds) AS mean_runtime_sq
         FROM agent_run_history
         WHERE finished_at IS NOT NULL
+          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup')
           AND terminal_status IN ('completed', 'failed', 'blocked', 'interrupted')
           AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
           {repo_clause}
@@ -605,3 +677,43 @@ def _as_optional_float(value: object, field: str) -> float | None:
     if isinstance(value, int | float):
         return float(value)
     raise RuntimeError(f"Invalid {field} value in observability query result")
+
+
+@dataclass(frozen=True)
+class _ActiveRunMeta:
+    codex_active: bool
+    prompt: str | None
+    codex_mode: str | None
+    codex_session_id: str | None
+    codex_invocation_started_at: str | None
+
+
+def _active_run_meta_from_json(meta_json: str) -> _ActiveRunMeta:
+    try:
+        payload = json.loads(meta_json)
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    return _ActiveRunMeta(
+        codex_active=payload.get("codex_active") is True,
+        prompt=_normalized_meta_text(payload.get("last_prompt")),
+        codex_mode=_normalized_meta_text(payload.get("codex_mode")),
+        codex_session_id=_normalized_meta_text(payload.get("codex_session_id")),
+        codex_invocation_started_at=_normalized_meta_text(
+            payload.get("codex_invocation_started_at")
+        ),
+    )
+
+
+def _normalized_meta_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _prompt_from_meta_json(meta_json: str) -> str | None:
+    return _active_run_meta_from_json(meta_json).prompt

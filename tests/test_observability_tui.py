@@ -16,6 +16,7 @@ from mergexo.observability_queries import (
     OverviewStats,
     PrHistoryRow,
     RuntimeMetric,
+    TerminalIssueOutcomeRow,
     TrackedOrBlockedRow,
 )
 from mergexo.service_runner import ServiceSignal
@@ -45,6 +46,10 @@ def test_observability_tui_helper_functions() -> None:
         branch="agent/design/7",
         started_at="2026-02-24T00:00:00.000Z",
         elapsed_seconds=12.0,
+        prompt="Prompt for active run",
+        codex_mode="bugfix",
+        codex_session_id="thread-123",
+        codex_invocation_started_at="2026-02-24T00:00:10.000Z",
     )
     tracked_pr = TrackedOrBlockedRow(
         repo_full_name="o/repo-a",
@@ -91,6 +96,10 @@ def test_observability_tui_helper_functions() -> None:
 
     active_context = tui._active_row_context(active)
     assert "Issue: 7" in active_context
+    assert "Codex Mode: bugfix" in active_context
+    assert "Codex Session ID: thread-123" in active_context
+    assert "Last Prompt:" in active_context
+    assert "Prompt for active run" in active_context
     tracked_context = tui._tracked_row_context(tracked_pr)
     assert "Repo URL: https://github.com/o/repo-a" in tracked_context
     assert "Blocked Reason:" in tracked_context
@@ -98,6 +107,9 @@ def test_observability_tui_helper_functions() -> None:
     active_fields = tui._active_row_detail_fields(active)
     assert active_fields[0].label == "Repo"
     assert active_fields[0].url == "https://github.com/o/repo-a"
+    active_field_map = {field.label: field for field in active_fields}
+    assert active_field_map["Codex Mode"].value == "bugfix"
+    assert active_field_map["Codex Session ID"].value == "thread-123"
     tracked_fields = tui._tracked_row_detail_fields(tracked_pr)
     tracked_field_map = {field.label: field for field in tracked_fields}
     assert tracked_field_map["Repo"].url == "https://github.com/o/repo-a"
@@ -112,6 +124,68 @@ def test_observability_tui_helper_functions() -> None:
     assert tracked_issue_field_map["PR"].url is None
     assert tracked_issue_field_map["Last Seen Head SHA"].value == "-"
     assert tracked_issue_field_map["Last Seen Head SHA"].url is None
+    merged_outcome = TerminalIssueOutcomeRow(
+        repo_full_name="o/repo-a",
+        issue_number=7,
+        pr_number=101,
+        status="merged",
+        branch="agent/design/7",
+        updated_at="2026-02-24T00:00:00.000Z",
+    )
+    closed_outcome = TerminalIssueOutcomeRow(
+        repo_full_name="o/repo-a",
+        issue_number=8,
+        pr_number=102,
+        status="closed",
+        branch="agent/design/8",
+        updated_at="2026-02-24T00:01:00.000Z",
+    )
+    other_outcome = TerminalIssueOutcomeRow(
+        repo_full_name="o/repo-a",
+        issue_number=9,
+        pr_number=103,
+        status="blocked",
+        branch="agent/design/9",
+        updated_at="2026-02-24T00:02:00.000Z",
+    )
+    no_pr_outcome = TerminalIssueOutcomeRow(
+        repo_full_name="o/repo-a",
+        issue_number=10,
+        pr_number=None,
+        status="closed",
+        branch=None,
+        updated_at="2026-02-24T00:03:00.000Z",
+    )
+    assert tui._terminal_issue_outcome_label(merged_outcome) == "completed"
+    assert tui._terminal_issue_outcome_label(closed_outcome) == "abandoned"
+    assert tui._terminal_issue_outcome_label(other_outcome) == "blocked"
+    assert tui._history_row_key(merged_outcome) == (
+        "o/repo-a",
+        7,
+        101,
+        "merged",
+        "2026-02-24T00:00:00.000Z",
+    )
+    assert tui._terminal_history_title(merged_outcome) == "Issue #7 Completed"
+    history_context = tui._terminal_history_context(merged_outcome)
+    assert "Repo URL: https://github.com/o/repo-a" in history_context
+    assert "Issue URL: https://github.com/o/repo-a/issues/7" in history_context
+    assert "PR URL: https://github.com/o/repo-a/pull/101" in history_context
+    history_fields = tui._terminal_history_detail_fields(merged_outcome)
+    history_field_map = {field.label: field for field in history_fields}
+    assert history_field_map["Repo"].url == "https://github.com/o/repo-a"
+    assert history_field_map["Issue"].url == "https://github.com/o/repo-a/issues/7"
+    assert history_field_map["PR"].url == "https://github.com/o/repo-a/pull/101"
+    assert history_field_map["Branch"].url == "https://github.com/o/repo-a/tree/agent/design/7"
+    closed_history_fields = tui._terminal_history_detail_fields(closed_outcome)
+    closed_history_field_map = {field.label: field for field in closed_history_fields}
+    assert closed_history_field_map["Outcome"].value == "abandoned"
+    no_pr_context = tui._terminal_history_context(no_pr_outcome)
+    assert "PR: -" in no_pr_context
+    no_pr_history_fields = tui._terminal_history_detail_fields(no_pr_outcome)
+    no_pr_history_field_map = {field.label: field for field in no_pr_history_fields}
+    assert no_pr_history_field_map["PR"].value == "-"
+    assert no_pr_history_field_map["PR"].url is None
     sort_stack: tuple[tui._TrackedSortKey, ...] = ()
     sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
     assert sort_stack == (tui._TrackedSortKey(column_index=2, descending=True),)
@@ -490,7 +564,6 @@ def test_notify_shutdown_without_callback_marks_notified(tmp_path: Path) -> None
 def test_observability_app_refresh_and_keybindings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    calls: dict[str, int] = {"issue_history": 0, "pr_history": 0}
     overview = OverviewStats(
         active_agents=1,
         blocked_prs=1,
@@ -510,6 +583,10 @@ def test_observability_app_refresh_and_keybindings(
             branch="agent/design/7",
             started_at="2026-02-24T00:00:00.000Z",
             elapsed_seconds=12.0,
+            prompt="Current active prompt",
+            codex_mode="small-job",
+            codex_session_id="thread-123",
+            codex_invocation_started_at="2026-02-24T00:00:10.000Z",
         ),
     )
     tracked_rows = (
@@ -545,34 +622,22 @@ def test_observability_app_refresh_and_keybindings(
             ),
         ),
     )
-    issue_history = (
-        IssueHistoryRow(
-            run_id="run-1",
+    terminal_history = (
+        TerminalIssueOutcomeRow(
             repo_full_name="o/repo-a",
-            run_kind="issue_flow",
-            issue_number=7,
-            pr_number=None,
-            flow="design_doc",
-            branch="agent/design/7",
-            started_at="2026-02-24T00:00:00.000Z",
-            finished_at="2026-02-24T00:01:00.000Z",
-            terminal_status="completed",
-            failure_class=None,
-            error=None,
-            duration_seconds=60.0,
+            issue_number=8,
+            pr_number=102,
+            status="closed",
+            branch="agent/design/8",
+            updated_at="2026-02-24T00:00:01.000Z",
         ),
-    )
-    pr_history = (
-        PrHistoryRow(
-            id=1,
+        TerminalIssueOutcomeRow(
             repo_full_name="o/repo-a",
-            pr_number=101,
             issue_number=7,
-            from_status="awaiting_feedback",
-            to_status="blocked",
-            reason="history_rewrite",
-            detail="detail",
-            changed_at="2026-02-24T00:00:00.000Z",
+            pr_number=101,
+            status="merged",
+            branch="agent/design/7",
+            updated_at="2026-02-24T00:00:00.000Z",
         ),
     )
 
@@ -580,19 +645,15 @@ def test_observability_app_refresh_and_keybindings(
     monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: active_rows)
     monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: tracked_rows)
     monkeypatch.setattr(tui, "load_metrics", lambda *args, **kwargs: metrics)
+    monkeypatch.setattr(
+        tui,
+        "load_terminal_issue_outcomes",
+        lambda *args, **kwargs: terminal_history[
+            kwargs["offset"] : kwargs["offset"] + kwargs["limit"]
+        ],
+    )
     opened_urls: list[str] = []
     monkeypatch.setattr(tui, "_open_external_url", lambda url: opened_urls.append(url) or True)
-
-    def fake_issue_history(*args, **kwargs):  # type: ignore[no-untyped-def]
-        calls["issue_history"] += 1
-        return issue_history
-
-    def fake_pr_history(*args, **kwargs):  # type: ignore[no-untyped-def]
-        calls["pr_history"] += 1
-        return pr_history
-
-    monkeypatch.setattr(tui, "load_issue_history", fake_issue_history)
-    monkeypatch.setattr(tui, "load_pr_history", fake_pr_history)
 
     app = tui.ObservabilityApp(
         db_path=tmp_path / "state.db",
@@ -610,9 +671,13 @@ def test_observability_app_refresh_and_keybindings(
             await _pilot.pause()
             active = app.query_one("#active-table", DataTable)
             tracked = app.query_one("#tracked-table", DataTable)
+            history = app.query_one("#history-table", DataTable)
             summary = app.query_one("#summary", Static)
             assert active.row_count == 1
             assert tracked.row_count == 1
+            assert history.row_count == 2
+            assert str(history.get_row_at(0)[1]) == "abandoned"
+            assert str(history.get_row_at(1)[1]) == "completed"
             assert "window=24h" in str(summary.renderable)
             app.action_cycle_window()
             assert app._window == "7d"
@@ -623,14 +688,12 @@ def test_observability_app_refresh_and_keybindings(
             active.move_cursor(row=0, column=0, animate=False)
             await _pilot.press("enter")
             await _pilot.pause()
-            assert calls["issue_history"] >= 1
             assert shown_details[-1][0] == "Issue #7 Context"
+            assert "Current active prompt" in shown_details[-1][1]
             active.move_cursor(row=0, column=2, animate=False)
-            issue_history_calls = calls["issue_history"]
             await _pilot.press("enter")
             await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
-            assert calls["issue_history"] == issue_history_calls
             tracked.focus()
             await _pilot.pause()
             tracked.move_cursor(row=0, column=1, animate=False)
@@ -653,18 +716,32 @@ def test_observability_app_refresh_and_keybindings(
             assert "Blocked Reason:" in shown_details[-1][1]
             app.action_refresh()
             assert tracked.cursor_column == 6
-            app._detail_target = tui._DetailTarget(kind="pr", number=101)
-            app._refresh_history_table()
-            assert calls["pr_history"] >= 1
+            history.focus()
+            await _pilot.pause()
+            history.move_cursor(row=1, column=3, animate=False)
+            await _pilot.press("enter")
+            await _pilot.pause()
+            assert shown_details[-1][0] == "Issue #7 Completed"
+            assert "Repo URL: https://github.com/o/repo-a" in shown_details[-1][1]
+            assert "PR URL: https://github.com/o/repo-a/pull/101" in shown_details[-1][1]
+            app.action_refresh()
+            assert history.cursor_row == 1
+            assert history.cursor_column == 3
+            app._refresh_history_table(reset=True)
+            assert history.row_count == 2
             # Defensive selection paths when table/model counts are out of sync.
             app._active_rows = ()
             assert app._active_row_selection() is None
             app._tracked_rows = ()
             assert app._tracked_row_selection() is None
+            app._history_rows = ()
+            assert app._history_row_selection() is None
             active.clear(columns=False)
             tracked.clear(columns=False)
+            history.clear(columns=False)
             app._restore_active_selection(None, 0)
             app._restore_tracked_selection(None, 0)
+            app._restore_history_selection(None, 1, 2)
             app.action_cycle_focus()
             app.action_refresh()
 
@@ -678,7 +755,6 @@ def test_action_show_detail_uses_tracked_focus_branch(tmp_path: Path) -> None:
                 db_path=db_path, refresh_seconds=60, default_window="24h", row_limit=20
             )
             self._forced_focus = DataTable(id="tracked-table")
-            self.refreshed = False
 
         @property
         def focused(self):  # type: ignore[override]
@@ -697,15 +773,11 @@ def test_action_show_detail_uses_tracked_focus_branch(tmp_path: Path) -> None:
                 updated_at="now",
             )
 
-        def _refresh_history_table(self) -> None:
-            self.refreshed = True
-
     app = FocusApp(db_path=tmp_path / "state.db")
     app.action_show_detail()
     assert app._detail_target is not None
     assert app._detail_target.kind == "pr"
     assert app._detail_target.number == 101
-    assert app.refreshed is True
 
 
 def test_action_show_detail_uses_issue_detail_for_tracked_row_without_pr(tmp_path: Path) -> None:
@@ -715,7 +787,6 @@ def test_action_show_detail_uses_issue_detail_for_tracked_row_without_pr(tmp_pat
                 db_path=db_path, refresh_seconds=60, default_window="24h", row_limit=20
             )
             self._forced_focus = DataTable(id="tracked-table")
-            self.refreshed = False
 
         @property
         def focused(self):  # type: ignore[override]
@@ -734,15 +805,11 @@ def test_action_show_detail_uses_issue_detail_for_tracked_row_without_pr(tmp_pat
                 updated_at="now",
             )
 
-        def _refresh_history_table(self) -> None:
-            self.refreshed = True
-
     app = FocusApp(db_path=tmp_path / "state.db")
     app.action_show_detail()
     assert app._detail_target is not None
     assert app._detail_target.kind == "issue"
     assert app._detail_target.number == 8
-    assert app.refreshed is True
 
 
 def test_open_external_url_uses_open_command_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -834,26 +901,22 @@ def test_app_open_external_url_shows_manual_fallback(tmp_path: Path) -> None:
     ]
 
 
-def test_action_show_detail_refreshes_history_when_focus_is_other(tmp_path: Path) -> None:
+def test_action_show_detail_noop_when_focus_is_other(tmp_path: Path) -> None:
     class FocusApp(tui.ObservabilityApp):
         def __init__(self, *, db_path: Path) -> None:
             super().__init__(
                 db_path=db_path, refresh_seconds=60, default_window="24h", row_limit=20
             )
             self._forced_focus = Static(id="other")
-            self.refreshed = 0
 
         @property
         def focused(self):  # type: ignore[override]
             return self._forced_focus
 
-        def _refresh_history_table(self) -> None:
-            self.refreshed += 1
-
     app = FocusApp(db_path=tmp_path / "state.db")
     app._detail_target = tui._DetailTarget(kind="issue", number=7)
     app.action_show_detail()
-    assert app.refreshed == 1
+    assert app._detail_target == tui._DetailTarget(kind="issue", number=7)
 
 
 def test_show_detail_context_pushes_modal_when_running(
@@ -888,6 +951,7 @@ def test_show_detail_context_pushes_modal_when_running(
             per_repo=(),
         ),
     )
+    monkeypatch.setattr(tui, "load_terminal_issue_outcomes", lambda *args, **kwargs: ())
 
     app = tui.ObservabilityApp(
         db_path=tmp_path / "state.db",
@@ -954,6 +1018,7 @@ def test_detail_modal_field_navigation_opens_urls(
             per_repo=(),
         ),
     )
+    monkeypatch.setattr(tui, "load_terminal_issue_outcomes", lambda *args, **kwargs: ())
     fields = tui._tracked_row_detail_fields(row)
     app = tui.ObservabilityApp(
         db_path=tmp_path / "state.db",
@@ -1069,6 +1134,7 @@ def test_tracked_header_click_sorts_with_deduped_stack(
             per_repo=(),
         ),
     )
+    monkeypatch.setattr(tui, "load_terminal_issue_outcomes", lambda *args, **kwargs: ())
 
     app = tui.ObservabilityApp(
         db_path=tmp_path / "state.db",
@@ -1115,6 +1181,191 @@ def test_tracked_header_click_sorts_with_deduped_stack(
     asyncio.run(run_app())
 
 
+def test_history_table_paginates_when_scrolling_near_bottom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        tui,
+        "load_overview",
+        lambda *args, **kwargs: OverviewStats(
+            active_agents=0,
+            blocked_prs=0,
+            tracked_prs=0,
+            failures=0,
+            mean_runtime_seconds=0.0,
+            stddev_runtime_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: ())
+    monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        tui,
+        "load_metrics",
+        lambda *args, **kwargs: MetricsStats(
+            overall=RuntimeMetric(
+                repo_full_name="__all__",
+                terminal_count=0,
+                failed_count=0,
+                failure_rate=0.0,
+                mean_runtime_seconds=0.0,
+                stddev_runtime_seconds=0.0,
+            ),
+            per_repo=(),
+        ),
+    )
+    terminal_rows = (
+        TerminalIssueOutcomeRow(
+            repo_full_name="o/repo-a",
+            issue_number=1,
+            pr_number=101,
+            status="merged",
+            branch="agent/design/1",
+            updated_at="2026-02-24T00:00:03.000Z",
+        ),
+        TerminalIssueOutcomeRow(
+            repo_full_name="o/repo-a",
+            issue_number=2,
+            pr_number=102,
+            status="closed",
+            branch="agent/design/2",
+            updated_at="2026-02-24T00:00:02.000Z",
+        ),
+        TerminalIssueOutcomeRow(
+            repo_full_name="o/repo-a",
+            issue_number=3,
+            pr_number=103,
+            status="merged",
+            branch="agent/design/3",
+            updated_at="2026-02-24T00:00:01.000Z",
+        ),
+    )
+    load_calls: list[tuple[int, int]] = []
+
+    def fake_load_terminal(*args, **kwargs):  # type: ignore[no-untyped-def]
+        limit = kwargs["limit"]
+        offset = kwargs["offset"]
+        load_calls.append((limit, offset))
+        return terminal_rows[offset : offset + limit]
+
+    monkeypatch.setattr(tui, "load_terminal_issue_outcomes", fake_load_terminal)
+
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=2,
+    )
+
+    async def run_app() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            history = app.query_one("#history-table", DataTable)
+            assert history.row_count == 2
+            assert load_calls[0] == (2, 0)
+            row_key = history.ordered_rows[1].key
+            app.on_data_table_row_highlighted(
+                DataTable.RowHighlighted(history, cursor_row=1, row_key=row_key)
+            )
+            await pilot.pause()
+            assert history.row_count == 3
+            assert load_calls[1] == (2, 2)
+
+    asyncio.run(run_app())
+
+
+def test_history_row_highlight_ignores_non_loading_paths(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    load_calls: list[bool] = []
+    app._load_more_history_rows = lambda: load_calls.append(True)  # type: ignore[method-assign]
+
+    other_table = SimpleNamespace(id="metrics-table", row_count=1)
+    app.on_data_table_row_highlighted(SimpleNamespace(data_table=other_table, cursor_row=0))
+
+    history_table = SimpleNamespace(id="history-table", row_count=7)
+
+    app.on_data_table_row_highlighted(SimpleNamespace(data_table=history_table, cursor_row=-1))
+
+    app._history_has_more = False
+    app._history_loading = False
+    app.on_data_table_row_highlighted(SimpleNamespace(data_table=history_table, cursor_row=0))
+
+    app._history_has_more = True
+    app._history_loading = True
+    app.on_data_table_row_highlighted(SimpleNamespace(data_table=history_table, cursor_row=0))
+
+    app._history_loading = False
+    app.on_data_table_row_highlighted(SimpleNamespace(data_table=history_table, cursor_row=0))
+    assert load_calls == []
+
+
+def test_history_page_size_load_guard_and_placeholder_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=None,
+    )
+    assert app._history_page_size() == 200
+
+    load_attempts: list[bool] = []
+    monkeypatch.setattr(
+        tui,
+        "load_terminal_issue_outcomes",
+        lambda *args, **kwargs: load_attempts.append(True) or (),
+    )
+    app._history_loading = True
+    app._load_more_history_rows()
+    app._history_loading = False
+    app._history_has_more = False
+    app._load_more_history_rows()
+    assert load_attempts == []
+
+    class FakeHistoryTable:
+        def __init__(self) -> None:
+            self.rows: list[tuple[object, ...]] = []
+
+        @property
+        def row_count(self) -> int:
+            return len(self.rows)
+
+        def clear(self, *, columns: bool = False) -> None:
+            _ = columns
+            self.rows.clear()
+
+        def add_row(self, *items: object) -> None:
+            self.rows.append(items)
+
+        def get_row_at(self, index: int) -> tuple[object, ...]:
+            return self.rows[index]
+
+    fake_table = FakeHistoryTable()
+    app._base_table = lambda selector: fake_table  # type: ignore[method-assign]
+    app._history_rows = ()
+    app._render_history_rows(())
+    assert fake_table.row_count == 1
+    assert str(fake_table.get_row_at(0)[5]) == "No terminal issue outcomes found"
+
+    new_row = TerminalIssueOutcomeRow(
+        repo_full_name="o/repo-a",
+        issue_number=10,
+        pr_number=110,
+        status="merged",
+        branch="agent/design/10",
+        updated_at="2026-02-24T00:03:00.000Z",
+    )
+    app._history_rows = (new_row,)
+    app._render_history_rows((new_row,))
+    assert fake_table.row_count == 1
+    assert str(fake_table.get_row_at(0)[5]) == "merged"
+
+
 def test_refresh_data_while_modal_open_uses_base_screen(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1147,6 +1398,7 @@ def test_refresh_data_while_modal_open_uses_base_screen(
             per_repo=(),
         ),
     )
+    monkeypatch.setattr(tui, "load_terminal_issue_outcomes", lambda *args, **kwargs: ())
 
     app = tui.ObservabilityApp(
         db_path=tmp_path / "state.db",
@@ -1235,7 +1487,7 @@ def test_detail_modal_activate_falls_back_to_module_open(monkeypatch: pytest.Mon
 
 
 def test_detail_data_table_ignores_non_target_ids(monkeypatch: pytest.MonkeyPatch) -> None:
-    table = tui._DetailDataTable(id="history-table")
+    table = tui._DetailDataTable(id="metrics-table")
     monkeypatch.setattr(DataTable, "action_select_cursor", lambda self: None)
     table.action_select_cursor()
 

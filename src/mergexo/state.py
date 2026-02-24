@@ -463,6 +463,19 @@ class StateStore:
             )
         return cursor.rowcount > 0
 
+    def update_agent_run_meta(self, *, run_id: str, meta_json: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE agent_run_history
+                SET meta_json = ?
+                WHERE run_id = ?
+                  AND finished_at IS NULL
+                """,
+                (meta_json, run_id),
+            )
+        return cursor.rowcount > 0
+
     def reconcile_unfinished_agent_runs(self, *, repo_full_name: str | None = None) -> int:
         repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
         with self._lock, self._connect() as conn:
