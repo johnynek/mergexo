@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import io
 import logging
@@ -9,7 +10,7 @@ import sys
 import pytest
 
 from mergexo import observability
-from mergexo.observability import configure_logging, log_event
+from mergexo.observability import configure_logging, log_event, logging_repo_context
 
 
 @pytest.fixture(autouse=True)
@@ -64,9 +65,53 @@ def test_configure_logging_verbose_mode_is_idempotent() -> None:
     assert handler.stream is sys.stderr
     assert handler.formatter is not None
     assert "%(threadName)s" in handler.formatter._fmt
+    assert "%(repo_full_name)s" in handler.formatter._fmt
 
     configure_logging(verbose=True)
     assert len(logger.handlers) == 1
+
+
+def test_logging_repo_context_is_applied_to_verbose_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging(verbose=True)
+    logger = logging.getLogger("mergexo.tests.repo")
+    with logging_repo_context("o/r"):
+        logger.info("event=issue_enqueued issue_number=1")
+
+    stderr = capsys.readouterr().err
+    assert "repo_full_name=o/r" in stderr
+    assert "event=issue_enqueued issue_number=1" in stderr
+
+
+def test_extract_repo_full_name_accepts_quoted_token() -> None:
+    assert observability._extract_repo_full_name('event=x repo_full_name="o/r"') == "o/r"
+
+
+def test_extract_repo_full_name_keeps_invalid_json_token() -> None:
+    assert observability._extract_repo_full_name(r'event=x repo_full_name="o\q/r"') == '"o\\q/r"'
+
+
+def test_logging_repo_context_is_isolated_per_thread() -> None:
+    def resolve_repo(repo_full_name: str) -> str:
+        with logging_repo_context(repo_full_name):
+            record = logging.LogRecord(
+                name="mergexo.tests.repo_threads",
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=1,
+                msg="event=probe",
+                args=(),
+                exc_info=None,
+            )
+            return observability._repo_full_name_for_record(record)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(resolve_repo, "o/one")
+        second = pool.submit(resolve_repo, "o/two")
+
+    assert first.result() == "o/one"
+    assert second.result() == "o/two"
 
 
 def test_configure_logging_low_mode_filters_to_high_signal_events(

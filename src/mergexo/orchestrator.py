@@ -54,7 +54,7 @@ from mergexo.models import (
     PullRequestReviewComment,
     WorkResult,
 )
-from mergexo.observability import log_event
+from mergexo.observability import log_event, logging_repo_context
 from mergexo.shell import CommandError, run
 from mergexo.state import (
     ImplementationCandidateState,
@@ -226,88 +226,90 @@ class Phase1Orchestrator:
         }
 
     def run(self, *, once: bool) -> None:
-        with ThreadPoolExecutor(max_workers=self._config.runtime.worker_count) as pool:
-            while True:
-                self.poll_once(pool, allow_enqueue=True)
-                self._drain_for_pending_restart_if_needed()
-
-                if once:
-                    self._wait_for_all(pool)
-                    self._reap_finished()
-                    if self._config.runtime.enable_github_operations:
-                        self._run_poll_step(
-                            step_name="scan_operator_commands_once",
-                            fn=self._scan_operator_commands,
-                        )
+        with logging_repo_context(self._repo.full_name):
+            with ThreadPoolExecutor(max_workers=self._config.runtime.worker_count) as pool:
+                while True:
+                    self.poll_once(pool, allow_enqueue=True)
                     self._drain_for_pending_restart_if_needed()
-                    if self._config.runtime.enable_issue_comment_routing:
-                        self._run_poll_step(
-                            step_name="scan_post_pr_source_issue_comment_redirects_once",
-                            fn=self._scan_post_pr_source_issue_comment_redirects,
-                        )
-                    break
 
-                time.sleep(self._config.runtime.poll_interval_seconds)
+                    if once:
+                        self._wait_for_all(pool)
+                        self._reap_finished()
+                        if self._config.runtime.enable_github_operations:
+                            self._run_poll_step(
+                                step_name="scan_operator_commands_once",
+                                fn=self._scan_operator_commands,
+                            )
+                        self._drain_for_pending_restart_if_needed()
+                        if self._config.runtime.enable_issue_comment_routing:
+                            self._run_poll_step(
+                                step_name="scan_post_pr_source_issue_comment_redirects_once",
+                                fn=self._scan_post_pr_source_issue_comment_redirects,
+                            )
+                        break
+
+                    time.sleep(self._config.runtime.poll_interval_seconds)
 
     def poll_once(self, pool: ThreadPoolExecutor, *, allow_enqueue: bool = True) -> None:
-        self._ensure_poll_setup()
-        log_event(
-            LOGGER,
-            "poll_started",
-            once=False,
-            github_operations_enabled=self._config.runtime.enable_github_operations,
-            allow_enqueue=allow_enqueue,
-        )
-        self._reap_finished()
+        with logging_repo_context(self._repo.full_name):
+            self._ensure_poll_setup()
+            log_event(
+                LOGGER,
+                "poll_started",
+                once=False,
+                github_operations_enabled=self._config.runtime.enable_github_operations,
+                allow_enqueue=allow_enqueue,
+            )
+            self._reap_finished()
 
-        poll_had_github_errors = False
-        if self._config.runtime.enable_github_operations:
-            if not self._run_poll_step(
-                step_name="scan_operator_commands",
-                fn=self._scan_operator_commands,
-            ):
-                poll_had_github_errors = True
-
-        restart_pending = self._is_restart_pending()
-        enqueue_allowed = allow_enqueue and not restart_pending
-
-        if enqueue_allowed:
-            if not self._run_poll_step(
-                step_name="enqueue_new_work",
-                fn=lambda: self._enqueue_new_work(pool),
-            ):
-                poll_had_github_errors = True
-            if not self._run_poll_step(
-                step_name="enqueue_implementation_work",
-                fn=lambda: self._enqueue_implementation_work(pool),
-            ):
-                poll_had_github_errors = True
-            if self._config.runtime.enable_issue_comment_routing:
+            poll_had_github_errors = False
+            if self._config.runtime.enable_github_operations:
                 if not self._run_poll_step(
-                    step_name="enqueue_pre_pr_followup_work",
-                    fn=lambda: self._enqueue_pre_pr_followup_work(pool),
-                ):
-                    poll_had_github_errors = True
-            if not self._run_poll_step(
-                step_name="enqueue_feedback_work",
-                fn=lambda: self._enqueue_feedback_work(pool),
-            ):
-                poll_had_github_errors = True
-            if self._config.runtime.enable_issue_comment_routing:
-                if not self._run_poll_step(
-                    step_name="scan_post_pr_source_issue_comment_redirects",
-                    fn=self._scan_post_pr_source_issue_comment_redirects,
+                    step_name="scan_operator_commands",
+                    fn=self._scan_operator_commands,
                 ):
                     poll_had_github_errors = True
 
-        log_event(
-            LOGGER,
-            "poll_completed",
-            running_issue_count=len(self._running),
-            running_feedback_count=len(self._running_feedback),
-            draining_for_restart=not enqueue_allowed,
-            poll_had_github_errors=poll_had_github_errors,
-        )
+            restart_pending = self._is_restart_pending()
+            enqueue_allowed = allow_enqueue and not restart_pending
+
+            if enqueue_allowed:
+                if not self._run_poll_step(
+                    step_name="enqueue_new_work",
+                    fn=lambda: self._enqueue_new_work(pool),
+                ):
+                    poll_had_github_errors = True
+                if not self._run_poll_step(
+                    step_name="enqueue_implementation_work",
+                    fn=lambda: self._enqueue_implementation_work(pool),
+                ):
+                    poll_had_github_errors = True
+                if self._config.runtime.enable_issue_comment_routing:
+                    if not self._run_poll_step(
+                        step_name="enqueue_pre_pr_followup_work",
+                        fn=lambda: self._enqueue_pre_pr_followup_work(pool),
+                    ):
+                        poll_had_github_errors = True
+                if not self._run_poll_step(
+                    step_name="enqueue_feedback_work",
+                    fn=lambda: self._enqueue_feedback_work(pool),
+                ):
+                    poll_had_github_errors = True
+                if self._config.runtime.enable_issue_comment_routing:
+                    if not self._run_poll_step(
+                        step_name="scan_post_pr_source_issue_comment_redirects",
+                        fn=self._scan_post_pr_source_issue_comment_redirects,
+                    ):
+                        poll_had_github_errors = True
+
+            log_event(
+                LOGGER,
+                "poll_completed",
+                running_issue_count=len(self._running),
+                running_feedback_count=len(self._running_feedback),
+                draining_for_restart=not enqueue_allowed,
+                poll_had_github_errors=poll_had_github_errors,
+            )
 
     def pending_work_count(self) -> int:
         with self._running_lock:
@@ -550,7 +552,7 @@ class Phase1Orchestrator:
                             reason="already_running",
                         )
                         continue
-                fut = pool.submit(self._process_feedback_turn, tracked)
+                fut = pool.submit(self._process_feedback_turn_worker, tracked)
                 fut.add_done_callback(lambda _: self._work_limiter.release())
                 capacity_reserved = False
                 with self._running_lock:
@@ -1479,11 +1481,12 @@ class Phase1Orchestrator:
         flow: IssueFlow,
         consumed_comment_id_max: int,
     ) -> WorkResult:
-        return self._process_issue(
-            issue,
-            flow,
-            pre_pr_last_consumed_comment_id=consumed_comment_id_max,
-        )
+        with logging_repo_context(self._repo.full_name):
+            return self._process_issue(
+                issue,
+                flow,
+                pre_pr_last_consumed_comment_id=consumed_comment_id_max,
+            )
 
     def _process_issue(
         self,
@@ -1905,11 +1908,16 @@ class Phase1Orchestrator:
         issue: Issue,
         consumed_comment_id_max: int,
     ) -> WorkResult:
-        return self._process_implementation_candidate(
-            candidate,
-            issue_override=issue,
-            pre_pr_last_consumed_comment_id=consumed_comment_id_max,
-        )
+        with logging_repo_context(self._repo.full_name):
+            return self._process_implementation_candidate(
+                candidate,
+                issue_override=issue,
+                pre_pr_last_consumed_comment_id=consumed_comment_id_max,
+            )
+
+    def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> None:
+        with logging_repo_context(self._repo.full_name):
+            self._process_feedback_turn(tracked)
 
     def _save_agent_session_if_present(
         self, *, issue_number: int, session: AgentSession | None

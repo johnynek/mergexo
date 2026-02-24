@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 import json
 import logging
@@ -10,7 +11,16 @@ from typing import Final, Literal, TextIO, cast
 
 _LOGGER_NAME: Final[str] = "mergexo"
 _MAX_VALUE_LEN: Final[int] = 120
-_VERBOSE_FORMAT: Final[str] = "%(asctime)s %(levelname)s %(name)s [%(threadName)s] %(message)s"
+_VERBOSE_FORMAT: Final[str] = (
+    "%(asctime)s %(levelname)s %(name)s [%(threadName)s] repo_full_name=%(repo_full_name)s "
+    "%(message)s"
+)
+_UNKNOWN_REPO_FULL_NAME: Final[str] = "<unknown>"
+# We intentionally keep repo context in a ContextVar so callers don't need to thread
+# repo_full_name through every log call (including deep helper boundaries). ContextVar
+# values are execution-context local (thread/task isolated), so this is not shared
+# mutable global state across concurrent workers.
+_REPO_CONTEXT: Final[ContextVar[str | None]] = ContextVar("mergexo_repo_full_name", default=None)
 _LOW_VERBOSITY_EVENTS: Final[frozenset[str]] = frozenset(
     {
         "issue_enqueued",
@@ -27,6 +37,11 @@ _LOW_VERBOSITY_EVENTS: Final[frozenset[str]] = frozenset(
 
 
 VerboseMode = Literal["low", "high"]
+
+
+def logging_repo_context(repo_full_name: str | None) -> _LoggingRepoContext:
+    # Worker entrypoints set this once so nested log lines inherit repo metadata.
+    return _LoggingRepoContext(repo_full_name)
 
 
 def configure_logging(
@@ -100,8 +115,53 @@ def _normalize_verbose_mode(verbose: bool | str | None) -> VerboseMode | None:
 
 def _configure_handler(handler: logging.Handler, mode: VerboseMode) -> None:
     handler.setFormatter(logging.Formatter(_VERBOSE_FORMAT))
+    handler.addFilter(_RepoContextFilter())
     if mode == "low":
         handler.addFilter(_LowVerbosityFilter())
+
+
+def _normalize_repo_full_name(repo_full_name: str | None) -> str | None:
+    if repo_full_name is None:
+        return None
+    normalized = repo_full_name.strip()
+    return normalized or None
+
+
+def _extract_repo_full_name(message: str) -> str | None:
+    for field in message.split():
+        if not field.startswith("repo_full_name="):
+            continue
+        raw = field[len("repo_full_name=") :]
+        if raw.startswith('"') and raw.endswith('"'):
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                decoded = raw
+            if isinstance(decoded, str):
+                normalized = _normalize_repo_full_name(decoded)
+                if normalized is not None:
+                    return normalized
+        normalized = _normalize_repo_full_name(raw)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _repo_full_name_for_record(record: logging.LogRecord) -> str:
+    explicit_repo = getattr(record, "repo_full_name", None)
+    if isinstance(explicit_repo, str):
+        normalized_explicit_repo = _normalize_repo_full_name(explicit_repo)
+        if normalized_explicit_repo is not None:
+            return normalized_explicit_repo
+
+    message_repo = _extract_repo_full_name(record.getMessage())
+    if message_repo is not None:
+        return message_repo
+
+    context_repo = _normalize_repo_full_name(_REPO_CONTEXT.get())
+    if context_repo is not None:
+        return context_repo
+    return _UNKNOWN_REPO_FULL_NAME
 
 
 def _extract_event_name(message: str) -> str | None:
@@ -119,6 +179,32 @@ class _LowVerbosityFilter(logging.Filter):
             return True
         event_name = _extract_event_name(record.getMessage())
         return event_name in _LOW_VERBOSITY_EVENTS
+
+
+class _RepoContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        setattr(record, "repo_full_name", _repo_full_name_for_record(record))
+        return True
+
+
+class _LoggingRepoContext:
+    def __init__(self, repo_full_name: str | None) -> None:
+        self._repo_full_name = _normalize_repo_full_name(repo_full_name)
+        self._token: Token[str | None] | None = None
+
+    def __enter__(self) -> None:
+        self._token = _REPO_CONTEXT.set(self._repo_full_name)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object | None,
+    ) -> bool:
+        if self._token is not None:
+            _REPO_CONTEXT.reset(self._token)
+            self._token = None
+        return False
 
 
 class _UtcDailyFileHandler(logging.Handler):
