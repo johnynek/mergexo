@@ -42,6 +42,31 @@ def _get_row(
         conn.close()
 
 
+def _get_agent_run_history_row(
+    db_path: Path, run_id: str
+) -> tuple[str, str | None, str | None, str | None, float | None]:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT terminal_status, failure_class, error, finished_at, duration_seconds
+            FROM agent_run_history
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        assert row is not None
+        terminal_status, failure_class, error, finished_at, duration_seconds = row
+        assert terminal_status is None or isinstance(terminal_status, str)
+        assert failure_class is None or isinstance(failure_class, str)
+        assert error is None or isinstance(error, str)
+        assert finished_at is None or isinstance(finished_at, str)
+        assert duration_seconds is None or isinstance(duration_seconds, float)
+        return terminal_status, failure_class, error, finished_at, duration_seconds
+    finally:
+        conn.close()
+
+
 def test_state_store_transitions_and_feedback_tracking(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
@@ -77,6 +102,244 @@ def test_state_store_transitions_and_feedback_tracking(tmp_path: Path) -> None:
     store.save_agent_session(issue_number=42, adapter="codex", thread_id="thread-1")
     assert store.get_agent_session(42) == ("codex", "thread-1")
     assert store.get_agent_session(999) is None
+
+
+def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                """
+            ).fetchall()
+        }
+        assert "agent_run_history" in tables
+        assert "pr_status_history" in tables
+        run_history_columns = set(_table_columns(conn, "agent_run_history"))
+        assert "run_id" in run_history_columns
+        assert "terminal_status" in run_history_columns
+        assert "duration_seconds" in run_history_columns
+    finally:
+        conn.close()
+
+    run_id = store.record_agent_run_start(
+        run_kind="issue_flow",
+        issue_number=42,
+        pr_number=None,
+        flow="design_doc",
+        branch="agent/design/42-x",
+        run_id="run-42",
+        started_at="2026-02-24T00:00:00.000Z",
+    )
+    assert run_id == "run-42"
+    assert store.finish_agent_run(
+        run_id=run_id,
+        terminal_status="completed",
+        finished_at="2026-02-24T00:01:40.000Z",
+    )
+    assert (
+        store.finish_agent_run(
+            run_id=run_id,
+            terminal_status="failed",
+        )
+        is False
+    )
+    terminal_status, failure_class, error, finished_at, duration_seconds = (
+        _get_agent_run_history_row(db_path, "run-42")
+    )
+    assert terminal_status == "completed"
+    assert failure_class is None
+    assert error is None
+    assert finished_at is not None
+    assert duration_seconds is not None
+    assert 99.0 <= duration_seconds <= 101.0
+
+
+def test_state_store_reconcile_and_prune_observability_history(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.record_agent_run_start(
+        run_kind="issue_flow",
+        issue_number=1,
+        pr_number=None,
+        flow="design_doc",
+        branch="agent/design/1",
+        run_id="stale-run",
+        started_at="2026-01-01T00:00:00.000Z",
+        repo_full_name="o/repo-a",
+    )
+    reconciled = store.reconcile_unfinished_agent_runs(repo_full_name="o/repo-a")
+    assert reconciled == 1
+    terminal_status, failure_class, _error, _finished_at, duration_seconds = (
+        _get_agent_run_history_row(db_path, "stale-run")
+    )
+    assert terminal_status == "interrupted"
+    assert failure_class == "unknown"
+    assert duration_seconds is not None
+    store.record_agent_run_start(
+        run_kind="issue_flow",
+        issue_number=3,
+        pr_number=None,
+        flow="design_doc",
+        branch="agent/design/3",
+        run_id="stale-run-global",
+        started_at="2026-01-01T00:00:00.000Z",
+        repo_full_name="o/repo-b",
+    )
+    assert store.reconcile_unfinished_agent_runs() == 1
+
+    store.mark_completed(
+        2,
+        "agent/design/2",
+        101,
+        "https://example/pr/101",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_pr_status(
+        pr_number=101,
+        issue_number=2,
+        status="blocked",
+        error="blocked",
+        repo_full_name="o/repo-a",
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO agent_run_history(
+                run_id, repo_full_name, run_kind, issue_number, started_at, finished_at, terminal_status
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "very-old",
+                "o/repo-a",
+                "issue_flow",
+                99,
+                "2000-01-01T00:00:00.000Z",
+                "2000-01-01T00:05:00.000Z",
+                "failed",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO pr_status_history(
+                repo_full_name, pr_number, issue_number, from_status, to_status, changed_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            ("o/repo-a", 999, 99, "blocked", "awaiting_feedback", "2000-01-01T00:00:00.000Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    deleted_agent_rows, deleted_pr_rows = store.prune_observability_history(
+        retention_days=1,
+        repo_full_name="o/repo-a",
+    )
+    assert deleted_agent_rows >= 1
+    assert deleted_pr_rows >= 1
+    global_deleted_agent_rows, global_deleted_pr_rows = store.prune_observability_history(
+        retention_days=1
+    )
+    assert global_deleted_agent_rows >= 0
+    assert global_deleted_pr_rows >= 0
+    with pytest.raises(ValueError, match="retention_days"):
+        store.prune_observability_history(retention_days=0)
+
+
+def test_state_store_pr_status_history_and_pull_request_status_lookup(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_completed(
+        8,
+        "agent/design/8-foo",
+        101,
+        "https://example/pr/101",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_pr_status(
+        pr_number=101,
+        issue_number=8,
+        status="merged",
+        last_seen_head_sha="head-1",
+        reason="merged_by_human",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_pr_status(
+        pr_number=101,
+        issue_number=8,
+        status="blocked",
+        error="non-fast-forward",
+        repo_full_name="o/repo-a",
+    )
+    store.reset_blocked_pull_requests(
+        pr_numbers=(101,),
+        last_seen_head_sha_override="head-2",
+        repo_full_name="o/repo-a",
+    )
+    state = store.get_pull_request_status(101, repo_full_name="o/repo-a")
+    assert state is not None
+    assert state.status == "awaiting_feedback"
+    assert state.last_seen_head_sha == "head-2"
+    assert store.get_pull_request_status(999) is None
+    single_row = store.get_pull_request_status(101)
+    assert single_row is not None
+    assert single_row.repo_full_name == "o/repo-a"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT from_status, to_status, reason, detail
+            FROM pr_status_history
+            WHERE repo_full_name = ? AND pr_number = ?
+            ORDER BY id ASC
+            """,
+            ("o/repo-a", 101),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows[0][0] is None
+    assert rows[0][1] == "awaiting_feedback"
+    assert rows[0][2] == "issue_run_completed"
+    assert rows[1][0] == "awaiting_feedback"
+    assert rows[1][1] == "merged"
+    assert rows[1][2] == "merged_by_human"
+    assert rows[2][0] == "merged"
+    assert rows[2][1] == "blocked"
+    assert rows[2][3] == "non-fast-forward"
+    assert rows[3][0] == "blocked"
+    assert rows[3][1] == "awaiting_feedback"
+    assert rows[3][2] == "manual_unblock"
+    assert rows[3][3] == "last_seen_head_sha_override=head-2"
+
+    store.mark_completed(
+        9,
+        "agent/design/9-foo",
+        101,
+        "https://example/pr/101",
+        repo_full_name="o/repo-b",
+    )
+    with pytest.raises(RuntimeError, match="specify repo_full_name"):
+        store.get_pull_request_status(101)
+
+    store.mark_pr_status(
+        pr_number=404,
+        issue_number=40,
+        status="blocked",
+        error="missing_tracking_row",
+        repo_full_name="o/repo-a",
+    )
 
 
 def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:

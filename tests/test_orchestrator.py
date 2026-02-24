@@ -59,9 +59,11 @@ from mergexo.orchestrator import (
     _has_regression_test_changes,
     _is_mergexo_status_comment,
     _is_merge_conflict_error,
+    _normalize_feedback_terminal_status,
     _implementation_candidate_from_json_dict,
     _implementation_candidate_to_json_dict,
     _infer_pre_pr_flow_from_issue_and_error,
+    _failure_class_for_exception,
     _is_recoverable_pre_pr_error,
     _is_recoverable_pre_pr_exception,
     _issue_from_json_dict,
@@ -428,6 +430,9 @@ class FakeState:
         self.tracked: list[TrackedPullRequestState] = []
         self.implementation_candidates: list[ImplementationCandidateState] = []
         self.status_updates: list[tuple[int, int, str, str | None, str | None]] = []
+        self.run_starts: list[tuple[str, str, int, int | None]] = []
+        self.run_finishes: list[tuple[str, str, str | None, str | None]] = []
+        self._pr_status_by_pr: dict[int, str] = {}
 
     def can_enqueue(self, issue_number: int, *, repo_full_name: str | None = None) -> bool:
         _ = repo_full_name
@@ -450,6 +455,7 @@ class FakeState:
         self.completed.append(
             WorkResult(issue_number=issue_number, branch=branch, pr_number=pr_number, pr_url=pr_url)
         )
+        self._pr_status_by_pr[pr_number] = "awaiting_feedback"
 
     def mark_failed(
         self, *, issue_number: int, error: str, repo_full_name: str | None = None
@@ -500,6 +506,47 @@ class FakeState:
     ) -> tuple[object, ...]:
         _ = repo_full_name
         return ()
+
+    def reconcile_unfinished_agent_runs(self, *, repo_full_name: str | None = None) -> int:
+        _ = repo_full_name
+        return 0
+
+    def prune_observability_history(
+        self, *, retention_days: int, repo_full_name: str | None = None
+    ) -> tuple[int, int]:
+        _ = retention_days, repo_full_name
+        return 0, 0
+
+    def record_agent_run_start(
+        self,
+        *,
+        run_kind: str,
+        issue_number: int,
+        pr_number: int | None,
+        flow: str | None,
+        branch: str | None,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str:
+        _ = flow, branch, meta_json, started_at, repo_full_name
+        run_key = run_id or f"{run_kind}:{issue_number}:{len(self.run_starts) + 1}"
+        self.run_starts.append((run_kind, run_key, issue_number, pr_number))
+        return run_key
+
+    def finish_agent_run(
+        self,
+        *,
+        run_id: str,
+        terminal_status: str,
+        failure_class: str | None = None,
+        error: str | None = None,
+        finished_at: str | None = None,
+    ) -> bool:
+        _ = finished_at
+        self.run_finishes.append((run_id, terminal_status, failure_class, error))
+        return True
 
     def get_runtime_operation(self, op_name: str):  # type: ignore[no-untyped-def]
         _ = op_name
@@ -565,6 +612,20 @@ class FakeState:
         _ = kwargs
         return 0
 
+    def get_pull_request_status(self, pr_number: int, *, repo_full_name: str | None = None):  # type: ignore[no-untyped-def]
+        _ = repo_full_name
+        status = self._pr_status_by_pr.get(pr_number)
+        if status is None:
+            return None
+        return cast(
+            object,
+            type(
+                "PullRequestStatusState",
+                (),
+                {"status": status},
+            )(),
+        )
+
     def mark_pr_status(
         self,
         *,
@@ -573,10 +634,13 @@ class FakeState:
         status: str,
         last_seen_head_sha: str | None = None,
         error: str | None = None,
+        reason: str | None = None,
+        detail: str | None = None,
         repo_full_name: str | None = None,
     ) -> None:
-        _ = repo_full_name
+        _ = repo_full_name, reason, detail
         self.status_updates.append((pr_number, issue_number, status, last_seen_head_sha, error))
+        self._pr_status_by_pr[pr_number] = status
 
     def ingest_feedback_events(self, events: object, *, repo_full_name: str | None = None) -> None:
         _ = events, repo_full_name
@@ -754,12 +818,176 @@ def test_orchestrator_queue_count_accessors(tmp_path: Path) -> None:
         agent=FakeAgent(),
     )
     running: Future[WorkResult] = Future()
-    feedback: Future[None] = Future()
+    feedback: Future[str] = Future()
     orch._running = {1: running}
-    orch._running_feedback = {101: _FeedbackFuture(issue_number=1, future=feedback)}
+    orch._running_feedback = {101: _FeedbackFuture(issue_number=1, run_id="run-1", future=feedback)}
     assert orch.pending_work_count() == 2
     assert orch.queue_counts() == (1, 1)
     assert orch.in_flight_work_count() == 0
+
+
+def test_enqueue_paths_record_run_history_starts(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=3)
+    issue = _issue(labels=("agent:design",))
+    state = FakeState(allowed={issue.number})
+    github = FakeGitHub([issue])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    class NoopPool:
+        def submit(self, fn, *args):  # type: ignore[no-untyped-def]
+            _ = fn, args
+            fut: Future[WorkResult] = Future()
+            return fut
+
+    orch._enqueue_new_work(NoopPool())
+    assert state.run_starts[0][0] == "issue_flow"
+
+    state.implementation_candidates = [
+        ImplementationCandidateState(
+            issue_number=issue.number,
+            design_branch="agent/design/7-add-worker-scheduler",
+            design_pr_number=11,
+            design_pr_url="https://example/pr/11",
+        )
+    ]
+    orch._running = {}
+    orch._enqueue_implementation_work(NoopPool())
+    assert any(kind == "implementation_flow" for kind, *_ in state.run_starts)
+
+    state.tracked = [
+        TrackedPullRequestState(
+            pr_number=101,
+            issue_number=issue.number,
+            branch="agent/design/7-add-worker-scheduler",
+            status="awaiting_feedback",
+            last_seen_head_sha=None,
+        )
+    ]
+
+    class FeedbackPool:
+        def submit(self, fn, *args):  # type: ignore[no-untyped-def]
+            _ = fn, args
+            fut: Future[str] = Future()
+            return fut
+
+    orch._enqueue_feedback_work(FeedbackPool())
+    assert any(kind == "feedback_turn" for kind, *_ in state.run_starts)
+
+
+def test_reap_finished_completes_issue_run_once(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    done: Future[WorkResult] = Future()
+    done.set_result(
+        WorkResult(
+            issue_number=7,
+            branch="agent/design/7-worker",
+            pr_number=101,
+            pr_url="https://example/pr/101",
+        )
+    )
+    orch._running = {7: done}
+    orch._running_issue_metadata = {
+        7: _RunningIssueMetadata(
+            run_id="run-7",
+            flow="design_doc",
+            branch="agent/design/7-worker",
+            context_json="{}",
+            source_issue_number=7,
+            consumed_comment_id_max=0,
+        )
+    }
+
+    orch._reap_finished()
+    orch._reap_finished()
+    assert state.run_finishes == [("run-7", "completed", None, None)]
+
+
+def test_reap_finished_marks_failed_run_with_metadata(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    bad: Future[WorkResult] = Future()
+    bad.set_exception(RuntimeError("boom"))
+    orch._running = {7: bad}
+    orch._running_issue_metadata = {
+        7: _RunningIssueMetadata(
+            run_id="run-7",
+            flow="design_doc",
+            branch="agent/design/7-worker",
+            context_json="{}",
+            source_issue_number=7,
+            consumed_comment_id_max=0,
+        )
+    }
+
+    orch._reap_finished()
+    assert state.run_finishes == [("run-7", "failed", "unknown", "boom")]
+
+
+def test_feedback_terminal_status_from_state_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=7,
+        branch="agent/design/7-worker",
+        status="awaiting_feedback",
+        last_seen_head_sha=None,
+    )
+    assert (
+        orch._feedback_terminal_status_from_state(tracked=tracked, fallback="blocked") == "blocked"
+    )
+    state._pr_status_by_pr[101] = "awaiting_feedback"
+    assert (
+        orch._feedback_terminal_status_from_state(tracked=tracked, fallback="blocked")
+        == "completed"
+    )
+
+
+def test_ensure_poll_setup_logs_when_stale_runs_reconciled(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+
+    class ReconState(FakeState):
+        def reconcile_unfinished_agent_runs(self, *, repo_full_name: str | None = None) -> int:
+            _ = repo_full_name
+            return 1
+
+    state = ReconState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    orch._ensure_poll_setup()
 
 
 @given(st.text())
@@ -844,6 +1072,23 @@ def test_flow_helpers() -> None:
         )
         == "https://github.com/johnynek/mergexo/blob/main/docs/design/7-x.md"
     )
+
+
+def test_observability_failure_and_terminal_helpers() -> None:
+    assert _normalize_feedback_terminal_status("completed") == "completed"
+    assert _normalize_feedback_terminal_status("bad-value") == "completed"
+    assert _failure_class_for_exception(DirectFlowBlockedError("x flow blocked: waiting")) == (
+        "policy_block"
+    )
+    assert _failure_class_for_exception(RuntimeError("required pre-push tests failed")) == (
+        "tests_failed"
+    )
+    assert _failure_class_for_exception(RuntimeError("non-fast-forward transition")) == (
+        "history_rewrite"
+    )
+    assert _failure_class_for_exception(GitHubPollingError("x")) == "github_error"
+    assert _failure_class_for_exception(RuntimeError("github API failure")) == "github_error"
+    assert _failure_class_for_exception(CommandError(["git"], 1, "", "")) == "agent_error"
 
 
 def test_render_design_doc_includes_frontmatter_and_summary() -> None:
@@ -1907,6 +2152,7 @@ def test_reap_finished_recoverable_pre_pr_failure_moves_to_followup_waiting(
     orch._running = {7: bad}
     orch._running_issue_metadata = {
         7: _RunningIssueMetadata(
+            run_id="run-7",
             flow="bugfix",
             branch="agent/bugfix/7-worker",
             context_json='{"flow":"bugfix"}',
@@ -2515,7 +2761,10 @@ def test_enqueue_pre_pr_followup_work_handles_capacity_and_missing_context_paths
     )
     full_future: Future[WorkResult] = Future()
     orch._running = {1: full_future}
-    orch._running_feedback = {2: _FeedbackFuture(issue_number=8, future=Future())}
+    feedback_future: Future[str] = Future()
+    orch._running_feedback = {
+        2: _FeedbackFuture(issue_number=8, run_id="run-feedback", future=feedback_future)
+    }
     orch._enqueue_pre_pr_followup_work(NoopPool())
 
     # Already-running path.
@@ -2746,6 +2995,7 @@ def test_reap_finished_success_with_metadata_updates_followup_cursor(
     orch._running = {7: ok}
     orch._running_issue_metadata = {
         7: _RunningIssueMetadata(
+            run_id="run-7",
             flow="bugfix",
             branch="agent/bugfix/7-worker",
             context_json='{"flow":"bugfix"}',
@@ -3993,7 +4243,7 @@ def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) ->
 
         def submit(self, fn, tracked):  # type: ignore[no-untyped-def]
             _ = fn
-            fut: Future[None] = Future()
+            fut: Future[str] = Future()
             self.submitted.append(tracked.pr_number)
             return fut
 
@@ -4002,8 +4252,10 @@ def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) ->
     assert pool.submitted == [101, 102]
 
     # Duplicate entry should be skipped when already running.
-    duplicate_future: Future[None] = Future()
-    orch._running_feedback = {101: _FeedbackFuture(issue_number=7, future=duplicate_future)}
+    duplicate_future: Future[str] = Future()
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-duplicate", future=duplicate_future)
+    }
     pool.submitted.clear()
     state.tracked = [state.tracked[0]]
     orch._enqueue_feedback_work(pool)
@@ -4025,12 +4277,40 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
     state = FakeState()
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
-    bad_feedback: Future[None] = Future()
+    bad_feedback: Future[str] = Future()
     bad_feedback.set_exception(RuntimeError("feedback boom"))
-    orch._running_feedback = {101: _FeedbackFuture(issue_number=7, future=bad_feedback)}
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-bad", future=bad_feedback)
+    }
 
     orch._reap_finished()
     assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
+
+
+def test_reap_finished_keeps_feedback_tracked_on_github_polling_error(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    polling_failure: Future[str] = Future()
+    polling_failure.set_exception(GitHubPollingError("GitHub polling GET failed for path /x: boom"))
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-poll", future=polling_failure)
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
+    assert state.run_finishes == [
+        (
+            "run-poll",
+            "failed",
+            "github_error",
+            "GitHub polling GET failed for path /x: boom",
+        )
+    ]
 
 
 def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
@@ -4041,9 +4321,11 @@ def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
     state = FakeState()
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
-    ok_feedback: Future[None] = Future()
-    ok_feedback.set_result(None)
-    orch._running_feedback = {101: _FeedbackFuture(issue_number=7, future=ok_feedback)}
+    ok_feedback: Future[str] = Future()
+    ok_feedback.set_result("completed")
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-ok", future=ok_feedback)
+    }
 
     orch._reap_finished()
     assert orch._running_feedback == {}

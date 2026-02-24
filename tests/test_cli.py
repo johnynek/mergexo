@@ -64,6 +64,7 @@ def test_build_parser_supports_commands() -> None:
     parsed_run = parser.parse_args(["run", "--once", "--verbose"])
     parsed_run_high = parser.parse_args(["run", "--once", "--verbose", "high"])
     parsed_service = parser.parse_args(["service", "--once", "--verbose"])
+    parsed_top = parser.parse_args(["top", "--verbose"])
     parsed_feedback_list = parser.parse_args(["feedback", "blocked", "list", "--json"])
     parsed_feedback_reset = parser.parse_args(
         [
@@ -89,6 +90,8 @@ def test_build_parser_supports_commands() -> None:
     assert parsed_service.command == "service"
     assert parsed_service.once is True
     assert parsed_service.verbose == "low"
+    assert parsed_top.command == "top"
+    assert parsed_top.verbose == "low"
     assert parsed_feedback_list.command == "feedback"
     assert parsed_feedback_list.feedback_command == "blocked"
     assert parsed_feedback_list.blocked_command == "list"
@@ -208,6 +211,33 @@ def test_main_dispatches_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert called["verbose"] is True
     assert called["state_dir"] == cfg.runtime.base_dir
     assert called["service"] == (cfg, True)
+
+
+def test_main_dispatches_top(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+
+    class FakeParser:
+        def parse_args(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                command="top",
+                config=Path("cfg.toml"),
+                verbose=False,
+            )
+
+    called: dict[str, object] = {}
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
+    )
+    monkeypatch.setattr(cli, "_cmd_top", lambda c: called.setdefault("top", c))
+
+    cli.main()
+    assert called["verbose"] is False
+    assert called["state_dir"] == cfg.runtime.base_dir
+    assert called["top"] == cfg
 
 
 def test_main_unknown_command_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -423,6 +453,55 @@ def test_cmd_service_constructs_runner(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert service_call["once"] is False
     assert len(service_call["repo_runtimes"]) == 1
     assert service_call["agent_by_repo_full_name"] == {"johnynek/mergexo": "codex:True"}
+
+
+def test_cmd_top_runs_tui_with_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    cfg = AppConfig(
+        runtime=RuntimeConfig(
+            base_dir=cfg.runtime.base_dir,
+            worker_count=cfg.runtime.worker_count,
+            poll_interval_seconds=cfg.runtime.poll_interval_seconds,
+            observability_refresh_seconds=5,
+            observability_default_window="7d",
+            observability_row_limit=111,
+            observability_history_retention_days=45,
+        ),
+        repos=cfg.repos,
+        codex=cfg.codex,
+    )
+    called: dict[str, object] = {}
+
+    class FakeState:
+        def __init__(self, path: Path) -> None:
+            called["state_path"] = path
+
+        def reconcile_unfinished_agent_runs(self) -> int:
+            called["reconciled"] = True
+            return 1
+
+        def prune_observability_history(self, *, retention_days: int) -> tuple[int, int]:
+            called["retention_days"] = retention_days
+            return 2, 3
+
+    monkeypatch.setattr(cli, "StateStore", FakeState)
+    monkeypatch.setattr(
+        cli,
+        "run_observability_tui",
+        lambda **kwargs: called.setdefault("top", kwargs),
+    )
+
+    cli._cmd_top(cfg)
+
+    assert called["reconciled"] is True
+    assert called["retention_days"] == 45
+    top_call = called["top"]
+    assert isinstance(top_call, dict)
+    assert top_call["refresh_seconds"] == 5
+    assert top_call["default_window"] == "7d"
+    assert top_call["row_limit"] == 111
 
 
 def test_build_codex_agents_by_repo_uses_repo_overrides(

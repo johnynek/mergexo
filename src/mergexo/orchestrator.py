@@ -57,6 +57,7 @@ from mergexo.models import (
 from mergexo.observability import log_event, logging_repo_context
 from mergexo.shell import CommandError, run
 from mergexo.state import (
+    AgentRunFailureClass,
     ImplementationCandidateState,
     PrePrFollowupState,
     StateStore,
@@ -93,7 +94,8 @@ class _SlotLease:
 @dataclass(frozen=True)
 class _FeedbackFuture:
     issue_number: int
-    future: Future[None]
+    run_id: str
+    future: Future[str]
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ class _GitOpOutcome:
 
 @dataclass(frozen=True)
 class _RunningIssueMetadata:
+    run_id: str
     flow: PrePrFlow
     branch: str
     context_json: str
@@ -344,6 +347,20 @@ class Phase1Orchestrator:
         if self._poll_setup_done:
             return
         self._git.ensure_layout()
+        reconciled_count = self._state.reconcile_unfinished_agent_runs(
+            repo_full_name=self._state_repo_full_name()
+        )
+        if reconciled_count > 0:
+            log_event(
+                LOGGER,
+                "stale_agent_runs_reconciled",
+                repo_full_name=self._state_repo_full_name(),
+                reconciled_count=reconciled_count,
+            )
+        self._state.prune_observability_history(
+            retention_days=self._config.runtime.observability_history_retention_days,
+            repo_full_name=self._state_repo_full_name(),
+        )
         if self._config.runtime.enable_issue_comment_routing:
             self._run_poll_step(
                 step_name="adopt_legacy_failed_pre_pr_runs",
@@ -445,6 +462,14 @@ class Phase1Orchestrator:
                     issue.number
                 )
                 self._state.mark_running(issue.number, repo_full_name=self._state_repo_full_name())
+                run_id = self._state.record_agent_run_start(
+                    run_kind="issue_flow",
+                    issue_number=issue.number,
+                    pr_number=None,
+                    flow=flow,
+                    branch=branch,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 fut = pool.submit(self._process_issue_worker, issue, flow, consumed_comment_id_max)
                 # Ensure global capacity is returned even if worker code fails.
                 fut.add_done_callback(lambda _: self._work_limiter.release())
@@ -452,6 +477,7 @@ class Phase1Orchestrator:
                 with self._running_lock:
                     self._running[issue.number] = fut
                     self._running_issue_metadata[issue.number] = _RunningIssueMetadata(
+                        run_id=run_id,
                         flow=flow,
                         branch=branch,
                         context_json=context_json,
@@ -515,6 +541,14 @@ class Phase1Orchestrator:
                 self._state.mark_running(
                     candidate.issue_number, repo_full_name=self._state_repo_full_name()
                 )
+                run_id = self._state.record_agent_run_start(
+                    run_kind="implementation_flow",
+                    issue_number=candidate.issue_number,
+                    pr_number=None,
+                    flow="implementation",
+                    branch=branch,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 fut = pool.submit(
                     self._process_implementation_candidate_worker,
                     candidate,
@@ -526,6 +560,7 @@ class Phase1Orchestrator:
                 with self._running_lock:
                     self._running[candidate.issue_number] = fut
                     self._running_issue_metadata[candidate.issue_number] = _RunningIssueMetadata(
+                        run_id=run_id,
                         flow="implementation",
                         branch=branch,
                         context_json=context_json,
@@ -570,12 +605,21 @@ class Phase1Orchestrator:
                             reason="already_running",
                         )
                         continue
+                run_id = self._state.record_agent_run_start(
+                    run_kind="feedback_turn",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    flow=None,
+                    branch=tracked.branch,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 fut = pool.submit(self._process_feedback_turn_worker, tracked)
                 fut.add_done_callback(lambda _: self._work_limiter.release())
                 capacity_reserved = False
                 with self._running_lock:
                     self._running_feedback[tracked.pr_number] = _FeedbackFuture(
                         issue_number=tracked.issue_number,
+                        run_id=run_id,
                         future=fut,
                     )
             finally:
@@ -660,6 +704,14 @@ class Phase1Orchestrator:
                     followup.issue_number,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                run_id = self._state.record_agent_run_start(
+                    run_kind="pre_pr_followup",
+                    issue_number=followup.issue_number,
+                    pr_number=None,
+                    flow=followup.flow,
+                    branch=branch,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 log_event(
                     LOGGER,
                     "pre_pr_followup_resumed",
@@ -688,6 +740,7 @@ class Phase1Orchestrator:
                 with self._running_lock:
                     self._running[followup.issue_number] = fut
                     self._running_issue_metadata[followup.issue_number] = _RunningIssueMetadata(
+                        run_id=run_id,
                         flow=followup.flow,
                         branch=branch,
                         context_json=context_json,
@@ -1506,6 +1559,11 @@ class Phase1Orchestrator:
                             issue_number=issue_number,
                             consumed_comment_id_max=metadata.consumed_comment_id_max,
                         )
+                    if metadata is not None:
+                        self._state.finish_agent_run(
+                            run_id=metadata.run_id,
+                            terminal_status="completed",
+                        )
                 except Exception as exc:  # noqa: BLE001
                     if (
                         self._config.runtime.enable_issue_comment_routing
@@ -1541,6 +1599,12 @@ class Phase1Orchestrator:
                             flow=metadata.flow,
                             reason=waiting_reason,
                         )
+                        self._state.finish_agent_run(
+                            run_id=metadata.run_id,
+                            terminal_status="blocked",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=waiting_reason,
+                        )
                         continue
 
                     self._state.mark_failed(
@@ -1554,11 +1618,25 @@ class Phase1Orchestrator:
                         issue_number=issue_number,
                         error_type=type(exc).__name__,
                     )
+                    if metadata is not None:
+                        self._state.finish_agent_run(
+                            run_id=metadata.run_id,
+                            terminal_status="failed",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=str(exc),
+                        )
 
             for pr_number in finished_pr_numbers:
                 handle = self._running_feedback.pop(pr_number)
                 try:
-                    handle.future.result()
+                    run_terminal_status = _normalize_feedback_terminal_status(
+                        handle.future.result()
+                    )
+                    self._state.finish_agent_run(
+                        run_id=handle.run_id,
+                        terminal_status=run_terminal_status,
+                        failure_class="policy_block" if run_terminal_status == "blocked" else None,
+                    )
                     log_event(
                         LOGGER,
                         "feedback_turn_completed",
@@ -1566,6 +1644,33 @@ class Phase1Orchestrator:
                         pr_number=pr_number,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    if isinstance(exc, GitHubPollingError):
+                        # Polling errors are recoverable transport/API failures; keep PRs tracked
+                        # so the next poll retries feedback instead of requiring manual unblock.
+                        self._state.mark_pr_status(
+                            pr_number=pr_number,
+                            issue_number=handle.issue_number,
+                            status="awaiting_feedback",
+                            error=None,
+                            reason="github_polling_retry",
+                            detail=str(exc),
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_retry",
+                            issue_number=handle.issue_number,
+                            pr_number=pr_number,
+                            reason="github_polling_error",
+                        )
+                        self._state.finish_agent_run(
+                            run_id=handle.run_id,
+                            terminal_status="failed",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=str(exc),
+                        )
+                        continue
+
                     self._state.mark_pr_status(
                         pr_number=pr_number,
                         issue_number=handle.issue_number,
@@ -1579,6 +1684,12 @@ class Phase1Orchestrator:
                         issue_number=handle.issue_number,
                         pr_number=pr_number,
                         reason=type(exc).__name__,
+                    )
+                    self._state.finish_agent_run(
+                        run_id=handle.run_id,
+                        terminal_status="failed",
+                        failure_class=_failure_class_for_exception(exc),
+                        error=str(exc),
                     )
 
     def _wait_for_all(self, pool: ThreadPoolExecutor) -> None:
@@ -2029,9 +2140,9 @@ class Phase1Orchestrator:
                 pre_pr_last_consumed_comment_id=consumed_comment_id_max,
             )
 
-    def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> None:
+    def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> str:
         with logging_repo_context(self._repo.full_name):
-            self._process_feedback_turn(tracked)
+            return self._process_feedback_turn(tracked)
 
     def _save_agent_session_if_present(
         self, *, issue_number: int, session: AgentSession | None
@@ -2545,7 +2656,7 @@ class Phase1Orchestrator:
             author_login=base_issue.author_login,
         )
 
-    def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> None:
+    def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> str:
         lease = self._slot_pool.acquire()
         try:
             log_event(
@@ -2572,7 +2683,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_merged",
                 )
-                return
+                return "merged"
             if pr.state.lower() != "open":
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
@@ -2588,7 +2699,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_closed",
                 )
-                return
+                return "closed"
 
             issue = self._github.get_issue(tracked.issue_number)
             if not self._repo.allows(issue.author_login):
@@ -2617,7 +2728,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason=reason,
                 )
-                return
+                return "blocked"
 
             if tracked.last_seen_head_sha and tracked.last_seen_head_sha != pr.head_sha:
                 transition_status = self._classify_remote_history_transition(
@@ -2632,7 +2743,7 @@ class Phase1Orchestrator:
                         phase="cross_cycle_drift",
                         transition_status=transition_status,
                     )
-                    return
+                    return "blocked"
 
             review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
             issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
@@ -2680,7 +2791,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="no_pending_events",
                 )
-                return
+                return "completed"
 
             pending_event_keys = tuple(event.event_key for event in pending_events)
             pending_event_key_set = set(pending_event_keys)
@@ -2726,7 +2837,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason="missing_agent_session",
                 )
-                return
+                return "blocked"
             session = AgentSession(adapter=session_row[0], thread_id=session_row[1])
 
             if not self._git.restore_feedback_branch(lease.path, tracked.branch, pr.head_sha):
@@ -2737,7 +2848,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason="head_mismatch_retry",
                 )
-                return
+                return "blocked"
 
             turn_head_sha = (
                 pr.head_sha if not previous_pending else (tracked.last_seen_head_sha or pr.head_sha)
@@ -2772,7 +2883,9 @@ class Phase1Orchestrator:
                 pull_request=pr,
             )
             if feedback_outcome is None:
-                return
+                return self._feedback_terminal_status_from_state(
+                    tracked=tracked, fallback="blocked"
+                )
             result, pr = feedback_outcome
 
             local_head_sha = self._git.current_head_sha(lease.path)
@@ -2785,7 +2898,7 @@ class Phase1Orchestrator:
                     transition_status="local_non_ancestor",
                     state_head_sha=turn_start_head,
                 )
-                return
+                return "blocked"
 
             commit_outcome = self._commit_push_feedback_with_required_tests(
                 tracked=tracked,
@@ -2796,7 +2909,9 @@ class Phase1Orchestrator:
                 turn_start_head=turn_start_head,
             )
             if commit_outcome is None:
-                return
+                return self._feedback_terminal_status_from_state(
+                    tracked=tracked, fallback="blocked"
+                )
             result, pr = commit_outcome
 
             refreshed_pr = self._github.get_pull_request(tracked.pr_number)
@@ -2815,7 +2930,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_merged",
                 )
-                return
+                return "merged"
             if refreshed_pr.state.lower() != "open":
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
@@ -2831,7 +2946,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_closed",
                 )
-                return
+                return "closed"
 
             transition_status = self._classify_remote_history_transition(
                 older_sha=turn_start_head,
@@ -2845,7 +2960,7 @@ class Phase1Orchestrator:
                     phase="pre_finalize_remote",
                     transition_status=transition_status,
                 )
-                return
+                return "blocked"
             pr = refreshed_pr
 
             expected_tokens: list[str] = []
@@ -2884,7 +2999,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason="token_reconciliation_incomplete",
                 )
-                return
+                return "blocked"
 
             self._state.finalize_feedback_turn(
                 pr_number=tracked.pr_number,
@@ -2902,11 +3017,28 @@ class Phase1Orchestrator:
                 turn_key=turn_key,
                 processed_event_count=len(pending_event_keys),
             )
+            return "completed"
         finally:
             try:
                 self._git.cleanup_slot(lease.path)
             finally:
                 self._slot_pool.release(lease)
+
+    def _feedback_terminal_status_from_state(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        fallback: str,
+    ) -> str:
+        state = self._state.get_pull_request_status(
+            tracked.pr_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if state is None:
+            return fallback
+        if state.status in {"blocked", "merged", "closed"}:
+            return state.status
+        return "completed"
 
     def _append_required_tests_feedback_reminder(
         self,
@@ -3759,6 +3891,38 @@ def _trigger_labels(repo: RepoConfig) -> tuple[str, ...]:
         if label not in labels:
             labels.append(label)
     return tuple(labels)
+
+
+def _normalize_feedback_terminal_status(
+    status: str,
+) -> Literal["completed", "failed", "blocked", "merged", "closed", "interrupted"]:
+    if status in {"completed", "failed", "blocked", "merged", "closed", "interrupted"}:
+        return cast(
+            Literal["completed", "failed", "blocked", "merged", "closed", "interrupted"],
+            status,
+        )
+    return "completed"
+
+
+def _failure_class_for_exception(exc: Exception) -> AgentRunFailureClass:
+    normalized = str(exc).strip().lower()
+    if "non-fast-forward" in normalized or "history transition" in normalized:
+        return "history_rewrite"
+    if isinstance(exc, GitHubPollingError):
+        return "github_error"
+    if (
+        isinstance(exc, DirectFlowBlockedError)
+        or " flow blocked:" in normalized
+        or "missing saved agent session" in normalized
+    ):
+        return "policy_block"
+    if "required pre-push test" in normalized or "required tests" in normalized:
+        return "tests_failed"
+    if "github" in normalized:
+        return "github_error"
+    if isinstance(exc, CommandError):
+        return "agent_error"
+    return "unknown"
 
 
 def _resolve_issue_flow(
