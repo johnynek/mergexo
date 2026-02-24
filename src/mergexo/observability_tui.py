@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import platform
+import subprocess
 import webbrowser
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from mergexo.observability_queries import (
@@ -32,12 +35,57 @@ _ACTIVE_COL_BRANCH = 5
 _TRACKED_COL_PR = 1
 _TRACKED_COL_ISSUE = 2
 _TRACKED_COL_BRANCH = 4
+_BLOCKED_REASON_MAX_CHARS = 36
 
 
 @dataclass(frozen=True)
 class _DetailTarget:
     kind: str
     number: int
+
+
+class _DetailModal(ModalScreen[None]):
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("enter", "close", "Close"),
+        Binding("q", "close", "Close"),
+    ]
+    CSS = """
+    #detail-dialog {
+        width: 90%;
+        height: 80%;
+        border: round $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #detail-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #detail-body-scroll {
+        height: 1fr;
+        border: round $boost;
+        padding: 0 1;
+    }
+    #detail-hint {
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, *, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="detail-dialog"):
+            yield Static(self._title, id="detail-title")
+            with VerticalScroll(id="detail-body-scroll"):
+                yield Static(self._body, id="detail-body")
+            yield Static("Press Esc, Enter, or q to close.", id="detail-hint")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 class ObservabilityApp(App[None]):
@@ -125,22 +173,56 @@ class ObservabilityApp(App[None]):
             if selected is not None:
                 active_url = _url_for_active_row(selected, focused.cursor_column)
                 if active_url is not None:
-                    webbrowser.open(active_url)
+                    self._open_external_url(active_url)
                     return
                 self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
+                self._refresh_history_table()
+                self._show_detail_context(
+                    title=f"Issue #{selected.issue_number} Context",
+                    body=_active_row_context(selected),
+                )
+                return
         elif isinstance(focused, DataTable) and focused.id == "tracked-table":
             selected = self._tracked_row_selection()
             if selected is not None:
                 tracked_url = _url_for_tracked_row(selected, focused.cursor_column)
                 if tracked_url is not None:
-                    webbrowser.open(tracked_url)
+                    self._open_external_url(tracked_url)
                     return
                 if selected.pr_number is None:
                     self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
                 else:
                     self._detail_target = _DetailTarget(kind="pr", number=selected.pr_number)
+                self._refresh_history_table()
+                work_label = (
+                    f"PR #{selected.pr_number} Context"
+                    if selected.pr_number is not None
+                    else f"Issue #{selected.issue_number} Context"
+                )
+                self._show_detail_context(
+                    title=work_label,
+                    body=_tracked_row_context(selected),
+                )
+                return
         if self._detail_target is not None:
             self._refresh_history_table()
+
+    def _open_external_url(self, url: str) -> None:
+        if _open_external_url(url):
+            return
+        self._show_detail_context(
+            title="Open URL Manually",
+            body=(
+                "MergeXO could not open the system browser automatically.\n\n"
+                "Open this URL manually:\n"
+                f"{url}"
+            ),
+        )
+
+    def _show_detail_context(self, *, title: str, body: str) -> None:
+        if not self.is_running:
+            return
+        self.push_screen(_DetailModal(title=title, body=body))
 
     def refresh_data(self) -> None:
         overview = load_overview(self._db_path, self._repo_filter, self._window)
@@ -216,7 +298,7 @@ class ObservabilityApp(App[None]):
                 row.status,
                 row.branch,
                 str(row.pending_event_count),
-                row.blocked_reason or "-",
+                _render_context_snippet(row.blocked_reason, max_chars=_BLOCKED_REASON_MAX_CHARS),
                 row.updated_at,
             )
         self._restore_tracked_selection(previous_key, previous_column)
@@ -442,3 +524,69 @@ def _url_for_tracked_row(row: TrackedOrBlockedRow, column: int) -> str | None:
     if column == _TRACKED_COL_BRANCH and row.branch and row.branch != "-":
         return f"https://github.com/{row.repo_full_name}/tree/{row.branch}"
     return None
+
+
+def _render_context_snippet(value: str | None, *, max_chars: int) -> str:
+    if value is None:
+        return "-"
+    if max_chars < 1:
+        return ""
+    text = value.strip()
+    if not text:
+        return "-"
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return "." * max_chars
+    return text[: max_chars - 3] + "..."
+
+
+def _active_row_context(row: ActiveAgentRow) -> str:
+    return "\n".join(
+        [
+            f"Repo: {row.repo_full_name}",
+            f"Run Kind: {row.run_kind}",
+            f"Issue: {row.issue_number}",
+            f"PR: {row.pr_number if row.pr_number is not None else '-'}",
+            f"Flow: {row.flow or '-'}",
+            f"Branch: {row.branch or '-'}",
+            f"Started: {row.started_at}",
+            f"Elapsed: {_render_seconds(row.elapsed_seconds)}",
+        ]
+    )
+
+
+def _tracked_row_context(row: TrackedOrBlockedRow) -> str:
+    return "\n".join(
+        [
+            f"Repo: {row.repo_full_name}",
+            f"PR: {row.pr_number if row.pr_number is not None else '-'}",
+            f"Issue: {row.issue_number}",
+            f"Status: {row.status}",
+            f"Branch: {row.branch}",
+            f"Pending Events: {row.pending_event_count}",
+            f"Last Seen Head SHA: {row.last_seen_head_sha or '-'}",
+            f"Updated: {row.updated_at}",
+            "",
+            "Blocked Reason:",
+            row.blocked_reason or "-",
+        ]
+    )
+
+
+def _open_external_url(url: str) -> bool:
+    if platform.system().lower() == "darwin":
+        try:
+            process = subprocess.run(
+                ["open", url],
+                check=False,
+                capture_output=True,
+            )
+            if process.returncode == 0:
+                return True
+        except OSError:
+            pass
+    try:
+        return bool(webbrowser.open_new_tab(url))
+    except webbrowser.Error:
+        return False

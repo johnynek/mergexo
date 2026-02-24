@@ -299,11 +299,6 @@ def load_tracked_and_blocked(
                 updated_at
             FROM tracked_work
             ORDER BY
-                CASE status
-                    WHEN 'blocked' THEN 0
-                    WHEN 'awaiting_issue_followup' THEN 1
-                    ELSE 2
-                END,
                 updated_at DESC,
                 repo_full_name ASC,
                 issue_number ASC,

@@ -79,6 +79,18 @@ def test_observability_tui_helper_functions() -> None:
     assert tui._url_for_tracked_row(tracked_issue, 2) == "https://github.com/o/repo-a/issues/8"
     assert tui._tracked_row_key(tracked_pr) == ("o/repo-a", 101, 7, "blocked")
     assert tui._tracked_row_key(tracked_issue) == ("o/repo-a", None, 8, "awaiting_issue_followup")
+    assert tui._render_context_snippet(None, max_chars=10) == "-"
+    assert tui._render_context_snippet("x", max_chars=10) == "x"
+    assert tui._render_context_snippet("abcdefghijklmnopqrstuvwxyz", max_chars=10) == "abcdefg..."
+    assert tui._render_context_snippet("abcdefghijklmnopqrstuvwxyz", max_chars=2) == ".."
+    assert tui._render_context_snippet("abc", max_chars=0) == ""
+    assert tui._render_context_snippet("   ", max_chars=10) == "-"
+
+    active_context = tui._active_row_context(active)
+    assert "Issue: 7" in active_context
+    tracked_context = tui._tracked_row_context(tracked_pr)
+    assert "Blocked Reason:" in tracked_context
+    assert "boom" in tracked_context
 
     summary = tui._summary_text(
         overview=OverviewStats(
@@ -283,7 +295,7 @@ def test_observability_app_refresh_and_keybindings(
     monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: tracked_rows)
     monkeypatch.setattr(tui, "load_metrics", lambda *args, **kwargs: metrics)
     opened_urls: list[str] = []
-    monkeypatch.setattr(tui.webbrowser, "open", lambda url: opened_urls.append(url))
+    monkeypatch.setattr(tui, "_open_external_url", lambda url: opened_urls.append(url) or True)
 
     def fake_issue_history(*args, **kwargs):  # type: ignore[no-untyped-def]
         calls["issue_history"] += 1
@@ -301,6 +313,10 @@ def test_observability_app_refresh_and_keybindings(
         refresh_seconds=60,
         default_window="24h",
         row_limit=20,
+    )
+    shown_details: list[tuple[str, str]] = []
+    app._show_detail_context = (  # type: ignore[method-assign]
+        lambda *, title, body: shown_details.append((title, body))
     )
 
     async def run_app() -> None:
@@ -321,6 +337,7 @@ def test_observability_app_refresh_and_keybindings(
             active.move_cursor(row=0, column=0, animate=False)
             app.action_show_detail()
             assert calls["issue_history"] >= 1
+            assert shown_details[-1][0] == "Issue #7 Context"
             active.move_cursor(row=0, column=2, animate=False)
             issue_history_calls = calls["issue_history"]
             app.action_show_detail()
@@ -334,8 +351,12 @@ def test_observability_app_refresh_and_keybindings(
             tracked.move_cursor(row=0, column=4, animate=False)
             app.action_show_detail()
             assert opened_urls[-1] == "https://github.com/o/repo-a/tree/agent/design/7"
+            tracked.move_cursor(row=0, column=6, animate=False)
+            app.action_show_detail()
+            assert shown_details[-1][0] == "PR #101 Context"
+            assert "Blocked Reason:" in shown_details[-1][1]
             app.action_refresh()
-            assert tracked.cursor_column == 4
+            assert tracked.cursor_column == 6
             app._detail_target = tui._DetailTarget(kind="pr", number=101)
             app._refresh_history_table()
             assert calls["pr_history"] >= 1
@@ -426,3 +447,178 @@ def test_action_show_detail_uses_issue_detail_for_tracked_row_without_pr(tmp_pat
     assert app._detail_target.kind == "issue"
     assert app._detail_target.number == 8
     assert app.refreshed is True
+
+
+def test_open_external_url_uses_open_command_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    class FakeCompletedProcess:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    monkeypatch.setattr(tui.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        tui.subprocess,
+        "run",
+        lambda args, check, capture_output: (
+            calls.append((args, check, capture_output)) or FakeCompletedProcess(0)
+        ),
+    )
+    monkeypatch.setattr(
+        tui.webbrowser,
+        "open_new_tab",
+        lambda url: (_ for _ in ()).throw(RuntimeError(f"unexpected fallback: {url}")),
+    )
+
+    assert tui._open_external_url("https://example.com") is True
+    assert calls == [(["open", "https://example.com"], False, True)]
+
+
+def test_open_external_url_falls_back_to_webbrowser(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tui.platform, "system", lambda: "Linux")
+    opened: list[str] = []
+    monkeypatch.setattr(tui.webbrowser, "open_new_tab", lambda url: opened.append(url) or True)
+
+    assert tui._open_external_url("https://example.com/next") is True
+    assert opened == ["https://example.com/next"]
+
+
+def test_open_external_url_handles_oserror_then_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tui.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        tui.subprocess,
+        "run",
+        lambda args, check, capture_output: (_ for _ in ()).throw(OSError("missing open")),
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(tui.webbrowser, "open_new_tab", lambda url: opened.append(url) or True)
+
+    assert tui._open_external_url("https://example.com/fallback") is True
+    assert opened == ["https://example.com/fallback"]
+
+
+def test_open_external_url_handles_webbrowser_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tui.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        tui.webbrowser,
+        "open_new_tab",
+        lambda url: (_ for _ in ()).throw(tui.webbrowser.Error("boom")),
+    )
+
+    assert tui._open_external_url("https://example.com/error") is False
+
+
+def test_app_open_external_url_shows_manual_fallback(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    shown: list[tuple[str, str]] = []
+    app._show_detail_context = (  # type: ignore[method-assign]
+        lambda *, title, body: shown.append((title, body))
+    )
+    original_open = tui._open_external_url
+    try:
+        tui._open_external_url = lambda url: False
+        app._open_external_url("https://example.com/manual")
+    finally:
+        tui._open_external_url = original_open
+
+    assert shown == [
+        (
+            "Open URL Manually",
+            "MergeXO could not open the system browser automatically.\n\n"
+            "Open this URL manually:\n"
+            "https://example.com/manual",
+        )
+    ]
+
+
+def test_action_show_detail_refreshes_history_when_focus_is_other(tmp_path: Path) -> None:
+    class FocusApp(tui.ObservabilityApp):
+        def __init__(self, *, db_path: Path) -> None:
+            super().__init__(
+                db_path=db_path, refresh_seconds=60, default_window="24h", row_limit=20
+            )
+            self._forced_focus = Static(id="other")
+            self.refreshed = 0
+
+        @property
+        def focused(self):  # type: ignore[override]
+            return self._forced_focus
+
+        def _refresh_history_table(self) -> None:
+            self.refreshed += 1
+
+    app = FocusApp(db_path=tmp_path / "state.db")
+    app._detail_target = tui._DetailTarget(kind="issue", number=7)
+    app.action_show_detail()
+    assert app.refreshed == 1
+
+
+def test_show_detail_context_pushes_modal_when_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        tui,
+        "load_overview",
+        lambda *args, **kwargs: OverviewStats(
+            active_agents=0,
+            blocked_prs=0,
+            tracked_prs=0,
+            failures=0,
+            mean_runtime_seconds=0.0,
+            stddev_runtime_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: ())
+    monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        tui,
+        "load_metrics",
+        lambda *args, **kwargs: MetricsStats(
+            overall=RuntimeMetric(
+                repo_full_name="__all__",
+                terminal_count=0,
+                failed_count=0,
+                failure_rate=0.0,
+                mean_runtime_seconds=0.0,
+                stddev_runtime_seconds=0.0,
+            ),
+            per_repo=(),
+        ),
+    )
+
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+
+    async def run_app() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._show_detail_context(title="Detail", body="full body")
+            await pilot.pause()
+            assert str(app.query_one("#detail-title", Static).renderable) == "Detail"
+            assert "full body" in str(app.query_one("#detail-body", Static).renderable)
+            modal = app.screen
+            assert isinstance(modal, tui._DetailModal)
+            modal.action_close()
+            await pilot.pause()
+
+    asyncio.run(run_app())
+
+
+def test_detail_modal_close_action_calls_dismiss(monkeypatch: pytest.MonkeyPatch) -> None:
+    modal = tui._DetailModal(title="Context", body="Body")
+    dismissed: list[None] = []
+    monkeypatch.setattr(modal, "dismiss", lambda value=None: dismissed.append(value))
+
+    modal.action_close()
+    assert dismissed == [None]

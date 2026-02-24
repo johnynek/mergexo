@@ -87,7 +87,7 @@ The dashboard is read-only and pulls directly from `state.db`. Keybindings:
 - `f`: cycle repo filter
 - `w`: cycle window (`1h`, `24h`, `7d`, `30d`)
 - `tab`: cycle focused panel
-- `enter`: open GitHub URL when focused on `Issue`, `PR`, or `Branch`; otherwise show detail history
+- `enter`: open GitHub URL when focused on `Issue`, `PR`, or `Branch`; otherwise open a scrollable context dialog and refresh detail history
 - `q`: quit
 
 Metrics definitions:

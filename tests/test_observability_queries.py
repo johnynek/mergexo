@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -154,16 +155,25 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert active_rows[0].elapsed_seconds >= 0
 
     tracked_rows = oq.load_tracked_and_blocked(db_path, limit=20)
-    assert [row.status for row in tracked_rows] == [
+    assert len(tracked_rows) == 3
+    assert {row.status for row in tracked_rows} == {
         "blocked",
         "awaiting_issue_followup",
         "awaiting_feedback",
-    ]
-    assert tracked_rows[0].pending_event_count == 1
-    assert tracked_rows[0].blocked_reason == "rewrite"
-    assert tracked_rows[1].pr_number is None
-    assert tracked_rows[1].issue_number == 12
-    assert tracked_rows[1].blocked_reason == "waiting for reporter clarification"
+    }
+    assert [row.updated_at for row in tracked_rows] == sorted(
+        (row.updated_at for row in tracked_rows),
+        reverse=True,
+    )
+    blocked_row = next(row for row in tracked_rows if row.status == "blocked")
+    awaiting_issue_row = next(
+        row for row in tracked_rows if row.status == "awaiting_issue_followup"
+    )
+    assert blocked_row.pending_event_count == 1
+    assert blocked_row.blocked_reason == "rewrite"
+    assert awaiting_issue_row.pr_number is None
+    assert awaiting_issue_row.issue_number == 12
+    assert awaiting_issue_row.blocked_reason == "waiting for reporter clarification"
 
     issue_history = oq.load_issue_history(db_path, None, issue_number=2, limit=10)
     assert len(issue_history) == 1
@@ -300,3 +310,39 @@ def test_observability_query_internal_error_paths() -> None:
 
     with pytest.raises(RuntimeError, match="count query"):
         oq._fetch_int(EmptyCountConn(), "SELECT 1", ())
+
+
+def test_load_tracked_and_blocked_sorted_by_updated_desc(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    _seed_state(store)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE pr_feedback_state
+            SET updated_at = '2026-02-24T00:00:02.000Z'
+            WHERE repo_full_name = 'o/repo-a' AND pr_number = 1010
+            """
+        )
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET updated_at = '2026-02-24T00:00:03.000Z'
+            WHERE repo_full_name = 'o/repo-b' AND issue_number = 12
+            """
+        )
+        conn.execute(
+            """
+            UPDATE pr_feedback_state
+            SET updated_at = '2026-02-24T00:00:01.000Z'
+            WHERE repo_full_name = 'o/repo-b' AND pr_number = 1111
+            """
+        )
+
+    rows = oq.load_tracked_and_blocked(db_path, limit=20)
+    assert [row.updated_at for row in rows] == [
+        "2026-02-24T00:00:03.000Z",
+        "2026-02-24T00:00:02.000Z",
+        "2026-02-24T00:00:01.000Z",
+    ]
