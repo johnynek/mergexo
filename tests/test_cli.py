@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 
 import pytest
 
@@ -60,10 +61,12 @@ def _multi_repo_config(tmp_path: Path) -> AppConfig:
 def test_build_parser_supports_commands() -> None:
     parser = cli.build_parser()
 
+    parsed_console = parser.parse_args(["console", "--verbose"])
     parsed_init = parser.parse_args(["init", "--verbose"])
     parsed_run = parser.parse_args(["run", "--once", "--verbose"])
     parsed_run_high = parser.parse_args(["run", "--once", "--verbose", "high"])
     parsed_service = parser.parse_args(["service", "--once", "--verbose"])
+    parsed_top = parser.parse_args(["top", "--verbose"])
     parsed_feedback_list = parser.parse_args(["feedback", "blocked", "list", "--json"])
     parsed_feedback_reset = parser.parse_args(
         [
@@ -80,6 +83,8 @@ def test_build_parser_supports_commands() -> None:
         ]
     )
 
+    assert parsed_console.command == "console"
+    assert parsed_console.verbose == "low"
     assert parsed_init.command == "init"
     assert parsed_init.verbose == "low"
     assert parsed_run.command == "run"
@@ -89,6 +94,8 @@ def test_build_parser_supports_commands() -> None:
     assert parsed_service.command == "service"
     assert parsed_service.once is True
     assert parsed_service.verbose == "low"
+    assert parsed_top.command == "top"
+    assert parsed_top.verbose == "low"
     assert parsed_feedback_list.command == "feedback"
     assert parsed_feedback_list.feedback_command == "blocked"
     assert parsed_feedback_list.blocked_command == "list"
@@ -104,7 +111,8 @@ def test_main_dispatches_init(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     cfg = _app_config(tmp_path)
 
     class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
             return SimpleNamespace(command="init", config=Path("cfg.toml"), verbose=True)
 
     called: dict[str, object] = {}
@@ -127,7 +135,8 @@ def test_main_dispatches_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     cfg = _app_config(tmp_path)
 
     class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
             return SimpleNamespace(command="run", config=Path("cfg.toml"), once=True, verbose=False)
 
     called: dict[str, object] = {}
@@ -150,7 +159,8 @@ def test_main_dispatches_feedback(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     cfg = _app_config(tmp_path)
 
     class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
             return SimpleNamespace(
                 command="feedback",
                 config=Path("cfg.toml"),
@@ -184,7 +194,8 @@ def test_main_dispatches_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     cfg = _app_config(tmp_path)
 
     class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
             return SimpleNamespace(
                 command="service",
                 config=Path("cfg.toml"),
@@ -210,11 +221,40 @@ def test_main_dispatches_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert called["service"] == (cfg, True)
 
 
+def test_main_dispatches_top(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+
+    class FakeParser:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
+            return SimpleNamespace(
+                command="top",
+                config=Path("cfg.toml"),
+                verbose=False,
+            )
+
+    called: dict[str, object] = {}
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
+    )
+    monkeypatch.setattr(cli, "_cmd_top", lambda c: called.setdefault("top", c))
+
+    cli.main()
+    assert called["verbose"] is False
+    assert called["state_dir"] == cfg.runtime.base_dir
+    assert called["top"] == cfg
+
+
 def test_main_unknown_command_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     cfg = _app_config(tmp_path)
 
     class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
             return SimpleNamespace(command="unknown", config=Path("cfg.toml"), verbose=False)
 
     monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
@@ -230,7 +270,8 @@ def test_main_defaults_verbose_to_false_when_missing(
     cfg = _app_config(tmp_path)
 
     class FakeParser:
-        def parse_args(self) -> SimpleNamespace:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
             return SimpleNamespace(command="init", config=Path("cfg.toml"))
 
     called: dict[str, object] = {}
@@ -246,6 +287,117 @@ def test_main_defaults_verbose_to_false_when_missing(
     cli.main()
     assert called["verbose"] is None
     assert called["state_dir"] == cfg.runtime.base_dir
+
+
+def test_main_defaults_to_console_and_low_verbosity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    called: dict[str, object] = {}
+    monkeypatch.setattr(sys, "argv", ["mergexo"])
+    monkeypatch.setattr(cli, "load_config", lambda p: called.setdefault("config_path", p) and cfg)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
+    )
+    monkeypatch.setattr(cli, "_cmd_console", lambda c: called.setdefault("console", c))
+
+    cli.main()
+
+    assert called["config_path"] == Path("mergexo.toml")
+    assert called["verbose"] == "low"
+    assert called["state_dir"] == cfg.runtime.base_dir
+    assert called["console"] == cfg
+
+
+def test_main_defaults_to_console_when_option_precedes_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    called: dict[str, object] = {}
+    custom_config = tmp_path / "custom.toml"
+    monkeypatch.setattr(sys, "argv", ["mergexo", "--config", str(custom_config)])
+    monkeypatch.setattr(cli, "load_config", lambda p: called.setdefault("config_path", p) and cfg)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
+    )
+    monkeypatch.setattr(cli, "_cmd_console", lambda c: called.setdefault("console", c))
+
+    cli.main()
+
+    assert called["config_path"] == custom_config
+    assert called["verbose"] == "low"
+    assert called["console"] == cfg
+
+
+def test_argv_with_default_command_helper() -> None:
+    assert cli._argv_with_default_command(()) == ("console",)
+    assert cli._argv_with_default_command(("--config", "mergexo.toml")) == (
+        "console",
+        "--config",
+        "mergexo.toml",
+    )
+    assert cli._argv_with_default_command(("service", "--once")) == ("service", "--once")
+    assert cli._argv_with_default_command(("--help",)) == ("--help",)
+
+
+def test_effective_verbose_mode_defaults_console_to_low() -> None:
+    assert cli._effective_verbose_mode(SimpleNamespace(command="console", verbose=None)) == "low"
+    assert cli._effective_verbose_mode(SimpleNamespace(command="service", verbose=None)) is None
+    assert cli._effective_verbose_mode(SimpleNamespace(command="console", verbose="high")) == "high"
+
+
+def test_cmd_console_runs_default_mode_with_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    cfg = AppConfig(
+        runtime=RuntimeConfig(
+            base_dir=cfg.runtime.base_dir,
+            worker_count=cfg.runtime.worker_count,
+            poll_interval_seconds=cfg.runtime.poll_interval_seconds,
+            observability_history_retention_days=42,
+        ),
+        repos=cfg.repos,
+        codex=cfg.codex,
+    )
+    called: dict[str, object] = {}
+
+    class FakeState:
+        def __init__(self, path: Path) -> None:
+            called["state_path"] = path
+
+        def reconcile_unfinished_agent_runs(self) -> int:
+            called["reconciled"] = True
+            return 1
+
+        def prune_observability_history(self, *, retention_days: int) -> tuple[int, int]:
+            called["retention_days"] = retention_days
+            return 2, 3
+
+    monkeypatch.setattr(cli, "StateStore", FakeState)
+    monkeypatch.setattr(cli, "CodexAdapter", lambda codex: f"codex:{codex.enabled}")
+    monkeypatch.setattr(cli, "GitHubGateway", lambda owner, name: f"gh:{owner}/{name}")
+    monkeypatch.setattr(cli, "GitRepoManager", lambda runtime, repo: f"git:{repo.full_name}")
+    monkeypatch.setattr(
+        cli,
+        "run_default_mode",
+        lambda **kwargs: called.setdefault("default_mode", kwargs),
+    )
+
+    cli._cmd_console(cfg)
+
+    assert called["reconciled"] is True
+    assert called["retention_days"] == 42
+    default_mode_call = called["default_mode"]
+    assert isinstance(default_mode_call, dict)
+    assert default_mode_call["config"] == cfg
+    assert default_mode_call["agent"] == "codex:True"
+    assert default_mode_call["agent_by_repo_full_name"] == {"johnynek/mergexo": "codex:True"}
+    assert len(default_mode_call["repo_runtimes"]) == 1
 
 
 def test_cmd_init_creates_layout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -423,6 +575,55 @@ def test_cmd_service_constructs_runner(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert service_call["once"] is False
     assert len(service_call["repo_runtimes"]) == 1
     assert service_call["agent_by_repo_full_name"] == {"johnynek/mergexo": "codex:True"}
+
+
+def test_cmd_top_runs_tui_with_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    cfg = AppConfig(
+        runtime=RuntimeConfig(
+            base_dir=cfg.runtime.base_dir,
+            worker_count=cfg.runtime.worker_count,
+            poll_interval_seconds=cfg.runtime.poll_interval_seconds,
+            observability_refresh_seconds=5,
+            observability_default_window="7d",
+            observability_row_limit=111,
+            observability_history_retention_days=45,
+        ),
+        repos=cfg.repos,
+        codex=cfg.codex,
+    )
+    called: dict[str, object] = {}
+
+    class FakeState:
+        def __init__(self, path: Path) -> None:
+            called["state_path"] = path
+
+        def reconcile_unfinished_agent_runs(self) -> int:
+            called["reconciled"] = True
+            return 1
+
+        def prune_observability_history(self, *, retention_days: int) -> tuple[int, int]:
+            called["retention_days"] = retention_days
+            return 2, 3
+
+    monkeypatch.setattr(cli, "StateStore", FakeState)
+    monkeypatch.setattr(
+        cli,
+        "run_observability_tui",
+        lambda **kwargs: called.setdefault("top", kwargs),
+    )
+
+    cli._cmd_top(cfg)
+
+    assert called["reconciled"] is True
+    assert called["retention_days"] == 45
+    top_call = called["top"]
+    assert isinstance(top_call, dict)
+    assert top_call["refresh_seconds"] == 5
+    assert top_call["default_window"] == "7d"
+    assert top_call["row_limit"] == 111
 
 
 def test_build_codex_agents_by_repo_uses_repo_overrides(

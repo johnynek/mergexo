@@ -16,11 +16,17 @@ class RuntimeConfig:
     poll_interval_seconds: int
     enable_github_operations: bool = False
     enable_issue_comment_routing: bool = False
+    enable_pr_actions_monitoring: bool = False
+    pr_actions_log_tail_lines: int = 500
     restart_drain_timeout_seconds: int = 900
     restart_default_mode: RestartMode = "git_checkout"
     restart_supported_modes: tuple[RestartMode, ...] = ("git_checkout",)
     git_checkout_root: Path | None = None
     service_python: str | None = None
+    observability_refresh_seconds: int = 2
+    observability_default_window: str = "24h"
+    observability_row_limit: int | None = 200
+    observability_history_retention_days: int = 90
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,10 @@ def load_config(path: Path) -> AppConfig:
         enable_issue_comment_routing=_bool_with_default(
             runtime_data, "enable_issue_comment_routing", False
         ),
+        enable_pr_actions_monitoring=_bool_with_default(
+            runtime_data, "enable_pr_actions_monitoring", False
+        ),
+        pr_actions_log_tail_lines=_int_with_default(runtime_data, "pr_actions_log_tail_lines", 500),
         restart_drain_timeout_seconds=_int_with_default(
             runtime_data, "restart_drain_timeout_seconds", 900
         ),
@@ -142,14 +152,32 @@ def load_config(path: Path) -> AppConfig:
         ),
         git_checkout_root=_optional_path(runtime_data, "git_checkout_root"),
         service_python=_optional_str(runtime_data, "service_python"),
+        observability_refresh_seconds=_int_with_default(
+            runtime_data, "observability_refresh_seconds", 2
+        ),
+        observability_default_window=_window_with_default(
+            runtime_data, "observability_default_window", "24h"
+        ),
+        observability_row_limit=_optional_positive_int_with_default(
+            runtime_data, "observability_row_limit", 200
+        ),
+        observability_history_retention_days=_int_with_default(
+            runtime_data, "observability_history_retention_days", 90
+        ),
     )
 
     if runtime.worker_count < 1:
         raise ConfigError("runtime.worker_count must be >= 1")
     if runtime.poll_interval_seconds < 5:
         raise ConfigError("runtime.poll_interval_seconds must be >= 5")
+    if runtime.pr_actions_log_tail_lines < 1 or runtime.pr_actions_log_tail_lines > 5000:
+        raise ConfigError("runtime.pr_actions_log_tail_lines must be between 1 and 5000")
     if runtime.restart_drain_timeout_seconds < 1:
         raise ConfigError("runtime.restart_drain_timeout_seconds must be >= 1")
+    if runtime.observability_refresh_seconds < 1:
+        raise ConfigError("runtime.observability_refresh_seconds must be >= 1")
+    if runtime.observability_history_retention_days < 1:
+        raise ConfigError("runtime.observability_history_retention_days must be >= 1")
     if runtime.restart_default_mode not in runtime.restart_supported_modes:
         raise ConfigError(
             "runtime.restart_default_mode must be included in runtime.restart_supported_modes"
@@ -441,6 +469,21 @@ def _optional_positive_int(data: dict[str, object], key: str) -> int | None:
         return None
     if not isinstance(value, int) or value < 1:
         raise ConfigError(f"{key} must be an integer >= 1 if provided")
+    return value
+
+
+def _optional_positive_int_with_default(
+    data: dict[str, object], key: str, default: int | None
+) -> int | None:
+    if key not in data:
+        return default
+    return _optional_positive_int(data, key)
+
+
+def _window_with_default(data: dict[str, object], key: str, default: str) -> str:
+    value = _str_with_default(data, key, default)
+    if value not in {"1h", "24h", "7d", "30d"}:
+        raise ConfigError(f"{key} must be one of: 1h, 24h, 7d, 30d")
     return value
 
 

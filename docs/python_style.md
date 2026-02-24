@@ -62,8 +62,10 @@ Example invariants:
 
 ## 7. Development workflow
 
-1. Add/update dependencies with `uv`.
-2. Format code with `uv run ruff format`.
-3. Run tests with coverage: `uv run pytest --cov=src --cov-report=term-missing --cov-fail-under=100`.
-4. Run type checks with `uv run ty`.
-5. Only merge when formatter, tests, coverage, and type checks pass.
+1. In worker environments, set a temporary UV cache before running `uv` commands: `export UV_CACHE_DIR=/tmp/uv-cache`.
+2. Add/update dependencies with `uv`.
+3. Format code with `uv run ruff format`.
+4. Run tests with coverage: `uv run pytest --cov=src --cov-report=term-missing --cov-fail-under=100`.
+5. Run type checks with `uv run ty`.
+6. Validate the full pre-push suite with `./scripts/test.sh`.
+7. Only merge when formatter, tests, coverage, and type checks pass.

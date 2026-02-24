@@ -25,11 +25,17 @@ worker_count = 2
 poll_interval_seconds = 60
 enable_github_operations = true
 enable_issue_comment_routing = true
+enable_pr_actions_monitoring = true
+pr_actions_log_tail_lines = 250
 restart_drain_timeout_seconds = 120
 restart_default_mode = "git_checkout"
 restart_supported_modes = ["git_checkout", "pypi"]
 git_checkout_root = "~/code/mergexo"
 service_python = "/usr/bin/python3"
+observability_refresh_seconds = 3
+observability_default_window = "7d"
+observability_row_limit = 150
+observability_history_retention_days = 120
 
 [repo]
 owner = "johnynek"
@@ -64,12 +70,18 @@ extra_args = ["--repo-mode"]
     assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
     assert loaded.runtime.enable_github_operations is True
     assert loaded.runtime.enable_issue_comment_routing is True
+    assert loaded.runtime.enable_pr_actions_monitoring is True
+    assert loaded.runtime.pr_actions_log_tail_lines == 250
     assert loaded.runtime.restart_drain_timeout_seconds == 120
     assert loaded.runtime.restart_default_mode == "git_checkout"
     assert loaded.runtime.restart_supported_modes == ("git_checkout", "pypi")
     assert loaded.runtime.git_checkout_root is not None
     assert loaded.runtime.git_checkout_root.as_posix().endswith("/code/mergexo")
     assert loaded.runtime.service_python == "/usr/bin/python3"
+    assert loaded.runtime.observability_refresh_seconds == 3
+    assert loaded.runtime.observability_default_window == "7d"
+    assert loaded.runtime.observability_row_limit == 150
+    assert loaded.runtime.observability_history_retention_days == 120
     assert loaded.repo.repo_id == "repo"
     assert loaded.repo.full_name == "johnynek/repo"
     assert loaded.repo.default_branch == "main"
@@ -121,6 +133,12 @@ coding_guidelines_path = "docs/python_style.md"
     loaded = config.load_config(cfg_path)
     assert len(loaded.repos) == 2
     assert loaded.runtime.enable_issue_comment_routing is False
+    assert loaded.runtime.enable_pr_actions_monitoring is False
+    assert loaded.runtime.pr_actions_log_tail_lines == 500
+    assert loaded.runtime.observability_refresh_seconds == 2
+    assert loaded.runtime.observability_default_window == "24h"
+    assert loaded.runtime.observability_row_limit == 200
+    assert loaded.runtime.observability_history_retention_days == 90
 
     by_id = {repo.repo_id: repo for repo in loaded.repos}
     assert by_id["mergexo"].name == "mergexo"
@@ -478,6 +496,36 @@ coding_guidelines_path = "docs/python_style.md"
 base_dir = "/tmp/x"
 worker_count = 1
 poll_interval_seconds = 5
+pr_actions_log_tail_lines = 0
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "pr_actions_log_tail_lines",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+pr_actions_log_tail_lines = 6001
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "pr_actions_log_tail_lines",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
 restart_drain_timeout_seconds = 0
 
 [repo]
@@ -486,6 +534,36 @@ name = "n"
 coding_guidelines_path = "docs/python_style.md"
 """.strip(),
             "restart_drain_timeout_seconds",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+observability_refresh_seconds = 0
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "observability_refresh_seconds",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+observability_history_retention_days = 0
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "observability_history_retention_days",
         ),
         (
             """
@@ -625,6 +703,14 @@ def test_helper_numeric_bool_and_tuple() -> None:
     assert config._optional_positive_int({"k": 2}, "k") == 2
     with pytest.raises(ConfigError, match="integer >= 1"):
         config._optional_positive_int({"k": 0}, "k")
+    assert config._optional_positive_int_with_default({}, "k", 9) == 9
+    assert config._optional_positive_int_with_default({"k": 3}, "k", 9) == 3
+    with pytest.raises(ConfigError, match="integer >= 1"):
+        config._optional_positive_int_with_default({"k": 0}, "k", 9)
+    assert config._window_with_default({}, "w", "24h") == "24h"
+    assert config._window_with_default({"w": "7d"}, "w", "24h") == "7d"
+    with pytest.raises(ConfigError, match="must be one of"):
+        config._window_with_default({"w": "2h"}, "w", "24h")
 
     assert config._optional_path({}, "k") is None
     assert config._optional_path({"k": "~/tmp"}, "k") is not None

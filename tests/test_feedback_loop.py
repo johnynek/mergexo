@@ -6,6 +6,7 @@ from mergexo.feedback_loop import (
     compute_general_comment_token,
     compute_history_rewrite_token,
     compute_operator_command_token,
+    compute_pre_pr_checkpoint_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
     compute_turn_key,
@@ -22,6 +23,13 @@ from mergexo.feedback_loop import (
 def test_event_key_and_turn_key_are_stable() -> None:
     key = event_key(pr_number=12, kind="review", comment_id=33, updated_at="2026-02-21T01:02:03Z")
     assert key == "12:review:33:2026-02-21T01:02:03Z"
+    actions_key = event_key(
+        pr_number=12,
+        kind="actions",
+        comment_id=44,
+        updated_at="2026-02-21T01:02:04Z",
+    )
+    assert actions_key == "12:actions:44:2026-02-21T01:02:04Z"
 
     turn_a = compute_turn_key(
         pr_number=12,
@@ -95,6 +103,14 @@ def test_source_issue_redirect_token_is_stable() -> None:
     token_a = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=77)
     token_b = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=77)
     token_c = compute_source_issue_redirect_token(issue_number=44, pr_number=101, comment_id=78)
+    assert token_a == token_b
+    assert token_a != token_c
+
+
+def test_pre_pr_checkpoint_token_is_stable() -> None:
+    token_a = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="abc123")
+    token_b = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="abc123")
+    token_c = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="def456")
     assert token_a == token_b
     assert token_a != token_c
 

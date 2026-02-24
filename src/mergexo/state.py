@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 import threading
+import uuid
 from typing import Literal, cast
 
 from mergexo.agent_adapter import AgentSession
@@ -26,6 +27,23 @@ _LEGACY_SCHEMA_REINIT_MESSAGE = (
     "Reinitialize state: stop MergeXO, remove the old state DB, run `mergexo init`, then restart."
 )
 PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
+AgentRunKind = Literal["issue_flow", "implementation_flow", "pre_pr_followup", "feedback_turn"]
+AgentRunTerminalStatus = Literal[
+    "completed",
+    "failed",
+    "blocked",
+    "merged",
+    "closed",
+    "interrupted",
+]
+AgentRunFailureClass = Literal[
+    "agent_error",
+    "tests_failed",
+    "policy_block",
+    "github_error",
+    "history_rewrite",
+    "unknown",
+]
 
 
 @dataclass(frozen=True)
@@ -74,6 +92,7 @@ class PrePrFollowupState:
     branch: str
     context_json: str
     waiting_reason: str
+    last_checkpoint_sha: str | None
     updated_at: str
     repo_full_name: str = ""
 
@@ -100,6 +119,17 @@ class LegacyFailedIssueRunState:
 class LegacyRunningIssueRunState:
     issue_number: int
     branch: str | None
+    updated_at: str
+    repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class PullRequestStatusState:
+    pr_number: int
+    issue_number: int
+    status: str
+    branch: str
+    last_seen_head_sha: str | None
     updated_at: str
     repo_full_name: str = ""
 
@@ -152,11 +182,20 @@ class StateStore:
                     branch TEXT NOT NULL,
                     context_json TEXT NOT NULL,
                     waiting_reason TEXT NOT NULL,
+                    last_checkpoint_sha TEXT NULL,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, issue_number)
                 )
                 """
             )
+            pre_pr_followup_columns = _table_columns(conn, "pre_pr_followup_state")
+            if "last_checkpoint_sha" not in pre_pr_followup_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE pre_pr_followup_state
+                    ADD COLUMN last_checkpoint_sha TEXT NULL
+                    """
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS issue_comment_cursors (
@@ -245,6 +284,71 @@ class StateStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_run_history (
+                    run_id TEXT PRIMARY KEY,
+                    repo_full_name TEXT NOT NULL,
+                    run_kind TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    pr_number INTEGER NULL,
+                    flow TEXT NULL,
+                    branch TEXT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NULL,
+                    terminal_status TEXT NULL,
+                    failure_class TEXT NULL,
+                    error TEXT NULL,
+                    duration_seconds REAL NULL,
+                    meta_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_run_history_repo_finished
+                ON agent_run_history(repo_full_name, finished_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_run_history_repo_started
+                ON agent_run_history(repo_full_name, started_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_run_history_repo_status_started
+                ON agent_run_history(repo_full_name, terminal_status, started_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pr_status_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo_full_name TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    from_status TEXT NULL,
+                    to_status TEXT NOT NULL,
+                    reason TEXT NULL,
+                    detail TEXT NULL,
+                    changed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pr_status_history_repo_pr_changed
+                ON pr_status_history(repo_full_name, pr_number, changed_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pr_status_history_repo_changed
+                ON pr_status_history(repo_full_name, changed_at)
+                """
+            )
 
     def _assert_not_legacy_schema(self, conn: sqlite3.Connection) -> None:
         if _table_exists(conn, "issue_runs"):
@@ -280,6 +384,258 @@ class StateStore:
                 ).fetchone()
         return row is None
 
+    def record_agent_run_start(
+        self,
+        *,
+        run_kind: AgentRunKind,
+        issue_number: int,
+        pr_number: int | None,
+        flow: str | None,
+        branch: str | None,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        run_key = run_id if run_id is not None else uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_run_history(
+                    run_id,
+                    repo_full_name,
+                    run_kind,
+                    issue_number,
+                    pr_number,
+                    flow,
+                    branch,
+                    started_at,
+                    meta_json
+                )
+                VALUES(
+                    ?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?
+                )
+                """,
+                (
+                    run_key,
+                    repo_key,
+                    run_kind,
+                    issue_number,
+                    pr_number,
+                    flow,
+                    branch,
+                    started_at,
+                    meta_json,
+                ),
+            )
+        return run_key
+
+    def finish_agent_run(
+        self,
+        *,
+        run_id: str,
+        terminal_status: AgentRunTerminalStatus,
+        failure_class: AgentRunFailureClass | None = None,
+        error: str | None = None,
+        finished_at: str | None = None,
+    ) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE agent_run_history
+                SET
+                    finished_at = COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    terminal_status = ?,
+                    failure_class = ?,
+                    error = ?,
+                    duration_seconds = MAX(
+                        0.0,
+                        (
+                            julianday(COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+                            - julianday(started_at)
+                        ) * 86400.0
+                    )
+                WHERE run_id = ?
+                  AND finished_at IS NULL
+                """,
+                (finished_at, terminal_status, failure_class, error, finished_at, run_id),
+            )
+        return cursor.rowcount > 0
+
+    def update_agent_run_meta(self, *, run_id: str, meta_json: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE agent_run_history
+                SET meta_json = ?
+                WHERE run_id = ?
+                  AND finished_at IS NULL
+                """,
+                (meta_json, run_id),
+            )
+        return cursor.rowcount > 0
+
+    def reconcile_unfinished_agent_runs(self, *, repo_full_name: str | None = None) -> int:
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                cursor = conn.execute(
+                    """
+                    UPDATE agent_run_history
+                    SET
+                        finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        terminal_status = 'interrupted',
+                        failure_class = 'unknown',
+                        duration_seconds = MAX(
+                            0.0,
+                            (
+                                julianday(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                                - julianday(started_at)
+                            ) * 86400.0
+                        )
+                    WHERE finished_at IS NULL
+                    """
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE agent_run_history
+                    SET
+                        finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        terminal_status = 'interrupted',
+                        failure_class = 'unknown',
+                        duration_seconds = MAX(
+                            0.0,
+                            (
+                                julianday(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                                - julianday(started_at)
+                            ) * 86400.0
+                        )
+                    WHERE finished_at IS NULL
+                      AND repo_full_name = ?
+                    """,
+                    (repo_key,),
+                )
+        return cursor.rowcount
+
+    def prune_observability_history(
+        self,
+        *,
+        retention_days: int,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, int]:
+        if retention_days < 1:
+            raise ValueError("retention_days must be >= 1")
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        retention_cutoff = f"-{retention_days} days"
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                agent_cursor = conn.execute(
+                    """
+                    DELETE FROM agent_run_history
+                    WHERE finished_at IS NOT NULL
+                      AND finished_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+                    """,
+                    (retention_cutoff,),
+                )
+                pr_cursor = conn.execute(
+                    """
+                    DELETE FROM pr_status_history
+                    WHERE changed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+                    """,
+                    (retention_cutoff,),
+                )
+            else:
+                agent_cursor = conn.execute(
+                    """
+                    DELETE FROM agent_run_history
+                    WHERE finished_at IS NOT NULL
+                      AND finished_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+                      AND repo_full_name = ?
+                    """,
+                    (retention_cutoff, repo_key),
+                )
+                pr_cursor = conn.execute(
+                    """
+                    DELETE FROM pr_status_history
+                    WHERE changed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+                      AND repo_full_name = ?
+                    """,
+                    (retention_cutoff, repo_key),
+                )
+        return agent_cursor.rowcount, pr_cursor.rowcount
+
+    def get_pull_request_status(
+        self, pr_number: int, *, repo_full_name: str | None = None
+    ) -> PullRequestStatusState | None:
+        with self._lock, self._connect() as conn:
+            if repo_full_name is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        repo_full_name,
+                        pr_number,
+                        issue_number,
+                        status,
+                        branch,
+                        last_seen_head_sha,
+                        updated_at
+                    FROM pr_feedback_state
+                    WHERE pr_number = ?
+                    ORDER BY repo_full_name ASC
+                    """,
+                    (pr_number,),
+                ).fetchall()
+                if not rows:
+                    row = None
+                else:
+                    if len(rows) > 1:
+                        raise RuntimeError(
+                            f"Multiple pr_feedback_state rows found for pr_number={pr_number}; "
+                            "specify repo_full_name."
+                        )
+                    row = rows[0]
+            else:
+                repo_key = _normalize_repo_full_name(repo_full_name)
+                row = conn.execute(
+                    """
+                    SELECT
+                        repo_full_name,
+                        pr_number,
+                        issue_number,
+                        status,
+                        branch,
+                        last_seen_head_sha,
+                        updated_at
+                    FROM pr_feedback_state
+                    WHERE repo_full_name = ? AND pr_number = ?
+                    """,
+                    (repo_key, pr_number),
+                ).fetchone()
+        if row is None:
+            return None
+        (
+            row_repo_full_name,
+            row_pr_number,
+            issue_number,
+            status,
+            branch,
+            last_seen_head_sha,
+            updated_at,
+        ) = row
+        return PullRequestStatusState(
+            repo_full_name=str(row_repo_full_name),
+            pr_number=int(row_pr_number),
+            issue_number=int(issue_number),
+            status=str(status),
+            branch=str(branch),
+            last_seen_head_sha=str(last_seen_head_sha)
+            if isinstance(last_seen_head_sha, str)
+            else None,
+            updated_at=str(updated_at),
+        )
+
     def mark_running(self, issue_number: int, *, repo_full_name: str | None = None) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
         with self._lock, self._connect() as conn:
@@ -306,6 +662,11 @@ class StateStore:
     ) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
         with self._lock, self._connect() as conn:
+            previous_status = _select_pr_feedback_status(
+                conn=conn,
+                repo_full_name=repo_key,
+                pr_number=pr_number,
+            )
             conn.execute(
                 """
                 INSERT INTO issue_runs(
@@ -352,6 +713,16 @@ class StateStore:
                 """,
                 (repo_key, issue_number),
             )
+            _append_pr_status_history(
+                conn=conn,
+                repo_full_name=repo_key,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                from_status=previous_status,
+                to_status="awaiting_feedback",
+                reason="issue_run_completed",
+                detail=None,
+            )
 
     def mark_failed(
         self, issue_number: int, error: str, *, repo_full_name: str | None = None
@@ -385,6 +756,7 @@ class StateStore:
         branch: str,
         context_json: str,
         waiting_reason: str,
+        last_checkpoint_sha: str | None = None,
         repo_full_name: str | None = None,
     ) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
@@ -419,17 +791,27 @@ class StateStore:
                     flow,
                     branch,
                     context_json,
-                    waiting_reason
+                    waiting_reason,
+                    last_checkpoint_sha
                 )
-                VALUES(?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     flow=excluded.flow,
                     branch=excluded.branch,
                     context_json=excluded.context_json,
                     waiting_reason=excluded.waiting_reason,
+                    last_checkpoint_sha=excluded.last_checkpoint_sha,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
-                (repo_key, issue_number, flow, branch, context_json, waiting_reason),
+                (
+                    repo_key,
+                    issue_number,
+                    flow,
+                    branch,
+                    context_json,
+                    waiting_reason,
+                    last_checkpoint_sha,
+                ),
             )
 
     def list_pre_pr_followups(
@@ -447,6 +829,7 @@ class StateStore:
                         p.branch,
                         p.context_json,
                         p.waiting_reason,
+                        p.last_checkpoint_sha,
                         p.updated_at
                     FROM pre_pr_followup_state AS p
                     INNER JOIN issue_runs AS r
@@ -466,6 +849,7 @@ class StateStore:
                         p.branch,
                         p.context_json,
                         p.waiting_reason,
+                        p.last_checkpoint_sha,
                         p.updated_at
                     FROM pre_pr_followup_state AS p
                     INNER JOIN issue_runs AS r
@@ -485,6 +869,9 @@ class StateStore:
                 branch=str(branch),
                 context_json=str(context_json),
                 waiting_reason=str(waiting_reason),
+                last_checkpoint_sha=(
+                    str(last_checkpoint_sha) if isinstance(last_checkpoint_sha, str) else None
+                ),
                 updated_at=str(updated_at),
             )
             for (
@@ -494,6 +881,7 @@ class StateStore:
                 branch,
                 context_json,
                 waiting_reason,
+                last_checkpoint_sha,
                 updated_at,
             ) in rows
         )
@@ -1310,6 +1698,21 @@ class StateStore:
                 """,
                 issue_keys,
             )
+            for row_repo_full_name, row_pr_number, row_issue_number in rows:
+                _append_pr_status_history(
+                    conn=conn,
+                    repo_full_name=str(row_repo_full_name),
+                    pr_number=int(row_pr_number),
+                    issue_number=int(row_issue_number),
+                    from_status="blocked",
+                    to_status="awaiting_feedback",
+                    reason="manual_unblock",
+                    detail=(
+                        f"last_seen_head_sha_override={last_seen_head_sha_override}"
+                        if last_seen_head_sha_override is not None
+                        else None
+                    ),
+                )
 
         return len(blocked_keys)
 
@@ -1321,10 +1724,17 @@ class StateStore:
         status: str,
         last_seen_head_sha: str | None = None,
         error: str | None = None,
+        reason: str | None = None,
+        detail: str | None = None,
         repo_full_name: str | None = None,
     ) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
         with self._lock, self._connect() as conn:
+            previous_status = _select_pr_feedback_status(
+                conn=conn,
+                repo_full_name=repo_key,
+                pr_number=pr_number,
+            )
             conn.execute(
                 """
                 UPDATE pr_feedback_state
@@ -1345,6 +1755,16 @@ class StateStore:
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, status, error),
+            )
+            _append_pr_status_history(
+                conn=conn,
+                repo_full_name=repo_key,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                from_status=previous_status,
+                to_status=status,
+                reason=reason,
+                detail=detail if detail is not None else error,
             )
 
     def ingest_feedback_events(
@@ -1424,6 +1844,28 @@ class StateStore:
             for event_key, kind, comment_id, updated_at in rows
         )
 
+    def mark_feedback_events_processed(
+        self,
+        *,
+        event_keys: tuple[str, ...],
+        repo_full_name: str | None = None,
+    ) -> None:
+        if not event_keys:
+            return
+        placeholders = ",".join("?" for _ in event_keys)
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE feedback_events
+                SET processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND event_key IN ({placeholders})
+                  AND processed_at IS NULL
+                """,
+                (repo_key, *event_keys),
+            )
+
     def finalize_feedback_turn(
         self,
         *,
@@ -1436,6 +1878,11 @@ class StateStore:
     ) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
         with self._lock, self._connect() as conn:
+            previous_status = _select_pr_feedback_status(
+                conn=conn,
+                repo_full_name=repo_key,
+                pr_number=pr_number,
+            )
             if processed_event_keys:
                 placeholders = ",".join("?" for _ in processed_event_keys)
                 conn.execute(
@@ -1482,6 +1929,70 @@ class StateStore:
                 """,
                 (repo_key, issue_number),
             )
+            _append_pr_status_history(
+                conn=conn,
+                repo_full_name=repo_key,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                from_status=previous_status,
+                to_status="awaiting_feedback",
+                reason=None,
+                detail=None,
+            )
+
+
+def _select_pr_feedback_status(
+    *, conn: sqlite3.Connection, repo_full_name: str, pr_number: int
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT status
+        FROM pr_feedback_state
+        WHERE repo_full_name = ? AND pr_number = ?
+        """,
+        (repo_full_name, pr_number),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _append_pr_status_history(
+    *,
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    pr_number: int,
+    issue_number: int,
+    from_status: str | None,
+    to_status: str,
+    reason: str | None,
+    detail: str | None,
+) -> None:
+    if from_status == to_status and reason is None and detail is None:
+        return
+    conn.execute(
+        """
+        INSERT INTO pr_status_history(
+            repo_full_name,
+            pr_number,
+            issue_number,
+            from_status,
+            to_status,
+            reason,
+            detail
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            repo_full_name,
+            pr_number,
+            issue_number,
+            from_status,
+            to_status,
+            reason,
+            detail,
+        ),
+    )
 
 
 def _select_operator_command_row(

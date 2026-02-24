@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from mergexo.feedback_loop import (
     compute_general_comment_token,
     compute_history_rewrite_token,
     compute_operator_command_token,
+    compute_pre_pr_checkpoint_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
     compute_turn_key,
@@ -52,12 +54,23 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestSnapshot,
     PullRequestReviewComment,
+    WorkflowJobSnapshot,
+    WorkflowRunSnapshot,
     WorkResult,
 )
 from mergexo.observability import log_event, logging_repo_context
+from mergexo.prompts import (
+    build_bugfix_prompt,
+    build_design_prompt,
+    build_feedback_prompt,
+    build_implementation_prompt,
+    build_small_job_prompt,
+)
 from mergexo.shell import CommandError, run
 from mergexo.state import (
+    AgentRunFailureClass,
     ImplementationCandidateState,
+    PendingFeedbackEvent,
     PrePrFollowupState,
     StateStore,
     TrackedPullRequestState,
@@ -71,6 +84,8 @@ _MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
 _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS = 3
 _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT = 12000
 _ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
+_ACTIONS_ACTIVE_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
+_ACTIONS_GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 _RESTART_OPERATION_NAME = "restart"
 _RESTART_PENDING_STATUSES = {"pending", "running"}
 _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
@@ -80,6 +95,16 @@ _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "new_issue_comments_pending",
 )
 _PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(r"(bugfix|small-job|implementation) flow blocked:")
+_DEFAULT_RUN_META_JSON = json.dumps(
+    {
+        "codex_active": False,
+        "codex_invocation_started_at": None,
+        "codex_mode": None,
+        "codex_session_id": None,
+        "last_prompt": None,
+    },
+    sort_keys=True,
+)
 
 PrePrFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
 
@@ -93,7 +118,8 @@ class _SlotLease:
 @dataclass(frozen=True)
 class _FeedbackFuture:
     issue_number: int
-    future: Future[None]
+    run_id: str
+    future: Future[str]
 
 
 @dataclass(frozen=True)
@@ -105,6 +131,7 @@ class _GitOpOutcome:
 
 @dataclass(frozen=True)
 class _RunningIssueMetadata:
+    run_id: str
     flow: PrePrFlow
     branch: str
     context_json: str
@@ -122,6 +149,21 @@ class DirectFlowBlockedError(DirectFlowError):
 
 class DirectFlowValidationError(DirectFlowError):
     """Direct-flow output failed deterministic policy checks."""
+
+
+class CheckpointedPrePrBlockedError(DirectFlowBlockedError):
+    def __init__(
+        self,
+        *,
+        waiting_reason: str,
+        checkpoint_branch: str,
+        checkpoint_sha: str,
+    ) -> None:
+        normalized_reason = waiting_reason.strip() or "recoverable_pre_pr_blocked"
+        super().__init__(normalized_reason)
+        self.waiting_reason = normalized_reason
+        self.checkpoint_branch = checkpoint_branch
+        self.checkpoint_sha = checkpoint_sha
 
 
 @dataclass(frozen=True)
@@ -217,6 +259,7 @@ class Phase1Orchestrator:
         self._running: dict[int, Future[WorkResult]] = {}
         self._running_issue_metadata: dict[int, _RunningIssueMetadata] = {}
         self._running_feedback: dict[int, _FeedbackFuture] = {}
+        self._run_meta_cache: dict[str, dict[str, object]] = {}
         self._running_lock = threading.Lock()
         self._poll_setup_done = False
         self._restart_drain_started_at_monotonic: float | None = None
@@ -308,6 +351,12 @@ class Phase1Orchestrator:
                         fn=lambda: self._enqueue_pre_pr_followup_work(pool),
                     ):
                         poll_had_github_errors = True
+                if self._config.runtime.enable_pr_actions_monitoring:
+                    if not self._run_poll_step(
+                        step_name="monitor_pr_actions",
+                        fn=self._monitor_pr_actions,
+                    ):
+                        poll_had_github_errors = True
                 if not self._run_poll_step(
                     step_name="enqueue_feedback_work",
                     fn=lambda: self._enqueue_feedback_work(pool),
@@ -344,6 +393,20 @@ class Phase1Orchestrator:
         if self._poll_setup_done:
             return
         self._git.ensure_layout()
+        reconciled_count = self._state.reconcile_unfinished_agent_runs(
+            repo_full_name=self._state_repo_full_name()
+        )
+        if reconciled_count > 0:
+            log_event(
+                LOGGER,
+                "stale_agent_runs_reconciled",
+                repo_full_name=self._state_repo_full_name(),
+                reconciled_count=reconciled_count,
+            )
+        self._state.prune_observability_history(
+            retention_days=self._config.runtime.observability_history_retention_days,
+            repo_full_name=self._state_repo_full_name(),
+        )
         if self._config.runtime.enable_issue_comment_routing:
             self._run_poll_step(
                 step_name="adopt_legacy_failed_pre_pr_runs",
@@ -445,13 +508,30 @@ class Phase1Orchestrator:
                     issue.number
                 )
                 self._state.mark_running(issue.number, repo_full_name=self._state_repo_full_name())
-                fut = pool.submit(self._process_issue_worker, issue, flow, consumed_comment_id_max)
+                run_id = self._state.record_agent_run_start(
+                    run_kind="issue_flow",
+                    issue_number=issue.number,
+                    pr_number=None,
+                    flow=flow,
+                    branch=branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                self._initialize_run_meta_cache(run_id)
+                fut = pool.submit(
+                    self._process_issue_worker,
+                    issue,
+                    flow,
+                    branch,
+                    consumed_comment_id_max,
+                )
                 # Ensure global capacity is returned even if worker code fails.
                 fut.add_done_callback(lambda _: self._work_limiter.release())
                 capacity_reserved = False
                 with self._running_lock:
                     self._running[issue.number] = fut
                     self._running_issue_metadata[issue.number] = _RunningIssueMetadata(
+                        run_id=run_id,
                         flow=flow,
                         branch=branch,
                         context_json=context_json,
@@ -515,10 +595,21 @@ class Phase1Orchestrator:
                 self._state.mark_running(
                     candidate.issue_number, repo_full_name=self._state_repo_full_name()
                 )
+                run_id = self._state.record_agent_run_start(
+                    run_kind="implementation_flow",
+                    issue_number=candidate.issue_number,
+                    pr_number=None,
+                    flow="implementation",
+                    branch=branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_implementation_candidate_worker,
                     candidate,
                     issue,
+                    branch,
                     consumed_comment_id_max,
                 )
                 fut.add_done_callback(lambda _: self._work_limiter.release())
@@ -526,6 +617,7 @@ class Phase1Orchestrator:
                 with self._running_lock:
                     self._running[candidate.issue_number] = fut
                     self._running_issue_metadata[candidate.issue_number] = _RunningIssueMetadata(
+                        run_id=run_id,
                         flow="implementation",
                         branch=branch,
                         context_json=context_json,
@@ -570,12 +662,23 @@ class Phase1Orchestrator:
                             reason="already_running",
                         )
                         continue
+                run_id = self._state.record_agent_run_start(
+                    run_kind="feedback_turn",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    flow=None,
+                    branch=tracked.branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(self._process_feedback_turn_worker, tracked)
                 fut.add_done_callback(lambda _: self._work_limiter.release())
                 capacity_reserved = False
                 with self._running_lock:
                     self._running_feedback[tracked.pr_number] = _FeedbackFuture(
                         issue_number=tracked.issue_number,
+                        run_id=run_id,
                         future=fut,
                     )
             finally:
@@ -660,6 +763,16 @@ class Phase1Orchestrator:
                     followup.issue_number,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                run_id = self._state.record_agent_run_start(
+                    run_kind="pre_pr_followup",
+                    issue_number=followup.issue_number,
+                    pr_number=None,
+                    flow=followup.flow,
+                    branch=branch,
+                    meta_json=_DEFAULT_RUN_META_JSON,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                self._initialize_run_meta_cache(run_id)
                 log_event(
                     LOGGER,
                     "pre_pr_followup_resumed",
@@ -674,6 +787,7 @@ class Phase1Orchestrator:
                         self._process_implementation_candidate_worker,
                         candidate,
                         resume_issue,
+                        branch,
                         consumed_comment_id_max,
                     )
                 else:
@@ -681,6 +795,7 @@ class Phase1Orchestrator:
                         self._process_issue_worker,
                         resume_issue,
                         cast(IssueFlow, followup.flow),
+                        branch,
                         consumed_comment_id_max,
                     )
                 fut.add_done_callback(lambda _: self._work_limiter.release())
@@ -688,6 +803,7 @@ class Phase1Orchestrator:
                 with self._running_lock:
                     self._running[followup.issue_number] = fut
                     self._running_issue_metadata[followup.issue_number] = _RunningIssueMetadata(
+                        run_id=run_id,
                         flow=followup.flow,
                         branch=branch,
                         context_json=context_json,
@@ -706,6 +822,83 @@ class Phase1Orchestrator:
             finally:
                 if capacity_reserved:
                     self._work_limiter.release()
+
+    def _monitor_pr_actions(self) -> None:
+        tracked_prs = self._state.list_tracked_pull_requests(
+            repo_full_name=self._state_repo_full_name()
+        )
+        log_event(
+            LOGGER,
+            "actions_monitor_scan_started",
+            tracked_pr_count=len(tracked_prs),
+        )
+        for tracked in tracked_prs:
+            pr = self._github.get_pull_request(tracked.pr_number)
+            if pr.merged or pr.state.lower() != "open":
+                continue
+
+            runs = self._github.list_workflow_runs_for_head(tracked.pr_number, pr.head_sha)
+            non_terminal_runs = tuple(run for run in runs if run.status != "completed")
+            if non_terminal_runs:
+                log_event(
+                    LOGGER,
+                    "actions_monitor_active_runs_detected",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    head_sha=pr.head_sha,
+                    active_run_count=len(non_terminal_runs),
+                )
+                continue
+
+            failed_runs = tuple(
+                run
+                for run in runs
+                if run.status == "completed" and run.conclusion not in _ACTIONS_GREEN_CONCLUSIONS
+            )
+            if not failed_runs:
+                continue
+
+            feedback_events = tuple(
+                self._actions_feedback_event_for_run(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    run=run,
+                )
+                for run in failed_runs
+            )
+            self._state.ingest_feedback_events(
+                feedback_events,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            log_event(
+                LOGGER,
+                "actions_failure_events_enqueued",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                head_sha=pr.head_sha,
+                failed_run_count=len(failed_runs),
+            )
+
+    def _actions_feedback_event_for_run(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        run: WorkflowRunSnapshot,
+    ) -> FeedbackEventRecord:
+        return FeedbackEventRecord(
+            event_key=event_key(
+                pr_number=pr_number,
+                kind="actions",
+                comment_id=run.run_id,
+                updated_at=run.updated_at,
+            ),
+            pr_number=pr_number,
+            issue_number=issue_number,
+            kind="actions",
+            comment_id=run.run_id,
+            updated_at=run.updated_at,
+        )
 
     def _scan_post_pr_source_issue_comment_redirects(self) -> None:
         redirect_targets: dict[int, int] = {}
@@ -1449,6 +1642,132 @@ class Phase1Orchestrator:
                 return True
         return False
 
+    def _checkpoint_recoverable_pre_pr_blocked(
+        self,
+        *,
+        issue: Issue,
+        flow: PrePrFlow,
+        checkout_path: Path,
+        branch: str,
+        blocked_error: Exception,
+    ) -> CheckpointedPrePrBlockedError:
+        waiting_reason = str(blocked_error).strip() or type(blocked_error).__name__
+        flow_label = _pre_pr_flow_label(flow)
+        checkpoint_commit_message = (
+            f"chore: checkpoint blocked {flow_label} flow for issue #{issue.number}"
+        )
+        log_event(
+            LOGGER,
+            "pre_pr_checkpoint_started",
+            repo_full_name=self._state_repo_full_name(),
+            issue_number=issue.number,
+            flow=flow,
+            branch=branch,
+        )
+        try:
+            checkpoint_sha = self._git.persist_checkpoint_branch(
+                checkout_path,
+                branch,
+                commit_message=checkpoint_commit_message,
+            )
+        except Exception as checkpoint_exc:  # noqa: BLE001
+            checkpoint_detail = _summarize_git_error(str(checkpoint_exc))
+            log_event(
+                LOGGER,
+                "pre_pr_checkpoint_failed",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue.number,
+                flow=flow,
+                branch=branch,
+                error_type=type(checkpoint_exc).__name__,
+            )
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=_render_pre_pr_checkpoint_failure_comment(
+                    branch=branch,
+                    waiting_reason=waiting_reason,
+                    checkpoint_error=checkpoint_detail,
+                ),
+            )
+            raise DirectFlowValidationError(
+                "checkpoint persistence failed before follow-up handoff: "
+                f"issue #{issue.number} branch `{branch}` ({checkpoint_detail})"
+            ) from checkpoint_exc
+
+        self._post_pre_pr_checkpoint_comment(
+            issue_number=issue.number,
+            branch=branch,
+            checkpoint_sha=checkpoint_sha,
+            waiting_reason=waiting_reason,
+        )
+        log_event(
+            LOGGER,
+            "pre_pr_checkpoint_ready",
+            repo_full_name=self._state_repo_full_name(),
+            issue_number=issue.number,
+            flow=flow,
+            branch=branch,
+            checkpoint_sha=checkpoint_sha,
+        )
+        return CheckpointedPrePrBlockedError(
+            waiting_reason=waiting_reason,
+            checkpoint_branch=branch,
+            checkpoint_sha=checkpoint_sha,
+        )
+
+    def _post_pre_pr_checkpoint_comment(
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        checkpoint_sha: str,
+        waiting_reason: str,
+    ) -> None:
+        token = compute_pre_pr_checkpoint_token(
+            issue_number=issue_number,
+            checkpoint_sha=checkpoint_sha,
+        )
+        if self._issue_has_action_token(
+            github=self._github, issue_number=issue_number, token=token
+        ):
+            log_event(
+                LOGGER,
+                "pre_pr_checkpoint_comment_skipped",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue_number,
+                checkpoint_sha=checkpoint_sha,
+                reason="token_already_present",
+            )
+            return
+
+        tree_url = f"https://github.com/{self._state_repo_full_name()}/tree/{checkpoint_sha}"
+        compare_url = (
+            "https://github.com/"
+            f"{self._state_repo_full_name()}/compare/"
+            f"{self._repo.default_branch}...{checkpoint_sha}"
+        )
+        self._github.post_issue_comment(
+            issue_number=issue_number,
+            body=append_action_token(
+                body=_render_pre_pr_checkpoint_comment(
+                    waiting_reason=waiting_reason,
+                    checkpoint_branch=branch,
+                    checkpoint_sha=checkpoint_sha,
+                    tree_url=tree_url,
+                    compare_url=compare_url,
+                    default_branch=self._repo.default_branch,
+                ),
+                token=token,
+            ),
+        )
+        log_event(
+            LOGGER,
+            "pre_pr_checkpoint_comment_posted",
+            repo_full_name=self._state_repo_full_name(),
+            issue_number=issue_number,
+            checkpoint_sha=checkpoint_sha,
+        )
+
     def _github_for_repo(self, repo_full_name: str) -> GitHubGateway:
         normalized = repo_full_name.strip()
         if normalized and normalized in self._github_by_repo_full_name:
@@ -1506,6 +1825,11 @@ class Phase1Orchestrator:
                             issue_number=issue_number,
                             consumed_comment_id_max=metadata.consumed_comment_id_max,
                         )
+                    if metadata is not None:
+                        self._state.finish_agent_run(
+                            run_id=metadata.run_id,
+                            terminal_status="completed",
+                        )
                 except Exception as exc:  # noqa: BLE001
                     if (
                         self._config.runtime.enable_issue_comment_routing
@@ -1513,12 +1837,19 @@ class Phase1Orchestrator:
                         and _is_recoverable_pre_pr_exception(exc)
                     ):
                         waiting_reason = str(exc).strip() or type(exc).__name__
+                        checkpoint_branch = metadata.branch
+                        last_checkpoint_sha: str | None = None
+                        if isinstance(exc, CheckpointedPrePrBlockedError):
+                            waiting_reason = exc.waiting_reason
+                            checkpoint_branch = exc.checkpoint_branch
+                            last_checkpoint_sha = exc.checkpoint_sha
                         self._state.mark_awaiting_issue_followup(
                             issue_number=issue_number,
                             flow=metadata.flow,
-                            branch=metadata.branch,
+                            branch=checkpoint_branch,
                             context_json=metadata.context_json,
                             waiting_reason=waiting_reason,
+                            last_checkpoint_sha=last_checkpoint_sha,
                             repo_full_name=self._state_repo_full_name(),
                         )
                         self._state.advance_pre_pr_last_consumed_comment_id(
@@ -1540,6 +1871,14 @@ class Phase1Orchestrator:
                             issue_number=issue_number,
                             flow=metadata.flow,
                             reason=waiting_reason,
+                            checkpoint_branch=checkpoint_branch,
+                            checkpoint_sha=last_checkpoint_sha or "",
+                        )
+                        self._state.finish_agent_run(
+                            run_id=metadata.run_id,
+                            terminal_status="blocked",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=waiting_reason,
                         )
                         continue
 
@@ -1554,11 +1893,28 @@ class Phase1Orchestrator:
                         issue_number=issue_number,
                         error_type=type(exc).__name__,
                     )
+                    if metadata is not None:
+                        self._state.finish_agent_run(
+                            run_id=metadata.run_id,
+                            terminal_status="failed",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=str(exc),
+                        )
+                finally:
+                    if metadata is not None:
+                        self._run_meta_cache.pop(metadata.run_id, None)
 
             for pr_number in finished_pr_numbers:
                 handle = self._running_feedback.pop(pr_number)
                 try:
-                    handle.future.result()
+                    run_terminal_status = _normalize_feedback_terminal_status(
+                        handle.future.result()
+                    )
+                    self._state.finish_agent_run(
+                        run_id=handle.run_id,
+                        terminal_status=run_terminal_status,
+                        failure_class="policy_block" if run_terminal_status == "blocked" else None,
+                    )
                     log_event(
                         LOGGER,
                         "feedback_turn_completed",
@@ -1566,6 +1922,33 @@ class Phase1Orchestrator:
                         pr_number=pr_number,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    if isinstance(exc, GitHubPollingError):
+                        # Polling errors are recoverable transport/API failures; keep PRs tracked
+                        # so the next poll retries feedback instead of requiring manual unblock.
+                        self._state.mark_pr_status(
+                            pr_number=pr_number,
+                            issue_number=handle.issue_number,
+                            status="awaiting_feedback",
+                            error=None,
+                            reason="github_polling_retry",
+                            detail=str(exc),
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_retry",
+                            issue_number=handle.issue_number,
+                            pr_number=pr_number,
+                            reason="github_polling_error",
+                        )
+                        self._state.finish_agent_run(
+                            run_id=handle.run_id,
+                            terminal_status="failed",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=str(exc),
+                        )
+                        continue
+
                     self._state.mark_pr_status(
                         pr_number=pr_number,
                         issue_number=handle.issue_number,
@@ -1580,6 +1963,14 @@ class Phase1Orchestrator:
                         pr_number=pr_number,
                         reason=type(exc).__name__,
                     )
+                    self._state.finish_agent_run(
+                        run_id=handle.run_id,
+                        terminal_status="failed",
+                        failure_class=_failure_class_for_exception(exc),
+                        error=str(exc),
+                    )
+                finally:
+                    self._run_meta_cache.pop(handle.run_id, None)
 
     def _wait_for_all(self, pool: ThreadPoolExecutor) -> None:
         while True:
@@ -1593,12 +1984,14 @@ class Phase1Orchestrator:
         self,
         issue: Issue,
         flow: IssueFlow,
+        resume_branch: str,
         consumed_comment_id_max: int,
     ) -> WorkResult:
         with logging_repo_context(self._repo.full_name):
             return self._process_issue(
                 issue,
                 flow,
+                branch_override=resume_branch,
                 pre_pr_last_consumed_comment_id=consumed_comment_id_max,
             )
 
@@ -1607,6 +2000,7 @@ class Phase1Orchestrator:
         issue: Issue,
         flow: IssueFlow,
         *,
+        branch_override: str | None = None,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         if not self._is_issue_author_allowed(
@@ -1618,6 +2012,7 @@ class Phase1Orchestrator:
                 f"Issue #{issue.number} author is not allowed by repo.allowed_users"
             )
 
+        branch = branch_override or _branch_for_issue_flow(flow=flow, issue=issue)
         lease = self._slot_pool.acquire()
         try:
             log_event(
@@ -1636,15 +2031,28 @@ class Phase1Orchestrator:
                 return self._process_design_issue(
                     issue=issue,
                     checkout_path=lease.path,
+                    branch=branch,
                     pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
                 )
             return self._process_direct_issue(
                 issue=issue,
                 flow=flow,
                 checkout_path=lease.path,
+                branch=branch,
                 pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
             )
         except Exception as exc:  # noqa: BLE001
+            if (
+                self._config.runtime.enable_issue_comment_routing
+                and _is_recoverable_pre_pr_exception(exc)
+            ):
+                raise self._checkpoint_recoverable_pre_pr_blocked(
+                    issue=issue,
+                    flow=cast(PrePrFlow, flow),
+                    checkout_path=lease.path,
+                    branch=branch,
+                    blocked_error=exc,
+                ) from exc
             log_event(
                 LOGGER,
                 "issue_processing_failed",
@@ -1666,12 +2074,12 @@ class Phase1Orchestrator:
         *,
         issue: Issue,
         checkout_path: Path,
+        branch: str,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
-        slug = _slugify(issue.title)
-        branch = _issue_branch(flow="design_doc", issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
 
+        slug = _slugify(issue.title)
         design_relpath = f"{self._repo.design_docs_dir}/{issue.number}-{slug}.md"
         log_event(
             LOGGER,
@@ -1679,12 +2087,33 @@ class Phase1Orchestrator:
             issue_number=issue.number,
             branch=branch,
         )
-        start_result = self._agent.start_design_from_issue(
+        run_id = self._active_run_id_for_issue(issue.number)
+        design_prompt = build_design_prompt(
             issue=issue,
             repo_full_name=self._state_repo_full_name(),
             design_doc_path=design_relpath,
             default_branch=self._repo.default_branch,
-            cwd=checkout_path,
+        )
+        self._mark_codex_invocation_started(
+            run_id=run_id,
+            mode="writing_doc",
+            prompt=design_prompt,
+            session_id=None,
+        )
+        try:
+            start_result = self._agent.start_design_from_issue(
+                issue=issue,
+                repo_full_name=self._state_repo_full_name(),
+                design_doc_path=design_relpath,
+                default_branch=self._repo.default_branch,
+                cwd=checkout_path,
+            )
+        except Exception:
+            self._mark_codex_invocation_finished(run_id=run_id)
+            raise
+        self._mark_codex_invocation_finished(
+            run_id=run_id,
+            session_id=start_result.session.thread_id if start_result.session else None,
         )
         log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
         generated = start_result.design
@@ -1729,11 +2158,7 @@ class Phase1Orchestrator:
             title=f"Design doc for #{issue.number}: {generated.title}",
             head=branch,
             base=self._repo.default_branch,
-            body=(
-                f"Design doc for issue #{issue.number}.\n\n"
-                f"Refs #{issue.number}\n\n"
-                f"Source issue: {issue.html_url}"
-            ),
+            body=(f"Design doc.\n\nRefs #{issue.number}"),
         )
 
         self._github.post_issue_comment(
@@ -1763,14 +2188,15 @@ class Phase1Orchestrator:
         issue: Issue,
         flow: IssueFlow,
         checkout_path: Path,
+        branch: str,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
-        slug = _slugify(issue.title)
-        branch = _issue_branch(flow=flow, issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
         coding_guidelines_path = self._coding_guidelines_path_for_checkout(
             checkout_path=checkout_path
         )
+        repo_full_name = self._state_repo_full_name()
+        run_id = self._active_run_id_for_issue(issue.number)
 
         flow_label: str
         direct_turn: Callable[[Issue], DirectStartResult]
@@ -1778,26 +2204,68 @@ class Phase1Orchestrator:
             flow_label = "bugfix"
 
             def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
-                return self._agent.start_bugfix_from_issue(
+                prompt = build_bugfix_prompt(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
-                    cwd=checkout_path,
                 )
+                self._mark_codex_invocation_started(
+                    run_id=run_id,
+                    mode="bugfix",
+                    prompt=prompt,
+                    session_id=None,
+                )
+                try:
+                    result = self._agent.start_bugfix_from_issue(
+                        issue=agent_issue,
+                        repo_full_name=repo_full_name,
+                        default_branch=self._repo.default_branch,
+                        coding_guidelines_path=coding_guidelines_path,
+                        cwd=checkout_path,
+                    )
+                except Exception:
+                    self._mark_codex_invocation_finished(run_id=run_id)
+                    raise
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=result.session.thread_id if result.session else None,
+                )
+                return result
 
             direct_turn = run_direct_turn
         elif flow == "small_job":
             flow_label = "small-job"
 
             def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
-                return self._agent.start_small_job_from_issue(
+                prompt = build_small_job_prompt(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
-                    cwd=checkout_path,
                 )
+                self._mark_codex_invocation_started(
+                    run_id=run_id,
+                    mode="small-job",
+                    prompt=prompt,
+                    session_id=None,
+                )
+                try:
+                    result = self._agent.start_small_job_from_issue(
+                        issue=agent_issue,
+                        repo_full_name=repo_full_name,
+                        default_branch=self._repo.default_branch,
+                        coding_guidelines_path=coding_guidelines_path,
+                        cwd=checkout_path,
+                    )
+                except Exception:
+                    self._mark_codex_invocation_finished(run_id=run_id)
+                    raise
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=result.session.thread_id if result.session else None,
+                )
+                return result
 
             direct_turn = run_direct_turn
         else:
@@ -1829,11 +2297,7 @@ class Phase1Orchestrator:
             title=start_result.pr_title,
             head=branch,
             base=self._repo.default_branch,
-            body=(
-                f"{start_result.pr_summary}\n\n"
-                f"Fixes #{issue.number}\n\n"
-                f"Source issue: {issue.html_url}"
-            ),
+            body=(f"{start_result.pr_summary}\n\nFixes #{issue.number}"),
         )
 
         self._github.post_issue_comment(
@@ -1861,6 +2325,7 @@ class Phase1Orchestrator:
         candidate: ImplementationCandidateState,
         *,
         issue_override: Issue | None = None,
+        branch_override: str | None = None,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         issue = issue_override or self._github.get_issue(candidate.issue_number)
@@ -1896,7 +2361,7 @@ class Phase1Orchestrator:
                     "Implementation candidate is missing a valid design branch suffix"
                 )
 
-            branch = f"agent/impl/{slug}"
+            branch = branch_override or f"agent/impl/{slug}"
             self._git.create_or_reset_branch(lease.path, branch)
 
             design_relpath = f"{self._repo.design_docs_dir}/{slug}.md"
@@ -1921,19 +2386,46 @@ class Phase1Orchestrator:
             coding_guidelines_path = self._coding_guidelines_path_for_checkout(
                 checkout_path=lease.path
             )
+            repo_full_name = self._state_repo_full_name()
+            run_id = self._active_run_id_for_issue(issue.number)
 
             def run_implementation_turn(agent_issue: Issue) -> DirectStartResult:
-                return self._agent.start_implementation_from_design(
+                prompt = build_implementation_prompt(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                     design_doc_path=design_relpath,
                     design_doc_markdown=design_doc_markdown,
                     design_pr_number=candidate.design_pr_number,
                     design_pr_url=candidate.design_pr_url,
-                    cwd=lease.path,
                 )
+                self._mark_codex_invocation_started(
+                    run_id=run_id,
+                    mode="implementation",
+                    prompt=prompt,
+                    session_id=None,
+                )
+                try:
+                    result = self._agent.start_implementation_from_design(
+                        issue=agent_issue,
+                        repo_full_name=repo_full_name,
+                        default_branch=self._repo.default_branch,
+                        coding_guidelines_path=coding_guidelines_path,
+                        design_doc_path=design_relpath,
+                        design_doc_markdown=design_doc_markdown,
+                        design_pr_number=candidate.design_pr_number,
+                        design_pr_url=candidate.design_pr_url,
+                        cwd=lease.path,
+                    )
+                except Exception:
+                    self._mark_codex_invocation_finished(run_id=run_id)
+                    raise
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=result.session.thread_id if result.session else None,
+                )
+                return result
 
             default_commit_message = _default_commit_message(
                 flow="small_job", issue_number=issue.number
@@ -1977,8 +2469,7 @@ class Phase1Orchestrator:
                     f"{start_result.pr_summary}\n\n"
                     f"Fixes #{issue.number}\n\n"
                     f"Implements design doc: [{design_relpath}]({design_doc_url})\n\n"
-                    f"{design_pr_line}"
-                    f"Source issue: {issue.html_url}"
+                    + design_pr_line.rstrip()
                 ),
             )
 
@@ -2002,6 +2493,22 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
             )
         except Exception as exc:  # noqa: BLE001
+            if (
+                self._config.runtime.enable_issue_comment_routing
+                and _is_recoverable_pre_pr_exception(exc)
+            ):
+                checkpoint_branch = (
+                    branch_override
+                    if branch_override is not None
+                    else _branch_for_implementation_candidate(candidate)
+                )
+                raise self._checkpoint_recoverable_pre_pr_blocked(
+                    issue=issue,
+                    flow="implementation",
+                    checkout_path=lease.path,
+                    branch=checkpoint_branch,
+                    blocked_error=exc,
+                ) from exc
             log_event(
                 LOGGER,
                 "issue_processing_failed",
@@ -2020,18 +2527,102 @@ class Phase1Orchestrator:
         self,
         candidate: ImplementationCandidateState,
         issue: Issue,
+        resume_branch: str,
         consumed_comment_id_max: int,
     ) -> WorkResult:
         with logging_repo_context(self._repo.full_name):
             return self._process_implementation_candidate(
                 candidate,
                 issue_override=issue,
+                branch_override=resume_branch,
                 pre_pr_last_consumed_comment_id=consumed_comment_id_max,
             )
 
-    def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> None:
+    def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> str:
         with logging_repo_context(self._repo.full_name):
-            self._process_feedback_turn(tracked)
+            return self._process_feedback_turn(tracked)
+
+    def _active_run_id_for_issue(self, issue_number: int) -> str | None:
+        for _ in range(20):
+            with self._running_lock:
+                metadata = self._running_issue_metadata.get(issue_number)
+                if metadata is not None:
+                    return metadata.run_id
+            time.sleep(0.01)
+        return None
+
+    def _active_run_id_for_pr(self, pr_number: int) -> str | None:
+        for _ in range(20):
+            with self._running_lock:
+                feedback = self._running_feedback.get(pr_number)
+                if feedback is not None:
+                    return feedback.run_id
+            time.sleep(0.01)
+        return None
+
+    def _active_run_id_for_pr_now(self, pr_number: int) -> str | None:
+        with self._running_lock:
+            feedback = self._running_feedback.get(pr_number)
+            if feedback is None:
+                return None
+            return feedback.run_id
+
+    def _initialize_run_meta_cache(self, run_id: str) -> None:
+        self._run_meta_cache[run_id] = json.loads(_DEFAULT_RUN_META_JSON)
+
+    def _update_run_meta(self, run_id: str | None, **updates: object) -> None:
+        if run_id is None:
+            return
+        current = dict(self._run_meta_cache.get(run_id, {}))
+        current.update(updates)
+        self._run_meta_cache[run_id] = current
+        updated = self._state.update_agent_run_meta(
+            run_id=run_id,
+            meta_json=json.dumps(current, sort_keys=True),
+        )
+        if not updated:
+            self._run_meta_cache.pop(run_id, None)
+
+    def _record_run_prompt(self, run_id: str | None, prompt: str) -> None:
+        if run_id is None:
+            return
+        self._update_run_meta(
+            run_id,
+            last_prompt=prompt,
+        )
+
+    def _mark_codex_invocation_started(
+        self,
+        *,
+        run_id: str | None,
+        mode: str,
+        prompt: str,
+        session_id: str | None,
+    ) -> None:
+        self._update_run_meta(
+            run_id,
+            codex_active=True,
+            codex_invocation_started_at=datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            ),
+            codex_mode=mode,
+            codex_session_id=session_id,
+            last_prompt=prompt,
+        )
+
+    def _mark_codex_invocation_finished(
+        self,
+        *,
+        run_id: str | None,
+        session_id: str | None = None,
+    ) -> None:
+        updates: dict[str, object] = {
+            "codex_active": False,
+            "codex_invocation_started_at": None,
+        }
+        if session_id is not None:
+            updates["codex_session_id"] = session_id
+        self._update_run_meta(run_id, **updates)
 
     def _save_agent_session_if_present(
         self, *, issue_number: int, session: AgentSession | None
@@ -2545,7 +3136,7 @@ class Phase1Orchestrator:
             author_login=base_issue.author_login,
         )
 
-    def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> None:
+    def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> str:
         lease = self._slot_pool.acquire()
         try:
             log_event(
@@ -2572,7 +3163,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_merged",
                 )
-                return
+                return "merged"
             if pr.state.lower() != "open":
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
@@ -2588,7 +3179,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_closed",
                 )
-                return
+                return "closed"
 
             issue = self._github.get_issue(tracked.issue_number)
             if not self._repo.allows(issue.author_login):
@@ -2617,7 +3208,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason=reason,
                 )
-                return
+                return "blocked"
 
             if tracked.last_seen_head_sha and tracked.last_seen_head_sha != pr.head_sha:
                 transition_status = self._classify_remote_history_transition(
@@ -2632,7 +3223,7 @@ class Phase1Orchestrator:
                         phase="cross_cycle_drift",
                         transition_status=transition_status,
                     )
-                    return
+                    return "blocked"
 
             review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
             issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
@@ -2672,7 +3263,39 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 pending_count=len(pending_events),
             )
-            if not pending_events:
+            pending_review_events, pending_issue_events, pending_actions_events = (
+                self._partition_pending_feedback_events(pending_events)
+            )
+            (
+                actionable_actions_events,
+                actions_synthetic_comments,
+                stale_action_event_keys,
+            ) = self._resolve_actions_feedback_events(
+                pr_number=tracked.pr_number,
+                head_sha=pr.head_sha,
+                action_events=pending_actions_events,
+            )
+
+            pending_event_key_set = {
+                event.event_key
+                for event in pending_review_events
+                + pending_issue_events
+                + actionable_actions_events
+            }
+            if stale_action_event_keys:
+                self._state.mark_feedback_events_processed(
+                    event_keys=stale_action_event_keys,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "actions_failure_event_stale_resolved",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    stale_event_count=len(stale_action_event_keys),
+                )
+
+            if not pending_event_key_set:
                 log_event(
                     LOGGER,
                     "feedback_turn_completed",
@@ -2680,10 +3303,14 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="no_pending_events",
                 )
-                return
+                return "completed"
 
-            pending_event_keys = tuple(event.event_key for event in pending_events)
-            pending_event_key_set = set(pending_event_keys)
+            pending_event_keys = tuple(
+                event.event_key
+                for event in pending_review_events
+                + pending_issue_events
+                + actionable_actions_events
+            )
             pending_review_comments = tuple(
                 comment
                 for normalized_event, comment in normalized_review
@@ -2695,7 +3322,7 @@ class Phase1Orchestrator:
                 if normalized_event.event_key in pending_event_key_set
             )
             turn_issue_comments = self._append_required_tests_feedback_reminder(
-                pending_issue_comments,
+                pending_issue_comments + actions_synthetic_comments,
                 checkout_path=lease.path,
             )
 
@@ -2726,7 +3353,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason="missing_agent_session",
                 )
-                return
+                return "blocked"
             session = AgentSession(adapter=session_row[0], thread_id=session_row[1])
 
             if not self._git.restore_feedback_branch(lease.path, tracked.branch, pr.head_sha):
@@ -2737,7 +3364,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason="head_mismatch_retry",
                 )
-                return
+                return "blocked"
 
             turn_head_sha = (
                 pr.head_sha if not previous_pending else (tracked.last_seen_head_sha or pr.head_sha)
@@ -2772,7 +3399,9 @@ class Phase1Orchestrator:
                 pull_request=pr,
             )
             if feedback_outcome is None:
-                return
+                return self._feedback_terminal_status_from_state(
+                    tracked=tracked, fallback="blocked"
+                )
             result, pr = feedback_outcome
 
             local_head_sha = self._git.current_head_sha(lease.path)
@@ -2785,7 +3414,7 @@ class Phase1Orchestrator:
                     transition_status="local_non_ancestor",
                     state_head_sha=turn_start_head,
                 )
-                return
+                return "blocked"
 
             commit_outcome = self._commit_push_feedback_with_required_tests(
                 tracked=tracked,
@@ -2796,7 +3425,9 @@ class Phase1Orchestrator:
                 turn_start_head=turn_start_head,
             )
             if commit_outcome is None:
-                return
+                return self._feedback_terminal_status_from_state(
+                    tracked=tracked, fallback="blocked"
+                )
             result, pr = commit_outcome
 
             refreshed_pr = self._github.get_pull_request(tracked.pr_number)
@@ -2815,7 +3446,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_merged",
                 )
-                return
+                return "merged"
             if refreshed_pr.state.lower() != "open":
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
@@ -2831,7 +3462,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     result="pr_closed",
                 )
-                return
+                return "closed"
 
             transition_status = self._classify_remote_history_transition(
                 older_sha=turn_start_head,
@@ -2845,7 +3476,7 @@ class Phase1Orchestrator:
                     phase="pre_finalize_remote",
                     transition_status=transition_status,
                 )
-                return
+                return "blocked"
             pr = refreshed_pr
 
             expected_tokens: list[str] = []
@@ -2884,7 +3515,7 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     reason="token_reconciliation_incomplete",
                 )
-                return
+                return "blocked"
 
             self._state.finalize_feedback_turn(
                 pr_number=tracked.pr_number,
@@ -2902,11 +3533,184 @@ class Phase1Orchestrator:
                 turn_key=turn_key,
                 processed_event_count=len(pending_event_keys),
             )
+            return "completed"
         finally:
             try:
                 self._git.cleanup_slot(lease.path)
             finally:
                 self._slot_pool.release(lease)
+
+    def _feedback_terminal_status_from_state(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        fallback: str,
+    ) -> str:
+        state = self._state.get_pull_request_status(
+            tracked.pr_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if state is None:
+            return fallback
+        if state.status in {"blocked", "merged", "closed"}:
+            return state.status
+        return "completed"
+
+    def _partition_pending_feedback_events(
+        self,
+        pending_events: tuple[PendingFeedbackEvent, ...],
+    ) -> tuple[
+        tuple[PendingFeedbackEvent, ...],
+        tuple[PendingFeedbackEvent, ...],
+        tuple[PendingFeedbackEvent, ...],
+    ]:
+        review_events: list[PendingFeedbackEvent] = []
+        issue_events: list[PendingFeedbackEvent] = []
+        actions_events: list[PendingFeedbackEvent] = []
+        for pending in pending_events:
+            if pending.kind == "review":
+                review_events.append(pending)
+            elif pending.kind == "issue":
+                issue_events.append(pending)
+            elif pending.kind == "actions":
+                actions_events.append(pending)
+        return tuple(review_events), tuple(issue_events), tuple(actions_events)
+
+    def _resolve_actions_feedback_events(
+        self,
+        *,
+        pr_number: int,
+        head_sha: str,
+        action_events: tuple[PendingFeedbackEvent, ...],
+    ) -> tuple[
+        tuple[PendingFeedbackEvent, ...],
+        tuple[PullRequestIssueComment, ...],
+        tuple[str, ...],
+    ]:
+        if not action_events:
+            return (), (), ()
+
+        runs = self._github.list_workflow_runs_for_head(pr_number, head_sha)
+        runs_by_id = {run.run_id: run for run in runs}
+
+        stale_event_keys: list[str] = []
+        actionable_events: list[PendingFeedbackEvent] = []
+        actionable_runs: list[WorkflowRunSnapshot] = []
+        for event in action_events:
+            run = runs_by_id.get(event.comment_id)
+            # Revalidate against current run snapshot so reruns/head changes do not trigger
+            # remediation for stale failures.
+            if run is None:
+                stale_event_keys.append(event.event_key)
+                continue
+            if run.updated_at != event.updated_at:
+                stale_event_keys.append(event.event_key)
+                continue
+            if run.status != "completed":
+                stale_event_keys.append(event.event_key)
+                continue
+            if run.conclusion in _ACTIONS_GREEN_CONCLUSIONS:
+                stale_event_keys.append(event.event_key)
+                continue
+            actionable_events.append(event)
+            actionable_runs.append(run)
+
+        synthetic_comments, failed_action_count = self._build_actions_failure_context_comments(
+            actionable_runs
+        )
+        if actionable_runs:
+            log_event(
+                LOGGER,
+                "actions_failure_context_loaded",
+                pr_number=pr_number,
+                head_sha=head_sha,
+                failed_run_count=len(actionable_runs),
+                failed_action_count=failed_action_count,
+            )
+
+        return tuple(actionable_events), synthetic_comments, tuple(stale_event_keys)
+
+    def _build_actions_failure_context_comments(
+        self,
+        runs: list[WorkflowRunSnapshot],
+    ) -> tuple[tuple[PullRequestIssueComment, ...], int]:
+        if not runs:
+            return (), 0
+
+        tail_lines = self._config.runtime.pr_actions_log_tail_lines
+        synthetic_comments: list[PullRequestIssueComment] = []
+        failed_action_count = 0
+        for index, run in enumerate(sorted(runs, key=lambda candidate: candidate.run_id), start=1):
+            jobs = self._github.list_workflow_jobs(run.run_id)
+            failed_jobs = tuple(
+                job
+                for job in jobs
+                if job.status == "completed" and job.conclusion not in _ACTIONS_GREEN_CONCLUSIONS
+            )
+            failed_action_count += len(failed_jobs)
+            log_tails_by_action = self._github.get_failed_run_log_tails(
+                run.run_id,
+                tail_lines_per_action=tail_lines,
+            )
+            synthetic_comments.append(
+                PullRequestIssueComment(
+                    comment_id=-(9200 + index),
+                    body=self._render_actions_failure_context_comment(
+                        run=run,
+                        failed_jobs=failed_jobs,
+                        log_tails_by_action=log_tails_by_action,
+                        tail_lines=tail_lines,
+                    ),
+                    user_login="mergexo-system",
+                    html_url=run.html_url,
+                    created_at=run.updated_at or "now",
+                    updated_at=run.updated_at or "now",
+                )
+            )
+
+        return tuple(synthetic_comments), failed_action_count
+
+    def _render_actions_failure_context_comment(
+        self,
+        *,
+        run: WorkflowRunSnapshot,
+        failed_jobs: tuple[WorkflowJobSnapshot, ...],
+        log_tails_by_action: dict[str, str | None],
+        tail_lines: int,
+    ) -> str:
+        lines = [
+            "MergeXO GitHub Actions failure context:",
+            f"- workflow run: {run.name}",
+            f"- run_id: {run.run_id}",
+            f"- status: {run.status}",
+            f"- conclusion: {run.conclusion or '<none>'}",
+            f"- run_url: {run.html_url}",
+            f"- run_updated_at: {run.updated_at}",
+            "",
+        ]
+        if not failed_jobs:
+            lines.append("No failed actions were returned by the jobs API for this run.")
+            return "\n".join(lines)
+
+        job_name_counts = Counter(_normalized_actions_job_name(job.name) for job in failed_jobs)
+        lines.append("Failed actions:")
+        for job in failed_jobs:
+            action_name = _actions_log_key_for_job(job=job, job_name_counts=job_name_counts)
+            log_tail = log_tails_by_action.get(action_name)
+            lines.extend(
+                (
+                    f"- action: {action_name}",
+                    f"  conclusion: {job.conclusion or '<none>'}",
+                    f"  action_url: {job.html_url}",
+                    f"  last {tail_lines} log lines (truncated tail):",
+                )
+            )
+            if log_tail is None:
+                lines.append("  <logs unavailable for this action>")
+                continue
+            for tail_line in log_tail.splitlines() or ("<empty>",):
+                lines.append(f"  {tail_line}")
+        return "\n".join(lines)
 
     def _append_required_tests_feedback_reminder(
         self,
@@ -3168,6 +3972,8 @@ class Phase1Orchestrator:
         round_number = 0
 
         while True:
+            run_id = self._active_run_id_for_pr_now(tracked.pr_number)
+            prompt = build_feedback_prompt(turn=current_turn)
             log_event(
                 LOGGER,
                 "feedback_agent_call_started",
@@ -3175,10 +3981,27 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 turn_key=current_turn.turn_key,
             )
-            result = self._agent.respond_to_feedback(
-                session=current_session,
-                turn=current_turn,
-                cwd=checkout_path,
+            self._mark_codex_invocation_started(
+                run_id=run_id,
+                mode="respond_to_review",
+                prompt=prompt,
+                session_id=current_session.thread_id,
+            )
+            try:
+                result = self._agent.respond_to_feedback(
+                    session=current_session,
+                    turn=current_turn,
+                    cwd=checkout_path,
+                )
+            except Exception:
+                self._mark_codex_invocation_finished(
+                    run_id=run_id,
+                    session_id=current_session.thread_id,
+                )
+                raise
+            self._mark_codex_invocation_finished(
+                run_id=run_id,
+                session_id=result.session.thread_id,
             )
             log_event(
                 LOGGER,
@@ -3736,6 +4559,52 @@ def _render_source_issue_redirect_comment(
     )
 
 
+def _render_pre_pr_checkpoint_comment(
+    *,
+    waiting_reason: str,
+    checkpoint_branch: str,
+    checkpoint_sha: str,
+    tree_url: str,
+    compare_url: str,
+    default_branch: str,
+) -> str:
+    return (
+        "MergeXO pre-PR flow is waiting for source-issue follow-up.\n"
+        f"- blocked reason: {waiting_reason}\n"
+        f"- checkpoint branch: `{checkpoint_branch}`\n"
+        f"- checkpoint commit: `{checkpoint_sha}`\n"
+        f"- checkpoint tree: {tree_url}\n"
+        f"- compare vs `{default_branch}`: {compare_url}\n\n"
+        "Next steps:\n"
+        "1. Review the checkpoint tree/compare links above.\n"
+        "2. Reply on this issue with clarifications or updated instructions.\n"
+        "3. MergeXO will resume from this checkpoint branch head."
+    )
+
+
+def _render_pre_pr_checkpoint_failure_comment(
+    *,
+    branch: str,
+    waiting_reason: str,
+    checkpoint_error: str,
+) -> str:
+    return (
+        "MergeXO could not persist a recoverable pre-PR checkpoint before cleanup.\n"
+        f"- blocked reason: {waiting_reason}\n"
+        f"- checkpoint branch: `{branch}`\n"
+        f"- checkpoint persistence error: {checkpoint_error}\n\n"
+        "Please inspect worker logs and recover manually from the local checkout if needed."
+    )
+
+
+def _pre_pr_flow_label(flow: PrePrFlow) -> str:
+    if flow == "design_doc":
+        return "design"
+    if flow == "small_job":
+        return "small-job"
+    return flow
+
+
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "issue"
@@ -3759,6 +4628,38 @@ def _trigger_labels(repo: RepoConfig) -> tuple[str, ...]:
         if label not in labels:
             labels.append(label)
     return tuple(labels)
+
+
+def _normalize_feedback_terminal_status(
+    status: str,
+) -> Literal["completed", "failed", "blocked", "merged", "closed", "interrupted"]:
+    if status in {"completed", "failed", "blocked", "merged", "closed", "interrupted"}:
+        return cast(
+            Literal["completed", "failed", "blocked", "merged", "closed", "interrupted"],
+            status,
+        )
+    return "completed"
+
+
+def _failure_class_for_exception(exc: Exception) -> AgentRunFailureClass:
+    normalized = str(exc).strip().lower()
+    if "non-fast-forward" in normalized or "history transition" in normalized:
+        return "history_rewrite"
+    if isinstance(exc, GitHubPollingError):
+        return "github_error"
+    if (
+        isinstance(exc, DirectFlowBlockedError)
+        or " flow blocked:" in normalized
+        or "missing saved agent session" in normalized
+    ):
+        return "policy_block"
+    if "required pre-push test" in normalized or "required tests" in normalized:
+        return "tests_failed"
+    if "github" in normalized:
+        return "github_error"
+    if isinstance(exc, CommandError):
+        return "agent_error"
+    return "unknown"
 
 
 def _resolve_issue_flow(
@@ -3848,15 +4749,10 @@ def _is_no_staged_changes_error_text(error: str) -> bool:
 
 def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, str, str]:
     flow = _flow_label_from_branch(branch)
-    source_line = f"Source issue: {issue.html_url}"
     if flow == "design":
         return (
             f"Design doc for #{issue.number}: {issue.title}",
-            (
-                "Recovered design PR from a previously pushed branch.\n\n"
-                f"Refs #{issue.number}\n\n"
-                f"{source_line}"
-            ),
+            (f"Recovered design PR from a previously pushed branch.\n\nRefs #{issue.number}"),
             flow,
         )
     if flow == "implementation":
@@ -3864,28 +4760,19 @@ def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, s
             f"Implementation for #{issue.number}: {issue.title}",
             (
                 "Recovered implementation PR from a previously pushed branch.\n\n"
-                f"Fixes #{issue.number}\n\n"
-                f"{source_line}"
+                f"Fixes #{issue.number}"
             ),
             flow,
         )
     if flow == "bugfix":
         return (
             f"Bugfix for #{issue.number}: {issue.title}",
-            (
-                "Recovered bugfix PR from a previously pushed branch.\n\n"
-                f"Fixes #{issue.number}\n\n"
-                f"{source_line}"
-            ),
+            (f"Recovered bugfix PR from a previously pushed branch.\n\nFixes #{issue.number}"),
             flow,
         )
     return (
         issue.title,
-        (
-            "Recovered small-job PR from a previously pushed branch.\n\n"
-            f"Fixes #{issue.number}\n\n"
-            f"{source_line}"
-        ),
+        (f"Recovered small-job PR from a previously pushed branch.\n\nFixes #{issue.number}"),
         flow,
     )
 
@@ -3898,6 +4785,18 @@ def _flow_label_from_branch(branch: str) -> str:
     if branch.startswith("agent/impl/"):
         return "implementation"
     return "small-job"
+
+
+def _normalized_actions_job_name(raw_name: str) -> str:
+    normalized = raw_name.strip()
+    return normalized or "unnamed-action"
+
+
+def _actions_log_key_for_job(*, job: WorkflowJobSnapshot, job_name_counts: Counter[str]) -> str:
+    base_name = _normalized_actions_job_name(job.name)
+    if job_name_counts[base_name] == 1:
+        return base_name
+    return f"{base_name} [job {job.job_id}]"
 
 
 def _render_git_op_result_comment(*, outcomes: list[_GitOpOutcome], round_number: int) -> str:

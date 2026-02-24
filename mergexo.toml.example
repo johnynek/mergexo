@@ -5,6 +5,10 @@ poll_interval_seconds = 600
 enable_github_operations = false
 # Enable pre-PR issue comment routing (queued retries before PR creation + post-PR redirects).
 enable_issue_comment_routing = false
+# Monitor GitHub Actions runs for tracked PR heads and enqueue CI remediation feedback events.
+enable_pr_actions_monitoring = false
+# Tail size per failed GitHub Actions job injected into CI feedback context.
+pr_actions_log_tail_lines = 500
 # Restart drain timeout before pending restart is marked failed.
 restart_drain_timeout_seconds = 900
 # Default restart mode when /mergexo restart omits mode=...
@@ -15,6 +19,14 @@ restart_supported_modes = ["git_checkout"]
 # git_checkout_root = "/Users/oscar/code/mergexo"
 # Required for pypi mode.
 # service_python = "/usr/bin/python3"
+# Observability dashboard refresh cadence (seconds).
+observability_refresh_seconds = 2
+# Default dashboard metrics window.
+observability_default_window = "24h"
+# Optional row cap per panel. Set to null to disable.
+observability_row_limit = 200
+# History retention for observability tables.
+observability_history_retention_days = 90
 
 [repo.mergexo]
 owner = "johnynek"

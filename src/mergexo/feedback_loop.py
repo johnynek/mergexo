@@ -9,7 +9,7 @@ from typing import Literal
 ACTION_TOKEN_PATTERN = re.compile(r"<!--\s*mergexo-action:([0-9a-f]{64})\s*-->")
 _OPERATOR_COMMAND_PATTERN = re.compile(r"(?mi)^\s*/mergexo(?:\s+(.+))?\s*$")
 _HEAD_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{7,64}")
-FeedbackKind = Literal["review", "issue"]
+FeedbackKind = Literal["review", "issue", "actions"]
 OperatorCommandName = Literal["unblock", "restart", "help", "invalid"]
 
 
@@ -90,6 +90,11 @@ def compute_source_issue_redirect_token(
     *, issue_number: int, pr_number: int, comment_id: int
 ) -> str:
     payload = f"source_issue_redirect:{issue_number}:{pr_number}:{comment_id}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_pre_pr_checkpoint_token(*, issue_number: int, checkpoint_sha: str) -> str:
+    payload = f"pre_pr_checkpoint:{issue_number}:{checkpoint_sha}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

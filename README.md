@@ -69,17 +69,61 @@ uv run mergexo run --config mergexo.toml --once --verbose high
 uv run mergexo run --config mergexo.toml
 ```
 
-For GitHub-operated restart/update workflows, run supervisor mode instead:
+Run the default console mode (service + TUI + file logging):
+
+```bash
+uv run mergexo --config mergexo.toml
+```
+
+Equivalent explicit command:
+
+```bash
+uv run mergexo console --config mergexo.toml
+```
+
+For non-interactive environments and GitHub-operated restart/update workflows, run supervisor mode instead:
 
 ```bash
 uv run mergexo service --config mergexo.toml
 ```
 
+6. Run the observability dashboard:
+
+```bash
+uv run mergexo top --config mergexo.toml
+```
+
+The dashboard is read-only and pulls directly from `state.db`. Keybindings:
+
+- `r`: refresh now
+- `f`: cycle repo filter
+- `w`: cycle window (`1h`, `24h`, `7d`, `30d`)
+- `tab`: cycle focused panel
+- `enter`: open GitHub URL when focused on `Issue`, `PR`, or `Branch`; otherwise open a scrollable context dialog and refresh detail history
+- `q`: quit
+
+Metrics definitions:
+
+- terminal sample set: finished runs with terminal status in `completed`, `failed`, `blocked`, `interrupted`
+- mean runtime: `AVG(duration_seconds)`
+- std-dev runtime: `sqrt(AVG(x^2) - AVG(x)^2)` (returns `0` when sample size < 2)
+- failure rate: `failed_count / terminal_count`
+
+Runtime settings for dashboard and retention:
+
+- `runtime.observability_refresh_seconds`
+- `runtime.observability_default_window`
+- `runtime.observability_row_limit`
+- `runtime.observability_history_retention_days`
+
 ## Notes on polling
 
 Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
 
-Use `--verbose` on `init`, `run`, `service`, or `feedback` for high-signal lifecycle logs (`low` mode), or `--verbose high` for full event logs including poll internals. Verbose logs are also appended under `<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
+`console` defaults to `--verbose low`, so it writes lifecycle logs to stderr and
+`<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
+
+Use `--verbose` on `init`, `run`, `service`, `top`, `feedback`, or `console` for high-signal lifecycle logs (`low` mode), or `--verbose high` for full event logs including poll internals.
 
 ## State schema upgrade note
 
@@ -100,6 +144,8 @@ Behavior:
 
 1. Before a PR exists:
    - Recoverable pre-PR blocked outcomes move to `awaiting_issue_followup` instead of terminal `failed`.
+   - MergeXO checkpoints the blocked tree to the flow branch before cleanup and posts one status
+     comment with blocked reason, branch, commit SHA, tree link, and compare link.
    - Reply on the source issue to unblock/resume.
    - Comments are queued by comment id and consumed in order on the next retry turn.
 2. While a retry worker is active:
@@ -121,6 +167,28 @@ Recommended rollout:
    - comment during active retry;
    - issue comment after PR exists (redirect only).
 3. Expand once stable.
+
+## GitHub Actions feedback monitoring
+
+Enable PR Actions monitoring with:
+
+- `runtime.enable_pr_actions_monitoring = true`
+- optional `runtime.pr_actions_log_tail_lines = 500`
+
+Behavior:
+
+1. MergeXO scans tracked `awaiting_feedback` PRs and checks workflow runs for the current PR head SHA.
+2. If any run is still active, MergeXO only logs monitoring state and waits.
+3. When all runs are terminal and at least one run is non-green (anything except `success`, `neutral`, `skipped`), MergeXO enqueues deterministic `actions` feedback events keyed by run id + `updated_at`.
+4. On the next feedback turn, MergeXO revalidates those events against the current head/run state:
+   - stale events (run now green, run no longer on current head, or run updated) are auto-resolved;
+   - actionable events inject synthetic CI context into the agent turn, including failed action names and `last N log lines` tails for each failed action.
+5. If no PR review/issue comments exist, CI context alone can trigger a feedback remediation turn.
+
+Notes:
+
+- This feature is currently GitHub Actions only.
+- Remote CI status does not replace required local pre-push checks; configured `required_tests` still gate pushes.
 
 ## GitHub operator commands
 
