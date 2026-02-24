@@ -282,6 +282,16 @@ class Phase1Orchestrator:
 
             if enqueue_allowed:
                 if not self._run_poll_step(
+                    step_name="repair_stale_running_runs",
+                    fn=self._repair_stale_running_runs,
+                ):
+                    poll_had_github_errors = True
+                if not self._run_poll_step(
+                    step_name="repair_failed_no_staged_change_runs",
+                    fn=self._repair_failed_no_staged_change_runs,
+                ):
+                    poll_had_github_errors = True
+                if not self._run_poll_step(
                     step_name="enqueue_new_work",
                     fn=lambda: self._enqueue_new_work(pool),
                 ):
@@ -812,6 +822,94 @@ class Phase1Orchestrator:
                 issue_number=legacy.issue_number,
                 reason="legacy_failed_run_adopted",
             )
+
+    def _repair_failed_no_staged_change_runs(self) -> None:
+        failed_runs = self._state.list_legacy_failed_issue_runs_without_pr(
+            repo_full_name=self._state_repo_full_name()
+        )
+        for failed in failed_runs:
+            branch = (failed.branch or "").strip()
+            if not branch:
+                continue
+            if not _is_no_staged_changes_error_text(failed.error or ""):
+                continue
+            self._recover_missing_pr_branch(issue_number=failed.issue_number, branch=branch)
+
+    def _repair_stale_running_runs(self) -> None:
+        running_runs = self._state.list_legacy_running_issue_runs_without_pr(
+            repo_full_name=self._state_repo_full_name()
+        )
+        with self._running_lock:
+            active_issue_numbers = set(self._running.keys())
+        for running in running_runs:
+            if running.issue_number in active_issue_numbers:
+                continue
+            branch = (running.branch or "").strip()
+            if not branch:
+                continue
+            self._recover_missing_pr_branch(issue_number=running.issue_number, branch=branch)
+
+    def _recover_missing_pr_branch(self, *, issue_number: int, branch: str) -> None:
+        issue = self._github.get_issue(issue_number)
+        if not self._is_issue_author_allowed(
+            issue_number=issue.number,
+            author_login=issue.author_login,
+            reason="unauthorized_issue_author_defensive",
+        ):
+            return
+
+        title, body, flow_label = _recovery_pr_payload_for_issue(issue=issue, branch=branch)
+        try:
+            pr = self._github.create_pull_request(
+                title=title,
+                head=branch,
+                base=self._repo.default_branch,
+                body=body,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "failed_branch_pr_repair_failed",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue.number,
+                branch=branch,
+                error_type=type(exc).__name__,
+            )
+            return
+
+        self._state.mark_completed(
+            issue_number=issue.number,
+            branch=branch,
+            pr_number=pr.number,
+            pr_url=pr.html_url,
+            repo_full_name=self._state_repo_full_name(),
+        )
+
+        try:
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=f"Opened recovered {flow_label} PR: {pr.html_url}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "failed_branch_pr_repair_comment_failed",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue.number,
+                branch=branch,
+                pr_number=pr.number,
+                error_type=type(exc).__name__,
+            )
+
+        log_event(
+            LOGGER,
+            "failed_branch_pr_repaired",
+            repo_full_name=self._state_repo_full_name(),
+            issue_number=issue.number,
+            branch=branch,
+            pr_number=pr.number,
+            flow=flow_label,
+        )
 
     def _has_capacity_locked(self) -> bool:
         local_active = len(self._running) + len(self._running_feedback)
@@ -2210,6 +2308,8 @@ class Phase1Orchestrator:
         if is_bot_login(comment.user_login):
             return False
         if not self._repo.allows(comment.user_login):
+            return False
+        if _is_mergexo_status_comment(comment.body):
             return False
         if has_action_token(comment.body):
             return False
@@ -3707,12 +3807,77 @@ def _render_issue_start_comment(
     return f"MergeXO assigned an agent and started {action} for issue #{issue_number}."
 
 
+def _is_mergexo_status_comment(body: str) -> bool:
+    normalized = " ".join(body.split()).strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith("mergexo ")
+
+
 def _has_regression_test_changes(paths: tuple[str, ...]) -> bool:
     return any(path == "tests" or path.startswith("tests/") for path in paths)
 
 
 def _is_no_staged_changes_error(exc: RuntimeError) -> bool:
-    return "No staged changes to commit" in str(exc)
+    return _is_no_staged_changes_error_text(str(exc))
+
+
+def _is_no_staged_changes_error_text(error: str) -> bool:
+    return "no staged changes to commit" in error.lower()
+
+
+def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, str, str]:
+    flow = _flow_label_from_branch(branch)
+    source_line = f"Source issue: {issue.html_url}"
+    if flow == "design":
+        return (
+            f"Design doc for #{issue.number}: {issue.title}",
+            (
+                "Recovered design PR from a previously pushed branch.\n\n"
+                f"Refs #{issue.number}\n\n"
+                f"{source_line}"
+            ),
+            flow,
+        )
+    if flow == "implementation":
+        return (
+            f"Implementation for #{issue.number}: {issue.title}",
+            (
+                "Recovered implementation PR from a previously pushed branch.\n\n"
+                f"Fixes #{issue.number}\n\n"
+                f"{source_line}"
+            ),
+            flow,
+        )
+    if flow == "bugfix":
+        return (
+            f"Bugfix for #{issue.number}: {issue.title}",
+            (
+                "Recovered bugfix PR from a previously pushed branch.\n\n"
+                f"Fixes #{issue.number}\n\n"
+                f"{source_line}"
+            ),
+            flow,
+        )
+    return (
+        issue.title,
+        (
+            "Recovered small-job PR from a previously pushed branch.\n\n"
+            f"Fixes #{issue.number}\n\n"
+            f"{source_line}"
+        ),
+        flow,
+    )
+
+
+def _flow_label_from_branch(branch: str) -> str:
+    if branch.startswith("agent/design/"):
+        return "design"
+    if branch.startswith("agent/bugfix/"):
+        return "bugfix"
+    if branch.startswith("agent/impl/"):
+        return "implementation"
+    return "small-job"
 
 
 def _render_git_op_result_comment(*, outcomes: list[_GitOpOutcome], round_number: int) -> str:

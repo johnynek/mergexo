@@ -285,21 +285,18 @@ class GitRepoManager:
         run(["git", "-C", str(checkout_path), "reset", "--hard", f"origin/{branch}"])
 
     def _remote_branch_exists(self, checkout_path: Path, branch: str) -> bool:
-        try:
-            run(
-                [
-                    "git",
-                    "-C",
-                    str(checkout_path),
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    f"refs/remotes/origin/{branch}",
-                ]
-            )
-        except CommandError:
-            return False
-        return True
+        output = run(
+            [
+                "git",
+                "-C",
+                str(checkout_path),
+                "show-ref",
+                "--verify",
+                f"refs/remotes/origin/{branch}",
+            ],
+            check=False,
+        )
+        return bool(output.strip())
 
     def _ensure_mirror(self) -> None:
         remote_url = self.repo.effective_remote_url

@@ -56,6 +56,7 @@ from mergexo.orchestrator import (
     _design_doc_url,
     _default_commit_message,
     _has_regression_test_changes,
+    _is_mergexo_status_comment,
     _is_merge_conflict_error,
     _implementation_candidate_from_json_dict,
     _implementation_candidate_to_json_dict,
@@ -484,6 +485,18 @@ class FakeState:
     ) -> tuple[ImplementationCandidateState, ...]:
         _ = repo_full_name
         return tuple(self.implementation_candidates)
+
+    def list_legacy_failed_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[object, ...]:
+        _ = repo_full_name
+        return ()
+
+    def list_legacy_running_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[object, ...]:
+        _ = repo_full_name
+        return ()
 
     def get_runtime_operation(self, op_name: str):  # type: ignore[no-untyped-def]
         _ = op_name
@@ -1893,6 +1906,142 @@ def test_process_issue_pre_pr_ordering_gate_blocks_pr_creation_until_comments_pr
         )
 
     assert github.created_prs == []
+
+
+def test_pending_source_issue_followups_ignore_mergexo_status_comments(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_issue_comment_routing=True,
+        allowed_users=("johnynek", "reviewer"),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    comments = [
+        PullRequestIssueComment(
+            comment_id=1,
+            body="MergeXO assigned an agent and started small-job PR work for issue #7.",
+            user_login="johnynek",
+            html_url="https://example/issues/7#issuecomment-1",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=2,
+            body="MergeXO small-job flow was blocked for issue #7: waiting for details.",
+            user_login="johnynek",
+            html_url="https://example/issues/7#issuecomment-2",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=3,
+            body="Please include one integration test.",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-3",
+            created_at="2026-02-23T00:00:02Z",
+            updated_at="2026-02-23T00:00:02Z",
+        ),
+    ]
+
+    pending = orch._pending_source_issue_followups(comments=comments, after_comment_id=0)
+
+    assert tuple(comment.comment_id for comment in pending) == (3,)
+
+
+def test_is_mergexo_status_comment_detects_prefixed_status_messages() -> None:
+    assert (
+        _is_mergexo_status_comment(
+            "MergeXO assigned an agent and started small-job PR work for issue #7."
+        )
+        is True
+    )
+    assert (
+        _is_mergexo_status_comment(
+            "MergeXO small-job flow was blocked for issue #7: waiting for details."
+        )
+        is True
+    )
+    assert _is_mergexo_status_comment("Please retry after rebasing on main.") is False
+
+
+def test_repair_failed_no_staged_change_run_opens_recovery_pr(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:small-job",))
+    github = FakeGitHub([issue])
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+
+    branch = "agent/small/7-add-worker-scheduler"
+    state.mark_awaiting_issue_followup(
+        issue_number=issue.number,
+        flow="small_job",
+        branch=branch,
+        context_json='{"flow":"small_job"}',
+        waiting_reason="temporary placeholder",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_failed(
+        issue.number,
+        "No staged changes to commit",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._repair_failed_no_staged_change_runs()
+
+    assert len(github.created_prs) == 1
+    _, head, base, body = github.created_prs[0]
+    assert head == branch
+    assert base == "main"
+    assert "Recovered small-job PR from a previously pushed branch." in body
+    row = _issue_run_row(tmp_path / "state.db", issue.number)
+    assert row[0] == "awaiting_feedback"
+    assert row[1] == branch
+    assert row[2] == 101
+    assert row[3] == "https://example/pr/101"
+    assert row[4] is None
+    assert any("Opened recovered small-job PR" in comment for _, comment in github.comments)
+
+
+def test_repair_stale_running_run_opens_recovery_pr(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:design",))
+    github = FakeGitHub([issue])
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+
+    branch = "agent/design/7-add-worker-scheduler"
+    state.mark_awaiting_issue_followup(
+        issue_number=issue.number,
+        flow="design_doc",
+        branch=branch,
+        context_json='{"flow":"design_doc"}',
+        waiting_reason="temporary placeholder",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.mark_running(issue.number, repo_full_name=cfg.repo.full_name)
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._repair_stale_running_runs()
+
+    assert len(github.created_prs) == 1
+    _, head, base, body = github.created_prs[0]
+    assert head == branch
+    assert base == "main"
+    assert "Recovered design PR from a previously pushed branch." in body
+    row = _issue_run_row(tmp_path / "state.db", issue.number)
+    assert row[0] == "awaiting_feedback"
+    assert row[1] == branch
+    assert row[2] == 101
+    assert row[3] == "https://example/pr/101"
+    assert row[4] is None
+    assert any("Opened recovered design PR" in comment for _, comment in github.comments)
 
 
 def test_enqueue_pre_pr_followup_work_enqueues_pending_comments_in_order(
