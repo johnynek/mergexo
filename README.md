@@ -129,6 +129,8 @@ Behavior:
 
 1. Before a PR exists:
    - Recoverable pre-PR blocked outcomes move to `awaiting_issue_followup` instead of terminal `failed`.
+   - MergeXO checkpoints the blocked tree to the flow branch before cleanup and posts one status
+     comment with blocked reason, branch, commit SHA, tree link, and compare link.
    - Reply on the source issue to unblock/resume.
    - Comments are queued by comment id and consumed in order on the next retry turn.
 2. While a retry worker is active:

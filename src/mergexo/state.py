@@ -92,6 +92,7 @@ class PrePrFollowupState:
     branch: str
     context_json: str
     waiting_reason: str
+    last_checkpoint_sha: str | None
     updated_at: str
     repo_full_name: str = ""
 
@@ -181,11 +182,20 @@ class StateStore:
                     branch TEXT NOT NULL,
                     context_json TEXT NOT NULL,
                     waiting_reason TEXT NOT NULL,
+                    last_checkpoint_sha TEXT NULL,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, issue_number)
                 )
                 """
             )
+            pre_pr_followup_columns = _table_columns(conn, "pre_pr_followup_state")
+            if "last_checkpoint_sha" not in pre_pr_followup_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE pre_pr_followup_state
+                    ADD COLUMN last_checkpoint_sha TEXT NULL
+                    """
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS issue_comment_cursors (
@@ -733,6 +743,7 @@ class StateStore:
         branch: str,
         context_json: str,
         waiting_reason: str,
+        last_checkpoint_sha: str | None = None,
         repo_full_name: str | None = None,
     ) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
@@ -767,17 +778,27 @@ class StateStore:
                     flow,
                     branch,
                     context_json,
-                    waiting_reason
+                    waiting_reason,
+                    last_checkpoint_sha
                 )
-                VALUES(?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     flow=excluded.flow,
                     branch=excluded.branch,
                     context_json=excluded.context_json,
                     waiting_reason=excluded.waiting_reason,
+                    last_checkpoint_sha=excluded.last_checkpoint_sha,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
-                (repo_key, issue_number, flow, branch, context_json, waiting_reason),
+                (
+                    repo_key,
+                    issue_number,
+                    flow,
+                    branch,
+                    context_json,
+                    waiting_reason,
+                    last_checkpoint_sha,
+                ),
             )
 
     def list_pre_pr_followups(
@@ -795,6 +816,7 @@ class StateStore:
                         p.branch,
                         p.context_json,
                         p.waiting_reason,
+                        p.last_checkpoint_sha,
                         p.updated_at
                     FROM pre_pr_followup_state AS p
                     INNER JOIN issue_runs AS r
@@ -814,6 +836,7 @@ class StateStore:
                         p.branch,
                         p.context_json,
                         p.waiting_reason,
+                        p.last_checkpoint_sha,
                         p.updated_at
                     FROM pre_pr_followup_state AS p
                     INNER JOIN issue_runs AS r
@@ -833,6 +856,9 @@ class StateStore:
                 branch=str(branch),
                 context_json=str(context_json),
                 waiting_reason=str(waiting_reason),
+                last_checkpoint_sha=(
+                    str(last_checkpoint_sha) if isinstance(last_checkpoint_sha, str) else None
+                ),
                 updated_at=str(updated_at),
             )
             for (
@@ -842,6 +868,7 @@ class StateStore:
                 branch,
                 context_json,
                 waiting_reason,
+                last_checkpoint_sha,
                 updated_at,
             ) in rows
         )

@@ -25,6 +25,7 @@ from mergexo.agent_adapter import (
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import (
     ParsedOperatorCommand,
+    compute_pre_pr_checkpoint_token,
     compute_source_issue_redirect_token,
     parse_operator_command,
 )
@@ -42,6 +43,7 @@ from mergexo.models import (
     WorkResult,
 )
 from mergexo.orchestrator import (
+    CheckpointedPrePrBlockedError,
     DirectFlowBlockedError,
     DirectFlowValidationError,
     GlobalWorkLimiter,
@@ -74,6 +76,7 @@ from mergexo.orchestrator import (
     _operator_reply_issue_number,
     _operator_reply_status_for_record,
     _operator_source_comment_url,
+    _pre_pr_flow_label,
     _pull_request_url,
     _render_source_issue_redirect_comment,
     _render_design_doc,
@@ -109,6 +112,7 @@ class FakeGitManager:
         self.branch_calls: list[tuple[Path, str]] = []
         self.commit_calls: list[tuple[Path, str]] = []
         self.push_calls: list[tuple[Path, str]] = []
+        self.checkpoint_persist_calls: list[tuple[Path, str, str]] = []
         self.cleanup_calls: list[Path] = []
         self.ensure_checkout_calls: list[int] = []
         self.restore_calls: list[tuple[Path, str, str]] = []
@@ -119,6 +123,8 @@ class FakeGitManager:
         self.restore_feedback_result = True
         self.staged_files: tuple[str, ...] = ("src/a.py", "tests/test_a.py")
         self.current_head_sha_value = "headsha"
+        self.checkpoint_head_sha_value = "checkpointsha"
+        self.persist_checkpoint_should_fail = False
         self.is_ancestor_results: dict[tuple[str, str], bool] = {}
 
     def ensure_layout(self) -> None:
@@ -145,6 +151,18 @@ class FakeGitManager:
 
     def push_branch(self, checkout_path: Path, branch: str) -> None:
         self.push_calls.append((checkout_path, branch))
+
+    def persist_checkpoint_branch(
+        self,
+        checkout_path: Path,
+        branch: str,
+        *,
+        commit_message: str,
+    ) -> str:
+        self.checkpoint_persist_calls.append((checkout_path, branch, commit_message))
+        if self.persist_checkpoint_should_fail:
+            raise RuntimeError("checkpoint push failed")
+        return self.checkpoint_head_sha_value
 
     def cleanup_slot(self, checkout_path: Path) -> None:
         self.cleanup_calls.append(checkout_path)
@@ -1703,6 +1721,81 @@ def test_process_implementation_candidate_blocked_posts_comment(tmp_path: Path) 
     assert any("Need migration strategy from humans." in body for _, body in github.comments)
 
 
+def test_process_implementation_candidate_recoverable_blocked_checkpoints_with_default_branch(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.checkpoint_head_sha_value = "implsha1"
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent()
+    agent.implementation_result = DirectStartResult(
+        pr_title="N/A",
+        pr_summary="N/A",
+        commit_message=None,
+        blocked_reason="Need migration strategy from humans.",
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    state = StateStore(tmp_path / "state.db")
+
+    checkout_path = git.ensure_checkout(0)
+    design_doc = checkout_path / "docs/design/7-add-worker-scheduler.md"
+    design_doc.parent.mkdir(parents=True, exist_ok=True)
+    design_doc.write_text("# Design\n\nImplement queue scheduler.", encoding="utf-8")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    with pytest.raises(RuntimeError, match="implementation flow blocked"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            )
+        )
+
+    assert len(git.checkpoint_persist_calls) == 1
+    assert git.checkpoint_persist_calls[0][1] == "agent/impl/7-add-worker-scheduler"
+
+
+def test_process_implementation_candidate_recoverable_blocked_checkpoints_with_branch_override(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.checkpoint_head_sha_value = "implsha2"
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent()
+    agent.implementation_result = DirectStartResult(
+        pr_title="N/A",
+        pr_summary="N/A",
+        commit_message=None,
+        blocked_reason="Need migration strategy from humans.",
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    state = StateStore(tmp_path / "state.db")
+
+    checkout_path = git.ensure_checkout(0)
+    design_doc = checkout_path / "docs/design/7-add-worker-scheduler.md"
+    design_doc.parent.mkdir(parents=True, exist_ok=True)
+    design_doc.write_text("# Design\n\nImplement queue scheduler.", encoding="utf-8")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    with pytest.raises(RuntimeError, match="implementation flow blocked"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            ),
+            branch_override="agent/impl/custom-resume-branch",
+        )
+
+    assert len(git.checkpoint_persist_calls) == 1
+    assert git.checkpoint_persist_calls[0][1] == "agent/impl/custom-resume-branch"
+
+
 def test_process_issue_direct_flow_blocked_posts_comment(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -1727,6 +1820,125 @@ def test_process_issue_direct_flow_blocked_posts_comment(tmp_path: Path) -> None
     assert any("Missing reproduction steps" in body for _, body in github.comments)
 
 
+def test_process_issue_recoverable_blocked_checkpoints_and_posts_checkpoint_comment(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.checkpoint_head_sha_value = "abc1234"
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    agent.bugfix_result = DirectStartResult(
+        pr_title="Fix bug",
+        pr_summary="Summary",
+        commit_message=None,
+        blocked_reason="Need reproducible environment details",
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=github,
+        git_manager=git,
+        agent=agent,
+    )
+
+    with pytest.raises(RuntimeError, match="bugfix flow blocked"):
+        orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert len(git.checkpoint_persist_calls) == 1
+    checkpoint_call = git.checkpoint_persist_calls[0]
+    assert checkpoint_call[1] == "agent/bugfix/7-add-worker-scheduler"
+
+    checkpoint_comments = [body for _, body in github.comments if "checkpoint branch" in body]
+    assert len(checkpoint_comments) == 1
+    checkpoint_body = checkpoint_comments[0]
+    assert "blocked reason: bugfix flow blocked: Need reproducible environment details" in (
+        checkpoint_body
+    )
+    assert "checkpoint branch: `agent/bugfix/7-add-worker-scheduler`" in checkpoint_body
+    assert "checkpoint commit: `abc1234`" in checkpoint_body
+    assert "tree/abc1234" in checkpoint_body
+    assert "compare/main...abc1234" in checkpoint_body
+    token = compute_pre_pr_checkpoint_token(issue_number=7, checkpoint_sha="abc1234")
+    assert token in checkpoint_body
+
+
+def test_process_issue_recoverable_blocked_checkpoint_comment_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.checkpoint_head_sha_value = "abc1234"
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    agent.bugfix_result = DirectStartResult(
+        pr_title="Fix bug",
+        pr_summary="Summary",
+        commit_message=None,
+        blocked_reason="Need reproducible environment details",
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    existing_token = compute_pre_pr_checkpoint_token(issue_number=7, checkpoint_sha="abc1234")
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=99,
+            body=f"existing\n\n<!-- mergexo-action:{existing_token} -->",
+            user_login="mergexo[bot]",
+            html_url="https://example/issues/7#issuecomment-99",
+            created_at="2026-02-24T00:00:00Z",
+            updated_at="2026-02-24T00:00:00Z",
+        )
+    ]
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=github,
+        git_manager=git,
+        agent=agent,
+    )
+
+    with pytest.raises(RuntimeError, match="bugfix flow blocked"):
+        orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    checkpoint_comments = [body for _, body in github.comments if "checkpoint branch" in body]
+    assert checkpoint_comments == []
+
+
+def test_process_issue_recoverable_blocked_checkpoint_failure_is_not_silent(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.persist_checkpoint_should_fail = True
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    agent.bugfix_result = DirectStartResult(
+        pr_title="Fix bug",
+        pr_summary="Summary",
+        commit_message=None,
+        blocked_reason="Need reproducible environment details",
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=github,
+        git_manager=git,
+        agent=agent,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="checkpoint persistence failed before follow-up handoff"
+    ):
+        orch._process_issue(_issue(labels=("agent:bugfix",)), "bugfix")
+
+    assert any(
+        "could not persist a recoverable pre-pr checkpoint" in body.lower()
+        for _, body in github.comments
+    )
+
+
 def test_process_direct_issue_rejects_unsupported_flow(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -1740,6 +1952,7 @@ def test_process_direct_issue_rejects_unsupported_flow(tmp_path: Path) -> None:
             issue=_issue(labels=("agent:design",)),
             flow="design_doc",
             checkout_path=tmp_path / "checkout",
+            branch="agent/design/7-add-worker-scheduler",
         )
 
 
@@ -1786,10 +1999,15 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
     observed: dict[str, object] = {}
 
     def fake_process_issue(
-        issue: Issue, flow: IssueFlow, *, pre_pr_last_consumed_comment_id: int = 0
+        issue: Issue,
+        flow: IssueFlow,
+        *,
+        branch_override: str | None = None,
+        pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         observed["issue_number"] = issue.number
         observed["flow"] = flow
+        observed["branch_override"] = branch_override
         observed["pre_pr_last_consumed_comment_id"] = pre_pr_last_consumed_comment_id
         logging.getLogger("mergexo.tests.wrapper").info("event=wrapper_probe")
         return issue_result
@@ -1798,12 +2016,14 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
         candidate: ImplementationCandidateState,
         *,
         issue_override: Issue | None = None,
+        branch_override: str | None = None,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         observed["implementation_issue_number"] = candidate.issue_number
         observed["implementation_issue_override"] = (
             issue_override.number if issue_override else None
         )
+        observed["implementation_branch_override"] = branch_override
         observed["implementation_pre_pr_last_consumed_comment_id"] = pre_pr_last_consumed_comment_id
         return impl_result
 
@@ -1820,7 +2040,10 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
     configure_logging(verbose=True)
 
     issue = _issue()
-    assert orch._process_issue_worker(issue, "design_doc", 17) == issue_result
+    assert (
+        orch._process_issue_worker(issue, "design_doc", "agent/design/7-add-worker-scheduler", 17)
+        == issue_result
+    )
 
     candidate = ImplementationCandidateState(
         issue_number=issue.number,
@@ -1828,7 +2051,12 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
         design_pr_number=101,
         design_pr_url="https://example/pr/101",
     )
-    assert orch._process_implementation_candidate_worker(candidate, issue, 23) == impl_result
+    assert (
+        orch._process_implementation_candidate_worker(
+            candidate, issue, "agent/impl/7-add-worker-scheduler", 23
+        )
+        == impl_result
+    )
 
     tracked = TrackedPullRequestState(
         pr_number=101,
@@ -1842,9 +2070,11 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
     assert observed == {
         "issue_number": issue.number,
         "flow": "design_doc",
+        "branch_override": "agent/design/7-add-worker-scheduler",
         "pre_pr_last_consumed_comment_id": 17,
         "implementation_issue_number": issue.number,
         "implementation_issue_override": issue.number,
+        "implementation_branch_override": "agent/impl/7-add-worker-scheduler",
         "implementation_pre_pr_last_consumed_comment_id": 23,
         "feedback_pr_number": 101,
     }
@@ -2172,8 +2402,51 @@ def test_reap_finished_recoverable_pre_pr_failure_moves_to_followup_waiting(
     assert len(followups) == 1
     assert followups[0].flow == "bugfix"
     assert "reporter follow-up" in followups[0].waiting_reason
+    assert followups[0].last_checkpoint_sha is None
     cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
     assert cursor.pre_pr_last_consumed_comment_id == 19
+
+
+def test_reap_finished_checkpointed_pre_pr_failure_persists_checkpoint_sha(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    bad: Future[WorkResult] = Future()
+    bad.set_exception(
+        CheckpointedPrePrBlockedError(
+            waiting_reason="bugfix flow blocked: waiting",
+            checkpoint_branch="agent/bugfix/7-checkpoint",
+            checkpoint_sha="abc123",
+        )
+    )
+    orch._running = {7: bad}
+    orch._running_issue_metadata = {
+        7: _RunningIssueMetadata(
+            run_id="run-7",
+            flow="bugfix",
+            branch="agent/bugfix/7-worker",
+            context_json='{"flow":"bugfix"}',
+            source_issue_number=7,
+            consumed_comment_id_max=21,
+        )
+    }
+
+    orch._reap_finished()
+
+    row = _issue_run_row(tmp_path / "state.db", 7)
+    assert row[0] == "awaiting_issue_followup"
+    assert row[1] == "agent/bugfix/7-checkpoint"
+    followups = state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name)
+    assert len(followups) == 1
+    assert followups[0].last_checkpoint_sha == "abc123"
+    cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor.pre_pr_last_consumed_comment_id == 21
 
 
 def test_process_issue_pre_pr_ordering_gate_blocks_pr_creation_until_comments_processed(
@@ -2570,11 +2843,11 @@ def test_enqueue_pre_pr_followup_work_enqueues_pending_comments_in_order(
 
     class FakePool:
         def __init__(self) -> None:
-            self.submitted: list[tuple[Issue, IssueFlow, int]] = []
+            self.submitted: list[tuple[Issue, IssueFlow, str, int]] = []
 
-        def submit(self, fn, issue_arg, flow_arg, consumed):  # type: ignore[no-untyped-def]
+        def submit(self, fn, issue_arg, flow_arg, branch_arg, consumed):  # type: ignore[no-untyped-def]
             _ = fn
-            self.submitted.append((issue_arg, flow_arg, consumed))
+            self.submitted.append((issue_arg, flow_arg, branch_arg, consumed))
             fut: Future[WorkResult] = Future()
             return fut
 
@@ -2582,8 +2855,9 @@ def test_enqueue_pre_pr_followup_work_enqueues_pending_comments_in_order(
     orch._enqueue_pre_pr_followup_work(pool)
 
     assert len(pool.submitted) == 1
-    submitted_issue, submitted_flow, consumed_comment_id = pool.submitted[0]
+    submitted_issue, submitted_flow, submitted_branch, consumed_comment_id = pool.submitted[0]
     assert submitted_flow == "bugfix"
+    assert submitted_branch == "agent/bugfix/7-add-worker-scheduler"
     assert consumed_comment_id == 6
     assert "new direction" in submitted_issue.body
     assert "waiting for clarifications" in submitted_issue.body
@@ -2887,7 +3161,8 @@ def test_enqueue_pre_pr_followup_work_implementation_resume_path_submits_worker(
     assert submitted[0] == orch._process_implementation_candidate_worker
     assert isinstance(submitted[1], ImplementationCandidateState)
     assert isinstance(submitted[2], Issue)
-    assert submitted[3] == 11
+    assert submitted[3] == "agent/impl/7-add-worker-scheduler"
+    assert submitted[4] == 11
 
 
 def test_scan_post_pr_source_issue_comment_redirects_handles_no_targets_and_blocked_targets(
@@ -3047,10 +3322,15 @@ def test_worker_wrappers_delegate_with_consumed_comment_id(tmp_path: Path) -> No
     )
 
     def fake_process_issue(
-        arg_issue: Issue, flow: IssueFlow, *, pre_pr_last_consumed_comment_id: int = 0
+        arg_issue: Issue,
+        flow: IssueFlow,
+        *,
+        branch_override: str | None = None,
+        pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         assert arg_issue.number == 7
         assert flow == "design_doc"
+        assert branch_override == "agent/design/7-add-worker-scheduler"
         assert pre_pr_last_consumed_comment_id == 12
         return WorkResult(issue_number=7, branch="b", pr_number=1, pr_url="u")
 
@@ -3058,18 +3338,33 @@ def test_worker_wrappers_delegate_with_consumed_comment_id(tmp_path: Path) -> No
         arg_candidate: ImplementationCandidateState,
         *,
         issue_override: Issue | None = None,
+        branch_override: str | None = None,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         assert arg_candidate.issue_number == 7
         assert issue_override is issue
+        assert branch_override == "agent/impl/7-add-worker-scheduler"
         assert pre_pr_last_consumed_comment_id == 13
         return WorkResult(issue_number=7, branch="b", pr_number=1, pr_url="u")
 
     orch._process_issue = fake_process_issue  # type: ignore[method-assign]
     orch._process_implementation_candidate = fake_process_impl  # type: ignore[method-assign]
 
-    assert orch._process_issue_worker(issue, "design_doc", 12).issue_number == 7
-    assert orch._process_implementation_candidate_worker(candidate, issue, 13).issue_number == 7
+    assert (
+        orch._process_issue_worker(
+            issue, "design_doc", "agent/design/7-add-worker-scheduler", 12
+        ).issue_number
+        == 7
+    )
+    assert (
+        orch._process_implementation_candidate_worker(
+            candidate,
+            issue,
+            "agent/impl/7-add-worker-scheduler",
+            13,
+        ).issue_number
+        == 7
+    )
 
 
 def test_pre_pr_comment_helpers_filter_tokenized_and_allow_empty_pending(tmp_path: Path) -> None:
@@ -3118,6 +3413,7 @@ def test_decode_pre_pr_context_invalid_json_falls_back_to_live_issue(tmp_path: P
             branch="b",
             context_json="{not-json",
             waiting_reason="x",
+            last_checkpoint_sha=None,
             updated_at="now",
             repo_full_name=cfg.repo.full_name,
         )
@@ -3128,6 +3424,8 @@ def test_decode_pre_pr_context_invalid_json_falls_back_to_live_issue(tmp_path: P
 
 def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
     issue = _issue(labels=("triage",))
+    assert _pre_pr_flow_label("design_doc") == "design"
+    assert _pre_pr_flow_label("small_job") == "small-job"
     assert _issue_to_json_dict(issue)["number"] == 7
     assert _issue_from_json_dict({1: "bad"}) is None  # type: ignore[arg-type]
     assert _issue_from_json_dict({"number": "7"}) is None  # type: ignore[dict-item]

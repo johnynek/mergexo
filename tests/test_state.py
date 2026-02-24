@@ -423,6 +423,18 @@ def test_pre_pr_followup_state_and_issue_comment_cursors(tmp_path: Path) -> None
     assert followup.issue_number == 7
     assert followup.flow == "small_job"
     assert followup.context_json == '{"flow":"small_job"}'
+    assert followup.last_checkpoint_sha is None
+
+    store.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="small_job",
+        branch="agent/small/7-worker",
+        context_json='{"flow":"small_job"}',
+        waiting_reason="small-job flow blocked: waiting on reporter context",
+        last_checkpoint_sha="abc123",
+    )
+    followups = store.list_pre_pr_followups()
+    assert followups[0].last_checkpoint_sha == "abc123"
 
     cursor0 = store.get_issue_comment_cursor(7)
     assert cursor0.pre_pr_last_consumed_comment_id == 0
@@ -440,6 +452,58 @@ def test_pre_pr_followup_state_and_issue_comment_cursors(tmp_path: Path) -> None
 
     store.clear_pre_pr_followup_state(7)
     assert store.list_pre_pr_followups() == ()
+
+
+def test_pre_pr_followup_state_migrates_last_checkpoint_sha_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE issue_runs (
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                branch TEXT,
+                pr_number INTEGER,
+                pr_url TEXT,
+                error TEXT,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (repo_full_name, issue_number)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE pre_pr_followup_state (
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                flow TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                waiting_reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (repo_full_name, issue_number)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = StateStore(db_path)
+    store.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-worker",
+        context_json='{"flow":"bugfix"}',
+        waiting_reason="bugfix flow blocked: waiting for details",
+        last_checkpoint_sha="def456",
+    )
+
+    followups = store.list_pre_pr_followups()
+    assert len(followups) == 1
+    assert followups[0].last_checkpoint_sha == "def456"
 
 
 def test_list_legacy_failed_issue_runs_without_pr_filters_rows(tmp_path: Path) -> None:

@@ -28,6 +28,7 @@ from mergexo.feedback_loop import (
     compute_general_comment_token,
     compute_history_rewrite_token,
     compute_operator_command_token,
+    compute_pre_pr_checkpoint_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
     compute_turn_key,
@@ -125,6 +126,21 @@ class DirectFlowBlockedError(DirectFlowError):
 
 class DirectFlowValidationError(DirectFlowError):
     """Direct-flow output failed deterministic policy checks."""
+
+
+class CheckpointedPrePrBlockedError(DirectFlowBlockedError):
+    def __init__(
+        self,
+        *,
+        waiting_reason: str,
+        checkpoint_branch: str,
+        checkpoint_sha: str,
+    ) -> None:
+        normalized_reason = waiting_reason.strip() or "recoverable_pre_pr_blocked"
+        super().__init__(normalized_reason)
+        self.waiting_reason = normalized_reason
+        self.checkpoint_branch = checkpoint_branch
+        self.checkpoint_sha = checkpoint_sha
 
 
 @dataclass(frozen=True)
@@ -470,7 +486,13 @@ class Phase1Orchestrator:
                     branch=branch,
                     repo_full_name=self._state_repo_full_name(),
                 )
-                fut = pool.submit(self._process_issue_worker, issue, flow, consumed_comment_id_max)
+                fut = pool.submit(
+                    self._process_issue_worker,
+                    issue,
+                    flow,
+                    branch,
+                    consumed_comment_id_max,
+                )
                 # Ensure global capacity is returned even if worker code fails.
                 fut.add_done_callback(lambda _: self._work_limiter.release())
                 capacity_reserved = False
@@ -553,6 +575,7 @@ class Phase1Orchestrator:
                     self._process_implementation_candidate_worker,
                     candidate,
                     issue,
+                    branch,
                     consumed_comment_id_max,
                 )
                 fut.add_done_callback(lambda _: self._work_limiter.release())
@@ -726,6 +749,7 @@ class Phase1Orchestrator:
                         self._process_implementation_candidate_worker,
                         candidate,
                         resume_issue,
+                        branch,
                         consumed_comment_id_max,
                     )
                 else:
@@ -733,6 +757,7 @@ class Phase1Orchestrator:
                         self._process_issue_worker,
                         resume_issue,
                         cast(IssueFlow, followup.flow),
+                        branch,
                         consumed_comment_id_max,
                     )
                 fut.add_done_callback(lambda _: self._work_limiter.release())
@@ -1502,6 +1527,132 @@ class Phase1Orchestrator:
                 return True
         return False
 
+    def _checkpoint_recoverable_pre_pr_blocked(
+        self,
+        *,
+        issue: Issue,
+        flow: PrePrFlow,
+        checkout_path: Path,
+        branch: str,
+        blocked_error: Exception,
+    ) -> CheckpointedPrePrBlockedError:
+        waiting_reason = str(blocked_error).strip() or type(blocked_error).__name__
+        flow_label = _pre_pr_flow_label(flow)
+        checkpoint_commit_message = (
+            f"chore: checkpoint blocked {flow_label} flow for issue #{issue.number}"
+        )
+        log_event(
+            LOGGER,
+            "pre_pr_checkpoint_started",
+            repo_full_name=self._state_repo_full_name(),
+            issue_number=issue.number,
+            flow=flow,
+            branch=branch,
+        )
+        try:
+            checkpoint_sha = self._git.persist_checkpoint_branch(
+                checkout_path,
+                branch,
+                commit_message=checkpoint_commit_message,
+            )
+        except Exception as checkpoint_exc:  # noqa: BLE001
+            checkpoint_detail = _summarize_git_error(str(checkpoint_exc))
+            log_event(
+                LOGGER,
+                "pre_pr_checkpoint_failed",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue.number,
+                flow=flow,
+                branch=branch,
+                error_type=type(checkpoint_exc).__name__,
+            )
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=_render_pre_pr_checkpoint_failure_comment(
+                    branch=branch,
+                    waiting_reason=waiting_reason,
+                    checkpoint_error=checkpoint_detail,
+                ),
+            )
+            raise DirectFlowValidationError(
+                "checkpoint persistence failed before follow-up handoff: "
+                f"issue #{issue.number} branch `{branch}` ({checkpoint_detail})"
+            ) from checkpoint_exc
+
+        self._post_pre_pr_checkpoint_comment(
+            issue_number=issue.number,
+            branch=branch,
+            checkpoint_sha=checkpoint_sha,
+            waiting_reason=waiting_reason,
+        )
+        log_event(
+            LOGGER,
+            "pre_pr_checkpoint_ready",
+            repo_full_name=self._state_repo_full_name(),
+            issue_number=issue.number,
+            flow=flow,
+            branch=branch,
+            checkpoint_sha=checkpoint_sha,
+        )
+        return CheckpointedPrePrBlockedError(
+            waiting_reason=waiting_reason,
+            checkpoint_branch=branch,
+            checkpoint_sha=checkpoint_sha,
+        )
+
+    def _post_pre_pr_checkpoint_comment(
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        checkpoint_sha: str,
+        waiting_reason: str,
+    ) -> None:
+        token = compute_pre_pr_checkpoint_token(
+            issue_number=issue_number,
+            checkpoint_sha=checkpoint_sha,
+        )
+        if self._issue_has_action_token(
+            github=self._github, issue_number=issue_number, token=token
+        ):
+            log_event(
+                LOGGER,
+                "pre_pr_checkpoint_comment_skipped",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue_number,
+                checkpoint_sha=checkpoint_sha,
+                reason="token_already_present",
+            )
+            return
+
+        tree_url = f"https://github.com/{self._state_repo_full_name()}/tree/{checkpoint_sha}"
+        compare_url = (
+            "https://github.com/"
+            f"{self._state_repo_full_name()}/compare/"
+            f"{self._repo.default_branch}...{checkpoint_sha}"
+        )
+        self._github.post_issue_comment(
+            issue_number=issue_number,
+            body=append_action_token(
+                body=_render_pre_pr_checkpoint_comment(
+                    waiting_reason=waiting_reason,
+                    checkpoint_branch=branch,
+                    checkpoint_sha=checkpoint_sha,
+                    tree_url=tree_url,
+                    compare_url=compare_url,
+                    default_branch=self._repo.default_branch,
+                ),
+                token=token,
+            ),
+        )
+        log_event(
+            LOGGER,
+            "pre_pr_checkpoint_comment_posted",
+            repo_full_name=self._state_repo_full_name(),
+            issue_number=issue_number,
+            checkpoint_sha=checkpoint_sha,
+        )
+
     def _github_for_repo(self, repo_full_name: str) -> GitHubGateway:
         normalized = repo_full_name.strip()
         if normalized and normalized in self._github_by_repo_full_name:
@@ -1571,12 +1722,19 @@ class Phase1Orchestrator:
                         and _is_recoverable_pre_pr_exception(exc)
                     ):
                         waiting_reason = str(exc).strip() or type(exc).__name__
+                        checkpoint_branch = metadata.branch
+                        last_checkpoint_sha: str | None = None
+                        if isinstance(exc, CheckpointedPrePrBlockedError):
+                            waiting_reason = exc.waiting_reason
+                            checkpoint_branch = exc.checkpoint_branch
+                            last_checkpoint_sha = exc.checkpoint_sha
                         self._state.mark_awaiting_issue_followup(
                             issue_number=issue_number,
                             flow=metadata.flow,
-                            branch=metadata.branch,
+                            branch=checkpoint_branch,
                             context_json=metadata.context_json,
                             waiting_reason=waiting_reason,
+                            last_checkpoint_sha=last_checkpoint_sha,
                             repo_full_name=self._state_repo_full_name(),
                         )
                         self._state.advance_pre_pr_last_consumed_comment_id(
@@ -1598,6 +1756,8 @@ class Phase1Orchestrator:
                             issue_number=issue_number,
                             flow=metadata.flow,
                             reason=waiting_reason,
+                            checkpoint_branch=checkpoint_branch,
+                            checkpoint_sha=last_checkpoint_sha or "",
                         )
                         self._state.finish_agent_run(
                             run_id=metadata.run_id,
@@ -1704,12 +1864,14 @@ class Phase1Orchestrator:
         self,
         issue: Issue,
         flow: IssueFlow,
+        resume_branch: str,
         consumed_comment_id_max: int,
     ) -> WorkResult:
         with logging_repo_context(self._repo.full_name):
             return self._process_issue(
                 issue,
                 flow,
+                branch_override=resume_branch,
                 pre_pr_last_consumed_comment_id=consumed_comment_id_max,
             )
 
@@ -1718,6 +1880,7 @@ class Phase1Orchestrator:
         issue: Issue,
         flow: IssueFlow,
         *,
+        branch_override: str | None = None,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         if not self._is_issue_author_allowed(
@@ -1729,6 +1892,7 @@ class Phase1Orchestrator:
                 f"Issue #{issue.number} author is not allowed by repo.allowed_users"
             )
 
+        branch = branch_override or _branch_for_issue_flow(flow=flow, issue=issue)
         lease = self._slot_pool.acquire()
         try:
             log_event(
@@ -1747,15 +1911,28 @@ class Phase1Orchestrator:
                 return self._process_design_issue(
                     issue=issue,
                     checkout_path=lease.path,
+                    branch=branch,
                     pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
                 )
             return self._process_direct_issue(
                 issue=issue,
                 flow=flow,
                 checkout_path=lease.path,
+                branch=branch,
                 pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
             )
         except Exception as exc:  # noqa: BLE001
+            if (
+                self._config.runtime.enable_issue_comment_routing
+                and _is_recoverable_pre_pr_exception(exc)
+            ):
+                raise self._checkpoint_recoverable_pre_pr_blocked(
+                    issue=issue,
+                    flow=cast(PrePrFlow, flow),
+                    checkout_path=lease.path,
+                    branch=branch,
+                    blocked_error=exc,
+                ) from exc
             log_event(
                 LOGGER,
                 "issue_processing_failed",
@@ -1777,12 +1954,12 @@ class Phase1Orchestrator:
         *,
         issue: Issue,
         checkout_path: Path,
+        branch: str,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
-        slug = _slugify(issue.title)
-        branch = _issue_branch(flow="design_doc", issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
 
+        slug = _slugify(issue.title)
         design_relpath = f"{self._repo.design_docs_dir}/{issue.number}-{slug}.md"
         log_event(
             LOGGER,
@@ -1870,10 +2047,9 @@ class Phase1Orchestrator:
         issue: Issue,
         flow: IssueFlow,
         checkout_path: Path,
+        branch: str,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
-        slug = _slugify(issue.title)
-        branch = _issue_branch(flow=flow, issue_number=issue.number, slug=slug)
         self._git.create_or_reset_branch(checkout_path, branch)
         coding_guidelines_path = self._coding_guidelines_path_for_checkout(
             checkout_path=checkout_path
@@ -1964,6 +2140,7 @@ class Phase1Orchestrator:
         candidate: ImplementationCandidateState,
         *,
         issue_override: Issue | None = None,
+        branch_override: str | None = None,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         issue = issue_override or self._github.get_issue(candidate.issue_number)
@@ -1999,7 +2176,7 @@ class Phase1Orchestrator:
                     "Implementation candidate is missing a valid design branch suffix"
                 )
 
-            branch = f"agent/impl/{slug}"
+            branch = branch_override or f"agent/impl/{slug}"
             self._git.create_or_reset_branch(lease.path, branch)
 
             design_relpath = f"{self._repo.design_docs_dir}/{slug}.md"
@@ -2104,6 +2281,22 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
             )
         except Exception as exc:  # noqa: BLE001
+            if (
+                self._config.runtime.enable_issue_comment_routing
+                and _is_recoverable_pre_pr_exception(exc)
+            ):
+                checkpoint_branch = (
+                    branch_override
+                    if branch_override is not None
+                    else _branch_for_implementation_candidate(candidate)
+                )
+                raise self._checkpoint_recoverable_pre_pr_blocked(
+                    issue=issue,
+                    flow="implementation",
+                    checkout_path=lease.path,
+                    branch=checkpoint_branch,
+                    blocked_error=exc,
+                ) from exc
             log_event(
                 LOGGER,
                 "issue_processing_failed",
@@ -2122,12 +2315,14 @@ class Phase1Orchestrator:
         self,
         candidate: ImplementationCandidateState,
         issue: Issue,
+        resume_branch: str,
         consumed_comment_id_max: int,
     ) -> WorkResult:
         with logging_repo_context(self._repo.full_name):
             return self._process_implementation_candidate(
                 candidate,
                 issue_override=issue,
+                branch_override=resume_branch,
                 pre_pr_last_consumed_comment_id=consumed_comment_id_max,
             )
 
@@ -3857,6 +4052,52 @@ def _render_source_issue_redirect_comment(
         "Comments on the source issue are no longer actioned after a PR exists. "
         "Please comment on the PR thread instead."
     )
+
+
+def _render_pre_pr_checkpoint_comment(
+    *,
+    waiting_reason: str,
+    checkpoint_branch: str,
+    checkpoint_sha: str,
+    tree_url: str,
+    compare_url: str,
+    default_branch: str,
+) -> str:
+    return (
+        "MergeXO pre-PR flow is waiting for source-issue follow-up.\n"
+        f"- blocked reason: {waiting_reason}\n"
+        f"- checkpoint branch: `{checkpoint_branch}`\n"
+        f"- checkpoint commit: `{checkpoint_sha}`\n"
+        f"- checkpoint tree: {tree_url}\n"
+        f"- compare vs `{default_branch}`: {compare_url}\n\n"
+        "Next steps:\n"
+        "1. Review the checkpoint tree/compare links above.\n"
+        "2. Reply on this issue with clarifications or updated instructions.\n"
+        "3. MergeXO will resume from this checkpoint branch head."
+    )
+
+
+def _render_pre_pr_checkpoint_failure_comment(
+    *,
+    branch: str,
+    waiting_reason: str,
+    checkpoint_error: str,
+) -> str:
+    return (
+        "MergeXO could not persist a recoverable pre-PR checkpoint before cleanup.\n"
+        f"- blocked reason: {waiting_reason}\n"
+        f"- checkpoint branch: `{branch}`\n"
+        f"- checkpoint persistence error: {checkpoint_error}\n\n"
+        "Please inspect worker logs and recover manually from the local checkout if needed."
+    )
+
+
+def _pre_pr_flow_label(flow: PrePrFlow) -> str:
+    if flow == "design_doc":
+        return "design"
+    if flow == "small_job":
+        return "small-job"
+    return flow
 
 
 def _slugify(value: str) -> str:

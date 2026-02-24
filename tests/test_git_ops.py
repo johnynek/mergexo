@@ -377,6 +377,91 @@ def test_commit_all_raises_when_no_diff(monkeypatch: pytest.MonkeyPatch, tmp_pat
         manager.commit_all(tmp_path, "msg")
 
 
+def test_persist_checkpoint_branch_commits_when_diff_and_returns_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-3:] == ["diff", "--cached", "--name-only"]:
+            return "src/a.py\n"
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return "abc123\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    head = manager.persist_checkpoint_branch(
+        checkout,
+        "feature",
+        commit_message="chore: checkpoint",
+    )
+
+    assert head == "abc123"
+    assert ["git", "-C", str(checkout), "commit", "-m", "chore: checkpoint"] in calls
+    assert ["git", "-C", str(checkout), "push", "-u", "origin", "feature"] in calls
+
+
+def test_persist_checkpoint_branch_skips_commit_when_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-3:] == ["diff", "--cached", "--name-only"]:
+            return ""
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return "abc123\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    head = manager.persist_checkpoint_branch(
+        checkout,
+        "feature",
+        commit_message="chore: checkpoint",
+    )
+
+    assert head == "abc123"
+    assert ["git", "-C", str(checkout), "push", "-u", "origin", "feature"] in calls
+    assert ["git", "-C", str(checkout), "commit", "-m", "chore: checkpoint"] not in calls
+
+
+def test_persist_checkpoint_branch_surfaces_push_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[-3:] == ["diff", "--cached", "--name-only"]:
+            return ""
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            raise CommandError("push failed")
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError, match="push failed"):
+        manager.persist_checkpoint_branch(
+            checkout,
+            "feature",
+            commit_message="chore: checkpoint",
+        )
+
+
 def test_list_staged_files_parses_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime, repo = _config(tmp_path, worker_count=1)
     manager = GitRepoManager(runtime, repo)
