@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import platform
 import subprocess
+from typing import Any
 import webbrowser
 
 from textual.app import App, ComposeResult
@@ -332,7 +333,7 @@ class ObservabilityApp(App[None]):
             return
         self.push_screen(_DetailModal(title=title, body=body, fields=fields))
 
-    def _base_screen(self) -> Screen[None]:
+    def _base_screen(self) -> Screen[Any]:
         if self.screen_stack:
             return self.screen_stack[0]
         return self.screen
@@ -710,7 +711,9 @@ def _active_row_detail_fields(row: ActiveAgentRow) -> tuple[_DetailField, ...]:
     return (
         _DetailField("Repo", row.repo_full_name, repo_link),
         _DetailField("Repo URL", repo_link, repo_link),
-        _DetailField("Issue", str(row.issue_number), _issue_url(row.repo_full_name, row.issue_number)),
+        _DetailField(
+            "Issue", str(row.issue_number), _issue_url(row.repo_full_name, row.issue_number)
+        ),
         _DetailField("PR", pr_value, pr_link),
         _DetailField("Flow", row.flow or "-"),
         _DetailField("Branch", branch_value, branch_link),
@@ -735,7 +738,9 @@ def _tracked_row_detail_fields(row: TrackedOrBlockedRow) -> tuple[_DetailField, 
         _DetailField("Repo", row.repo_full_name, repo_link),
         _DetailField("Repo URL", repo_link, repo_link),
         _DetailField("PR", pr_value, pr_link),
-        _DetailField("Issue", str(row.issue_number), _issue_url(row.repo_full_name, row.issue_number)),
+        _DetailField(
+            "Issue", str(row.issue_number), _issue_url(row.repo_full_name, row.issue_number)
+        ),
         _DetailField("Status", row.status),
         _DetailField("Branch", branch_value, branch_link),
         _DetailField("Pending Events", str(row.pending_event_count)),

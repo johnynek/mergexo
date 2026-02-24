@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from textual.widgets import DataTable, Static
@@ -761,7 +762,9 @@ def test_detail_modal_field_navigation_opens_urls(
     async def run_app() -> None:
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._show_detail_context(title="PR #101 Context", body="Blocked Reason:\nboom", fields=fields)
+            app._show_detail_context(
+                title="PR #101 Context", body="Blocked Reason:\nboom", fields=fields
+            )
             await pilot.pause()
             assert isinstance(app.screen, tui._DetailModal)
             table = app.query_one("#detail-fields-table", DataTable)
@@ -971,3 +974,134 @@ def test_detail_modal_close_action_calls_dismiss(monkeypatch: pytest.MonkeyPatch
 
     modal.action_close()
     assert dismissed == [None]
+
+
+def test_detail_modal_activate_without_fields_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    modal = tui._DetailModal(title="Context", body="Body")
+    closed: list[bool] = []
+    monkeypatch.setattr(modal, "action_close", lambda: closed.append(True))
+
+    modal.action_activate()
+    assert closed == [True]
+
+
+def test_detail_modal_activate_out_of_range_row_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    modal = tui._DetailModal(
+        title="Context",
+        body="Body",
+        fields=(tui._DetailField("Repo", "o/repo-a", "https://github.com/o/repo-a"),),
+    )
+    fake_table = SimpleNamespace(cursor_row=-1)
+    monkeypatch.setattr(modal, "query_one", lambda *args, **kwargs: fake_table)
+
+    modal.action_activate()
+
+
+def test_detail_modal_cell_selected_event_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    modal = tui._DetailModal(title="Context", body="Body")
+    calls: list[str] = []
+    monkeypatch.setattr(modal, "action_activate", lambda: calls.append("activate"))
+
+    modal.on_data_table_cell_selected(SimpleNamespace(data_table=SimpleNamespace(id="other")))
+    assert calls == []
+    modal.on_data_table_cell_selected(
+        SimpleNamespace(data_table=SimpleNamespace(id="detail-fields-table"))
+    )
+    assert calls == ["activate"]
+
+
+def test_detail_modal_activate_falls_back_to_module_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    modal = tui._DetailModal(
+        title="Context",
+        body="Body",
+        fields=(tui._DetailField("Repo", "o/repo-a", "https://github.com/o/repo-a"),),
+    )
+    fake_table = SimpleNamespace(cursor_row=0)
+    monkeypatch.setattr(modal, "query_one", lambda *args, **kwargs: fake_table)
+    opened: list[str] = []
+    monkeypatch.setattr(tui, "_open_external_url", lambda url: opened.append(url) or True)
+
+    class NonObservabilityApp:
+        pass
+
+    monkeypatch.setattr(type(modal), "app", property(lambda self: NonObservabilityApp()))
+    modal.action_activate()
+    assert opened == ["https://github.com/o/repo-a"]
+
+
+def test_detail_data_table_ignores_non_target_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    table = tui._DetailDataTable(id="history-table")
+    monkeypatch.setattr(DataTable, "action_select_cursor", lambda self: None)
+    table.action_select_cursor()
+
+
+def test_header_selected_ignores_non_tracked_table(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    called: list[int] = []
+    app._sort_tracked_by_column = lambda column_index: called.append(column_index)  # type: ignore[method-assign]
+
+    app.on_data_table_header_selected(
+        SimpleNamespace(data_table=SimpleNamespace(id="history-table"), column_index=3)
+    )
+    assert called == []
+
+
+def test_base_screen_falls_back_to_screen_when_stack_empty(tmp_path: Path) -> None:
+    class FakeApp(tui.ObservabilityApp):
+        def __init__(self, *, db_path: Path) -> None:
+            super().__init__(
+                db_path=db_path, refresh_seconds=60, default_window="24h", row_limit=20
+            )
+            self._fake_screen = SimpleNamespace(name="fallback-screen")
+
+        @property
+        def screen_stack(self):  # type: ignore[override]
+            return ()
+
+        @property
+        def screen(self):  # type: ignore[override]
+            return self._fake_screen
+
+    app = FakeApp(db_path=tmp_path / "state.db")
+    assert app._base_screen().name == "fallback-screen"
+
+
+def test_tracked_sort_value_branches() -> None:
+    row = TrackedOrBlockedRow(
+        repo_full_name="O/Repo-A",
+        pr_number=101,
+        issue_number=7,
+        status="Blocked",
+        branch="Agent/Design/7",
+        last_seen_head_sha="head",
+        blocked_reason="Boom",
+        pending_event_count=2,
+        updated_at="2026-02-24T00:00:00.000Z",
+    )
+    row_without_pr = TrackedOrBlockedRow(
+        repo_full_name="O/Repo-B",
+        pr_number=None,
+        issue_number=8,
+        status="Awaiting",
+        branch="Agent/Design/8",
+        last_seen_head_sha=None,
+        blocked_reason=None,
+        pending_event_count=0,
+        updated_at="2026-02-24T00:01:00.000Z",
+    )
+    assert tui._tracked_sort_value(row, 0) == "o/repo-a"
+    assert tui._tracked_sort_value(row, 1) == 101
+    assert tui._tracked_sort_value(row_without_pr, 1) == -1
+    assert tui._tracked_sort_value(row, 2) == 7
+    assert tui._tracked_sort_value(row, 3) == "blocked"
+    assert tui._tracked_sort_value(row, 4) == "agent/design/7"
+    assert tui._tracked_sort_value(row, 5) == 2
+    assert tui._tracked_sort_value(row, 6) == "boom"
+    assert tui._tracked_sort_value(row_without_pr, 6) == ""
+    assert tui._tracked_sort_value(row, 7) == "2026-02-24T00:00:00.000Z"
+    assert tui._tracked_sort_value(row, 999) == ""
