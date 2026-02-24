@@ -2081,6 +2081,48 @@ def test_repo_logging_context_wrappers_delegate_to_underlying_methods(
     assert "repo_full_name=johnynek/mergexo event=wrapper_probe" in capsys.readouterr().err
 
 
+def test_active_run_id_helpers_and_prompt_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    future: Future[str] = Future()
+    orch._running_issue_metadata[7] = _RunningIssueMetadata(
+        run_id="run-issue",
+        flow="design_doc",
+        branch="agent/design/7",
+        context_json="{}",
+        source_issue_number=7,
+        consumed_comment_id_max=0,
+    )
+    orch._running_feedback[70] = _FeedbackFuture(
+        issue_number=7, run_id="run-feedback", future=future
+    )
+
+    assert orch._active_run_id_for_issue(7) == "run-issue"
+    assert orch._active_run_id_for_pr(70) == "run-feedback"
+
+    recorded_meta: list[tuple[str, str]] = []
+
+    def fake_update_agent_run_meta(*, run_id: str, meta_json: str) -> bool:
+        recorded_meta.append((run_id, meta_json))
+        return True
+
+    monkeypatch.setattr(
+        orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
+    )
+
+    orch._record_run_prompt(None, "ignored")
+    assert recorded_meta == []
+
+    orch._record_run_prompt("run-issue", "Prompt text")
+    assert recorded_meta == [("run-issue", '{"last_prompt": "Prompt text"}')]
+
+
 def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")

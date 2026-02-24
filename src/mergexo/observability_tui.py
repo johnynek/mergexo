@@ -951,6 +951,7 @@ def _render_context_snippet(value: str | None, *, max_chars: int) -> str:
 
 
 def _active_row_context(row: ActiveAgentRow) -> str:
+    prompt_value = row.prompt or "-"
     return "\n".join(
         [
             f"Repo: {row.repo_full_name}",
@@ -961,6 +962,9 @@ def _active_row_context(row: ActiveAgentRow) -> str:
             f"Branch: {row.branch or '-'}",
             f"Started: {row.started_at}",
             f"Elapsed: {_render_seconds(row.elapsed_seconds)}",
+            "",
+            "Last Prompt:",
+            prompt_value,
         ]
     )
 

@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from math import sqrt
 from pathlib import Path
 import sqlite3
@@ -30,6 +31,7 @@ class ActiveAgentRow:
     branch: str | None
     started_at: str
     elapsed_seconds: float
+    prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -202,7 +204,8 @@ def load_active_agents(
                 flow,
                 branch,
                 started_at,
-                MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS elapsed_seconds
+                MAX(0.0, (julianday(?) - julianday(started_at)) * 86400.0) AS elapsed_seconds,
+                meta_json
             FROM agent_run_history
             WHERE finished_at IS NULL
               {repo_clause}
@@ -222,6 +225,7 @@ def load_active_agents(
             branch=_as_optional_str(row[6], "branch"),
             started_at=_as_str(row[7], "started_at"),
             elapsed_seconds=_as_float(row[8], "elapsed_seconds"),
+            prompt=_prompt_from_meta_json(_as_str(row[9], "meta_json")),
         )
         for row in rows
     )
@@ -502,6 +506,7 @@ def _load_metrics(
             AVG(duration_seconds * duration_seconds) AS mean_runtime_sq
         FROM agent_run_history
         WHERE finished_at IS NOT NULL
+          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup')
           AND terminal_status IN ('completed', 'failed', 'blocked', 'interrupted')
           AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
           {repo_clause}
@@ -528,6 +533,7 @@ def _load_metrics(
             AVG(duration_seconds * duration_seconds) AS mean_runtime_sq
         FROM agent_run_history
         WHERE finished_at IS NOT NULL
+          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup')
           AND terminal_status IN ('completed', 'failed', 'blocked', 'interrupted')
           AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
           {repo_clause}
@@ -663,3 +669,19 @@ def _as_optional_float(value: object, field: str) -> float | None:
     if isinstance(value, int | float):
         return float(value)
     raise RuntimeError(f"Invalid {field} value in observability query result")
+
+
+def _prompt_from_meta_json(meta_json: str) -> str | None:
+    try:
+        payload = json.loads(meta_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    prompt = payload.get("last_prompt")
+    if not isinstance(prompt, str):
+        return None
+    normalized = prompt.strip()
+    if not normalized:
+        return None
+    return normalized

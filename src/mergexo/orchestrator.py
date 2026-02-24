@@ -56,6 +56,13 @@ from mergexo.models import (
     WorkResult,
 )
 from mergexo.observability import log_event, logging_repo_context
+from mergexo.prompts import (
+    build_bugfix_prompt,
+    build_design_prompt,
+    build_feedback_prompt,
+    build_implementation_prompt,
+    build_small_job_prompt,
+)
 from mergexo.shell import CommandError, run
 from mergexo.state import (
     AgentRunFailureClass,
@@ -1967,6 +1974,14 @@ class Phase1Orchestrator:
             issue_number=issue.number,
             branch=branch,
         )
+        run_id = self._active_run_id_for_issue(issue.number)
+        design_prompt = build_design_prompt(
+            issue=issue,
+            repo_full_name=self._state_repo_full_name(),
+            design_doc_path=design_relpath,
+            default_branch=self._repo.default_branch,
+        )
+        self._record_run_prompt(run_id, design_prompt)
         start_result = self._agent.start_design_from_issue(
             issue=issue,
             repo_full_name=self._state_repo_full_name(),
@@ -2054,6 +2069,8 @@ class Phase1Orchestrator:
         coding_guidelines_path = self._coding_guidelines_path_for_checkout(
             checkout_path=checkout_path
         )
+        repo_full_name = self._state_repo_full_name()
+        run_id = self._active_run_id_for_issue(issue.number)
 
         flow_label: str
         direct_turn: Callable[[Issue], DirectStartResult]
@@ -2061,9 +2078,16 @@ class Phase1Orchestrator:
             flow_label = "bugfix"
 
             def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
+                prompt = build_bugfix_prompt(
+                    issue=agent_issue,
+                    repo_full_name=repo_full_name,
+                    default_branch=self._repo.default_branch,
+                    coding_guidelines_path=coding_guidelines_path,
+                )
+                self._record_run_prompt(run_id, prompt)
                 return self._agent.start_bugfix_from_issue(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                     cwd=checkout_path,
@@ -2074,9 +2098,16 @@ class Phase1Orchestrator:
             flow_label = "small-job"
 
             def run_direct_turn(agent_issue: Issue) -> DirectStartResult:
+                prompt = build_small_job_prompt(
+                    issue=agent_issue,
+                    repo_full_name=repo_full_name,
+                    default_branch=self._repo.default_branch,
+                    coding_guidelines_path=coding_guidelines_path,
+                )
+                self._record_run_prompt(run_id, prompt)
                 return self._agent.start_small_job_from_issue(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                     cwd=checkout_path,
@@ -2201,11 +2232,24 @@ class Phase1Orchestrator:
             coding_guidelines_path = self._coding_guidelines_path_for_checkout(
                 checkout_path=lease.path
             )
+            repo_full_name = self._state_repo_full_name()
+            run_id = self._active_run_id_for_issue(issue.number)
 
             def run_implementation_turn(agent_issue: Issue) -> DirectStartResult:
+                prompt = build_implementation_prompt(
+                    issue=agent_issue,
+                    repo_full_name=repo_full_name,
+                    default_branch=self._repo.default_branch,
+                    coding_guidelines_path=coding_guidelines_path,
+                    design_doc_path=design_relpath,
+                    design_doc_markdown=design_doc_markdown,
+                    design_pr_number=candidate.design_pr_number,
+                    design_pr_url=candidate.design_pr_url,
+                )
+                self._record_run_prompt(run_id, prompt)
                 return self._agent.start_implementation_from_design(
                     issue=agent_issue,
-                    repo_full_name=self._state_repo_full_name(),
+                    repo_full_name=repo_full_name,
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                     design_doc_path=design_relpath,
@@ -2329,6 +2373,32 @@ class Phase1Orchestrator:
     def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> str:
         with logging_repo_context(self._repo.full_name):
             return self._process_feedback_turn(tracked)
+
+    def _active_run_id_for_issue(self, issue_number: int) -> str | None:
+        for _ in range(20):
+            with self._running_lock:
+                metadata = self._running_issue_metadata.get(issue_number)
+                if metadata is not None:
+                    return metadata.run_id
+            time.sleep(0.01)
+        return None
+
+    def _active_run_id_for_pr(self, pr_number: int) -> str | None:
+        for _ in range(20):
+            with self._running_lock:
+                feedback = self._running_feedback.get(pr_number)
+                if feedback is not None:
+                    return feedback.run_id
+            time.sleep(0.01)
+        return None
+
+    def _record_run_prompt(self, run_id: str | None, prompt: str) -> None:
+        if run_id is None:
+            return
+        self._state.update_agent_run_meta(
+            run_id=run_id,
+            meta_json=json.dumps({"last_prompt": prompt}, sort_keys=True),
+        )
 
     def _save_agent_session_if_present(
         self, *, issue_number: int, session: AgentSession | None
@@ -2853,6 +2923,7 @@ class Phase1Orchestrator:
                 slot=lease.slot,
                 branch=tracked.branch,
             )
+            run_id = self._active_run_id_for_pr(tracked.pr_number)
             pr = self._github.get_pull_request(tracked.pr_number)
             if pr.merged:
                 self._state.mark_pr_status(
@@ -3060,6 +3131,8 @@ class Phase1Orchestrator:
                 changed_files=changed_files,
             )
             turn_start_head = pr.head_sha
+            feedback_prompt = build_feedback_prompt(turn=turn)
+            self._record_run_prompt(run_id, feedback_prompt)
 
             feedback_outcome = self._run_feedback_agent_with_git_ops(
                 tracked=tracked,

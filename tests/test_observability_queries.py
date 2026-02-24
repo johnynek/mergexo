@@ -95,6 +95,7 @@ def _seed_state(store: StateStore) -> None:
         pr_number=None,
         flow="small_job",
         branch="agent/small/5",
+        meta_json='{"last_prompt":"Active run prompt"}',
         started_at=_iso(now - timedelta(minutes=2)),
         repo_full_name="o/repo-a",
     )
@@ -171,6 +172,7 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert active_rows[0].run_id == "run-active-a"
     assert active_rows[0].issue_number == 5
     assert active_rows[0].elapsed_seconds >= 0
+    assert active_rows[0].prompt == "Active run prompt"
 
     tracked_rows = oq.load_tracked_and_blocked(db_path, limit=20)
     assert len(tracked_rows) == 3
@@ -215,18 +217,18 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert len(paged_outcomes) == 1
 
     metrics = oq.load_metrics(db_path, window="24h")
-    assert metrics.overall.terminal_count == 3
+    assert metrics.overall.terminal_count == 2
     assert metrics.overall.failed_count == 1
-    assert 0.3 < metrics.overall.failure_rate < 0.4
-    assert {item.repo_full_name for item in metrics.per_repo} == {"o/repo-a", "o/repo-b"}
+    assert metrics.overall.failure_rate == 0.5
+    assert {item.repo_full_name for item in metrics.per_repo} == {"o/repo-a"}
 
     repo_a_metrics = oq.load_metrics(db_path, repo_filter="o/repo-a", window="24h")
     assert repo_a_metrics.overall.terminal_count == 2
     assert repo_a_metrics.overall.failed_count == 1
     assert repo_a_metrics.overall.failure_rate == 0.5
 
-    assert oq.load_metrics(db_path, window="1h").overall.terminal_count == 3
-    assert oq.load_metrics(db_path, window="30d").overall.terminal_count == 4
+    assert oq.load_metrics(db_path, window="1h").overall.terminal_count == 2
+    assert oq.load_metrics(db_path, window="30d").overall.terminal_count == 3
 
 
 def test_observability_queries_empty_state(tmp_path: Path) -> None:
@@ -301,6 +303,12 @@ def test_observability_query_validation_paths(tmp_path: Path) -> None:
     assert oq._as_optional_float(1.5, "f") == 1.5
     with pytest.raises(RuntimeError, match="Invalid f"):
         oq._as_optional_float("x", "f")
+    assert oq._prompt_from_meta_json('{"last_prompt":"hello"}') == "hello"
+    assert oq._prompt_from_meta_json('{"last_prompt":"   hello   "}') == "hello"
+    assert oq._prompt_from_meta_json('{"last_prompt":"   "}') is None
+    assert oq._prompt_from_meta_json('{"other":"x"}') is None
+    assert oq._prompt_from_meta_json("[]") is None
+    assert oq._prompt_from_meta_json("not-json") is None
 
     metric = oq._build_metric(
         repo_full_name="all",

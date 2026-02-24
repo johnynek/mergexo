@@ -44,6 +44,7 @@ def test_observability_tui_helper_functions() -> None:
         branch="agent/design/7",
         started_at="2026-02-24T00:00:00.000Z",
         elapsed_seconds=12.0,
+        prompt="Prompt for active run",
     )
     tracked_pr = TrackedOrBlockedRow(
         repo_full_name="o/repo-a",
@@ -90,6 +91,8 @@ def test_observability_tui_helper_functions() -> None:
 
     active_context = tui._active_row_context(active)
     assert "Issue: 7" in active_context
+    assert "Last Prompt:" in active_context
+    assert "Prompt for active run" in active_context
     tracked_context = tui._tracked_row_context(tracked_pr)
     assert "Repo URL: https://github.com/o/repo-a" in tracked_context
     assert "Blocked Reason:" in tracked_context
@@ -371,6 +374,7 @@ def test_observability_app_refresh_and_keybindings(
             branch="agent/design/7",
             started_at="2026-02-24T00:00:00.000Z",
             elapsed_seconds=12.0,
+            prompt="Current active prompt",
         ),
     )
     tracked_rows = (
@@ -473,6 +477,7 @@ def test_observability_app_refresh_and_keybindings(
             await _pilot.press("enter")
             await _pilot.pause()
             assert shown_details[-1][0] == "Issue #7 Context"
+            assert "Current active prompt" in shown_details[-1][1]
             active.move_cursor(row=0, column=2, animate=False)
             await _pilot.press("enter")
             await _pilot.pause()
