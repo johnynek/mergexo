@@ -1123,6 +1123,7 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     assert result.pr_number == 101
     assert github.created_prs
     assert "Refs #7" in github.created_prs[0][3]
+    assert "Source issue:" not in github.created_prs[0][3]
     assert github.comments == [
         (7, "MergeXO assigned an agent and started design work for issue #7."),
         (7, "Opened design PR: https://example/pr/101"),
@@ -1179,7 +1180,7 @@ def test_process_issue_bugfix_flow_happy_path(tmp_path: Path) -> None:
     assert git.commit_calls[-1][1] == "fix: resolve issue"
     assert github.created_prs[0][0] == "Fix bug"
     assert "Fixes #7" in github.created_prs[0][3]
-    assert f"Source issue: {issue.html_url}" in github.created_prs[0][3]
+    assert "Source issue:" not in github.created_prs[0][3]
     assert github.comments == [
         (7, "MergeXO assigned an agent and started bugfix PR work for issue #7."),
         (7, "Opened bugfix PR: https://example/pr/101"),
@@ -1422,6 +1423,7 @@ def test_process_issue_small_job_flow_uses_default_commit_message(tmp_path: Path
     assert len(agent.small_job_calls) == 1
     assert git.commit_calls[-1][1] == "feat: implement issue #7"
     assert "Fixes #7" in github.created_prs[0][3]
+    assert "Source issue:" not in github.created_prs[0][3]
     assert github.comments == [
         (7, "MergeXO assigned an agent and started small-job PR work for issue #7."),
         (7, "Opened small-job PR: https://example/pr/101"),
@@ -1593,6 +1595,7 @@ def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
         in github.created_prs[0][3]
     )
     assert "Design source PR: https://example/pr/44" in github.created_prs[0][3]
+    assert "Source issue:" not in github.created_prs[0][3]
     assert github.comments == [
         (7, "MergeXO assigned an agent and started implementation PR work for issue #7."),
         (7, "Opened implementation PR: https://example/pr/101"),
@@ -2482,6 +2485,10 @@ def test_recover_missing_pr_branch_tolerates_issue_comment_failure(tmp_path: Pat
 def test_recovery_payload_covers_impl_and_bugfix_branches() -> None:
     issue = _issue(number=11, title="Handle edge case")
 
+    design_title, design_body, design_flow = _recovery_pr_payload_for_issue(
+        issue=issue,
+        branch="agent/design/11-handle-edge-case",
+    )
     impl_title, impl_body, impl_flow = _recovery_pr_payload_for_issue(
         issue=issue,
         branch="agent/impl/11-handle-edge-case",
@@ -2491,14 +2498,25 @@ def test_recovery_payload_covers_impl_and_bugfix_branches() -> None:
         branch="agent/bugfix/11-handle-edge-case",
     )
 
+    assert design_flow == "design"
+    assert design_title.startswith("Design doc for #11:")
+    assert "Recovered design PR from a previously pushed branch." in design_body
+    assert "Refs #11" in design_body
+    assert "Source issue:" not in design_body
+
     assert impl_flow == "implementation"
     assert impl_title.startswith("Implementation for #11:")
     assert "Recovered implementation PR from a previously pushed branch." in impl_body
+    assert "Fixes #11" in impl_body
+    assert "Source issue:" not in impl_body
 
     assert bug_flow == "bugfix"
     assert bug_title.startswith("Bugfix for #11:")
     assert "Recovered bugfix PR from a previously pushed branch." in bug_body
+    assert "Fixes #11" in bug_body
+    assert "Source issue:" not in bug_body
 
+    assert _flow_label_from_branch("agent/design/11-handle-edge-case") == "design"
     assert _flow_label_from_branch("agent/impl/11-handle-edge-case") == "implementation"
     assert _flow_label_from_branch("agent/bugfix/11-handle-edge-case") == "bugfix"
 
