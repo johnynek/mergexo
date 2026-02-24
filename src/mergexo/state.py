@@ -519,6 +519,105 @@ class StateStore:
                 )
         return cursor.rowcount
 
+    def reconcile_stale_running_issue_runs_with_followups(
+        self, *, repo_full_name: str | None = None
+    ) -> int:
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                cursor = conn.execute(
+                    """
+                    UPDATE issue_runs AS i
+                    SET
+                        status = 'awaiting_issue_followup',
+                        branch = COALESCE(
+                            (
+                                SELECT p.branch
+                                FROM pre_pr_followup_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                            ),
+                            i.branch
+                        ),
+                        pr_number = NULL,
+                        pr_url = NULL,
+                        error = COALESCE(
+                            (
+                                SELECT p.waiting_reason
+                                FROM pre_pr_followup_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                            ),
+                            i.error,
+                            'stale_running_issue_reconciled_to_pre_pr_followup'
+                        ),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE i.status = 'running'
+                      AND i.pr_number IS NULL
+                      AND EXISTS(
+                            SELECT 1
+                            FROM pre_pr_followup_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                        )
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.repo_full_name = i.repo_full_name
+                              AND a.issue_number = i.issue_number
+                              AND a.finished_at IS NULL
+                        )
+                    """
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE issue_runs AS i
+                    SET
+                        status = 'awaiting_issue_followup',
+                        branch = COALESCE(
+                            (
+                                SELECT p.branch
+                                FROM pre_pr_followup_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                            ),
+                            i.branch
+                        ),
+                        pr_number = NULL,
+                        pr_url = NULL,
+                        error = COALESCE(
+                            (
+                                SELECT p.waiting_reason
+                                FROM pre_pr_followup_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                            ),
+                            i.error,
+                            'stale_running_issue_reconciled_to_pre_pr_followup'
+                        ),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE i.status = 'running'
+                      AND i.pr_number IS NULL
+                      AND i.repo_full_name = ?
+                      AND EXISTS(
+                            SELECT 1
+                            FROM pre_pr_followup_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                        )
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.repo_full_name = i.repo_full_name
+                              AND a.issue_number = i.issue_number
+                              AND a.finished_at IS NULL
+                        )
+                    """,
+                    (repo_key,),
+                )
+        return cursor.rowcount
+
     def prune_observability_history(
         self,
         *,

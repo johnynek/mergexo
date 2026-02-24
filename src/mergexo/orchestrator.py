@@ -403,6 +403,16 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
                 reconciled_count=reconciled_count,
             )
+        reconciled_issue_runs_count = self._state.reconcile_stale_running_issue_runs_with_followups(
+            repo_full_name=self._state_repo_full_name()
+        )
+        if reconciled_issue_runs_count > 0:
+            log_event(
+                LOGGER,
+                "stale_issue_runs_reconciled_to_followup",
+                repo_full_name=self._state_repo_full_name(),
+                reconciled_count=reconciled_issue_runs_count,
+            )
         self._state.prune_observability_history(
             retention_days=self._config.runtime.observability_history_retention_days,
             repo_full_name=self._state_repo_full_name(),
