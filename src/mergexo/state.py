@@ -222,11 +222,20 @@ class StateStore:
                     pr_number INTEGER,
                     pr_url TEXT,
                     error TEXT,
+                    active_run_id TEXT NULL,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, issue_number)
                 )
                 """
             )
+            issue_run_columns = _table_columns(conn, "issue_runs")
+            if "active_run_id" not in issue_run_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_runs
+                    ADD COLUMN active_run_id TEXT NULL
+                    """
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pre_pr_followup_state (
@@ -476,6 +485,98 @@ class StateStore:
                 ).fetchone()
         return row is None
 
+    def _insert_agent_run_start(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        run_id: str,
+        repo_full_name: str,
+        run_kind: AgentRunKind,
+        issue_number: int,
+        pr_number: int | None,
+        flow: str | None,
+        branch: str | None,
+        started_at: str | None,
+        meta_json: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO agent_run_history(
+                run_id,
+                repo_full_name,
+                run_kind,
+                issue_number,
+                pr_number,
+                flow,
+                branch,
+                started_at,
+                meta_json
+            )
+            VALUES(
+                ?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?
+            )
+            """,
+            (
+                run_id,
+                repo_full_name,
+                run_kind,
+                issue_number,
+                pr_number,
+                flow,
+                branch,
+                started_at,
+                meta_json,
+            ),
+        )
+
+    def record_issue_run_start(
+        self,
+        *,
+        run_kind: Literal["issue_flow", "implementation_flow", "pre_pr_followup"],
+        issue_number: int,
+        flow: str,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        run_key = run_id if run_id is not None else uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            self._insert_agent_run_start(
+                conn=conn,
+                run_id=run_key,
+                repo_full_name=repo_key,
+                run_kind=run_kind,
+                issue_number=issue_number,
+                pr_number=None,
+                flow=flow,
+                branch=branch,
+                started_at=started_at,
+                meta_json=meta_json,
+            )
+            conn.execute(
+                """
+                INSERT INTO issue_runs(
+                    repo_full_name,
+                    issue_number,
+                    status,
+                    branch,
+                    active_run_id
+                )
+                VALUES(?, ?, 'running', ?, ?)
+                ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
+                    status='running',
+                    branch=COALESCE(excluded.branch, issue_runs.branch),
+                    error=NULL,
+                    active_run_id=excluded.active_run_id,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, issue_number, branch, run_key),
+            )
+        return run_key
+
     def record_agent_run_start(
         self,
         *,
@@ -492,34 +593,17 @@ class StateStore:
         repo_key = _normalize_repo_full_name(repo_full_name)
         run_key = run_id if run_id is not None else uuid.uuid4().hex
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO agent_run_history(
-                    run_id,
-                    repo_full_name,
-                    run_kind,
-                    issue_number,
-                    pr_number,
-                    flow,
-                    branch,
-                    started_at,
-                    meta_json
-                )
-                VALUES(
-                    ?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?
-                )
-                """,
-                (
-                    run_key,
-                    repo_key,
-                    run_kind,
-                    issue_number,
-                    pr_number,
-                    flow,
-                    branch,
-                    started_at,
-                    meta_json,
-                ),
+            self._insert_agent_run_start(
+                conn=conn,
+                run_id=run_key,
+                repo_full_name=repo_key,
+                run_kind=run_kind,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                flow=flow,
+                branch=branch,
+                started_at=started_at,
+                meta_json=meta_json,
             )
         return run_key
 
@@ -589,6 +673,20 @@ class StateStore:
                     WHERE finished_at IS NULL
                     """
                 )
+                conn.execute(
+                    """
+                    UPDATE issue_runs
+                    SET active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE active_run_id IS NOT NULL
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.run_id = issue_runs.active_run_id
+                              AND a.finished_at IS NULL
+                        )
+                    """
+                )
             else:
                 cursor = conn.execute(
                     """
@@ -609,12 +707,29 @@ class StateStore:
                     """,
                     (repo_key,),
                 )
+                conn.execute(
+                    """
+                    UPDATE issue_runs
+                    SET active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND active_run_id IS NOT NULL
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.run_id = issue_runs.active_run_id
+                              AND a.finished_at IS NULL
+                        )
+                    """,
+                    (repo_key,),
+                )
         return cursor.rowcount
 
     def reconcile_stale_running_issue_runs_with_followups(
         self, *, repo_full_name: str | None = None
     ) -> int:
         repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        reconciled_count = 0
         with self._lock, self._connect() as conn:
             if repo_key is None:
                 cursor = conn.execute(
@@ -643,6 +758,7 @@ class StateStore:
                             i.error,
                             'stale_running_issue_reconciled_to_pre_pr_followup'
                         ),
+                        active_run_id = NULL,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE i.status = 'running'
                       AND i.pr_number IS NULL
@@ -661,6 +777,91 @@ class StateStore:
                         )
                     """
                 )
+                reconciled_count += max(cursor.rowcount, 0)
+                cursor = conn.execute(
+                    """
+                    UPDATE issue_runs AS i
+                    SET
+                        status = (
+                            SELECT p.status
+                            FROM pr_feedback_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                            ORDER BY p.updated_at DESC, p.pr_number DESC
+                            LIMIT 1
+                        ),
+                        branch = COALESCE(
+                            (
+                                SELECT p.branch
+                                FROM pr_feedback_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                                ORDER BY p.updated_at DESC, p.pr_number DESC
+                                LIMIT 1
+                            ),
+                            i.branch
+                        ),
+                        pr_number = COALESCE(
+                            (
+                                SELECT p.pr_number
+                                FROM pr_feedback_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                                ORDER BY p.updated_at DESC, p.pr_number DESC
+                                LIMIT 1
+                            ),
+                            i.pr_number
+                        ),
+                        error = CASE
+                            WHEN (
+                                SELECT p.status
+                                FROM pr_feedback_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                                ORDER BY p.updated_at DESC, p.pr_number DESC
+                                LIMIT 1
+                            ) = 'blocked'
+                            THEN COALESCE(i.error, 'stale_running_issue_reconciled_from_pr_state')
+                            ELSE NULL
+                        END,
+                        active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE i.status = 'running'
+                      AND EXISTS(
+                            SELECT 1
+                            FROM pr_feedback_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                        )
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.repo_full_name = i.repo_full_name
+                              AND a.issue_number = i.issue_number
+                              AND a.finished_at IS NULL
+                        )
+                    """
+                )
+                reconciled_count += max(cursor.rowcount, 0)
+                cursor = conn.execute(
+                    """
+                    UPDATE issue_runs AS i
+                    SET
+                        status = 'failed',
+                        error = COALESCE(i.error, 'stale_running_issue_without_active_run'),
+                        active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE i.status = 'running'
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.repo_full_name = i.repo_full_name
+                              AND a.issue_number = i.issue_number
+                              AND a.finished_at IS NULL
+                        )
+                    """
+                )
+                reconciled_count += max(cursor.rowcount, 0)
             else:
                 cursor = conn.execute(
                     """
@@ -688,6 +889,7 @@ class StateStore:
                             i.error,
                             'stale_running_issue_reconciled_to_pre_pr_followup'
                         ),
+                        active_run_id = NULL,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE i.status = 'running'
                       AND i.pr_number IS NULL
@@ -708,7 +910,96 @@ class StateStore:
                     """,
                     (repo_key,),
                 )
-        return cursor.rowcount
+                reconciled_count += max(cursor.rowcount, 0)
+                cursor = conn.execute(
+                    """
+                    UPDATE issue_runs AS i
+                    SET
+                        status = (
+                            SELECT p.status
+                            FROM pr_feedback_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                            ORDER BY p.updated_at DESC, p.pr_number DESC
+                            LIMIT 1
+                        ),
+                        branch = COALESCE(
+                            (
+                                SELECT p.branch
+                                FROM pr_feedback_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                                ORDER BY p.updated_at DESC, p.pr_number DESC
+                                LIMIT 1
+                            ),
+                            i.branch
+                        ),
+                        pr_number = COALESCE(
+                            (
+                                SELECT p.pr_number
+                                FROM pr_feedback_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                                ORDER BY p.updated_at DESC, p.pr_number DESC
+                                LIMIT 1
+                            ),
+                            i.pr_number
+                        ),
+                        error = CASE
+                            WHEN (
+                                SELECT p.status
+                                FROM pr_feedback_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                                ORDER BY p.updated_at DESC, p.pr_number DESC
+                                LIMIT 1
+                            ) = 'blocked'
+                            THEN COALESCE(i.error, 'stale_running_issue_reconciled_from_pr_state')
+                            ELSE NULL
+                        END,
+                        active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE i.status = 'running'
+                      AND i.repo_full_name = ?
+                      AND EXISTS(
+                            SELECT 1
+                            FROM pr_feedback_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                        )
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.repo_full_name = i.repo_full_name
+                              AND a.issue_number = i.issue_number
+                              AND a.finished_at IS NULL
+                        )
+                    """,
+                    (repo_key,),
+                )
+                reconciled_count += max(cursor.rowcount, 0)
+                cursor = conn.execute(
+                    """
+                    UPDATE issue_runs AS i
+                    SET
+                        status = 'failed',
+                        error = COALESCE(i.error, 'stale_running_issue_without_active_run'),
+                        active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE i.status = 'running'
+                      AND i.repo_full_name = ?
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.repo_full_name = i.repo_full_name
+                              AND a.issue_number = i.issue_number
+                              AND a.finished_at IS NULL
+                        )
+                    """,
+                    (repo_key,),
+                )
+                reconciled_count += max(cursor.rowcount, 0)
+        return reconciled_count
 
     def prune_observability_history(
         self,
@@ -837,6 +1128,7 @@ class StateStore:
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     status='running',
                     error=NULL,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number),
@@ -875,6 +1167,7 @@ class StateStore:
                     pr_number=excluded.pr_number,
                     pr_url=excluded.pr_url,
                     error=NULL,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, branch, pr_number, pr_url),
@@ -927,6 +1220,7 @@ class StateStore:
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     status='failed',
                     error=excluded.error,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, error),
@@ -970,6 +1264,7 @@ class StateStore:
                     pr_number=NULL,
                     pr_url=NULL,
                     error=excluded.error,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, branch, waiting_reason),
@@ -2273,6 +2568,7 @@ class StateStore:
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     status='awaiting_feedback',
                     error=NULL,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 issue_keys,
@@ -2331,6 +2627,7 @@ class StateStore:
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     status=excluded.status,
                     error=excluded.error,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, status, error),
@@ -2504,6 +2801,7 @@ class StateStore:
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     status='awaiting_feedback',
                     error=NULL,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number),

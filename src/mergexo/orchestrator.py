@@ -560,11 +560,9 @@ class Phase1Orchestrator:
                 consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
                     issue.number
                 )
-                self._state.mark_running(issue.number, repo_full_name=self._state_repo_full_name())
-                run_id = self._state.record_agent_run_start(
+                run_id = self._state.record_issue_run_start(
                     run_kind="issue_flow",
                     issue_number=issue.number,
-                    pr_number=None,
                     flow=flow,
                     branch=branch,
                     meta_json=_DEFAULT_RUN_META_JSON,
@@ -645,13 +643,9 @@ class Phase1Orchestrator:
                 consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
                     candidate.issue_number
                 )
-                self._state.mark_running(
-                    candidate.issue_number, repo_full_name=self._state_repo_full_name()
-                )
-                run_id = self._state.record_agent_run_start(
+                run_id = self._state.record_issue_run_start(
                     run_kind="implementation_flow",
                     issue_number=candidate.issue_number,
-                    pr_number=None,
                     flow="implementation",
                     branch=branch,
                     meta_json=_DEFAULT_RUN_META_JSON,
@@ -847,14 +841,9 @@ class Phase1Orchestrator:
                     candidate=candidate,
                 )
 
-                self._state.mark_running(
-                    followup.issue_number,
-                    repo_full_name=self._state_repo_full_name(),
-                )
-                run_id = self._state.record_agent_run_start(
+                run_id = self._state.record_issue_run_start(
                     run_kind="pre_pr_followup",
                     issue_number=followup.issue_number,
-                    pr_number=None,
                     flow=followup.flow,
                     branch=branch,
                     meta_json=_DEFAULT_RUN_META_JSON,
