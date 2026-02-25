@@ -12,7 +12,15 @@ MergeXO is a local-first Python orchestrator that watches labeled issues and rou
 
 ## Quickstart Session (Start Here)
 
-This is the fastest way to get a working local service + TUI session.
+The best way to start now is to clone this repo, open `codex`, and ask it to read `README.md` and the codebase and set up MergeXO for your repos. It should explain options and ask which repos to manage, which users can send commands, and restart preferences.
+
+Example prompt:
+
+> "Read README.md and the codebase. Propose and set up a MergeXO config for my repos, explain key options, and ask me which repos to manage, which users can send commands, and restart preferences."
+
+Today MergeXO supports GitHub and Codex. We are open to adding support for other code hosts and coding agents.
+
+If you want to do it old school, here is how it works:
 
 ### 1. Requirements
 
