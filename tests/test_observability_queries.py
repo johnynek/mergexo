@@ -418,3 +418,55 @@ def test_load_tracked_and_blocked_sorted_by_updated_desc(tmp_path: Path) -> None
         "2026-02-24T00:00:02.000Z",
         "2026-02-24T00:00:01.000Z",
     ]
+
+
+def test_load_tracked_and_blocked_excludes_active_feedback_turn_prs(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    now = datetime.now(timezone.utc)
+
+    store.mark_completed(
+        21,
+        "agent/design/21",
+        2121,
+        "https://example/pr/2121",
+        repo_full_name="o/repo-a",
+    )
+    store.record_agent_run_start(
+        run_id="run-feedback-active",
+        run_kind="feedback_turn",
+        issue_number=21,
+        pr_number=2121,
+        flow=None,
+        branch="agent/design/21",
+        meta_json='{"codex_active":true,"codex_mode":"respond_to_review"}',
+        started_at=_iso(now - timedelta(minutes=2)),
+        repo_full_name="o/repo-a",
+    )
+
+    store.mark_completed(
+        22,
+        "agent/design/22",
+        2222,
+        "https://example/pr/2222",
+        repo_full_name="o/repo-a",
+    )
+    store.record_agent_run_start(
+        run_id="run-feedback-inactive",
+        run_kind="feedback_turn",
+        issue_number=22,
+        pr_number=2222,
+        flow=None,
+        branch="agent/design/22",
+        meta_json='{"codex_active":false}',
+        started_at=_iso(now - timedelta(minutes=1)),
+        repo_full_name="o/repo-a",
+    )
+
+    active_rows = oq.load_active_agents(db_path, limit=20)
+    assert {row.pr_number for row in active_rows} == {2121}
+
+    tracked_rows = oq.load_tracked_and_blocked(db_path, limit=20)
+    tracked_pr_numbers = {row.pr_number for row in tracked_rows if row.pr_number is not None}
+    assert 2121 not in tracked_pr_numbers
+    assert 2222 in tracked_pr_numbers
