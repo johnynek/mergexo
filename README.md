@@ -2,19 +2,15 @@
 
 MergeXO is a local-first Python orchestrator that watches labeled issues and routes each issue into one startup flow:
 
-- `design_doc`: generate a design-doc PR
-- `bugfix`: generate a direct bugfix PR
-- `small_job`: generate a direct scoped-change PR
+- `design_doc`: open a design-doc PR first, then implementation PR work after merge
+- `bugfix`: open a direct bugfix PR
+- `small_job`: open a direct scoped-change PR
 
-This repository currently implements Phase 1 of the MVP:
+## Quickstart Session (Start Here)
 
-- Configure one or more target repositories, worker count `N`, base state directory, poll interval, and flow labels.
-- Initialize a shared mirror plus `N` checkout slots.
-- Poll GitHub issues with configured trigger labels using `gh api`.
-- Farm each new issue to an available worker slot.
-- Run the flow-specific Codex prompt and open a linked PR.
+This is the fastest way to get a working local service + TUI session.
 
-## Requirements
+### 1. Requirements
 
 - Python 3.11+
 - `uv`
@@ -22,188 +18,232 @@ This repository currently implements Phase 1 of the MVP:
 - `gh` authenticated for the target repository
 - `codex` authenticated locally
 
-## Quickstart
+### 2. Create `mergexo.toml`
 
-1. Copy and edit config:
+MergeXO defaults to `mergexo.toml`. If you prefer a different filename (for example `mergexo.conf`), pass `--config <file>`.
 
-```bash
-cp mergexo.toml.example mergexo.toml
+Recommended minimal starting config:
+
+```toml
+[runtime]
+base_dir = "~/.local/share/mergexo"
+worker_count = 2
+poll_interval_seconds = 60
+
+[repo.mergexo]
+owner = "johnynek"
+# name omitted => "mergexo"
+default_branch = "main"
+coding_guidelines_path = "docs/python_style.md"
+required_tests = "scripts/test.sh"
+
+[codex]
+enabled = true
+extra_args = []
 ```
 
-Set allowlists per repo with `repo.allowed_users` (or use `[auth].allowed_users` only as a
-legacy single-repo fallback). In multi-repo configs, each `[repo.<id>]` can set its own
-allowlist; if omitted it defaults to `[owner]`.
+Why this is minimal:
 
-Agent settings under `[codex]` are global defaults. To override per repo, set
-`[codex.repo.<repo_id>]` and only include keys that should differ (all omitted keys inherit
-from `[codex]`).
+- required runtime keys are only `base_dir`, `worker_count`, `poll_interval_seconds`
+- required repo keys are `owner` and `coding_guidelines_path` (plus repo table id)
+- everything else can use defaults
 
-2. Sync environment:
+If issue authors are not the repo owner, set `allowed_users = ["..."]` under each repo table.
+
+### 3. Sync dependencies
 
 ```bash
 uv sync
 ```
 
-3. Initialize local state + mirror + checkout slots:
+### 4. Initialize local state
 
 ```bash
-uv run mergexo init --config mergexo.toml
+uv run mergexo init
 ```
 
-4. Run orchestrator once (single poll + wait for active workers):
+### 5. Start with no command options (recommended)
 
 ```bash
-uv run mergexo run --config mergexo.toml --once
+uv run mergexo
 ```
 
-Verbose mode (structured stderr runtime events):
+This starts default `console` mode, which runs:
 
-```bash
-uv run mergexo run --config mergexo.toml --once --verbose
-uv run mergexo run --config mergexo.toml --once --verbose high
-```
+- service loop
+- interactive observability TUI
+- file logging under `<runtime.base_dir>/logs/YYYY-MM-DD.log`
 
-5. Run continuously:
+This is the recommended first run because it gives you both orchestration and visibility immediately.
 
-```bash
-uv run mergexo run --config mergexo.toml
-```
+### 6. Useful first checks
 
-Run the default console mode (service + TUI + file logging):
+- open issues with your configured trigger labels
+- verify status comments appear on issues
+- watch active/blocked work in the TUI
 
-```bash
-uv run mergexo --config mergexo.toml
-```
+## Expected Workflows
 
-Equivalent explicit command:
+### Flow Selection Rules
 
-```bash
-uv run mergexo console --config mergexo.toml
-```
+MergeXO reads these repo labels:
 
-For non-interactive environments and GitHub-operated restart/update workflows, run supervisor mode instead:
+- `trigger_label` (default design flow)
+- `bugfix_label` (direct bugfix)
+- `small_job_label` (direct small job)
 
-```bash
-uv run mergexo service --config mergexo.toml
-```
+If multiple labels are present, precedence is deterministic:
 
-6. Run the observability dashboard:
+1. `bugfix_label`
+2. `small_job_label`
+3. `trigger_label`
 
-```bash
-uv run mergexo top --config mergexo.toml
-```
+### Example User Story
 
-The dashboard is read-only and pulls directly from `state.db`. Keybindings:
+Assume one repo with labels:
+
+- `agent:design`
+- `agent:bugfix`
+- `agent:small-job`
+
+1. Design flow issue:
+   - Issue `#120` has `agent:design`.
+   - MergeXO opens a status comment, creates `agent/design/120-...`, commits design doc to `docs/design/120-...md`, and opens a design PR with `Refs #120`.
+   - Reviewers add comments and request changes on the design PR; MergeXO responds to that PR feedback and updates the PR until it is ready to merge.
+   - After that design PR is merged, MergeXO automatically treats it as an implementation candidate and opens a follow-up implementation PR.
+
+2. Bugfix flow issue:
+   - Issue `#121` has `agent:bugfix`.
+   - MergeXO creates `agent/bugfix/121-...`, tries to reproduce the reported bug, and then applies a fix with regression tests.
+   - The user reviews both the tests and the bug fix in the PR.
+   - PR body uses `Fixes #121`.
+   - If `repo.test_file_regex` is set, at least one staged file must match it before PR creation.
+
+3. Small-job flow issue:
+   - Issue `#122` has `agent:small-job`.
+   - MergeXO creates `agent/small/122-...` and runs scoped direct changes.
+   - PR body uses `Fixes #122`.
+
+For both direct flows, MergeXO asks the agent to follow `coding_guidelines_path` and runs `required_tests` before each push when configured.
+
+## Workflow Details
+
+### Observability Dashboard (`top` / `console`)
+
+The dashboard is read-only and pulls from `state.db`.
+
+Keybindings:
 
 - `r`: refresh now
 - `f`: cycle repo filter
 - `w`: cycle window (`1h`, `24h`, `7d`, `30d`)
 - `tab`: cycle focused panel
-- `enter`: open GitHub URL when focused on `Issue`, `PR`, or `Branch`; otherwise open a scrollable context dialog and refresh detail history
+- `enter`: open GitHub URL when focused on `Issue`, `PR`, or `Branch`; otherwise open detail dialog
 - `q`: quit
 
 Metrics definitions:
 
 - terminal sample set: finished runs with terminal status in `completed`, `failed`, `blocked`, `interrupted`
 - mean runtime: `AVG(duration_seconds)`
-- std-dev runtime: `sqrt(AVG(x^2) - AVG(x)^2)` (returns `0` when sample size < 2)
+- std-dev runtime: `sqrt(AVG(x^2) - AVG(x)^2)` (`0` when sample size < 2)
 - failure rate: `failed_count / terminal_count`
 
-Runtime settings for dashboard and retention:
+Related runtime settings:
 
 - `runtime.observability_refresh_seconds`
 - `runtime.observability_default_window`
 - `runtime.observability_row_limit`
 - `runtime.observability_history_retention_days`
 
-## Notes on polling
+### Polling and Logging
 
-Phase 1 uses slow polling (for example every 60 seconds). Webhooks can be added later for lower latency and lower API usage.
+- Phase 1 uses polling (for example every 60 seconds); webhooks can be added later.
+- `console` defaults to `--verbose low`.
+- `--verbose high` enables full event stream logging.
 
-`console` defaults to `--verbose low`, so it writes lifecycle logs to stderr and
-`<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
+`console` lifecycle logs are written to stderr and `<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
 
-Use `--verbose` on `init`, `run`, `service`, `top`, `feedback`, or `console` for high-signal lifecycle logs (`low` mode), or `--verbose high` for full event logs including poll internals.
+### Authentication Allowlist Behavior
 
-## State schema upgrade note
+MergeXO normalizes allowlist entries to lowercase and matches case-insensitively at runtime.
 
-Multi-repo support uses a repo-scoped state schema. Upgrading from older builds requires reinitializing the state DB:
+- Multi-repo (`[repo.<id>]`): set `allowed_users` in each repo table (default is `[owner]` when omitted).
+- Legacy single-repo (`[repo]`): `repo.allowed_users` is preferred; `[auth].allowed_users` is fallback.
+- If no allowlist is configured in legacy mode, default is `[owner]`.
 
-1. Stop MergeXO.
-2. Remove the previous `state.db`.
-3. Run `mergexo init`.
-4. Restart MergeXO.
+For users not in `allowed_users`, MergeXO ignores:
 
-## Source issue comment routing (before/after PR)
+- new issue intake
+- PR review comments in feedback loop
+- PR issue comments in feedback loop
 
-Enable issue-comment routing with:
+### Source Issue Comment Routing (Pre-PR and Post-PR)
+
+Enable with:
 
 - `runtime.enable_issue_comment_routing = true`
 
 Behavior:
 
 1. Before a PR exists:
-   - Recoverable pre-PR blocked outcomes move to `awaiting_issue_followup` instead of terminal `failed`.
-   - MergeXO checkpoints the blocked tree to the flow branch before cleanup and posts one status
-     comment with blocked reason, branch, commit SHA, tree link, and compare link.
-   - Reply on the source issue to unblock/resume.
-   - Comments are queued by comment id and consumed in order on the next retry turn.
+   - recoverable blocked outcomes move to `awaiting_issue_followup` instead of terminal `failed`
+   - MergeXO checkpoints the blocked tree to the flow branch before cleanup and posts one status comment with blocked reason, branch, commit SHA, tree link, and compare link
+   - reply on the source issue to unblock/resume
+   - comments are queued by comment id and consumed in order on the next retry turn
 2. While a retry worker is active:
-   - New source-issue comments are not lost; they remain queued for the following retry turn.
+   - new source-issue comments remain queued for the following retry turn
 3. Right before PR creation:
-   - MergeXO checks for newly queued source-issue comments.
-   - If any are pending, PR creation is deferred until those comments are processed.
+   - MergeXO checks for newly queued source-issue comments
+   - if any are pending, PR creation is deferred until those comments are processed
 4. After a PR exists (`awaiting_feedback` or PR-level `blocked`):
-   - Source-issue comments are no longer actioned.
-   - MergeXO posts a deterministic redirect reply that links the PR and instructs users to comment on the PR thread.
+   - source-issue comments are no longer actioned
+   - MergeXO posts a deterministic redirect reply that links the PR and instructs users to comment on the PR thread
 5. Legacy recovery after upgrade:
-   - Historical `failed` runs with no PR that match known pre-PR blocked signatures are adopted into `awaiting_issue_followup` automatically, so a new source-issue comment can resume work.
+   - historical `failed` runs with no PR that match known pre-PR blocked signatures are adopted into `awaiting_issue_followup`
 
 Recommended rollout:
 
-1. Leave the flag off by default.
-2. Enable on one repo and verify canary scenarios:
-   - blocked-before-PR then issue reply then retry;
-   - comment during active retry;
-   - issue comment after PR exists (redirect only).
-3. Expand once stable.
+1. leave the flag off by default
+2. enable on one repo and verify canary scenarios:
+   - blocked-before-PR then issue reply then retry
+   - comment during active retry
+   - issue comment after PR exists (redirect only)
+3. expand once stable
 
-## GitHub Actions feedback monitoring
+### GitHub Actions Feedback Monitoring
 
-Enable PR Actions monitoring with:
+Enable with:
 
 - `runtime.enable_pr_actions_monitoring = true`
 - optional `runtime.pr_actions_log_tail_lines = 500`
 
 Behavior:
 
-1. MergeXO scans tracked `awaiting_feedback` PRs and checks workflow runs for the current PR head SHA.
-2. If any run is still active, MergeXO only logs monitoring state and waits.
+1. MergeXO scans tracked `awaiting_feedback` PRs and checks workflow runs for current PR head SHAs.
+2. If any run is still active, MergeXO logs monitoring state and waits.
 3. When all runs are terminal and at least one run is non-green (anything except `success`, `neutral`, `skipped`), MergeXO enqueues deterministic `actions` feedback events keyed by run id + `updated_at`.
-4. On the next feedback turn, MergeXO revalidates those events against the current head/run state:
-   - stale events (run now green, run no longer on current head, or run updated) are auto-resolved;
-   - actionable events inject synthetic CI context into the agent turn, including failed action names and `last N log lines` tails for each failed action.
+4. On the next feedback turn, MergeXO revalidates those events against current head/run state:
+   - stale events (run now green, run no longer on current head, or run updated) are auto-resolved
+   - actionable events inject CI context into agent turn, including failed action names and `last N log lines` tails
 5. If no PR review/issue comments exist, CI context alone can trigger a feedback remediation turn.
 
 Notes:
 
-- This feature is currently GitHub Actions only.
-- Remote CI status does not replace required local pre-push checks; configured `required_tests` still gate pushes.
+- feature is currently GitHub Actions only
+- remote CI status does not replace local `required_tests` pre-push checks
 
-## GitHub operator commands
+### GitHub Operator Commands
 
-Enable GitHub operations with:
+Enable with:
 
 - `runtime.enable_github_operations = true`
 - `repo.operator_logins = ["<maintainer-login>", ...]`
-- optional `repo.operations_issue_number = <issue-number>` for global commands
-  (the issue does not need to stay open; MergeXO scans comments by issue number
-  and reads comments from open or closed issues)
+- optional `repo.operations_issue_number = <issue-number>`
 
-Supported comment commands:
+Supported commands:
 
-- `/mergexo unblock` (target PR defaults from a blocked PR thread)
-- `/mergexo unblock head_sha=<sha>` (same target resolution as above)
+- `/mergexo unblock`
+- `/mergexo unblock head_sha=<sha>`
 - `/mergexo unblock pr=<number> [head_sha=<sha>]`
 - `/mergexo restart`
 - `/mergexo restart mode=git_checkout|pypi`
@@ -211,90 +251,185 @@ Supported comment commands:
 
 Behavior notes:
 
-- Operator commands are processed only from blocked PR threads and the optional operations issue.
-- `pr=` is optional on PR threads: `/mergexo unblock` and `/mergexo unblock head_sha=...` target that PR.
-- `pr=` is required on the operations issue: `/mergexo unblock` without `pr=<number>` is rejected.
-- Every `/mergexo ...` command receives one deterministic reply comment with status and detail.
-- Restart automation requires `mergexo service`; `mergexo run` rejects restart commands.
-- `git_checkout` restart mode runs `git pull --ff-only` + `uv sync` before re-exec.
-- `pypi` mode is available only when configured (`restart_supported_modes` + `service_python`).
+- operator commands are processed only from blocked PR threads and the optional operations issue
+- `pr=` is optional on PR threads (`/mergexo unblock` can target that thread's PR)
+- `pr=` is required on operations issue comments
+- every `/mergexo ...` command receives one deterministic reply comment with status and detail
+- restart automation requires `mergexo service`; `mergexo run` rejects restart commands
+- `git_checkout` restart mode runs `git pull --ff-only` and `uv sync` before re-exec
+- `pypi` mode is available only when configured (`restart_supported_modes` + `service_python`)
 
 Unblock user story (`head_sha` override):
 
-1. PR `#101` is in `blocked` status because MergeXO detected a non-fast-forward head change, for example:
-   - previous expected head: `abc1234`
-   - current observed head after force-push/rewrite: `def5678`
-2. MergeXO will not continue feedback automation while the PR remains blocked.
-3. A maintainer verifies the canonical head to resume from:
-   - if no override is needed, comment `/mergexo unblock` on the blocked PR thread;
-   - if canonical head should be explicit, comment `/mergexo unblock head_sha=def5678` on the blocked PR thread;
-   - from the operations issue, use `/mergexo unblock pr=101` or `/mergexo unblock pr=101 head_sha=def5678`.
-4. MergeXO transitions the PR from `blocked` back to `awaiting_feedback`.
-5. If `head_sha` is supplied, MergeXO also updates the stored `last_seen_head_sha` to that value before resuming.
+1. PR `#101` is blocked because MergeXO detected a non-fast-forward head change.
+2. MergeXO pauses feedback automation for that PR.
+3. A maintainer resumes from canonical head:
+   - `/mergexo unblock` (PR thread)
+   - `/mergexo unblock head_sha=<sha>` (PR thread)
+   - `/mergexo unblock pr=101 [head_sha=<sha>]` (operations issue)
+4. MergeXO transitions PR state from `blocked` back to `awaiting_feedback`.
+5. If `head_sha` is supplied, MergeXO updates stored `last_seen_head_sha` before resuming.
 
-## Issue labels and precedence
+### Abandoning Work Safely
 
-MergeXO reads these labels from each repo config (`[repo]` or `[repo.<id>]`):
+1. If the active artifact is a design PR, close that PR to stop design-loop automation.
+2. If the active artifact is implementation PR work, close that PR to stop implementation feedback automation.
+3. Closing only the source issue is not sufficient if the active PR remains open.
 
-- `trigger_label` (default behavior, design-doc flow)
-- `bugfix_label` (direct bugfix flow)
-- `small_job_label` (direct small-job flow)
-- `coding_guidelines_path` (repo-relative file that defines coding style and required pre-PR tests for direct flows)
-- `required_tests` (optional repo-relative or absolute executable path that must pass before MergeXO pushes)
-- `test_file_regex` (optional bugfix-only regression-test file gate; accepts a regex string or a list of regex strings)
+### State Schema Upgrade Note
 
-When an issue has more than one trigger label, precedence is deterministic:
+Multi-repo support uses repo-scoped state schema. If upgrading from old single-repo schema:
 
-1. `bugfix_label`
-2. `small_job_label`
-3. `trigger_label`
+1. stop MergeXO
+2. remove old `state.db`
+3. run `mergexo init`
+4. restart MergeXO
 
-Example:
+### Generated Design Doc Contract
 
-- issue labels: `agent:design` + `agent:bugfix` -> bugfix flow
-- issue labels: `agent:design` + `agent:small-job` -> small-job flow
-- issue labels: `agent:design` only -> design-doc flow
+Design prompts require `touch_paths` in output; these are recorded in design doc frontmatter.
 
-Direct-flow PR bodies include `Fixes #<issue_number>`. Design-doc PR bodies keep `Refs #<issue_number>`.
-When `test_file_regex` is configured, bugfix flow enforces at least one staged file matching one of
-those regexes before opening a PR. Matching uses OR semantics across configured regexes.
-When `test_file_regex` is not configured, MergeXO skips this staged-test-file gate.
-Bugfix and small-job prompts require the agent to read and follow `coding_guidelines_path`.
-When `required_tests` is configured, MergeXO runs it before every push. If it fails on direct/implementation/feedback flows, MergeXO feeds stdout/stderr back to the agent for repair attempts; if the agent reports impossible, the PR is marked blocked with that explanation.
+## Configuration Reference
 
-## Authentication allowlist
+### Repo Table Shapes
 
-MergeXO normalizes allowlist entries to lowercase and matches case-insensitively at runtime.
+Use exactly one repo shape:
 
-- Multi-repo (`[repo.<id>]`): use `allowed_users` in each repo table. If omitted, it defaults to `[owner]`.
-- Legacy single-repo (`[repo]`): `repo.allowed_users` is preferred; `[auth].allowed_users` is a compatibility fallback.
-- If neither is configured in legacy single-repo mode, allowlist defaults to `[owner]`.
+1. Multi-repo keyed tables (recommended): `[repo.<repo_id>]`
+2. Legacy single-repo table: `[repo]` (optional `[auth]` fallback for allowlist)
 
-For users not in `allowed_users`, MergeXO fully ignores:
+Do not mix both shapes in one file.
 
-- new issue intake (no branch/commit/PR/comment side effects),
-- PR review comments in feedback loop,
-- PR issue comments in feedback loop.
+### `[runtime]` Options
 
-If an already tracked PR is linked to an issue whose author is no longer allowlisted, MergeXO
-marks that PR feedback state as blocked internally and stays silent on GitHub.
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `base_dir` | yes | none | local state/log/mirror root |
+| `worker_count` | yes | none | must be `>= 1` |
+| `poll_interval_seconds` | yes | none | must be `>= 5` |
+| `enable_github_operations` | no | `false` | enables `/mergexo ...` command processing |
+| `enable_issue_comment_routing` | no | `false` | enables pre-PR follow-up + post-PR source redirects |
+| `enable_pr_actions_monitoring` | no | `false` | enables GitHub Actions feedback events |
+| `pr_actions_log_tail_lines` | no | `500` | valid range `1..5000` |
+| `restart_drain_timeout_seconds` | no | `900` | must be `>= 1` |
+| `restart_default_mode` | no | `"git_checkout"` | must be in `restart_supported_modes` |
+| `restart_supported_modes` | no | `["git_checkout"]` | list of `git_checkout` and/or `pypi` |
+| `git_checkout_root` | no | unset | optional for `git_checkout` restarts; defaults to current working directory when omitted |
+| `service_python` | no | unset | required for `pypi` restart mode |
+| `observability_refresh_seconds` | no | `2` | must be `>= 1` |
+| `observability_default_window` | no | `"24h"` | one of `1h`, `24h`, `7d`, `30d` |
+| `observability_row_limit` | no | `200` | positive int or `null` |
+| `observability_history_retention_days` | no | `90` | must be `>= 1` |
 
-## Abandoning work (changing direction)
+### `[repo.<repo_id>]` Options (or legacy `[repo]`)
 
-Sometimes we discover a deeper problem late, or priorities change. That is expected. Use this playbook to abandon work safely:
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `owner` | yes | none | GitHub org/user |
+| `name` | no (keyed) / yes (legacy) | keyed: `<repo_id>` | repo name |
+| `default_branch` | no | `"main"` | base branch for PRs |
+| `trigger_label` | no | `"agent:design"` | design flow trigger |
+| `bugfix_label` | no | `"agent:bugfix"` | bugfix flow trigger |
+| `small_job_label` | no | `"agent:small-job"` | small-job flow trigger |
+| `coding_guidelines_path` | yes | none | repo-relative path for coding/testing guidance |
+| `design_docs_dir` | no | `"docs/design"` | design doc output directory |
+| `allowed_users` | no | `[owner]` | normalized lowercase allowlist |
+| `local_clone_source` | no | unset | local repo/.git used to seed mirror |
+| `remote_url` | no | `git@github.com:<owner>/<name>.git` | explicit remote override |
+| `required_tests` | no | unset | repo-relative or absolute executable path |
+| `test_file_regex` | no | unset | bugfix-only regression-test staged-file gate; string or list |
+| `operations_issue_number` | no | unset | optional global ops issue |
+| `operator_logins` | no | `[]` | allowed `/mergexo` command authors |
 
-1. After design doc PR is opened (design phase):
-   - Close the design PR to stop active review-loop automation for that design.
-   - Optionally close the issue as well for project hygiene and visibility.
-   - Important: closing only the issue is not enough if the design PR remains open.
+### Legacy `[auth]`
 
-2. After design doc is merged and implementation PR is opened:
-   - Close the implementation PR to stop active review-loop automation for implementation.
-   - Close the issue so it is clearly no longer in scope.
-   - The merged design doc will remain in `main`; if you want to remove or supersede it, open a follow-up doc/change PR.
+- only for legacy single-repo shape
+- `auth.allowed_users` is a compatibility fallback when `repo.allowed_users` is absent
 
-In short: closing the currently active PR is the key action to stop automation for that phase.
+### `[codex]` Options
 
-## Generated design doc contract
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | no | `true` | master enable flag |
+| `model` | no | unset | adapter/model hint |
+| `sandbox` | no | unset | Codex sandbox mode |
+| `profile` | no | unset | Codex profile |
+| `extra_args` | no | `[]` | extra CLI args |
 
-The Codex prompt requires reporting likely implementation files in `touch_paths`, which are written into the design doc frontmatter.
+### `[codex.repo.<repo_id>]` Overrides
+
+- optional per-repo overrides
+- same keys as `[codex]`
+- omitted keys inherit from global `[codex]`
+
+## CLI Help and Modes
+
+`mergexo` uses subcommands, with `console` as the default command when omitted.
+
+### Top-Level Help
+
+```text
+usage: mergexo [-h] {console,init,run,service,top,feedback} ...
+```
+
+Subcommands:
+
+- `console`: run service + TUI + file logging together
+- `init`: initialize state DB, mirror, and checkouts
+- `run`: run orchestrator polling loop
+- `service`: orchestrator with supervisor/restart workflow support
+- `top`: observability-only TUI
+- `feedback`: inspect/manage feedback-loop state
+
+### Mode Motivations
+
+- `console`: best for local interactive operation (recommended default); requires an interactive terminal
+- `service`: best for non-interactive deployments and GitHub-driven restart automation
+- `run`: simple polling mode when you do not need supervisor/restart integration
+- `top`: read-only operational visibility without running service
+- `feedback`: manual inspection/reset of blocked feedback state
+- `init`: one-time setup and occasional reinit after schema upgrades
+
+### Command Help (Full)
+
+```text
+usage: mergexo console [-h] [--config CONFIG] [-v [MODE]]
+usage: mergexo init [-h] [--config CONFIG] [-v [MODE]]
+usage: mergexo run [-h] [--config CONFIG] [--once] [-v [MODE]]
+usage: mergexo service [-h] [--config CONFIG] [--once] [-v [MODE]]
+usage: mergexo top [-h] [--config CONFIG] [-v [MODE]]
+usage: mergexo feedback [-h] [--config CONFIG] [-v [MODE]] {blocked} ...
+```
+
+Shared options:
+
+- `--config CONFIG`: config path (default command expects `mergexo.toml` unless overridden)
+- `-v, --verbose [MODE]`: `low` or `high`
+
+Additional options:
+
+- `run --once`: single poll + wait for active workers
+- `service --once`: single poll + wait for active workers
+
+Feedback subcommands:
+
+```text
+usage: mergexo feedback blocked [-h] {list,reset} ...
+usage: mergexo feedback blocked list [-h] [--json]
+usage: mergexo feedback blocked reset [-h] (--pr PR | --all) [--yes] [--dry-run] [--head-sha HEAD_SHA] [--repo REPO]
+```
+
+`feedback blocked reset` options:
+
+- `--pr PR` (repeatable): reset specific blocked PR numbers
+- `--all`: reset all blocked PRs
+- `--yes`: required with `--all` unless `--dry-run`
+- `--dry-run`: preview only
+- `--head-sha <sha>`: override stored `last_seen_head_sha` on reset
+- `--repo <repo-id-or-owner/name>`: required with `--pr` in multi-repo configs
+
+## Label and PR Body Rules
+
+- `bugfix` and `small_job` PR bodies include `Fixes #<issue_number>`.
+- `design_doc` PR bodies include `Refs #<issue_number>`.
+- If multiple trigger labels are present, precedence is `bugfix` > `small_job` > `design_doc`.
