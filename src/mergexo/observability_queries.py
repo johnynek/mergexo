@@ -248,6 +248,7 @@ def load_tracked_and_blocked(
     with _connect(db_path) as conn:
         pr_repo_clause, pr_repo_params = _repo_filter_sql(repo_filter, prefix="p")
         issue_repo_clause, issue_repo_params = _repo_filter_sql(repo_filter, prefix="i")
+        history_repo_clause, history_repo_params = _repo_filter_sql(repo_filter, prefix="h")
         limit_clause = ""
         params: tuple[object, ...]
         if limit is not None:
@@ -329,7 +330,20 @@ def load_tracked_and_blocked(
             """,
             params,
         ).fetchall()
-    return tuple(
+        active_feedback_rows = conn.execute(
+            f"""
+            SELECT
+                h.repo_full_name,
+                h.pr_number,
+                h.meta_json
+            FROM agent_run_history AS h
+            WHERE h.run_kind = 'feedback_turn'
+              AND h.finished_at IS NULL
+              {history_repo_clause}
+            """,
+            history_repo_params,
+        ).fetchall()
+    tracked_rows = tuple(
         TrackedOrBlockedRow(
             repo_full_name=_as_str(row[0], "repo_full_name"),
             pr_number=_as_optional_int(row[1], "pr_number"),
@@ -342,6 +356,19 @@ def load_tracked_and_blocked(
             updated_at=_as_str(row[8], "updated_at"),
         )
         for row in rows
+    )
+    active_feedback_prs = {
+        (_as_str(row[0], "repo_full_name"), _as_int(row[1], "pr_number"))
+        for row in active_feedback_rows
+        if row[1] is not None
+        and _active_run_meta_from_json(_as_str(row[2], "meta_json")).codex_active
+    }
+    if not active_feedback_prs:
+        return tracked_rows
+    return tuple(
+        row
+        for row in tracked_rows
+        if row.pr_number is None or (row.repo_full_name, row.pr_number) not in active_feedback_prs
     )
 
 
