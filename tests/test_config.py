@@ -26,6 +26,9 @@ poll_interval_seconds = 60
 enable_github_operations = true
 enable_issue_comment_routing = true
 enable_pr_actions_monitoring = true
+enable_incremental_comment_fetch = true
+comment_fetch_overlap_seconds = 7
+comment_fetch_safe_backfill_seconds = 1000
 pr_actions_log_tail_lines = 250
 restart_drain_timeout_seconds = 120
 restart_default_mode = "git_checkout"
@@ -71,6 +74,9 @@ extra_args = ["--repo-mode"]
     assert loaded.runtime.enable_github_operations is True
     assert loaded.runtime.enable_issue_comment_routing is True
     assert loaded.runtime.enable_pr_actions_monitoring is True
+    assert loaded.runtime.enable_incremental_comment_fetch is True
+    assert loaded.runtime.comment_fetch_overlap_seconds == 7
+    assert loaded.runtime.comment_fetch_safe_backfill_seconds == 1000
     assert loaded.runtime.pr_actions_log_tail_lines == 250
     assert loaded.runtime.restart_drain_timeout_seconds == 120
     assert loaded.runtime.restart_default_mode == "git_checkout"
@@ -134,6 +140,9 @@ coding_guidelines_path = "docs/python_style.md"
     assert len(loaded.repos) == 2
     assert loaded.runtime.enable_issue_comment_routing is False
     assert loaded.runtime.enable_pr_actions_monitoring is False
+    assert loaded.runtime.enable_incremental_comment_fetch is False
+    assert loaded.runtime.comment_fetch_overlap_seconds == 5
+    assert loaded.runtime.comment_fetch_safe_backfill_seconds == 86400
     assert loaded.runtime.pr_actions_log_tail_lines == 500
     assert loaded.runtime.observability_refresh_seconds == 2
     assert loaded.runtime.observability_default_window == "24h"
@@ -200,6 +209,45 @@ extra_args = ["--beta-only"]
     assert beta_codex.sandbox == "workspace-write"
     assert beta_codex.profile == "strict"
     assert beta_codex.extra_args == ("--beta-only",)
+
+
+@pytest.mark.parametrize(
+    "runtime_lines,error",
+    [
+        ("comment_fetch_overlap_seconds = -1", "runtime.comment_fetch_overlap_seconds"),
+        ("comment_fetch_safe_backfill_seconds = 0", "runtime.comment_fetch_safe_backfill_seconds"),
+        (
+            "comment_fetch_overlap_seconds = 10\ncomment_fetch_safe_backfill_seconds = 9",
+            "runtime.comment_fetch_safe_backfill_seconds",
+        ),
+    ],
+)
+def test_load_config_rejects_invalid_incremental_fetch_bounds(
+    tmp_path: Path,
+    runtime_lines: str,
+    error: str,
+) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+"""
+            + runtime_lines
+            + """
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".rstrip()
+        ),
+    )
+    with pytest.raises(ConfigError, match=error):
+        config.load_config(cfg_path)
 
 
 def test_load_config_rejects_codex_override_for_unknown_repo(tmp_path: Path) -> None:

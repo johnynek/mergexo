@@ -8,10 +8,17 @@ import pytest
 from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
 from mergexo.state import (
+    ActionTokenObservation,
+    PollCursorUpdate,
     StateStore,
     _normalize_repo_full_name,
+    _parse_action_token_row,
+    _parse_action_token_scope_kind,
+    _parse_action_token_status,
+    _parse_github_comment_surface,
     _parse_operator_command_name,
     _parse_operator_command_row,
+    _parse_poll_cursor_row,
     _parse_operator_command_status,
     _parse_pre_pr_followup_flow,
     _parse_restart_mode,
@@ -419,6 +426,7 @@ def test_state_store_pr_status_history_and_pull_request_status_lookup(tmp_path: 
 def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
+    store.ingest_feedback_events(())
     store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100")
 
     events = (
@@ -480,6 +488,170 @@ def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:
         assert int(processed_count[0]) == 3
     finally:
         conn.close()
+
+
+def test_poll_cursor_and_action_token_lifecycle(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    assert store.get_action_token("z" * 64, repo_full_name="o/repo") is None
+    assert (
+        store.get_poll_cursor(
+            surface="pr_review_comments", scope_number=101, repo_full_name="o/repo"
+        )
+        is None
+    )
+
+    cursor = store.upsert_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        last_updated_at="2026-02-24T12:00:00Z",
+        last_comment_id=44,
+        bootstrap_complete=True,
+        repo_full_name="o/repo",
+    )
+    assert cursor.surface == "pr_review_comments"
+    assert cursor.scope_number == 101
+    assert cursor.last_updated_at == "2026-02-24T12:00:00Z"
+    assert cursor.last_comment_id == 44
+    assert cursor.bootstrap_complete is True
+
+    planned = store.record_action_token_planned(
+        token="a" * 64,
+        scope_kind="pr",
+        scope_number=101,
+        source="feedback_review_reply",
+        repo_full_name="o/repo",
+    )
+    assert planned.status == "planned"
+    assert planned.attempt_count == 0
+
+    posted = store.record_action_token_posted(
+        token="a" * 64,
+        scope_kind="pr",
+        scope_number=101,
+        source="feedback_review_reply",
+        repo_full_name="o/repo",
+    )
+    assert posted.status == "posted"
+    assert posted.attempt_count == 1
+
+    observed = store.record_action_token_observed(
+        token="a" * 64,
+        scope_kind="pr",
+        scope_number=101,
+        source="feedback_review_scan",
+        observed_comment_id=77,
+        observed_updated_at="2026-02-24T12:01:00Z",
+        repo_full_name="o/repo",
+    )
+    assert observed.status == "observed"
+    assert observed.observed_comment_id == 77
+    observed_again = store.record_action_token_planned(
+        token="a" * 64,
+        scope_kind="pr",
+        scope_number=101,
+        source="feedback_review_reply",
+        repo_full_name="o/repo",
+    )
+    assert observed_again.status == "observed"
+
+    fetched = store.get_action_token("a" * 64, repo_full_name="o/repo")
+    assert fetched is not None
+    assert fetched.status == "observed"
+    assert fetched.scope_kind == "pr"
+
+
+def test_ingest_feedback_scan_batch_updates_events_tokens_and_cursors(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.mark_completed(
+        7,
+        "agent/design/7",
+        101,
+        "https://example/pr/101",
+        repo_full_name="o/repo",
+    )
+    event = FeedbackEventRecord(
+        event_key="101:review:7:2026-02-24T12:00:00Z",
+        pr_number=101,
+        issue_number=7,
+        kind="review",
+        comment_id=7,
+        updated_at="2026-02-24T12:00:00Z",
+    )
+    store.ingest_feedback_scan_batch(
+        events=(event,),
+        cursor_updates=(
+            PollCursorUpdate(
+                surface="pr_review_comments",
+                scope_number=101,
+                last_updated_at="2026-02-24T12:00:00Z",
+                last_comment_id=7,
+                bootstrap_complete=True,
+            ),
+            PollCursorUpdate(
+                surface="pr_issue_comments",
+                scope_number=101,
+                last_updated_at="2026-02-24T12:00:00Z",
+                last_comment_id=0,
+                bootstrap_complete=True,
+            ),
+        ),
+        token_observations=(
+            ActionTokenObservation(
+                token="b" * 64,
+                scope_kind="pr",
+                scope_number=101,
+                source="feedback_pr_issue_scan",
+                comment_id=8,
+                updated_at="2026-02-24T12:00:01Z",
+            ),
+        ),
+        repo_full_name="o/repo",
+    )
+
+    pending = store.list_pending_feedback_events(101, repo_full_name="o/repo")
+    assert len(pending) == 1
+    assert pending[0].event_key == event.event_key
+    review_cursor = store.get_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        repo_full_name="o/repo",
+    )
+    issue_cursor = store.get_poll_cursor(
+        surface="pr_issue_comments",
+        scope_number=101,
+        repo_full_name="o/repo",
+    )
+    assert review_cursor is not None
+    assert issue_cursor is not None
+    assert review_cursor.last_comment_id == 7
+    assert issue_cursor.bootstrap_complete is True
+    observed = store.get_action_token("b" * 64, repo_full_name="o/repo")
+    assert observed is not None
+    assert observed.status == "observed"
+
+
+def test_seed_feedback_cursors_from_full_scan(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.seed_feedback_cursors_from_full_scan(
+        pr_number=101,
+        review_cursor=("2026-02-24T12:00:00Z", 50),
+        issue_cursor=("2026-02-24T12:00:01Z", 60),
+        repo_full_name="o/repo",
+    )
+    review = store.get_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        repo_full_name="o/repo",
+    )
+    issue = store.get_poll_cursor(
+        surface="pr_issue_comments",
+        scope_number=101,
+        repo_full_name="o/repo",
+    )
+    assert review is not None
+    assert issue is not None
+    assert review.last_comment_id == 50
+    assert issue.last_comment_id == 60
 
 
 def test_mark_feedback_events_processed_marks_subset(tmp_path: Path) -> None:
@@ -966,6 +1138,127 @@ def test_get_issue_comment_cursor_rejects_invalid_column_types(tmp_path: Path) -
         store.get_issue_comment_cursor(7)
 
 
+def test_get_poll_cursor_rejects_invalid_column_types(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.upsert_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=7,
+        last_updated_at="2026-02-24T00:00:00Z",
+        last_comment_id=1,
+        bootstrap_complete=True,
+    )
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute(
+            """
+            UPDATE github_comment_poll_cursors
+            SET last_comment_id = ?
+            WHERE surface = ? AND scope_number = ?
+            """,
+            (sqlite3.Binary(b"\x01"), "pr_review_comments", 7),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="last_comment_id"):
+        store.get_poll_cursor(surface="pr_review_comments", scope_number=7)
+
+
+def test_get_action_token_rejects_invalid_column_types(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.record_action_token_planned(
+        token="c" * 64,
+        scope_kind="pr",
+        scope_number=7,
+        source="feedback",
+    )
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute(
+            """
+            UPDATE action_tokens
+            SET attempt_count = ?
+            WHERE token = ?
+            """,
+            (sqlite3.Binary(b"\x02"), "c" * 64),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="attempt_count"):
+        store.get_action_token("c" * 64)
+
+
+def test_upsert_poll_cursor_raises_when_row_disappears(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = StateStore(tmp_path / "state.db")
+
+    class FakeCursor:
+        def fetchone(self) -> object:
+            return None
+
+    class FakeConn:
+        def execute(self, sql: str, params: tuple[object, ...] = ()) -> FakeCursor:
+            _ = sql, params
+            return FakeCursor()
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_connect():  # type: ignore[no-untyped-def]
+        yield FakeConn()
+
+    monkeypatch.setattr(store, "_connect", fake_connect)
+
+    with pytest.raises(RuntimeError, match="github_comment_poll_cursors row disappeared"):
+        store.upsert_poll_cursor(
+            surface="pr_review_comments",
+            scope_number=11,
+            last_updated_at="2026-02-24T00:00:00Z",
+            last_comment_id=1,
+            bootstrap_complete=True,
+        )
+
+
+def test_action_token_upserts_raise_when_row_disappears(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = StateStore(tmp_path / "state.db")
+    monkeypatch.setattr(
+        "mergexo.state._select_action_token_row",
+        lambda **kwargs: None,  # type: ignore[no-untyped-def]
+    )
+
+    with pytest.raises(RuntimeError, match="planned upsert"):
+        store.record_action_token_planned(
+            token="d" * 64,
+            scope_kind="pr",
+            scope_number=7,
+            source="feedback",
+        )
+    with pytest.raises(RuntimeError, match="posted upsert"):
+        store.record_action_token_posted(
+            token="d" * 64,
+            scope_kind="pr",
+            scope_number=7,
+            source="feedback",
+        )
+    with pytest.raises(RuntimeError, match="observed upsert"):
+        store.record_action_token_observed(
+            token="d" * 64,
+            scope_kind="pr",
+            scope_number=7,
+            source="feedback",
+            observed_comment_id=9,
+            observed_updated_at="2026-02-24T00:00:01Z",
+        )
+
+
 def test_operator_commands_and_runtime_operations(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
@@ -1337,6 +1630,132 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
         _parse_pre_pr_followup_flow(1)
     with pytest.raises(RuntimeError, match="Unknown flow value"):
         _parse_pre_pr_followup_flow("other")
+
+    with pytest.raises(RuntimeError, match="Invalid surface value"):
+        _parse_github_comment_surface(1)
+    with pytest.raises(RuntimeError, match="Unknown surface value"):
+        _parse_github_comment_surface("other")
+
+    with pytest.raises(RuntimeError, match="Invalid scope_kind value"):
+        _parse_action_token_scope_kind(1)
+    with pytest.raises(RuntimeError, match="Unknown scope_kind value"):
+        _parse_action_token_scope_kind("other")
+
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        _parse_action_token_status(1)
+    with pytest.raises(RuntimeError, match="Unknown status value"):
+        _parse_action_token_status("other")
+
+
+def test_parse_poll_cursor_row_validations() -> None:
+    valid = (
+        "pr_review_comments",
+        7,
+        "2026-02-24T00:00:00Z",
+        11,
+        1,
+        "2026-02-24T00:00:01Z",
+    )
+    with pytest.raises(RuntimeError, match="Invalid github_comment_poll_cursors row width"):
+        _parse_poll_cursor_row((), repo_full_name="o/r")
+    with pytest.raises(RuntimeError, match="surface"):
+        _parse_poll_cursor_row((1, *valid[1:]), repo_full_name="o/r")
+    with pytest.raises(RuntimeError, match="scope_number"):
+        _parse_poll_cursor_row((valid[0], "7", *valid[2:]), repo_full_name="o/r")  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="last_updated_at"):
+        _parse_poll_cursor_row((valid[0], valid[1], 1, *valid[3:]), repo_full_name="o/r")  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="bootstrap_complete"):
+        _parse_poll_cursor_row(
+            (valid[0], valid[1], valid[2], valid[3], "1", valid[5]),  # type: ignore[arg-type]
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="updated_at"):
+        _parse_poll_cursor_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], 1),  # type: ignore[arg-type]
+            repo_full_name="o/r",
+        )
+
+
+def test_parse_action_token_row_validations() -> None:
+    valid = (
+        "a" * 64,
+        "pr",
+        7,
+        "feedback",
+        "planned",
+        0,
+        None,
+        None,
+        "t1",
+        "t2",
+    )
+    with pytest.raises(RuntimeError, match="Invalid action_tokens row width"):
+        _parse_action_token_row((), repo_full_name="o/r")
+    with pytest.raises(RuntimeError, match="token"):
+        _parse_action_token_row((1, *valid[1:]), repo_full_name="o/r")
+    with pytest.raises(RuntimeError, match="scope_kind"):
+        _parse_action_token_row((valid[0], 1, *valid[2:]), repo_full_name="o/r")  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="scope_number"):
+        _parse_action_token_row((valid[0], valid[1], "7", *valid[3:]), repo_full_name="o/r")  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="source"):
+        _parse_action_token_row((valid[0], valid[1], valid[2], 1, *valid[4:]), repo_full_name="o/r")  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="status"):
+        _parse_action_token_row(
+            (valid[0], valid[1], valid[2], valid[3], 1, *valid[5:]), repo_full_name="o/r"
+        )  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="observed_comment_id"):
+        _parse_action_token_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], "x", *valid[7:]),  # type: ignore[arg-type]
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="observed_updated_at"):
+        _parse_action_token_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                1,  # type: ignore[arg-type]
+                valid[8],
+                valid[9],
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="created_at"):
+        _parse_action_token_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                1,  # type: ignore[arg-type]
+                valid[9],
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="updated_at"):
+        _parse_action_token_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                valid[8],
+                1,  # type: ignore[arg-type]
+            ),
+            repo_full_name="o/r",
+        )
 
 
 def test_state_store_repo_scoped_isolation(tmp_path: Path) -> None:

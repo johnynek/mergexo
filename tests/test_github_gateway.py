@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -242,7 +243,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
             }
         if path.endswith("/pulls/9/files?per_page=100"):
             return ["skip", {"filename": "src/a.py"}, {"filename": "README.md"}]
-        if path.endswith("/pulls/9/comments?per_page=100"):
+        if path.endswith("/pulls/9/comments?per_page=100&page=1"):
             return [
                 "skip",
                 {
@@ -258,7 +259,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
                     "updated_at": "t2",
                 },
             ]
-        if path.endswith("/issues/9/comments?per_page=100"):
+        if path.endswith("/issues/9/comments?per_page=100&page=1"):
             return [
                 "skip",
                 {
@@ -289,6 +290,132 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert review_comments[0].user_login == "reviewer"
     assert issue_comments[0].comment_id == 22
     assert issue_comments_direct[0].comment_id == 22
+
+
+def test_list_pull_request_review_comments_paginates_with_since(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    seen_pages: list[int] = []
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        assert method == "GET"
+        assert path.startswith("/repos/o/r/pulls/9/comments?")
+        parsed = urlparse(path)
+        query = parse_qs(parsed.query)
+        assert query["per_page"] == ["100"]
+        assert query["since"] == ["2026-02-22T00:00:00Z"]
+        page = int(query["page"][0])
+        seen_pages.append(page)
+        if page == 1:
+            return [
+                {
+                    "id": item_id,
+                    "body": f"review-{item_id}",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "side": "RIGHT",
+                    "in_reply_to_id": None,
+                    "user": {"login": "reviewer"},
+                    "html_url": f"https://example/review/{item_id}",
+                    "created_at": "2026-02-22T00:00:00Z",
+                    "updated_at": "2026-02-22T00:00:00Z",
+                }
+                for item_id in range(1, 101)
+            ]
+        if page == 2:
+            return [
+                {
+                    "id": 101,
+                    "body": "review-101",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "side": "RIGHT",
+                    "in_reply_to_id": None,
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/review/101",
+                    "created_at": "2026-02-22T00:00:01Z",
+                    "updated_at": "2026-02-22T00:00:01Z",
+                },
+                {
+                    "id": 102,
+                    "body": "review-102",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "side": "RIGHT",
+                    "in_reply_to_id": None,
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/review/102",
+                    "created_at": "2026-02-22T00:00:02Z",
+                    "updated_at": "2026-02-22T00:00:02Z",
+                },
+            ]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    comments = gateway.list_pull_request_review_comments(9, since="2026-02-22T00:00:00Z")
+    assert len(comments) == 102
+    assert comments[0].comment_id == 1
+    assert comments[-1].comment_id == 102
+    assert seen_pages == [1, 2]
+
+
+def test_list_issue_comments_paginates_with_since(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+    seen_pages: list[int] = []
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        assert method == "GET"
+        assert path.startswith("/repos/o/r/issues/7/comments?")
+        parsed = urlparse(path)
+        query = parse_qs(parsed.query)
+        assert query["per_page"] == ["100"]
+        assert query["since"] == ["2026-02-22T00:00:00Z"]
+        page = int(query["page"][0])
+        seen_pages.append(page)
+        if page == 1:
+            return [
+                {
+                    "id": item_id,
+                    "body": f"issue-{item_id}",
+                    "user": {"login": "reviewer"},
+                    "html_url": f"https://example/issue/{item_id}",
+                    "created_at": "2026-02-22T00:00:00Z",
+                    "updated_at": "2026-02-22T00:00:00Z",
+                }
+                for item_id in range(1, 101)
+            ]
+        if page == 2:
+            return [
+                {
+                    "id": 101,
+                    "body": "issue-101",
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/issue/101",
+                    "created_at": "2026-02-22T00:00:01Z",
+                    "updated_at": "2026-02-22T00:00:01Z",
+                }
+            ]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    comments = gateway.list_issue_comments(7, since="2026-02-22T00:00:00Z")
+    assert len(comments) == 101
+    assert comments[0].comment_id == 1
+    assert comments[-1].comment_id == 101
+    assert seen_pages == [1, 2]
 
 
 def test_get_pull_request_requires_head_and_base(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -790,9 +917,9 @@ def test_gateway_emits_read_and_write_logs(
             return [{"number": 1, "title": "Issue", "body": "", "html_url": "u", "labels": []}]
         if method == "GET" and path.endswith("/pulls/9/files?per_page=100"):
             return [{"filename": "src/a.py"}]
-        if method == "GET" and path.endswith("/pulls/9/comments?per_page=100"):
+        if method == "GET" and path.endswith("/pulls/9/comments?per_page=100&page=1"):
             return []
-        if method == "GET" and path.endswith("/issues/9/comments?per_page=100"):
+        if method == "GET" and path.endswith("/issues/9/comments?per_page=100&page=1"):
             return []
         if method == "GET" and path.endswith("/compare/base...head"):
             return {"status": "ahead"}

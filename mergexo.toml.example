@@ -7,6 +7,12 @@ enable_github_operations = false
 enable_issue_comment_routing = false
 # Monitor GitHub Actions runs for tracked PR heads and enqueue CI remediation feedback events.
 enable_pr_actions_monitoring = false
+# Enable incremental GitHub comment polling (bounded by cursors + overlap replay).
+enable_incremental_comment_fetch = false
+# Seconds of replay overlap applied to the persisted cursor timestamp.
+comment_fetch_overlap_seconds = 5
+# Safe backfill window when a cursor is invalid/future (seconds).
+comment_fetch_safe_backfill_seconds = 86400
 # Tail size per failed GitHub Actions job injected into CI feedback context.
 pr_actions_log_tail_lines = 500
 # Restart drain timeout before pending restart is marked failed.

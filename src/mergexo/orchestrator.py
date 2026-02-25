@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import logging
@@ -69,8 +69,13 @@ from mergexo.prompts import (
 from mergexo.shell import CommandError, run
 from mergexo.state import (
     AgentRunFailureClass,
+    ActionTokenObservation,
+    ActionTokenState,
+    GitHubCommentSurface,
+    GitHubCommentPollCursorState,
     ImplementationCandidateState,
     PendingFeedbackEvent,
+    PollCursorUpdate,
     PrePrFollowupState,
     StateStore,
     TrackedPullRequestState,
@@ -95,6 +100,12 @@ _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "new_issue_comments_pending",
 )
 _PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(r"(bugfix|small-job|implementation) flow blocked:")
+_COMMENT_CURSOR_EPOCH = "1970-01-01T00:00:00Z"
+_SURFACE_PR_REVIEW_COMMENTS: GitHubCommentSurface = "pr_review_comments"
+_SURFACE_PR_ISSUE_COMMENTS: GitHubCommentSurface = "pr_issue_comments"
+_SURFACE_ISSUE_PRE_PR_FOLLOWUPS: GitHubCommentSurface = "issue_pre_pr_followups"
+_SURFACE_ISSUE_POST_PR_REDIRECTS: GitHubCommentSurface = "issue_post_pr_redirects"
+_SURFACE_ISSUE_OPERATOR_COMMANDS: GitHubCommentSurface = "issue_operator_commands"
 _DEFAULT_RUN_META_JSON = json.dumps(
     {
         "codex_active": False,
@@ -137,6 +148,13 @@ class _RunningIssueMetadata:
     context_json: str
     source_issue_number: int
     consumed_comment_id_max: int
+
+
+@dataclass(frozen=True)
+class _IncrementalCommentScan:
+    fetched: tuple[PullRequestIssueComment | PullRequestReviewComment, ...]
+    new: tuple[PullRequestIssueComment | PullRequestReviewComment, ...]
+    cursor_update: PollCursorUpdate
 
 
 class DirectFlowError(RuntimeError):
@@ -717,7 +735,42 @@ class Phase1Orchestrator:
                     if followup.issue_number in self._running:
                         continue
 
-                source_comments = self._github.list_issue_comments(followup.issue_number)
+                if self._incremental_comment_fetch_enabled():
+                    incremental_scan = self._scan_incremental_issue_comments(
+                        issue_number=followup.issue_number,
+                        surface=_SURFACE_ISSUE_PRE_PR_FOLLOWUPS,
+                        bootstrap_mode="seed_latest",
+                    )
+                    source_comments = [
+                        cast(PullRequestIssueComment, comment) for comment in incremental_scan.new
+                    ]
+                    token_observations = self._action_token_observations_from_comments(
+                        scope_kind="issue",
+                        scope_number=followup.issue_number,
+                        source=_SURFACE_ISSUE_PRE_PR_FOLLOWUPS,
+                        comments=incremental_scan.fetched,
+                    )
+                    self._state.ingest_feedback_scan_batch(
+                        events=(),
+                        cursor_updates=(incremental_scan.cursor_update,),
+                        token_observations=token_observations,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                else:
+                    source_comments = self._github.list_issue_comments(followup.issue_number)
+                    token_observations = self._action_token_observations_from_comments(
+                        scope_kind="issue",
+                        scope_number=followup.issue_number,
+                        source=_SURFACE_ISSUE_PRE_PR_FOLLOWUPS,
+                        comments=tuple(source_comments),
+                    )
+                    if token_observations:
+                        self._state.ingest_feedback_scan_batch(
+                            events=(),
+                            cursor_updates=(),
+                            token_observations=token_observations,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
                 cursor = self._state.get_issue_comment_cursor(
                     followup.issue_number,
                     repo_full_name=self._state_repo_full_name(),
@@ -925,15 +978,47 @@ class Phase1Orchestrator:
             return
 
         for issue_number, pr_number in sorted(redirect_targets.items()):
-            comments = self._github.list_issue_comments(issue_number)
+            if self._incremental_comment_fetch_enabled():
+                incremental_scan = self._scan_incremental_issue_comments(
+                    issue_number=issue_number,
+                    surface=_SURFACE_ISSUE_POST_PR_REDIRECTS,
+                    bootstrap_mode="seed_latest",
+                )
+                comments = [
+                    cast(PullRequestIssueComment, comment) for comment in incremental_scan.new
+                ]
+                token_observations = self._action_token_observations_from_comments(
+                    scope_kind="issue",
+                    scope_number=issue_number,
+                    source=_SURFACE_ISSUE_POST_PR_REDIRECTS,
+                    comments=incremental_scan.fetched,
+                )
+                self._state.ingest_feedback_scan_batch(
+                    events=(),
+                    cursor_updates=(incremental_scan.cursor_update,),
+                    token_observations=token_observations,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            else:
+                comments = self._github.list_issue_comments(issue_number)
+                token_observations = self._action_token_observations_from_comments(
+                    scope_kind="issue",
+                    scope_number=issue_number,
+                    source=_SURFACE_ISSUE_POST_PR_REDIRECTS,
+                    comments=tuple(comments),
+                )
+                if token_observations:
+                    self._state.ingest_feedback_scan_batch(
+                        events=(),
+                        cursor_updates=(),
+                        token_observations=token_observations,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
             cursor = self._state.get_issue_comment_cursor(
                 issue_number,
                 repo_full_name=self._state_repo_full_name(),
             )
             max_scanned_comment_id = cursor.post_pr_last_redirected_comment_id
-            known_tokens = {
-                token for comment in comments for token in extract_action_tokens(comment.body)
-            }
             pr_url = _pull_request_url(
                 repo_full_name=self._state_repo_full_name(),
                 pr_number=pr_number,
@@ -951,19 +1036,18 @@ class Phase1Orchestrator:
                     pr_number=pr_number,
                     comment_id=comment.comment_id,
                 )
-                if token not in known_tokens:
-                    self._github.post_issue_comment(
-                        issue_number=issue_number,
-                        body=append_action_token(
-                            body=_render_source_issue_redirect_comment(
-                                pr_number=pr_number,
-                                pr_url=pr_url,
-                                source_comment_url=comment.html_url,
-                            ),
-                            token=token,
-                        ),
-                    )
-                    known_tokens.add(token)
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=issue_number,
+                    token=token,
+                    body=_render_source_issue_redirect_comment(
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        source_comment_url=comment.html_url,
+                    ),
+                    source="source_issue_redirect",
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 log_event(
                     LOGGER,
                     "source_issue_comment_redirected",
@@ -1141,7 +1225,40 @@ class Phase1Orchestrator:
 
         for issue_number in issue_numbers:
             source_pr_number = issue_number if issue_number in blocked_pr_numbers else None
-            comments = self._github.list_issue_comments(issue_number)
+            if self._incremental_comment_fetch_enabled():
+                incremental_scan = self._scan_incremental_issue_comments(
+                    issue_number=issue_number,
+                    surface=_SURFACE_ISSUE_OPERATOR_COMMANDS,
+                    bootstrap_mode="seed_latest",
+                )
+                comments = [cast(PullRequestIssueComment, c) for c in incremental_scan.new]
+                token_observations = self._action_token_observations_from_comments(
+                    scope_kind="issue",
+                    scope_number=issue_number,
+                    source=_SURFACE_ISSUE_OPERATOR_COMMANDS,
+                    comments=incremental_scan.fetched,
+                )
+                self._state.ingest_feedback_scan_batch(
+                    events=(),
+                    cursor_updates=(incremental_scan.cursor_update,),
+                    token_observations=token_observations,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            else:
+                comments = self._github.list_issue_comments(issue_number)
+                token_observations = self._action_token_observations_from_comments(
+                    scope_kind="issue",
+                    scope_number=issue_number,
+                    source=_SURFACE_ISSUE_OPERATOR_COMMANDS,
+                    comments=tuple(comments),
+                )
+                if token_observations:
+                    self._state.ingest_feedback_scan_batch(
+                        events=(),
+                        cursor_updates=(),
+                        token_observations=token_observations,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
             for comment in comments:
                 parsed = parse_operator_command(comment.body)
                 if parsed is None:
@@ -1627,8 +1744,6 @@ class Phase1Orchestrator:
         github = self._github_for_repo(command.repo_full_name)
         issue_number = issue_number_override or _operator_reply_issue_number(command)
         token = compute_operator_command_token(command_key=command.command_key)
-        if self._issue_has_action_token(github=github, issue_number=issue_number, token=token):
-            return
         body = _render_operator_command_result(
             normalized_command=_operator_normalized_command(command),
             status=reply_status,
@@ -1638,19 +1753,33 @@ class Phase1Orchestrator:
                 repo_full_name=command.repo_full_name or self._repo.full_name,
             ),
         )
-        github.post_issue_comment(
+        self._ensure_tokenized_issue_comment(
+            github=github,
             issue_number=issue_number,
-            body=append_action_token(body=body, token=token),
+            token=token,
+            body=body,
+            source="operator_command_reply",
+            repo_full_name=command.repo_full_name or self._repo.full_name,
         )
 
     def _issue_has_action_token(
-        self, *, github: GitHubGateway, issue_number: int, token: str
+        self,
+        *,
+        github: GitHubGateway,
+        issue_number: int,
+        token: str,
+        source: str,
+        repo_full_name: str | None = None,
     ) -> bool:
-        issue_comments = github.list_issue_comments(issue_number)
-        for comment in issue_comments:
-            if token in extract_action_tokens(comment.body):
-                return True
-        return False
+        repo_key = repo_full_name or self._state_repo_full_name()
+        planned = self._state.record_action_token_planned(
+            token=token,
+            scope_kind="issue",
+            scope_number=issue_number,
+            source=source,
+            repo_full_name=repo_key,
+        )
+        return self._is_action_token_observed(token_state=planned, github=github)
 
     def _checkpoint_recoverable_pre_pr_blocked(
         self,
@@ -1738,7 +1867,11 @@ class Phase1Orchestrator:
             checkpoint_sha=checkpoint_sha,
         )
         if self._issue_has_action_token(
-            github=self._github, issue_number=issue_number, token=token
+            github=self._github,
+            issue_number=issue_number,
+            token=token,
+            source="pre_pr_checkpoint",
+            repo_full_name=self._state_repo_full_name(),
         ):
             log_event(
                 LOGGER,
@@ -1756,19 +1889,20 @@ class Phase1Orchestrator:
             f"{self._state_repo_full_name()}/compare/"
             f"{self._repo.default_branch}...{checkpoint_sha}"
         )
-        self._github.post_issue_comment(
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
             issue_number=issue_number,
-            body=append_action_token(
-                body=_render_pre_pr_checkpoint_comment(
-                    waiting_reason=waiting_reason,
-                    checkpoint_branch=branch,
-                    checkpoint_sha=checkpoint_sha,
-                    tree_url=tree_url,
-                    compare_url=compare_url,
-                    default_branch=self._repo.default_branch,
-                ),
-                token=token,
+            token=token,
+            body=_render_pre_pr_checkpoint_comment(
+                waiting_reason=waiting_reason,
+                checkpoint_branch=branch,
+                checkpoint_sha=checkpoint_sha,
+                tree_url=tree_url,
+                compare_url=compare_url,
+                default_branch=self._repo.default_branch,
             ),
+            source="pre_pr_checkpoint",
+            repo_full_name=self._state_repo_full_name(),
         )
         log_event(
             LOGGER,
@@ -1786,6 +1920,446 @@ class Phase1Orchestrator:
 
     def _state_repo_full_name(self) -> str:
         return self._repo.full_name
+
+    def _incremental_comment_fetch_enabled(self) -> bool:
+        return self._config.runtime.enable_incremental_comment_fetch
+
+    def _load_poll_cursor(
+        self, *, surface: GitHubCommentSurface, scope_number: int
+    ) -> GitHubCommentPollCursorState:
+        repo_full_name = self._state_repo_full_name()
+        cursor = self._state.get_poll_cursor(
+            surface=surface,
+            scope_number=scope_number,
+            repo_full_name=repo_full_name,
+        )
+        if cursor is None:
+            return GitHubCommentPollCursorState(
+                repo_full_name=repo_full_name,
+                surface=surface,
+                scope_number=scope_number,
+                last_updated_at=_COMMENT_CURSOR_EPOCH,
+                last_comment_id=0,
+                bootstrap_complete=False,
+                updated_at="",
+            )
+
+        parsed_cursor_time = _parse_utc_timestamp(cursor.last_updated_at)
+        now_utc = datetime.now(timezone.utc)
+        if (
+            parsed_cursor_time is None
+            or parsed_cursor_time > (now_utc + timedelta(seconds=1))
+            or cursor.last_comment_id < 0
+        ):
+            reset_timestamp = _format_utc_timestamp(
+                now_utc
+                - timedelta(seconds=self._config.runtime.comment_fetch_safe_backfill_seconds)
+            )
+            log_event(
+                LOGGER,
+                "cursor_invalid",
+                repo_full_name=repo_full_name,
+                surface=surface,
+                scope_number=scope_number,
+                last_updated_at=cursor.last_updated_at,
+                last_comment_id=cursor.last_comment_id,
+                bootstrap_complete=cursor.bootstrap_complete,
+                reset_last_updated_at=reset_timestamp,
+            )
+            return self._state.upsert_poll_cursor(
+                surface=surface,
+                scope_number=scope_number,
+                last_updated_at=reset_timestamp,
+                last_comment_id=0,
+                bootstrap_complete=False,
+                repo_full_name=repo_full_name,
+            )
+
+        normalized_timestamp = _format_utc_timestamp(parsed_cursor_time)
+        if normalized_timestamp != cursor.last_updated_at:
+            return self._state.upsert_poll_cursor(
+                surface=surface,
+                scope_number=scope_number,
+                last_updated_at=normalized_timestamp,
+                last_comment_id=cursor.last_comment_id,
+                bootstrap_complete=cursor.bootstrap_complete,
+                repo_full_name=repo_full_name,
+            )
+        return cursor
+
+    def _since_for_cursor(self, *, last_updated_at: str) -> str:
+        parsed = _parse_utc_timestamp(last_updated_at)
+        if parsed is None:
+            parsed = _parse_utc_timestamp(_COMMENT_CURSOR_EPOCH)
+            if parsed is None:
+                parsed = datetime.now(timezone.utc)
+        since = parsed - timedelta(seconds=self._config.runtime.comment_fetch_overlap_seconds)
+        epoch = _parse_utc_timestamp(_COMMENT_CURSOR_EPOCH)
+        if epoch is not None and since < epoch:
+            since = epoch
+        return _format_utc_timestamp(since)
+
+    def _build_incremental_scan(
+        self,
+        *,
+        surface: GitHubCommentSurface,
+        scope_number: int,
+        cursor: GitHubCommentPollCursorState,
+        comments: tuple[PullRequestIssueComment | PullRequestReviewComment, ...],
+        bootstrap_mode: Literal["process_all", "seed_latest"],
+    ) -> _IncrementalCommentScan:
+        normalized_comments: list[
+            tuple[str, int, PullRequestIssueComment | PullRequestReviewComment]
+        ] = []
+        for comment in comments:
+            normalized_comments.append(
+                (
+                    _normalize_timestamp_for_compare(comment.updated_at),
+                    comment.comment_id,
+                    comment,
+                )
+            )
+        normalized_comments.sort(key=lambda item: (item[0], item[1]))
+
+        cursor_key = (cursor.last_updated_at, cursor.last_comment_id)
+        if cursor.bootstrap_complete:
+            new_comments = tuple(
+                item[2] for item in normalized_comments if (item[0], item[1]) > cursor_key
+            )
+        elif bootstrap_mode == "process_all":
+            new_comments = tuple(item[2] for item in normalized_comments)
+        else:
+            new_comments = ()
+
+        if normalized_comments:
+            next_updated_at, next_comment_id, _ = normalized_comments[-1]
+        elif cursor.bootstrap_complete:
+            next_updated_at, next_comment_id = cursor_key
+        else:
+            next_updated_at = _format_utc_timestamp(datetime.now(timezone.utc))
+            next_comment_id = 0
+
+        replay_count = max(0, len(normalized_comments) - len(new_comments))
+        if not cursor.bootstrap_complete:
+            log_event(
+                LOGGER,
+                "incremental_scan_backfill",
+                repo_full_name=self._state_repo_full_name(),
+                surface=surface,
+                scope_number=scope_number,
+                fetched_count=len(normalized_comments),
+                processed_count=len(new_comments),
+                bootstrap_mode=bootstrap_mode,
+            )
+
+        log_event(
+            LOGGER,
+            "incremental_scan_completed",
+            repo_full_name=self._state_repo_full_name(),
+            surface=surface,
+            scope_number=scope_number,
+            fetched_count=len(normalized_comments),
+            new_count=len(new_comments),
+            replay_count=replay_count,
+            last_updated_at=next_updated_at,
+            last_comment_id=next_comment_id,
+        )
+        return _IncrementalCommentScan(
+            fetched=tuple(item[2] for item in normalized_comments),
+            new=new_comments,
+            cursor_update=PollCursorUpdate(
+                surface=surface,
+                scope_number=scope_number,
+                last_updated_at=next_updated_at,
+                last_comment_id=next_comment_id,
+                bootstrap_complete=True,
+            ),
+        )
+
+    def _scan_incremental_pr_review_comments(self, *, pr_number: int) -> _IncrementalCommentScan:
+        cursor = self._load_poll_cursor(
+            surface=_SURFACE_PR_REVIEW_COMMENTS,
+            scope_number=pr_number,
+        )
+        since = (
+            None
+            if not cursor.bootstrap_complete
+            else self._since_for_cursor(last_updated_at=cursor.last_updated_at)
+        )
+        log_event(
+            LOGGER,
+            "incremental_scan_started",
+            repo_full_name=self._state_repo_full_name(),
+            surface=_SURFACE_PR_REVIEW_COMMENTS,
+            scope_number=pr_number,
+            since=since,
+            bootstrap_complete=cursor.bootstrap_complete,
+        )
+        comments = tuple(self._github.list_pull_request_review_comments(pr_number, since=since))
+        return self._build_incremental_scan(
+            surface=_SURFACE_PR_REVIEW_COMMENTS,
+            scope_number=pr_number,
+            cursor=cursor,
+            comments=comments,
+            bootstrap_mode="process_all",
+        )
+
+    def _scan_incremental_pr_issue_comments(self, *, pr_number: int) -> _IncrementalCommentScan:
+        cursor = self._load_poll_cursor(
+            surface=_SURFACE_PR_ISSUE_COMMENTS,
+            scope_number=pr_number,
+        )
+        since = (
+            None
+            if not cursor.bootstrap_complete
+            else self._since_for_cursor(last_updated_at=cursor.last_updated_at)
+        )
+        log_event(
+            LOGGER,
+            "incremental_scan_started",
+            repo_full_name=self._state_repo_full_name(),
+            surface=_SURFACE_PR_ISSUE_COMMENTS,
+            scope_number=pr_number,
+            since=since,
+            bootstrap_complete=cursor.bootstrap_complete,
+        )
+        comments = tuple(self._github.list_pull_request_issue_comments(pr_number, since=since))
+        return self._build_incremental_scan(
+            surface=_SURFACE_PR_ISSUE_COMMENTS,
+            scope_number=pr_number,
+            cursor=cursor,
+            comments=comments,
+            bootstrap_mode="process_all",
+        )
+
+    def _scan_incremental_issue_comments(
+        self,
+        *,
+        issue_number: int,
+        surface: GitHubCommentSurface,
+        bootstrap_mode: Literal["process_all", "seed_latest"],
+    ) -> _IncrementalCommentScan:
+        cursor = self._load_poll_cursor(surface=surface, scope_number=issue_number)
+        since = (
+            None
+            if not cursor.bootstrap_complete
+            else self._since_for_cursor(last_updated_at=cursor.last_updated_at)
+        )
+        log_event(
+            LOGGER,
+            "incremental_scan_started",
+            repo_full_name=self._state_repo_full_name(),
+            surface=surface,
+            scope_number=issue_number,
+            since=since,
+            bootstrap_complete=cursor.bootstrap_complete,
+        )
+        comments = tuple(self._github.list_issue_comments(issue_number, since=since))
+        return self._build_incremental_scan(
+            surface=surface,
+            scope_number=issue_number,
+            cursor=cursor,
+            comments=comments,
+            bootstrap_mode=bootstrap_mode,
+        )
+
+    def _action_token_observations_from_comments(
+        self,
+        *,
+        scope_kind: Literal["pr", "issue"],
+        scope_number: int,
+        source: str,
+        comments: tuple[PullRequestIssueComment | PullRequestReviewComment, ...],
+    ) -> tuple[ActionTokenObservation, ...]:
+        observed_by_token: dict[str, ActionTokenObservation] = {}
+        for comment in comments:
+            tokens = extract_action_tokens(comment.body)
+            if not tokens:
+                continue
+            normalized_updated_at = _normalize_timestamp_for_compare(comment.updated_at)
+            for token in tokens:
+                candidate = ActionTokenObservation(
+                    token=token,
+                    scope_kind=scope_kind,
+                    scope_number=scope_number,
+                    source=source,
+                    comment_id=comment.comment_id,
+                    updated_at=normalized_updated_at,
+                )
+                existing = observed_by_token.get(token)
+                if existing is None or (
+                    candidate.updated_at,
+                    candidate.comment_id,
+                ) > (existing.updated_at, existing.comment_id):
+                    observed_by_token[token] = candidate
+        return tuple(observed_by_token[token] for token in sorted(observed_by_token))
+
+    def _token_reconcile_since(self, *, created_at: str) -> str:
+        created_at_dt = _parse_utc_timestamp(created_at) or datetime.now(timezone.utc)
+        since = created_at_dt - timedelta(
+            seconds=self._config.runtime.comment_fetch_overlap_seconds
+        )
+        safe_floor = datetime.now(timezone.utc) - timedelta(
+            seconds=self._config.runtime.comment_fetch_safe_backfill_seconds
+        )
+        if since < safe_floor:
+            since = safe_floor
+        epoch = _parse_utc_timestamp(_COMMENT_CURSOR_EPOCH)
+        if epoch is not None and since < epoch:
+            since = epoch
+        return _format_utc_timestamp(since)
+
+    def _reconcile_action_token(
+        self,
+        *,
+        token_state: ActionTokenState,
+        github: GitHubGateway | None = None,
+    ) -> bool:
+        repo_full_name = token_state.repo_full_name or self._state_repo_full_name()
+        github_client = github if github is not None else self._github_for_repo(repo_full_name)
+        since = self._token_reconcile_since(created_at=token_state.created_at)
+
+        if token_state.scope_kind == "pr":
+            review_comments = tuple(
+                github_client.list_pull_request_review_comments(
+                    token_state.scope_number, since=since
+                )
+            )
+            issue_comments = tuple(
+                github_client.list_pull_request_issue_comments(
+                    token_state.scope_number, since=since
+                )
+            )
+            observations = self._action_token_observations_from_comments(
+                scope_kind="pr",
+                scope_number=token_state.scope_number,
+                source="token_reconcile_pr_review",
+                comments=review_comments,
+            ) + self._action_token_observations_from_comments(
+                scope_kind="pr",
+                scope_number=token_state.scope_number,
+                source="token_reconcile_pr_issue",
+                comments=issue_comments,
+            )
+        else:
+            issue_comments = tuple(
+                github_client.list_issue_comments(token_state.scope_number, since=since)
+            )
+            observations = self._action_token_observations_from_comments(
+                scope_kind="issue",
+                scope_number=token_state.scope_number,
+                source="token_reconcile_issue",
+                comments=issue_comments,
+            )
+
+        if observations:
+            self._state.ingest_feedback_scan_batch(
+                events=(),
+                cursor_updates=(),
+                token_observations=observations,
+                repo_full_name=repo_full_name,
+            )
+
+        refreshed = self._state.get_action_token(
+            token_state.token,
+            repo_full_name=repo_full_name,
+        )
+        if refreshed is not None and refreshed.status == "observed":
+            log_event(
+                LOGGER,
+                "token_observed",
+                repo_full_name=repo_full_name,
+                token=token_state.token,
+                scope_kind=token_state.scope_kind,
+                scope_number=token_state.scope_number,
+            )
+            return True
+
+        log_event(
+            LOGGER,
+            "token_reconcile_timeout",
+            repo_full_name=repo_full_name,
+            token=token_state.token,
+            scope_kind=token_state.scope_kind,
+            scope_number=token_state.scope_number,
+            since=since,
+        )
+        return False
+
+    def _is_action_token_observed(
+        self,
+        *,
+        token_state: ActionTokenState,
+        github: GitHubGateway | None = None,
+    ) -> bool:
+        if token_state.status == "observed":
+            return True
+        return self._reconcile_action_token(token_state=token_state, github=github)
+
+    def _ensure_tokenized_issue_comment(
+        self,
+        *,
+        github: GitHubGateway,
+        issue_number: int,
+        token: str,
+        body: str,
+        source: str,
+        repo_full_name: str,
+    ) -> bool:
+        planned = self._state.record_action_token_planned(
+            token=token,
+            scope_kind="issue",
+            scope_number=issue_number,
+            source=source,
+            repo_full_name=repo_full_name,
+        )
+        if self._is_action_token_observed(token_state=planned, github=github):
+            return False
+        github.post_issue_comment(
+            issue_number=issue_number,
+            body=append_action_token(body=body, token=token),
+        )
+        self._state.record_action_token_posted(
+            token=token,
+            scope_kind="issue",
+            scope_number=issue_number,
+            source=source,
+            repo_full_name=repo_full_name,
+        )
+        return True
+
+    def _ensure_tokenized_review_reply(
+        self,
+        *,
+        pr_number: int,
+        review_comment_id: int,
+        token: str,
+        body: str,
+        source: str,
+    ) -> bool:
+        repo_full_name = self._state_repo_full_name()
+        planned = self._state.record_action_token_planned(
+            token=token,
+            scope_kind="pr",
+            scope_number=pr_number,
+            source=source,
+            repo_full_name=repo_full_name,
+        )
+        if self._is_action_token_observed(token_state=planned, github=self._github):
+            return False
+        self._github.post_review_comment_reply(
+            pr_number=pr_number,
+            review_comment_id=review_comment_id,
+            body=append_action_token(body=body, token=token),
+        )
+        self._state.record_action_token_posted(
+            token=token,
+            scope_kind="pr",
+            scope_number=pr_number,
+            source=source,
+            repo_full_name=repo_full_name,
+        )
+        return True
 
     def _reap_finished(self) -> None:
         finished_issue_numbers: list[int] = []
@@ -3235,8 +3809,41 @@ class Phase1Orchestrator:
                     )
                     return "blocked"
 
-            review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
-            issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
+            if self._incremental_comment_fetch_enabled():
+                review_scan = self._scan_incremental_pr_review_comments(pr_number=tracked.pr_number)
+                issue_scan = self._scan_incremental_pr_issue_comments(pr_number=tracked.pr_number)
+                review_comments = [cast(PullRequestReviewComment, c) for c in review_scan.new]
+                issue_comments = [cast(PullRequestIssueComment, c) for c in issue_scan.new]
+                cursor_updates: tuple[PollCursorUpdate, ...] = (
+                    review_scan.cursor_update,
+                    issue_scan.cursor_update,
+                )
+                token_observations = self._action_token_observations_from_comments(
+                    scope_kind="pr",
+                    scope_number=tracked.pr_number,
+                    source=_SURFACE_PR_REVIEW_COMMENTS,
+                    comments=review_scan.fetched,
+                ) + self._action_token_observations_from_comments(
+                    scope_kind="pr",
+                    scope_number=tracked.pr_number,
+                    source=_SURFACE_PR_ISSUE_COMMENTS,
+                    comments=issue_scan.fetched,
+                )
+            else:
+                review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
+                issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
+                cursor_updates = ()
+                token_observations = self._action_token_observations_from_comments(
+                    scope_kind="pr",
+                    scope_number=tracked.pr_number,
+                    source=_SURFACE_PR_REVIEW_COMMENTS,
+                    comments=tuple(review_comments),
+                ) + self._action_token_observations_from_comments(
+                    scope_kind="pr",
+                    scope_number=tracked.pr_number,
+                    source=_SURFACE_PR_ISSUE_COMMENTS,
+                    comments=tuple(issue_comments),
+                )
             changed_files = self._github.list_pull_request_files(tracked.pr_number)
 
             previous_pending = self._state.list_pending_feedback_events(
@@ -3253,12 +3860,11 @@ class Phase1Orchestrator:
                 issue_number=tracked.issue_number,
                 comments=issue_comments,
             )
-            self._state.ingest_feedback_events(
-                [event for event, _ in normalized_review],
-                repo_full_name=self._state_repo_full_name(),
-            )
-            self._state.ingest_feedback_events(
-                [event for event, _ in normalized_issue],
+            self._state.ingest_feedback_scan_batch(
+                events=tuple(event for event, _ in normalized_review)
+                + tuple(event for event, _ in normalized_issue),
+                cursor_updates=cursor_updates,
+                token_observations=token_observations,
                 repo_full_name=self._state_repo_full_name(),
             )
 
@@ -3489,43 +4095,32 @@ class Phase1Orchestrator:
                 return "blocked"
             pr = refreshed_pr
 
-            expected_tokens: list[str] = []
             for review_reply in result.review_replies:
                 token = compute_review_reply_token(
                     turn_key=turn_key,
                     review_comment_id=review_reply.review_comment_id,
                     body=review_reply.body,
                 )
-                expected_tokens.append(token)
-                if self._token_exists_remotely(tracked.pr_number, token):
-                    continue
-                self._github.post_review_comment_reply(
+                self._ensure_tokenized_review_reply(
                     pr_number=tracked.pr_number,
                     review_comment_id=review_reply.review_comment_id,
-                    body=append_action_token(body=review_reply.body, token=token),
+                    token=token,
+                    body=review_reply.body,
+                    source="feedback_review_reply",
                 )
 
             if result.general_comment:
                 token = compute_general_comment_token(
                     turn_key=turn_key, body=result.general_comment
                 )
-                expected_tokens.append(token)
-                if not self._token_exists_remotely(tracked.pr_number, token):
-                    self._github.post_issue_comment(
-                        issue_number=tracked.pr_number,
-                        body=append_action_token(body=result.general_comment, token=token),
-                    )
-
-            remote_tokens = self._fetch_remote_action_tokens(tracked.pr_number)
-            if not set(expected_tokens).issubset(remote_tokens):
-                log_event(
-                    LOGGER,
-                    "feedback_turn_blocked",
-                    issue_number=tracked.issue_number,
-                    pr_number=tracked.pr_number,
-                    reason="token_reconciliation_incomplete",
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=tracked.pr_number,
+                    token=token,
+                    body=result.general_comment,
+                    source="feedback_general_comment",
+                    repo_full_name=self._state_repo_full_name(),
                 )
-                return "blocked"
 
             self._state.finalize_feedback_turn(
                 pr_number=tracked.pr_number,
@@ -4325,9 +4920,13 @@ class Phase1Orchestrator:
                 "Resolve by restoring linear history, or reset blocked state with an explicit "
                 "`--head-sha` override once the canonical head is confirmed."
             )
-            self._github.post_issue_comment(
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
                 issue_number=tracked.pr_number,
-                body=append_action_token(body=comment, token=token),
+                token=token,
+                body=comment,
+                source="history_rewrite_block",
+                repo_full_name=self._state_repo_full_name(),
             )
 
         error = (
@@ -4364,17 +4963,45 @@ class Phase1Orchestrator:
         )
 
     def _token_exists_remotely(self, pr_number: int, token: str) -> bool:
-        return token in self._fetch_remote_action_tokens(pr_number)
+        planned = self._state.record_action_token_planned(
+            token=token,
+            scope_kind="pr",
+            scope_number=pr_number,
+            source="feedback_pr_token_check",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return self._is_action_token_observed(token_state=planned, github=self._github)
 
     def _fetch_remote_action_tokens(self, pr_number: int) -> set[str]:
-        review_comments = self._github.list_pull_request_review_comments(pr_number)
-        issue_comments = self._github.list_pull_request_issue_comments(pr_number)
-        tokens: set[str] = set()
-        for comment in review_comments:
-            tokens.update(extract_action_tokens(comment.body))
-        for comment in issue_comments:
-            tokens.update(extract_action_tokens(comment.body))
-        return tokens
+        since = _format_utc_timestamp(
+            datetime.now(timezone.utc)
+            - timedelta(seconds=self._config.runtime.comment_fetch_safe_backfill_seconds)
+        )
+        review_comments = tuple(
+            self._github.list_pull_request_review_comments(pr_number, since=since)
+        )
+        issue_comments = tuple(
+            self._github.list_pull_request_issue_comments(pr_number, since=since)
+        )
+        observations = self._action_token_observations_from_comments(
+            scope_kind="pr",
+            scope_number=pr_number,
+            source="feedback_pr_review_scan",
+            comments=review_comments,
+        ) + self._action_token_observations_from_comments(
+            scope_kind="pr",
+            scope_number=pr_number,
+            source="feedback_pr_issue_scan",
+            comments=issue_comments,
+        )
+        if observations:
+            self._state.ingest_feedback_scan_batch(
+                events=(),
+                cursor_updates=(),
+                token_observations=observations,
+                repo_full_name=self._state_repo_full_name(),
+            )
+        return {observation.token for observation in observations}
 
     def _is_issue_author_allowed(
         self, *, issue_number: int, author_login: str, reason: str
@@ -4389,6 +5016,34 @@ class Phase1Orchestrator:
             reason=reason,
         )
         return False
+
+
+def _parse_utc_timestamp(value: str) -> datetime | None:
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.lower() == "now":
+        return datetime.now(timezone.utc)
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_timestamp_for_compare(value: str) -> str:
+    parsed = _parse_utc_timestamp(value)
+    if parsed is None:
+        return value
+    return _format_utc_timestamp(parsed)
 
 
 def _issue_to_json_dict(issue: Issue) -> dict[str, object]:

@@ -405,79 +405,119 @@ class GitHubGateway:
         )
         return tuple(files)
 
-    def list_pull_request_review_comments(self, pr_number: int) -> list[PullRequestReviewComment]:
-        path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/comments?per_page=100"
-        payload = self._api_json("GET", path)
-        if not isinstance(payload, list):
-            raise RuntimeError("Unexpected GitHub response: expected list of review comments")
-
+    def list_pull_request_review_comments(
+        self,
+        pr_number: int,
+        *,
+        since: str | None = None,
+    ) -> list[PullRequestReviewComment]:
         comments: list[PullRequestReviewComment] = []
-        for item in payload:
-            item_obj = _as_object_dict(item)
-            if item_obj is None:
-                continue
-            user_obj = _as_object_dict(item_obj.get("user"))
-            comments.append(
-                PullRequestReviewComment(
-                    comment_id=_as_int(item_obj.get("id"), field="id"),
-                    body=_as_string(item_obj.get("body")),
-                    path=_as_string(item_obj.get("path")),
-                    line=_as_optional_int(item_obj.get("line")),
-                    side=_as_optional_str(item_obj.get("side")),
-                    in_reply_to_id=_as_optional_int(item_obj.get("in_reply_to_id")),
-                    user_login=_as_string(user_obj.get("login") if user_obj else None),
-                    html_url=_as_string(item_obj.get("html_url")),
-                    created_at=_as_string(item_obj.get("created_at")),
-                    updated_at=_as_string(item_obj.get("updated_at")),
-                )
+        page = 1
+        while True:
+            query_items: dict[str, object] = {"per_page": 100, "page": page}
+            if since is not None:
+                query_items["since"] = since
+            path = (
+                f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/comments?"
+                f"{urlencode(query_items)}"
             )
+            payload = self._api_json("GET", path)
+            if not isinstance(payload, list):
+                raise RuntimeError("Unexpected GitHub response: expected list of review comments")
+
+            for item in payload:
+                item_obj = _as_object_dict(item)
+                if item_obj is None:
+                    continue
+                user_obj = _as_object_dict(item_obj.get("user"))
+                comments.append(
+                    PullRequestReviewComment(
+                        comment_id=_as_int(item_obj.get("id"), field="id"),
+                        body=_as_string(item_obj.get("body")),
+                        path=_as_string(item_obj.get("path")),
+                        line=_as_optional_int(item_obj.get("line")),
+                        side=_as_optional_str(item_obj.get("side")),
+                        in_reply_to_id=_as_optional_int(item_obj.get("in_reply_to_id")),
+                        user_login=_as_string(user_obj.get("login") if user_obj else None),
+                        html_url=_as_string(item_obj.get("html_url")),
+                        created_at=_as_string(item_obj.get("created_at")),
+                        updated_at=_as_string(item_obj.get("updated_at")),
+                    )
+                )
+            if len(payload) < 100:
+                break
+            page += 1
         log_event(
             LOGGER,
             "github_read",
             endpoint="pull_request_review_comments",
             pr_number=pr_number,
+            since=since,
             count=len(comments),
         )
         return comments
 
-    def list_pull_request_issue_comments(self, pr_number: int) -> list[PullRequestIssueComment]:
-        comments = self.list_issue_comments(pr_number)
+    def list_pull_request_issue_comments(
+        self,
+        pr_number: int,
+        *,
+        since: str | None = None,
+    ) -> list[PullRequestIssueComment]:
+        comments = self.list_issue_comments(pr_number, since=since)
         log_event(
             LOGGER,
             "github_read",
             endpoint="pull_request_issue_comments",
             pr_number=pr_number,
+            since=since,
             count=len(comments),
         )
         return comments
 
-    def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
-        path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}/comments?per_page=100"
-        payload = self._api_json("GET", path)
-        if not isinstance(payload, list):
-            raise RuntimeError("Unexpected GitHub response: expected list of issue comments")
-
+    def list_issue_comments(
+        self,
+        issue_number: int,
+        *,
+        since: str | None = None,
+    ) -> list[PullRequestIssueComment]:
         comments: list[PullRequestIssueComment] = []
-        for item in payload:
-            item_obj = _as_object_dict(item)
-            if item_obj is None:
-                continue
-            user_obj = _as_object_dict(item_obj.get("user"))
-            comments.append(
-                PullRequestIssueComment(
-                    comment_id=_as_int(item_obj.get("id"), field="id"),
-                    body=_as_string(item_obj.get("body")),
-                    user_login=_as_string(user_obj.get("login") if user_obj else None),
-                    html_url=_as_string(item_obj.get("html_url")),
-                    created_at=_as_string(item_obj.get("created_at")),
-                    updated_at=_as_string(item_obj.get("updated_at")),
-                )
+        page = 1
+        while True:
+            query_items: dict[str, object] = {"per_page": 100, "page": page}
+            if since is not None:
+                query_items["since"] = since
+            path = (
+                f"/repos/{self.owner}/{self.name}/issues/{issue_number}/comments?"
+                f"{urlencode(query_items)}"
             )
+            payload = self._api_json("GET", path)
+            if not isinstance(payload, list):
+                raise RuntimeError("Unexpected GitHub response: expected list of issue comments")
+
+            for item in payload:
+                item_obj = _as_object_dict(item)
+                if item_obj is None:
+                    continue
+                user_obj = _as_object_dict(item_obj.get("user"))
+                comments.append(
+                    PullRequestIssueComment(
+                        comment_id=_as_int(item_obj.get("id"), field="id"),
+                        body=_as_string(item_obj.get("body")),
+                        user_login=_as_string(user_obj.get("login") if user_obj else None),
+                        html_url=_as_string(item_obj.get("html_url")),
+                        created_at=_as_string(item_obj.get("created_at")),
+                        updated_at=_as_string(item_obj.get("updated_at")),
+                    )
+                )
+            if len(payload) < 100:
+                break
+            page += 1
         log_event(
             LOGGER,
             "github_read",
             endpoint="issue_comments",
             issue_number=issue_number,
+            since=since,
             count=len(comments),
         )
         return comments

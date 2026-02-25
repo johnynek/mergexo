@@ -94,7 +94,10 @@ class FakeGitHub:
         self.posted = []
         self.next_comment_id = 1000
 
-    def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
+    def list_issue_comments(
+        self, issue_number: int, *, since: str | None = None
+    ) -> list[PullRequestIssueComment]:
+        _ = since
         return list(self.threads.get(issue_number, ()))
 
     def post_issue_comment(self, issue_number: int, body: str) -> None:
