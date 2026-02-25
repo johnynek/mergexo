@@ -234,18 +234,26 @@ Recommended rollout:
 
 Enable with:
 
-- `runtime.enable_pr_actions_monitoring = true`
+- `repo.pr_actions_feedback_policy = "never" | "first_fail" | "all_complete"`
+- optional compatibility fallback: `runtime.enable_pr_actions_monitoring = true` (only used when repo policy is omitted)
 - optional `runtime.pr_actions_log_tail_lines = 500`
 
 Behavior:
 
 1. MergeXO scans tracked `awaiting_feedback` PRs and checks workflow runs for current PR head SHAs.
-2. If any run is still active, MergeXO logs monitoring state and waits.
-3. When all runs are terminal and at least one run is non-green (anything except `success`, `neutral`, `skipped`), MergeXO enqueues deterministic `actions` feedback events keyed by run id + `updated_at`.
-4. On the next feedback turn, MergeXO revalidates those events against current head/run state:
+2. Effective policy precedence is:
+   - explicit `repo.pr_actions_feedback_policy`
+   - otherwise `runtime.enable_pr_actions_monitoring = true` maps to `all_complete`
+   - otherwise `never`
+3. Policy behavior:
+   - `never`: skip Actions monitoring for that repo
+   - `all_complete`: if any run is active, wait; when all runs are terminal enqueue non-green failures
+   - `first_fail`: enqueue non-green completed failures even if other runs are still active
+4. Actions events are deterministic and deduped by run id + `updated_at`.
+5. On the next feedback turn, MergeXO revalidates those events against current head/run state:
    - stale events (run now green, run no longer on current head, or run updated) are auto-resolved
    - actionable events inject CI context into agent turn, including failed action names and `last N log lines` tails
-5. If no PR review/issue comments exist, CI context alone can trigger a feedback remediation turn.
+6. If no PR review/issue comments exist, CI context alone can trigger a feedback remediation turn.
 
 Notes:
 
@@ -329,7 +337,7 @@ Do not mix both shapes in one file.
 | `poll_interval_seconds` | yes | none | must be `>= 5` |
 | `enable_github_operations` | no | `false` | enables `/mergexo ...` command processing |
 | `enable_issue_comment_routing` | no | `false` | enables pre-PR follow-up + post-PR source redirects |
-| `enable_pr_actions_monitoring` | no | `false` | enables GitHub Actions feedback events |
+| `enable_pr_actions_monitoring` | no | `false` | compatibility fallback: when true, repos without explicit policy behave as `all_complete` |
 | `enable_incremental_comment_fetch` | no | `false` | enables incremental GitHub comment polling with persisted cursors |
 | `comment_fetch_overlap_seconds` | no | `5` | overlap replay window used with `since` queries; must be `>= 0` |
 | `comment_fetch_safe_backfill_seconds` | no | `86400` | cursor-reset safe backfill window; must be `>= overlap` |
@@ -361,6 +369,7 @@ Do not mix both shapes in one file.
 | `remote_url` | no | `git@github.com:<owner>/<name>.git` | explicit remote override |
 | `required_tests` | no | unset | repo-relative or absolute executable path |
 | `test_file_regex` | no | unset | bugfix-only regression-test staged-file gate; string or list |
+| `pr_actions_feedback_policy` | no | unset | one of `never`, `first_fail`, `all_complete`; when omitted runtime fallback applies (`true -> all_complete`, `false -> never`) |
 | `operations_issue_number` | no | unset | optional global ops issue |
 | `operator_logins` | no | `[]` | allowed `/mergexo` command authors |
 

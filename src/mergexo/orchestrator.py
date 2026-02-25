@@ -50,6 +50,7 @@ from mergexo.models import (
     OperatorCommandRecord,
     OperatorCommandStatus,
     OperatorReplyStatus,
+    PrActionsFeedbackPolicy,
     RestartMode,
     PullRequestIssueComment,
     PullRequestSnapshot,
@@ -369,7 +370,8 @@ class Phase1Orchestrator:
                         fn=lambda: self._enqueue_pre_pr_followup_work(pool),
                     ):
                         poll_had_github_errors = True
-                if self._config.runtime.enable_pr_actions_monitoring:
+                actions_policy = self._effective_pr_actions_feedback_policy()
+                if actions_policy != "never":
                     if not self._run_poll_step(
                         step_name="monitor_pr_actions",
                         fn=self._monitor_pr_actions,
@@ -445,6 +447,13 @@ class Phase1Orchestrator:
     def _is_restart_pending(self) -> bool:
         operation = self._state.get_runtime_operation(_RESTART_OPERATION_NAME)
         return operation is not None and operation.status in _RESTART_PENDING_STATUSES
+
+    def _effective_pr_actions_feedback_policy(self) -> PrActionsFeedbackPolicy:
+        if self._repo.pr_actions_feedback_policy is not None:
+            return self._repo.pr_actions_feedback_policy
+        if self._config.runtime.enable_pr_actions_monitoring:
+            return "all_complete"
+        return "never"
 
     def _run_poll_step(self, *, step_name: str, fn: Callable[[], None]) -> bool:
         try:
@@ -887,6 +896,10 @@ class Phase1Orchestrator:
                     self._work_limiter.release()
 
     def _monitor_pr_actions(self) -> None:
+        policy = self._effective_pr_actions_feedback_policy()
+        if policy == "never":
+            return
+
         tracked_prs = self._state.list_tracked_pull_requests(
             repo_full_name=self._state_repo_full_name()
         )
@@ -894,6 +907,7 @@ class Phase1Orchestrator:
             LOGGER,
             "actions_monitor_scan_started",
             tracked_pr_count=len(tracked_prs),
+            policy=policy,
         )
         for tracked in tracked_prs:
             pr = self._github.get_pull_request(tracked.pr_number)
@@ -901,23 +915,25 @@ class Phase1Orchestrator:
                 continue
 
             runs = self._github.list_workflow_runs_for_head(tracked.pr_number, pr.head_sha)
-            non_terminal_runs = tuple(run for run in runs if run.status != "completed")
-            if non_terminal_runs:
+            failed_runs = tuple(
+                run
+                for run in runs
+                if run.status == "completed" and run.conclusion not in _ACTIONS_GREEN_CONCLUSIONS
+            )
+            active_runs = tuple(run for run in runs if run.status != "completed")
+            if active_runs:
                 log_event(
                     LOGGER,
                     "actions_monitor_active_runs_detected",
                     issue_number=tracked.issue_number,
                     pr_number=tracked.pr_number,
                     head_sha=pr.head_sha,
-                    active_run_count=len(non_terminal_runs),
+                    policy=policy,
+                    active_run_count=len(active_runs),
+                    failed_run_count=len(failed_runs),
                 )
+            if policy == "all_complete" and active_runs:
                 continue
-
-            failed_runs = tuple(
-                run
-                for run in runs
-                if run.status == "completed" and run.conclusion not in _ACTIONS_GREEN_CONCLUSIONS
-            )
             if not failed_runs:
                 continue
 
@@ -939,7 +955,9 @@ class Phase1Orchestrator:
                 issue_number=tracked.issue_number,
                 pr_number=tracked.pr_number,
                 head_sha=pr.head_sha,
+                policy=policy,
                 failed_run_count=len(failed_runs),
+                active_run_count=len(active_runs),
             )
 
     def _actions_feedback_event_for_run(

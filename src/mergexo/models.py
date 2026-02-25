@@ -10,6 +10,7 @@ OperatorCommandStatus = Literal["applied", "rejected", "failed"]
 OperatorReplyStatus = Literal["applied", "rejected", "failed", "help"]
 RestartMode = Literal["git_checkout", "pypi"]
 RuntimeOperationStatus = Literal["pending", "running", "failed", "completed"]
+PrActionsFeedbackPolicy = Literal["never", "first_fail", "all_complete"]
 
 
 @dataclass(frozen=True)

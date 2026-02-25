@@ -6,7 +6,7 @@ import re
 import tomllib
 from typing import cast
 
-from mergexo.models import RestartMode
+from mergexo.models import PrActionsFeedbackPolicy, RestartMode
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,7 @@ class RepoConfig:
     remote_url: str | None
     required_tests: str | None = None
     test_file_regex: tuple[re.Pattern[str], ...] | None = None
+    pr_actions_feedback_policy: PrActionsFeedbackPolicy | None = None
     operations_issue_number: int | None = None
     operator_logins: tuple[str, ...] = ()
 
@@ -301,6 +302,9 @@ def _parse_repo_config(
         remote_url=_optional_str(repo_data, "remote_url"),
         required_tests=_optional_str(repo_data, "required_tests"),
         test_file_regex=_optional_regex_list(repo_data, "test_file_regex"),
+        pr_actions_feedback_policy=_optional_pr_actions_feedback_policy(
+            repo_data, "pr_actions_feedback_policy"
+        ),
         operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
         operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
     )
@@ -563,6 +567,20 @@ def _operator_logins_with_default(
         if login not in normalized:
             normalized.append(login)
     return tuple(normalized)
+
+
+def _optional_pr_actions_feedback_policy(
+    data: dict[str, object], key: str
+) -> PrActionsFeedbackPolicy | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{key} must be one of: never, first_fail, all_complete")
+    normalized = value.strip().lower()
+    if normalized not in {"never", "first_fail", "all_complete"}:
+        raise ConfigError(f"{key} must be one of: never, first_fail, all_complete")
+    return cast(PrActionsFeedbackPolicy, normalized)
 
 
 def _optional_allowed_users(data: dict[str, object], key: str) -> frozenset[str] | None:
