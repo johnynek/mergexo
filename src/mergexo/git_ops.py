@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import shutil
 
 from mergexo.config import RepoConfig, RuntimeConfig
 from mergexo.observability import log_event
@@ -17,6 +18,13 @@ def _is_non_fast_forward_push_error(detail: str) -> bool:
     if not normalized:
         return False
     return "non-fast-forward" in normalized
+
+
+def _is_checkout_overwrite_error(detail: str) -> bool:
+    normalized = detail.strip().lower()
+    if not normalized:
+        return False
+    return "would be overwritten by checkout" in normalized
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,56 @@ class GitRepoManager:
             default_branch=self.repo.default_branch,
         )
         run(["git", "-C", str(checkout_path), "fetch", "origin", "--prune", "--tags"])
+        self._force_clean_checkout(checkout_path)
+        try:
+            self._checkout_default_branch(checkout_path)
+        except CommandError as exc:
+            if not _is_checkout_overwrite_error(str(exc)):
+                raise
+            log_event(
+                LOGGER,
+                "git_prepare_checkout_retry_after_forced_clean",
+                checkout_path=str(checkout_path),
+                default_branch=self.repo.default_branch,
+            )
+            self._force_clean_checkout(checkout_path)
+            self._checkout_default_branch(checkout_path)
+
+    def recover_quarantined_slot(self, slot: int) -> Path:
+        checkout_path = self.slot_path(slot)
+        log_event(
+            LOGGER,
+            "git_slot_recovery_started",
+            slot=slot,
+            checkout_path=str(checkout_path),
+        )
+        try:
+            if checkout_path.exists():
+                shutil.rmtree(checkout_path)
+            recovered_path = self.ensure_checkout(slot)
+            self.prepare_checkout(recovered_path)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "git_slot_recovery_failed",
+                slot=slot,
+                checkout_path=str(checkout_path),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log_event(
+            LOGGER,
+            "git_slot_recovery_completed",
+            slot=slot,
+            checkout_path=str(recovered_path),
+        )
+        return recovered_path
+
+    def _force_clean_checkout(self, checkout_path: Path) -> None:
+        run(["git", "-C", str(checkout_path), "reset", "--hard"])
+        run(["git", "-C", str(checkout_path), "clean", "-ffdx"])
+
+    def _checkout_default_branch(self, checkout_path: Path) -> None:
         run(
             [
                 "git",

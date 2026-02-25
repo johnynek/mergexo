@@ -110,6 +110,60 @@ def test_prepare_branch_push_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert ["git", "-C", str(checkout), "push", "-u", "origin", "feature"] in calls
 
 
+def test_prepare_checkout_retries_when_checkout_would_overwrite_local_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+    checkout_attempts = 0
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        nonlocal checkout_attempts
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-4:] == ["checkout", "-B", "main", "origin/main"]:
+            checkout_attempts += 1
+            if checkout_attempts == 1:
+                raise CommandError(
+                    "error: Your local changes to the following files would be "
+                    "overwritten by checkout"
+                )
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    manager.prepare_checkout(checkout)
+
+    assert checkout_attempts == 2
+    assert calls.count(["git", "-C", str(checkout), "reset", "--hard"]) == 2
+    assert calls.count(["git", "-C", str(checkout), "clean", "-ffdx"]) == 3
+
+
+def test_recover_quarantined_slot_recreates_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    slot_path = manager.slot_path(0)
+    slot_path.mkdir(parents=True)
+    (slot_path / "stale.txt").write_text("stale", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    recovered = manager.recover_quarantined_slot(0)
+    assert recovered == slot_path
+    assert any(cmd[:3] == ["git", "clone", "--reference-if-able"] for cmd in calls)
+    assert ["git", "-C", str(slot_path), "fetch", "origin", "--prune", "--tags"] in calls
+
+
 def test_git_ops_emits_action_logs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
