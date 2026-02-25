@@ -1,5 +1,9 @@
 # MergeXO
 
+MergeXO uses GitHub as the UX and control plane for a team of local coding agents. You create issues, review design docs and pull requests, and manage progress from the same GitHub workflow you already use, including from the web or your phone.
+
+The goal is agentic development with normal software rigor: decisions are captured in issues, plans are reviewed in design docs, and code changes land through PR review. MergeXO orchestrates the local agent runtime so this workflow is automated, traceable, and easy to control.
+
 MergeXO is a local-first Python orchestrator that watches labeled issues and routes each issue into one startup flow:
 
 - `design_doc`: open a design-doc PR first, then implementation PR work after merge
