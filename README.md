@@ -109,11 +109,13 @@ Assume one repo with labels:
 1. Design flow issue:
    - Issue `#120` has `agent:design`.
    - MergeXO opens a status comment, creates `agent/design/120-...`, commits design doc to `docs/design/120-...md`, and opens a design PR with `Refs #120`.
+   - Reviewers add comments and request changes on the design PR; MergeXO responds to that PR feedback and updates the PR until it is ready to merge.
    - After that design PR is merged, MergeXO automatically treats it as an implementation candidate and opens a follow-up implementation PR.
 
 2. Bugfix flow issue:
    - Issue `#121` has `agent:bugfix`.
-   - MergeXO creates `agent/bugfix/121-...` and runs direct fix flow.
+   - MergeXO creates `agent/bugfix/121-...`, tries to reproduce the reported bug, and then applies a fix with regression tests.
+   - The user reviews both the tests and the bug fix in the PR.
    - PR body uses `Fixes #121`.
    - If `repo.test_file_regex` is set, at least one staged file must match it before PR creation.
 
