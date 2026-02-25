@@ -5,7 +5,7 @@ poll_interval_seconds = 600
 enable_github_operations = false
 # Enable pre-PR issue comment routing (queued retries before PR creation + post-PR redirects).
 enable_issue_comment_routing = false
-# Monitor GitHub Actions runs for tracked PR heads and enqueue CI remediation feedback events.
+# Compatibility fallback only: when true, repos without explicit policy behave as all_complete.
 enable_pr_actions_monitoring = false
 # Enable incremental GitHub comment polling (bounded by cursors + overlap replay).
 enable_incremental_comment_fetch = false
@@ -45,6 +45,9 @@ small_job_label = "agent:small-job"
 coding_guidelines_path = "docs/python_style.md"
 # Optional repo-relative or absolute path to an executable required before each push.
 required_tests = "scripts/test.sh"
+# Per-repo GitHub Actions feedback policy: never | first_fail | all_complete.
+# If omitted, runtime.enable_pr_actions_monitoring fallback is used.
+pr_actions_feedback_policy = "all_complete"
 # Optional bugfix-only staged regression-test gate.
 # Accepts either a single regex string or a list (OR semantics across patterns).
 # If omitted, MergeXO does not enforce staged test-file matching before bugfix PR creation.
@@ -65,6 +68,8 @@ operator_logins = []
 owner = "johnynek"
 name = "bosatsu"
 coding_guidelines_path = "docs/python_style.md"
+# Example for fail-fast pipelines: enqueue failures even while downstream jobs are pending.
+# pr_actions_feedback_policy = "first_fail"
 # required_tests = "scripts/required-tests.sh"
 # test_file_regex = ["^test/.*\\.scala$", "^integration/.*\\.scala$"]
 # allowed_users omitted => defaults to ["johnynek"]

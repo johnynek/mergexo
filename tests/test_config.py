@@ -45,6 +45,7 @@ owner = "johnynek"
 name = "repo"
 coding_guidelines_path = "docs/guidelines.md"
 required_tests = "scripts/required-tests.sh"
+pr_actions_feedback_policy = "first_fail"
 local_clone_source = "/tmp/local.git"
 operations_issue_number = 99
 operator_logins = ["Alice", "bob"]
@@ -98,6 +99,7 @@ extra_args = ["--repo-mode"]
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
     assert loaded.repo.required_tests == "scripts/required-tests.sh"
+    assert loaded.repo.pr_actions_feedback_policy == "first_fail"
     assert loaded.repo.test_file_regex is None
     assert loaded.repo.operations_issue_number == 99
     assert loaded.repo.operator_logins == ("alice", "bob")
@@ -128,6 +130,7 @@ poll_interval_seconds = 5
 owner = "johnynek"
 coding_guidelines_path = "docs/python_style.md"
 allowed_users = ["Alice", "bob", "alice"]
+pr_actions_feedback_policy = "never"
 
 [repo.bosatsu]
 owner = "johnynek"
@@ -153,11 +156,80 @@ coding_guidelines_path = "docs/python_style.md"
     assert by_id["mergexo"].name == "mergexo"
     assert by_id["mergexo"].full_name == "johnynek/mergexo"
     assert by_id["mergexo"].allowed_users == frozenset({"alice", "bob"})
+    assert by_id["mergexo"].pr_actions_feedback_policy == "never"
 
     assert by_id["bosatsu"].name == "bosatsu"
     assert by_id["bosatsu"].full_name == "johnynek/bosatsu"
     # owner default when allowed_users omitted in multi-repo mode
     assert by_id["bosatsu"].allowed_users == frozenset({"johnynek"})
+    assert by_id["bosatsu"].pr_actions_feedback_policy is None
+
+
+@pytest.mark.parametrize("policy", ["never", "first_fail", "all_complete"])
+def test_load_config_accepts_repo_actions_feedback_policy(tmp_path: Path, policy: str) -> None:
+    cfg_path = _write(
+        tmp_path / "mergexo.toml",
+        f"""
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+pr_actions_feedback_policy = "{policy}"
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+    assert loaded.repo.pr_actions_feedback_policy == policy
+
+
+def test_load_config_rejects_invalid_repo_actions_feedback_policy(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+pr_actions_feedback_policy = "eventually"
+""".strip(),
+    )
+
+    with pytest.raises(ConfigError, match="pr_actions_feedback_policy must be one of"):
+        config.load_config(cfg_path)
+
+
+def test_load_config_keeps_runtime_monitoring_flag_for_fallback_when_repo_policy_missing(
+    tmp_path: Path,
+) -> None:
+    cfg_path = _write(
+        tmp_path / "mergexo.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+enable_pr_actions_monitoring = true
+
+[repo]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+    )
+
+    loaded = config.load_config(cfg_path)
+    assert loaded.runtime.enable_pr_actions_monitoring is True
+    assert loaded.repo.pr_actions_feedback_policy is None
 
 
 def test_load_config_codex_repo_overrides_inherit_global_defaults(tmp_path: Path) -> None:
@@ -776,6 +848,13 @@ def test_helper_numeric_bool_and_tuple() -> None:
         config._parse_restart_mode("bad", key="k")
     with pytest.raises(ConfigError, match="one of"):
         config._parse_restart_mode(1, key="k")
+
+    assert config._optional_pr_actions_feedback_policy({}, "k") is None
+    assert config._optional_pr_actions_feedback_policy({"k": " FIRST_FAIL "}, "k") == "first_fail"
+    with pytest.raises(ConfigError, match="must be one of"):
+        config._optional_pr_actions_feedback_policy({"k": "later"}, "k")
+    with pytest.raises(ConfigError, match="must be one of"):
+        config._optional_pr_actions_feedback_policy({"k": 1}, "k")
 
 
 def test_repo_auth_and_app_config_helpers() -> None:
