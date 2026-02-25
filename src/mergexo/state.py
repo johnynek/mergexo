@@ -44,6 +44,15 @@ AgentRunFailureClass = Literal[
     "history_rewrite",
     "unknown",
 ]
+GitHubCommentSurface = Literal[
+    "pr_review_comments",
+    "pr_issue_comments",
+    "issue_pre_pr_followups",
+    "issue_post_pr_redirects",
+    "issue_operator_commands",
+]
+ActionTokenScopeKind = Literal["pr", "issue"]
+ActionTokenStatus = Literal["planned", "posted", "observed", "failed"]
 
 
 @dataclass(frozen=True)
@@ -134,6 +143,51 @@ class PullRequestStatusState:
     repo_full_name: str = ""
 
 
+@dataclass(frozen=True)
+class GitHubCommentPollCursorState:
+    surface: GitHubCommentSurface
+    scope_number: int
+    last_updated_at: str
+    last_comment_id: int
+    bootstrap_complete: bool
+    updated_at: str
+    repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class PollCursorUpdate:
+    surface: GitHubCommentSurface
+    scope_number: int
+    last_updated_at: str
+    last_comment_id: int
+    bootstrap_complete: bool = True
+
+
+@dataclass(frozen=True)
+class ActionTokenState:
+    token: str
+    scope_kind: ActionTokenScopeKind
+    scope_number: int
+    source: str
+    status: ActionTokenStatus
+    attempt_count: int
+    observed_comment_id: int | None
+    observed_updated_at: str | None
+    created_at: str
+    updated_at: str
+    repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class ActionTokenObservation:
+    token: str
+    scope_kind: ActionTokenScopeKind
+    scope_number: int
+    source: str
+    comment_id: int
+    updated_at: str
+
+
 class StateStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +264,20 @@ class StateStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS github_comment_poll_cursors (
+                    repo_full_name TEXT NOT NULL,
+                    surface TEXT NOT NULL,
+                    scope_number INTEGER NOT NULL,
+                    last_updated_at TEXT NOT NULL,
+                    last_comment_id INTEGER NOT NULL,
+                    bootstrap_complete INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, surface, scope_number)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS agent_sessions (
                     repo_full_name TEXT NOT NULL,
                     issue_number INTEGER NOT NULL,
@@ -218,6 +286,30 @@ class StateStore:
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, issue_number)
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS action_tokens (
+                    repo_full_name TEXT NOT NULL,
+                    token TEXT NOT NULL,
+                    scope_kind TEXT NOT NULL,
+                    scope_number INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    observed_comment_id INTEGER NULL,
+                    observed_updated_at TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, token)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_action_tokens_scope_status
+                ON action_tokens(repo_full_name, scope_kind, scope_number, status)
                 """
             )
             conn.execute(
@@ -1201,6 +1293,394 @@ class StateStore:
             )
         return self.get_issue_comment_cursor(issue_number, repo_full_name=repo_key)
 
+    def get_poll_cursor(
+        self,
+        *,
+        surface: GitHubCommentSurface,
+        scope_number: int,
+        repo_full_name: str | None = None,
+    ) -> GitHubCommentPollCursorState | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    surface,
+                    scope_number,
+                    last_updated_at,
+                    last_comment_id,
+                    bootstrap_complete,
+                    updated_at
+                FROM github_comment_poll_cursors
+                WHERE repo_full_name = ? AND surface = ? AND scope_number = ?
+                """,
+                (repo_key, surface, scope_number),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_poll_cursor_row(row, repo_full_name=repo_key)
+
+    def upsert_poll_cursor(
+        self,
+        *,
+        surface: GitHubCommentSurface,
+        scope_number: int,
+        last_updated_at: str,
+        last_comment_id: int,
+        bootstrap_complete: bool,
+        repo_full_name: str | None = None,
+    ) -> GitHubCommentPollCursorState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO github_comment_poll_cursors(
+                    repo_full_name,
+                    surface,
+                    scope_number,
+                    last_updated_at,
+                    last_comment_id,
+                    bootstrap_complete
+                )
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo_full_name, surface, scope_number) DO UPDATE SET
+                    last_updated_at = excluded.last_updated_at,
+                    last_comment_id = excluded.last_comment_id,
+                    bootstrap_complete = excluded.bootstrap_complete,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (
+                    repo_key,
+                    surface,
+                    scope_number,
+                    last_updated_at,
+                    last_comment_id,
+                    int(bootstrap_complete),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                    surface,
+                    scope_number,
+                    last_updated_at,
+                    last_comment_id,
+                    bootstrap_complete,
+                    updated_at
+                FROM github_comment_poll_cursors
+                WHERE repo_full_name = ? AND surface = ? AND scope_number = ?
+                """,
+                (repo_key, surface, scope_number),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("github_comment_poll_cursors row disappeared after upsert")
+        return _parse_poll_cursor_row(row, repo_full_name=repo_key)
+
+    def ingest_feedback_scan_batch(
+        self,
+        *,
+        events: Iterable[FeedbackEventRecord],
+        cursor_updates: Iterable[PollCursorUpdate],
+        token_observations: Iterable[ActionTokenObservation] = (),
+        repo_full_name: str | None = None,
+    ) -> None:
+        event_rows = tuple(events)
+        cursor_rows = tuple(cursor_updates)
+        observed_tokens = tuple(token_observations)
+        if not event_rows and not cursor_rows and not observed_tokens:
+            return
+
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            if event_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO feedback_events(
+                        repo_full_name,
+                        event_key,
+                        pr_number,
+                        issue_number,
+                        kind,
+                        comment_id,
+                        updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(repo_full_name, event_key) DO NOTHING
+                    """,
+                    [
+                        (
+                            repo_key,
+                            event.event_key,
+                            event.pr_number,
+                            event.issue_number,
+                            event.kind,
+                            event.comment_id,
+                            event.updated_at,
+                        )
+                        for event in event_rows
+                    ],
+                )
+            if observed_tokens:
+                conn.executemany(
+                    """
+                    INSERT INTO action_tokens(
+                        repo_full_name,
+                        token,
+                        scope_kind,
+                        scope_number,
+                        source,
+                        status,
+                        observed_comment_id,
+                        observed_updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, 'observed', ?, ?)
+                    ON CONFLICT(repo_full_name, token) DO UPDATE SET
+                        scope_kind = excluded.scope_kind,
+                        scope_number = excluded.scope_number,
+                        source = excluded.source,
+                        status = 'observed',
+                        observed_comment_id = excluded.observed_comment_id,
+                        observed_updated_at = excluded.observed_updated_at,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    """,
+                    [
+                        (
+                            repo_key,
+                            observed.token,
+                            observed.scope_kind,
+                            observed.scope_number,
+                            observed.source,
+                            observed.comment_id,
+                            observed.updated_at,
+                        )
+                        for observed in observed_tokens
+                    ],
+                )
+            if cursor_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO github_comment_poll_cursors(
+                        repo_full_name,
+                        surface,
+                        scope_number,
+                        last_updated_at,
+                        last_comment_id,
+                        bootstrap_complete
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(repo_full_name, surface, scope_number) DO UPDATE SET
+                        last_updated_at = excluded.last_updated_at,
+                        last_comment_id = excluded.last_comment_id,
+                        bootstrap_complete = excluded.bootstrap_complete,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    """,
+                    [
+                        (
+                            repo_key,
+                            update.surface,
+                            update.scope_number,
+                            update.last_updated_at,
+                            update.last_comment_id,
+                            int(update.bootstrap_complete),
+                        )
+                        for update in cursor_rows
+                    ],
+                )
+
+    def seed_feedback_cursors_from_full_scan(
+        self,
+        *,
+        pr_number: int,
+        review_cursor: tuple[str, int],
+        issue_cursor: tuple[str, int],
+        repo_full_name: str | None = None,
+    ) -> None:
+        self.ingest_feedback_scan_batch(
+            events=(),
+            cursor_updates=(
+                PollCursorUpdate(
+                    surface="pr_review_comments",
+                    scope_number=pr_number,
+                    last_updated_at=review_cursor[0],
+                    last_comment_id=review_cursor[1],
+                    bootstrap_complete=True,
+                ),
+                PollCursorUpdate(
+                    surface="pr_issue_comments",
+                    scope_number=pr_number,
+                    last_updated_at=issue_cursor[0],
+                    last_comment_id=issue_cursor[1],
+                    bootstrap_complete=True,
+                ),
+            ),
+            repo_full_name=repo_full_name,
+        )
+
+    def get_action_token(
+        self,
+        token: str,
+        *,
+        repo_full_name: str | None = None,
+    ) -> ActionTokenState | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    token,
+                    scope_kind,
+                    scope_number,
+                    source,
+                    status,
+                    attempt_count,
+                    observed_comment_id,
+                    observed_updated_at,
+                    created_at,
+                    updated_at
+                FROM action_tokens
+                WHERE repo_full_name = ? AND token = ?
+                """,
+                (repo_key, token),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_action_token_row(row, repo_full_name=repo_key)
+
+    def record_action_token_planned(
+        self,
+        *,
+        token: str,
+        scope_kind: ActionTokenScopeKind,
+        scope_number: int,
+        source: str,
+        repo_full_name: str | None = None,
+    ) -> ActionTokenState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO action_tokens(
+                    repo_full_name,
+                    token,
+                    scope_kind,
+                    scope_number,
+                    source,
+                    status
+                )
+                VALUES(?, ?, ?, ?, ?, 'planned')
+                ON CONFLICT(repo_full_name, token) DO UPDATE SET
+                    scope_kind = excluded.scope_kind,
+                    scope_number = excluded.scope_number,
+                    source = excluded.source,
+                    status = CASE
+                        WHEN action_tokens.status = 'observed' THEN 'observed'
+                        WHEN action_tokens.status = 'posted' THEN 'posted'
+                        ELSE 'planned'
+                    END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, token, scope_kind, scope_number, source),
+            )
+            row = _select_action_token_row(conn=conn, repo_full_name=repo_key, token=token)
+        if row is None:
+            raise RuntimeError("action_tokens row disappeared after planned upsert")
+        return _parse_action_token_row(row, repo_full_name=repo_key)
+
+    def record_action_token_posted(
+        self,
+        *,
+        token: str,
+        scope_kind: ActionTokenScopeKind,
+        scope_number: int,
+        source: str,
+        repo_full_name: str | None = None,
+    ) -> ActionTokenState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO action_tokens(
+                    repo_full_name,
+                    token,
+                    scope_kind,
+                    scope_number,
+                    source,
+                    status,
+                    attempt_count
+                )
+                VALUES(?, ?, ?, ?, ?, 'posted', 1)
+                ON CONFLICT(repo_full_name, token) DO UPDATE SET
+                    scope_kind = excluded.scope_kind,
+                    scope_number = excluded.scope_number,
+                    source = excluded.source,
+                    status = CASE
+                        WHEN action_tokens.status = 'observed' THEN 'observed'
+                        ELSE 'posted'
+                    END,
+                    attempt_count = CASE
+                        WHEN action_tokens.status = 'observed'
+                        THEN action_tokens.attempt_count
+                        ELSE action_tokens.attempt_count + 1
+                    END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, token, scope_kind, scope_number, source),
+            )
+            row = _select_action_token_row(conn=conn, repo_full_name=repo_key, token=token)
+        if row is None:
+            raise RuntimeError("action_tokens row disappeared after posted upsert")
+        return _parse_action_token_row(row, repo_full_name=repo_key)
+
+    def record_action_token_observed(
+        self,
+        *,
+        token: str,
+        scope_kind: ActionTokenScopeKind,
+        scope_number: int,
+        source: str,
+        observed_comment_id: int,
+        observed_updated_at: str,
+        repo_full_name: str | None = None,
+    ) -> ActionTokenState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO action_tokens(
+                    repo_full_name,
+                    token,
+                    scope_kind,
+                    scope_number,
+                    source,
+                    status,
+                    observed_comment_id,
+                    observed_updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, 'observed', ?, ?)
+                ON CONFLICT(repo_full_name, token) DO UPDATE SET
+                    scope_kind = excluded.scope_kind,
+                    scope_number = excluded.scope_number,
+                    source = excluded.source,
+                    status = 'observed',
+                    observed_comment_id = excluded.observed_comment_id,
+                    observed_updated_at = excluded.observed_updated_at,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (
+                    repo_key,
+                    token,
+                    scope_kind,
+                    scope_number,
+                    source,
+                    observed_comment_id,
+                    observed_updated_at,
+                ),
+            )
+            row = _select_action_token_row(conn=conn, repo_full_name=repo_key, token=token)
+        if row is None:
+            raise RuntimeError("action_tokens row disappeared after observed upsert")
+        return _parse_action_token_row(row, repo_full_name=repo_key)
+
     def save_agent_session(
         self,
         *,
@@ -2151,6 +2631,29 @@ def _select_operator_command_row(
     return rows[0]
 
 
+def _select_action_token_row(
+    *, conn: sqlite3.Connection, repo_full_name: str, token: str
+) -> tuple[object, ...] | None:
+    return conn.execute(
+        """
+        SELECT
+            token,
+            scope_kind,
+            scope_number,
+            source,
+            status,
+            attempt_count,
+            observed_comment_id,
+            observed_updated_at,
+            created_at,
+            updated_at
+        FROM action_tokens
+        WHERE repo_full_name = ? AND token = ?
+        """,
+        (repo_full_name, token),
+    ).fetchone()
+
+
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     row = conn.execute(
         """
@@ -2182,6 +2685,85 @@ def _normalize_repo_full_name(repo_full_name: str | None) -> str:
     if not normalized:
         return _DEFAULT_REPO_FULL_NAME
     return normalized
+
+
+def _parse_poll_cursor_row(
+    row: tuple[object, ...], *, repo_full_name: str
+) -> GitHubCommentPollCursorState:
+    if len(row) != 6:
+        raise RuntimeError("Invalid github_comment_poll_cursors row width")
+    surface, scope_number, last_updated_at, last_comment_id, bootstrap_complete, updated_at = row
+    if not isinstance(surface, str):
+        raise RuntimeError("Invalid surface value stored in github_comment_poll_cursors")
+    if not isinstance(scope_number, int):
+        raise RuntimeError("Invalid scope_number value stored in github_comment_poll_cursors")
+    if not isinstance(last_updated_at, str):
+        raise RuntimeError("Invalid last_updated_at value stored in github_comment_poll_cursors")
+    if not isinstance(last_comment_id, int):
+        raise RuntimeError("Invalid last_comment_id value stored in github_comment_poll_cursors")
+    if not isinstance(bootstrap_complete, int):
+        raise RuntimeError("Invalid bootstrap_complete value stored in github_comment_poll_cursors")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in github_comment_poll_cursors")
+    return GitHubCommentPollCursorState(
+        repo_full_name=repo_full_name,
+        surface=_parse_github_comment_surface(surface),
+        scope_number=scope_number,
+        last_updated_at=last_updated_at,
+        last_comment_id=last_comment_id,
+        bootstrap_complete=bootstrap_complete != 0,
+        updated_at=updated_at,
+    )
+
+
+def _parse_action_token_row(row: tuple[object, ...], *, repo_full_name: str) -> ActionTokenState:
+    if len(row) != 10:
+        raise RuntimeError("Invalid action_tokens row width")
+    (
+        token,
+        scope_kind,
+        scope_number,
+        source,
+        status,
+        attempt_count,
+        observed_comment_id,
+        observed_updated_at,
+        created_at,
+        updated_at,
+    ) = row
+    if not isinstance(token, str):
+        raise RuntimeError("Invalid token value stored in action_tokens")
+    if not isinstance(scope_kind, str):
+        raise RuntimeError("Invalid scope_kind value stored in action_tokens")
+    if not isinstance(scope_number, int):
+        raise RuntimeError("Invalid scope_number value stored in action_tokens")
+    if not isinstance(source, str):
+        raise RuntimeError("Invalid source value stored in action_tokens")
+    if not isinstance(status, str):
+        raise RuntimeError("Invalid status value stored in action_tokens")
+    if not isinstance(attempt_count, int):
+        raise RuntimeError("Invalid attempt_count value stored in action_tokens")
+    if observed_comment_id is not None and not isinstance(observed_comment_id, int):
+        raise RuntimeError("Invalid observed_comment_id value stored in action_tokens")
+    if observed_updated_at is not None and not isinstance(observed_updated_at, str):
+        raise RuntimeError("Invalid observed_updated_at value stored in action_tokens")
+    if not isinstance(created_at, str):
+        raise RuntimeError("Invalid created_at value stored in action_tokens")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in action_tokens")
+    return ActionTokenState(
+        repo_full_name=repo_full_name,
+        token=token,
+        scope_kind=_parse_action_token_scope_kind(scope_kind),
+        scope_number=scope_number,
+        source=source,
+        status=_parse_action_token_status(status),
+        attempt_count=attempt_count,
+        observed_comment_id=observed_comment_id,
+        observed_updated_at=observed_updated_at,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 def _parse_operator_command_row(row: tuple[object, ...]) -> OperatorCommandRecord:
@@ -2349,3 +2931,33 @@ def _parse_pre_pr_followup_flow(value: object) -> PrePrFollowupFlow:
     if value not in {"design_doc", "bugfix", "small_job", "implementation"}:
         raise RuntimeError(f"Unknown flow value stored in pre_pr_followup_state: {value}")
     return cast(PrePrFollowupFlow, value)
+
+
+def _parse_github_comment_surface(value: object) -> GitHubCommentSurface:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid surface value stored in github_comment_poll_cursors")
+    if value not in {
+        "pr_review_comments",
+        "pr_issue_comments",
+        "issue_pre_pr_followups",
+        "issue_post_pr_redirects",
+        "issue_operator_commands",
+    }:
+        raise RuntimeError(f"Unknown surface value stored in github_comment_poll_cursors: {value}")
+    return cast(GitHubCommentSurface, value)
+
+
+def _parse_action_token_scope_kind(value: object) -> ActionTokenScopeKind:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid scope_kind value stored in action_tokens")
+    if value not in {"pr", "issue"}:
+        raise RuntimeError(f"Unknown scope_kind value stored in action_tokens: {value}")
+    return cast(ActionTokenScopeKind, value)
+
+
+def _parse_action_token_status(value: object) -> ActionTokenStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in action_tokens")
+    if value not in {"planned", "posted", "observed", "failed"}:
+        raise RuntimeError(f"Unknown status value stored in action_tokens: {value}")
+    return cast(ActionTokenStatus, value)

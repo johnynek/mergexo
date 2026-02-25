@@ -163,6 +163,22 @@ Related runtime settings:
 
 `console` lifecycle logs are written to stderr and `<runtime.base_dir>/logs/YYYY-MM-DD.log` (UTC day rotation).
 
+### Incremental Comment Polling
+
+Enable with:
+
+- `runtime.enable_incremental_comment_fetch = true`
+- optional `runtime.comment_fetch_overlap_seconds = 5`
+- optional `runtime.comment_fetch_safe_backfill_seconds = 86400`
+
+Behavior:
+
+1. MergeXO tracks per-surface GitHub comment cursors and fetches comments with `since + pagination`.
+2. Cursor filtering uses `(updated_at, comment_id)` so same-second updates are not dropped.
+3. Token dedupe uses local `action_tokens` state, plus bounded targeted refetch when needed.
+4. Steady-state polling cost stays bounded by active monitored surfaces + new/edited comments.
+5. `closed` and `merged` PR feedback states remain terminal; reopening a PR does not auto-resume monitoring.
+
 ### Authentication Allowlist Behavior
 
 MergeXO normalizes allowlist entries to lowercase and matches case-insensitively at runtime.
@@ -310,6 +326,9 @@ Do not mix both shapes in one file.
 | `enable_github_operations` | no | `false` | enables `/mergexo ...` command processing |
 | `enable_issue_comment_routing` | no | `false` | enables pre-PR follow-up + post-PR source redirects |
 | `enable_pr_actions_monitoring` | no | `false` | enables GitHub Actions feedback events |
+| `enable_incremental_comment_fetch` | no | `false` | enables incremental GitHub comment polling with persisted cursors |
+| `comment_fetch_overlap_seconds` | no | `5` | overlap replay window used with `since` queries; must be `>= 0` |
+| `comment_fetch_safe_backfill_seconds` | no | `86400` | cursor-reset safe backfill window; must be `>= overlap` |
 | `pr_actions_log_tail_lines` | no | `500` | valid range `1..5000` |
 | `restart_drain_timeout_seconds` | no | `900` | must be `>= 1` |
 | `restart_default_mode` | no | `"git_checkout"` | must be in `restart_supported_modes` |

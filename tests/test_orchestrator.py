@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import logging
@@ -65,6 +66,7 @@ from mergexo.orchestrator import (
     _is_mergexo_status_comment,
     _is_merge_conflict_error,
     _normalize_feedback_terminal_status,
+    _normalize_timestamp_for_compare,
     _implementation_candidate_from_json_dict,
     _implementation_candidate_to_json_dict,
     _infer_pre_pr_flow_from_issue_and_error,
@@ -81,6 +83,7 @@ from mergexo.orchestrator import (
     _operator_source_comment_url,
     _pre_pr_flow_label,
     _pull_request_url,
+    _parse_utc_timestamp,
     _render_source_issue_redirect_comment,
     _render_design_doc,
     _render_operator_command_result,
@@ -94,8 +97,13 @@ from mergexo.orchestrator import (
 from mergexo.observability import configure_logging
 from mergexo.shell import CommandError
 from mergexo.state import (
+    ActionTokenScopeKind,
+    ActionTokenState,
+    GitHubCommentSurface,
+    GitHubCommentPollCursorState,
     ImplementationCandidateState,
     PendingFeedbackEvent,
+    PollCursorUpdate,
     PrePrFollowupState,
     StateStore,
     TrackedPullRequestState,
@@ -275,16 +283,24 @@ class FakeGitHub:
         assert pr_number == self.pr_snapshot.number
         return self.changed_files
 
-    def list_pull_request_review_comments(self, pr_number: int) -> list[PullRequestReviewComment]:
+    def list_pull_request_review_comments(
+        self, pr_number: int, *, since: str | None = None
+    ) -> list[PullRequestReviewComment]:
+        _ = since
         assert pr_number == self.pr_snapshot.number
         return list(self.review_comments)
 
-    def list_pull_request_issue_comments(self, pr_number: int) -> list[PullRequestIssueComment]:
+    def list_pull_request_issue_comments(
+        self, pr_number: int, *, since: str | None = None
+    ) -> list[PullRequestIssueComment]:
+        _ = since
         assert pr_number == self.pr_snapshot.number
         return list(self.issue_comments)
 
-    def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
-        _ = issue_number
+    def list_issue_comments(
+        self, issue_number: int, *, since: str | None = None
+    ) -> list[PullRequestIssueComment]:
+        _ = issue_number, since
         return list(self.issue_comments)
 
     def list_workflow_runs_for_head(
@@ -473,6 +489,8 @@ class FakeState:
         self.run_starts: list[tuple[str, str, int, int | None]] = []
         self.run_finishes: list[tuple[str, str, str | None, str | None]] = []
         self._pr_status_by_pr: dict[int, str] = {}
+        self._action_tokens: dict[str, ActionTokenState] = {}
+        self._poll_cursors: dict[tuple[str, int], GitHubCommentPollCursorState] = {}
 
     def can_enqueue(self, issue_number: int, *, repo_full_name: str | None = None) -> bool:
         _ = repo_full_name
@@ -691,6 +709,157 @@ class FakeState:
     def ingest_feedback_events(self, events: object, *, repo_full_name: str | None = None) -> None:
         _ = events, repo_full_name
 
+    def get_poll_cursor(
+        self,
+        *,
+        surface: str,
+        scope_number: int,
+        repo_full_name: str | None = None,
+    ) -> GitHubCommentPollCursorState | None:
+        _ = repo_full_name
+        return self._poll_cursors.get((surface, scope_number))
+
+    def upsert_poll_cursor(
+        self,
+        *,
+        surface: str,
+        scope_number: int,
+        last_updated_at: str,
+        last_comment_id: int,
+        bootstrap_complete: bool,
+        repo_full_name: str | None = None,
+    ) -> GitHubCommentPollCursorState:
+        cursor = GitHubCommentPollCursorState(
+            repo_full_name=repo_full_name or "johnynek/mergexo",
+            surface=cast(GitHubCommentSurface, surface),
+            scope_number=scope_number,
+            last_updated_at=last_updated_at,
+            last_comment_id=last_comment_id,
+            bootstrap_complete=bootstrap_complete,
+            updated_at="now",
+        )
+        self._poll_cursors[(surface, scope_number)] = cursor
+        return cursor
+
+    def ingest_feedback_scan_batch(
+        self,
+        *,
+        events: object,
+        cursor_updates: object,
+        token_observations: object = (),
+        repo_full_name: str | None = None,
+    ) -> None:
+        _ = events
+        for update in cast(tuple[PollCursorUpdate, ...], cursor_updates):
+            self.upsert_poll_cursor(
+                surface=update.surface,
+                scope_number=update.scope_number,
+                last_updated_at=update.last_updated_at,
+                last_comment_id=update.last_comment_id,
+                bootstrap_complete=update.bootstrap_complete,
+                repo_full_name=repo_full_name,
+            )
+        for observation in cast(tuple[object, ...], tuple(token_observations)):
+            token = getattr(observation, "token")
+            self.record_action_token_observed(
+                token=token,
+                scope_kind=getattr(observation, "scope_kind"),
+                scope_number=getattr(observation, "scope_number"),
+                source=getattr(observation, "source"),
+                observed_comment_id=getattr(observation, "comment_id"),
+                observed_updated_at=getattr(observation, "updated_at"),
+                repo_full_name=repo_full_name,
+            )
+
+    def get_action_token(
+        self, token: str, *, repo_full_name: str | None = None
+    ) -> ActionTokenState | None:
+        _ = repo_full_name
+        return self._action_tokens.get(token)
+
+    def record_action_token_planned(
+        self,
+        *,
+        token: str,
+        scope_kind: str,
+        scope_number: int,
+        source: str,
+        repo_full_name: str | None = None,
+    ) -> ActionTokenState:
+        existing = self._action_tokens.get(token)
+        if existing is not None and existing.status in {"observed", "posted"}:
+            return existing
+        state = ActionTokenState(
+            repo_full_name=repo_full_name or "johnynek/mergexo",
+            token=token,
+            scope_kind=cast(ActionTokenScopeKind, scope_kind),
+            scope_number=scope_number,
+            source=source,
+            status="planned",
+            attempt_count=0 if existing is None else existing.attempt_count,
+            observed_comment_id=None,
+            observed_updated_at=None,
+            created_at="now",
+            updated_at="now",
+        )
+        self._action_tokens[token] = state
+        return state
+
+    def record_action_token_posted(
+        self,
+        *,
+        token: str,
+        scope_kind: str,
+        scope_number: int,
+        source: str,
+        repo_full_name: str | None = None,
+    ) -> ActionTokenState:
+        existing = self._action_tokens.get(token)
+        attempts = 1 if existing is None else existing.attempt_count + 1
+        state = ActionTokenState(
+            repo_full_name=repo_full_name or "johnynek/mergexo",
+            token=token,
+            scope_kind=cast(ActionTokenScopeKind, scope_kind),
+            scope_number=scope_number,
+            source=source,
+            status="posted",
+            attempt_count=attempts,
+            observed_comment_id=None if existing is None else existing.observed_comment_id,
+            observed_updated_at=None if existing is None else existing.observed_updated_at,
+            created_at="now" if existing is None else existing.created_at,
+            updated_at="now",
+        )
+        self._action_tokens[token] = state
+        return state
+
+    def record_action_token_observed(
+        self,
+        *,
+        token: str,
+        scope_kind: str,
+        scope_number: int,
+        source: str,
+        observed_comment_id: int,
+        observed_updated_at: str,
+        repo_full_name: str | None = None,
+    ) -> ActionTokenState:
+        existing = self._action_tokens.get(token)
+        state = ActionTokenState(
+            repo_full_name=repo_full_name or "johnynek/mergexo",
+            token=token,
+            scope_kind=cast(ActionTokenScopeKind, scope_kind),
+            scope_number=scope_number,
+            source=source,
+            status="observed",
+            attempt_count=0 if existing is None else existing.attempt_count,
+            observed_comment_id=observed_comment_id,
+            observed_updated_at=observed_updated_at,
+            created_at="now" if existing is None else existing.created_at,
+            updated_at="now",
+        )
+        self._action_tokens[token] = state
+        return state
+
     def list_pending_feedback_events(
         self, pr_number: int, *, repo_full_name: str | None = None
     ) -> tuple[object, ...]:
@@ -725,6 +894,9 @@ def _config(
     enable_github_operations: bool = False,
     enable_issue_comment_routing: bool = False,
     enable_pr_actions_monitoring: bool = False,
+    enable_incremental_comment_fetch: bool = False,
+    comment_fetch_overlap_seconds: int = 5,
+    comment_fetch_safe_backfill_seconds: int = 86400,
     pr_actions_log_tail_lines: int = 500,
     restart_drain_timeout_seconds: int = 900,
     restart_default_mode: str = "git_checkout",
@@ -748,6 +920,9 @@ def _config(
             enable_github_operations=enable_github_operations,
             enable_issue_comment_routing=enable_issue_comment_routing,
             enable_pr_actions_monitoring=enable_pr_actions_monitoring,
+            enable_incremental_comment_fetch=enable_incremental_comment_fetch,
+            comment_fetch_overlap_seconds=comment_fetch_overlap_seconds,
+            comment_fetch_safe_backfill_seconds=comment_fetch_safe_backfill_seconds,
             pr_actions_log_tail_lines=pr_actions_log_tail_lines,
             restart_drain_timeout_seconds=restart_drain_timeout_seconds,
             restart_default_mode=cast(RestartMode, restart_default_mode),
@@ -3029,6 +3204,130 @@ def test_enqueue_pre_pr_followup_work_enqueues_pending_comments_in_order(
     assert "waiting for clarifications" in submitted_issue.body
 
 
+def test_enqueue_pre_pr_followup_work_legacy_mode_records_token_observation(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix",))
+    token = "f" * 64
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=6,
+            body=f"old direction\n\n<!-- mergexo-action:{token} -->",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-6",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+    ]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-add-worker-scheduler",
+        context_json='{"flow":"bugfix","issue":{"number":7,"title":"Add worker scheduler","body":"Body","html_url":"https://example/issues/7","labels":["agent:bugfix"],"author_login":"issue-author"}}',
+        waiting_reason="bugfix flow blocked: waiting for clarifications",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=6,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    class NoopPool:
+        def submit(self, *args: object, **kwargs: object) -> Future[WorkResult]:
+            _ = args, kwargs
+            raise AssertionError("submit should not be called")
+
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+    observed = state.get_action_token(token, repo_full_name=cfg.repo.full_name)
+    assert observed is not None
+    assert observed.status == "observed"
+
+
+def test_enqueue_pre_pr_followup_work_incremental_bootstrap_skips_history(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_issue_comment_routing=True,
+        enable_incremental_comment_fetch=True,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=6,
+            body="old direction",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-6",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-add-worker-scheduler",
+        context_json='{"flow":"bugfix","issue":{"number":7,"title":"Add worker scheduler","body":"Body","html_url":"https://example/issues/7","labels":["agent:bugfix"],"author_login":"issue-author"}}',
+        waiting_reason="bugfix flow blocked: waiting for clarifications",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=5,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.submitted: list[tuple[Issue, IssueFlow, str, int]] = []
+
+        def submit(self, fn, issue_arg, flow_arg, branch_arg, consumed):  # type: ignore[no-untyped-def]
+            _ = fn
+            self.submitted.append((issue_arg, flow_arg, branch_arg, consumed))
+            fut: Future[WorkResult] = Future()
+            return fut
+
+    pool = FakePool()
+    orch._enqueue_pre_pr_followup_work(pool)
+    assert pool.submitted == []
+
+    github.issue_comments.append(
+        PullRequestIssueComment(
+            comment_id=7,
+            body="new direction",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-7",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        )
+    )
+    orch._enqueue_pre_pr_followup_work(pool)
+    assert len(pool.submitted) == 1
+    assert pool.submitted[0][3] == 7
+
+
 def test_post_pr_source_issue_comment_redirects_are_idempotent_and_filtered(
     tmp_path: Path,
 ) -> None:
@@ -3090,6 +3389,61 @@ def test_post_pr_source_issue_comment_redirects_are_idempotent_and_filtered(
 
     orch._scan_post_pr_source_issue_comment_redirects()
     assert len(github.comments) == 1
+
+
+def test_post_pr_source_redirects_incremental_bootstrap_skips_history(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_issue_comment_routing=True,
+        enable_incremental_comment_fetch=True,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=30,
+            body="old comment",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-30",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/bugfix/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert github.comments == []
+
+    github.issue_comments.append(
+        PullRequestIssueComment(
+            comment_id=31,
+            body="new comment",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-31",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        )
+    )
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert len(github.comments) == 1
+    assert "no longer actioned" in github.comments[0][1]
 
 
 def test_adopt_legacy_failed_pre_pr_runs_moves_recoverable_rows_to_followup_waiting(
@@ -4358,6 +4712,206 @@ def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
     tracked_again = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked_again)
     assert len(agent.feedback_calls) == 1
+
+
+def test_feedback_turn_incremental_scan_handles_same_second_boundaries(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_incremental_comment_fetch=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment(comment_id=11, updated_at="2026-02-21T00:00:00Z")]
+    github.changed_files = ("docs/design/7-add-worker-scheduler.md",)
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    assert len(agent.feedback_calls) == 1
+
+    review_cursor = state.get_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert review_cursor is not None
+    assert review_cursor.last_comment_id == 11
+
+    github.review_comments.append(_review_comment(comment_id=12, updated_at="2026-02-21T00:00:00Z"))
+    tracked_again = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked_again)
+    assert len(agent.feedback_calls) == 2
+    review_cursor_again = state.get_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert review_cursor_again is not None
+    assert review_cursor_again.last_comment_id == 12
+
+
+def test_feedback_turn_incremental_resets_invalid_future_cursor(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_incremental_comment_fetch=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = []
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.upsert_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        last_updated_at="9999-01-01T00:00:00Z",
+        last_comment_id=9,
+        bootstrap_complete=True,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    cursor = state.get_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert cursor is not None
+    assert cursor.last_updated_at != "9999-01-01T00:00:00Z"
+
+
+def test_load_poll_cursor_normalizes_timestamp_format(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_incremental_comment_fetch=True)
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_poll_cursor(
+        surface="pr_review_comments",
+        scope_number=101,
+        last_updated_at="2026-02-24T00:00:00+00:00",
+        last_comment_id=9,
+        bootstrap_complete=True,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    normalized = orch._load_poll_cursor(surface="pr_review_comments", scope_number=101)
+    assert normalized.last_updated_at == "2026-02-24T00:00:00Z"
+    assert normalized.last_comment_id == 9
+
+
+def test_since_for_cursor_invalid_and_floor_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _config(tmp_path, enable_incremental_comment_fetch=True)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    monkeypatch.setattr(
+        "mergexo.orchestrator._parse_utc_timestamp",
+        lambda value: None,  # type: ignore[no-untyped-def]
+    )
+    since_invalid = orch._since_for_cursor(last_updated_at="bad-value")
+    assert since_invalid.endswith("Z")
+
+
+def test_since_for_cursor_clamps_to_epoch(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_incremental_comment_fetch=True)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    assert orch._since_for_cursor(last_updated_at="1970-01-01T00:00:00Z") == "1970-01-01T00:00:00Z"
+
+
+def test_token_reconcile_since_applies_safe_floor_and_epoch(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_incremental_comment_fetch=True)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    before = datetime.now(timezone.utc) - timedelta(days=2)
+    clamped = _parse_utc_timestamp(orch._token_reconcile_since(created_at="2000-01-01T00:00:00Z"))
+    assert clamped is not None
+    assert clamped >= before
+
+    epoch_cfg = _config(
+        tmp_path / "epoch",
+        enable_incremental_comment_fetch=True,
+        comment_fetch_safe_backfill_seconds=4_000_000_000,
+    )
+    epoch_orch = Phase1Orchestrator(
+        epoch_cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts-epoch"),
+        agent=FakeAgent(),
+    )
+    assert (
+        epoch_orch._token_reconcile_since(created_at="1970-01-01T00:00:02Z")
+        == "1970-01-01T00:00:00Z"
+    )
 
 
 def test_monitor_pr_actions_skips_enqueue_while_runs_active(tmp_path: Path) -> None:
@@ -6237,9 +6791,7 @@ def test_feedback_turn_blocks_when_required_tests_repair_outcome_blocks(
         conn.close()
 
 
-def test_feedback_turn_returns_when_expected_tokens_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_feedback_turn_posts_reply_without_remote_full_token_scan(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     issue = _issue()
@@ -6270,13 +6822,12 @@ def test_feedback_turn_returns_when_expected_tokens_missing(
         repo_full_name=cfg.repo.full_name,
     )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
-    monkeypatch.setattr(orch, "_fetch_remote_action_tokens", lambda pr_number: set())
 
     tracked = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked)
 
     assert len(github.review_replies) == 1
-    assert len(state.list_pending_feedback_events(101)) == 1
+    assert state.list_pending_feedback_events(101) == ()
 
 
 def test_normalize_filters_tokenized_comments(tmp_path: Path) -> None:
@@ -6327,6 +6878,57 @@ def test_normalize_filters_tokenized_comments(tmp_path: Path) -> None:
     assert normalized_review == []
     assert len(normalized_issue) == 1
     assert normalized_issue[0][0].kind == "issue"
+
+
+def test_fetch_remote_action_tokens_reads_recent_pr_comment_surfaces(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    token_a = "a" * 64
+    token_b = "b" * 64
+    github.review_comments = [
+        PullRequestReviewComment(
+            comment_id=1,
+            body=f"ok\n\n<!-- mergexo-action:{token_a} -->",
+            path="src/a.py",
+            line=1,
+            side="RIGHT",
+            in_reply_to_id=None,
+            user_login="reviewer",
+            html_url="u",
+            created_at="2026-02-21T00:00:00Z",
+            updated_at="2026-02-21T00:00:00Z",
+        )
+    ]
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=2,
+            body=f"ok\n\n<!-- mergexo-action:{token_b} -->",
+            user_login="reviewer",
+            html_url="u2",
+            created_at="2026-02-21T00:00:01Z",
+            updated_at="2026-02-21T00:00:01Z",
+        )
+    ]
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    tokens = orch._fetch_remote_action_tokens(101)
+    assert tokens == {token_a, token_b}
+
+
+def test_timestamp_parse_and_normalize_helpers_cover_invalid_and_naive_inputs() -> None:
+    assert _parse_utc_timestamp("   ") is None
+    assert _parse_utc_timestamp("not-a-timestamp") is None
+    naive = _parse_utc_timestamp("2026-02-24T12:34:56")
+    assert naive is not None
+    assert naive.isoformat() == "2026-02-24T12:34:56+00:00"
+    assert _normalize_timestamp_for_compare("bad-ts") == "bad-ts"
 
 
 def test_normalize_filters_unauthorized_comments(tmp_path: Path) -> None:
@@ -6996,7 +7598,10 @@ class OperatorGitHub:
         self.posted_comments: list[tuple[int, str]] = []
         self._next_comment_id = 5000
 
-    def list_issue_comments(self, issue_number: int) -> list[PullRequestIssueComment]:
+    def list_issue_comments(
+        self, issue_number: int, *, since: str | None = None
+    ) -> list[PullRequestIssueComment]:
+        _ = since
         return list(self._threads.get(issue_number, []))
 
     def post_issue_comment(self, issue_number: int, body: str) -> None:
@@ -7012,6 +7617,55 @@ class OperatorGitHub:
                 updated_at="now",
             )
         )
+
+
+def test_operator_scan_incremental_bootstrap_skips_history(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        enable_incremental_comment_fetch=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=10,
+                    body="/mergexo help",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:00:00Z",
+                    issue_number=77,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+    assert state.get_operator_command("77:10:2026-02-22T12:00:00Z") is None
+    assert github.posted_comments == []
+
+    github._threads[77].append(
+        _operator_issue_comment(
+            comment_id=11,
+            body="/mergexo help",
+            user_login="alice",
+            updated_at="2026-02-22T12:01:00Z",
+            issue_number=77,
+        )
+    )
+    orch._scan_operator_commands()
+    assert state.get_operator_command("77:11:2026-02-22T12:01:00Z") is not None
+    assert len(github.posted_comments) == 1
 
 
 def test_operator_unblock_command_resets_blocked_pr_and_is_idempotent(tmp_path: Path) -> None:

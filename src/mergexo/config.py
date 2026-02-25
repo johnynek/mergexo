@@ -17,6 +17,9 @@ class RuntimeConfig:
     enable_github_operations: bool = False
     enable_issue_comment_routing: bool = False
     enable_pr_actions_monitoring: bool = False
+    enable_incremental_comment_fetch: bool = False
+    comment_fetch_overlap_seconds: int = 5
+    comment_fetch_safe_backfill_seconds: int = 86400
     pr_actions_log_tail_lines: int = 500
     restart_drain_timeout_seconds: int = 900
     restart_default_mode: RestartMode = "git_checkout"
@@ -140,6 +143,15 @@ def load_config(path: Path) -> AppConfig:
         enable_pr_actions_monitoring=_bool_with_default(
             runtime_data, "enable_pr_actions_monitoring", False
         ),
+        enable_incremental_comment_fetch=_bool_with_default(
+            runtime_data, "enable_incremental_comment_fetch", False
+        ),
+        comment_fetch_overlap_seconds=_int_with_default(
+            runtime_data, "comment_fetch_overlap_seconds", 5
+        ),
+        comment_fetch_safe_backfill_seconds=_int_with_default(
+            runtime_data, "comment_fetch_safe_backfill_seconds", 86400
+        ),
         pr_actions_log_tail_lines=_int_with_default(runtime_data, "pr_actions_log_tail_lines", 500),
         restart_drain_timeout_seconds=_int_with_default(
             runtime_data, "restart_drain_timeout_seconds", 900
@@ -170,6 +182,15 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("runtime.worker_count must be >= 1")
     if runtime.poll_interval_seconds < 5:
         raise ConfigError("runtime.poll_interval_seconds must be >= 5")
+    if runtime.comment_fetch_overlap_seconds < 0:
+        raise ConfigError("runtime.comment_fetch_overlap_seconds must be >= 0")
+    if runtime.comment_fetch_safe_backfill_seconds < 1:
+        raise ConfigError("runtime.comment_fetch_safe_backfill_seconds must be >= 1")
+    if runtime.comment_fetch_safe_backfill_seconds < runtime.comment_fetch_overlap_seconds:
+        raise ConfigError(
+            "runtime.comment_fetch_safe_backfill_seconds must be >= "
+            "runtime.comment_fetch_overlap_seconds"
+        )
     if runtime.pr_actions_log_tail_lines < 1 or runtime.pr_actions_log_tail_lines > 5000:
         raise ConfigError("runtime.pr_actions_log_tail_lines must be between 1 and 5000")
     if runtime.restart_drain_timeout_seconds < 1:
