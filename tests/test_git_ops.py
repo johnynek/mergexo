@@ -164,6 +164,43 @@ def test_recover_quarantined_slot_recreates_checkout(
     assert ["git", "-C", str(slot_path), "fetch", "origin", "--prune", "--tags"] in calls
 
 
+def test_prepare_checkout_raises_when_checkout_error_is_not_recoverable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[-4:] == ["checkout", "-B", "main", "origin/main"]:
+            raise CommandError("")
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError):
+        manager.prepare_checkout(checkout)
+
+
+def test_recover_quarantined_slot_re_raises_after_recovery_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        if cmd[:3] == ["git", "clone", "--reference-if-able"]:
+            raise CommandError("clone failed")
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError, match="clone failed"):
+        manager.recover_quarantined_slot(0)
+
+
 def test_git_ops_emits_action_logs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

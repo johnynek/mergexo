@@ -1045,6 +1045,22 @@ def test_slot_pool_release_quarantines_and_recovers_slot(tmp_path: Path) -> None
     assert lease2.slot == 0
 
 
+def test_slot_pool_release_still_releases_when_quarantine_recovery_fails(tmp_path: Path) -> None:
+    manager = FakeGitManager(tmp_path / "checkouts")
+    pool = SlotPool(manager, worker_count=1)
+    lease = pool.acquire()
+
+    def fail_recovery(slot: int) -> Path:
+        _ = slot
+        raise RuntimeError("recovery failed")
+
+    manager.recover_quarantined_slot = fail_recovery
+    pool.release(lease, quarantine_reason="cleanup failed")
+
+    lease2 = pool.acquire()
+    assert lease2.slot == 0
+
+
 def test_global_work_limiter_guards_bounds() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         GlobalWorkLimiter(0)
