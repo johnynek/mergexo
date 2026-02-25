@@ -212,7 +212,23 @@ class SlotPool:
         log_event(LOGGER, "slot_acquired", slot=slot)
         return _SlotLease(slot=slot, path=path)
 
-    def release(self, lease: _SlotLease) -> None:
+    def release(self, lease: _SlotLease, *, quarantine_reason: str | None = None) -> None:
+        if quarantine_reason is not None:
+            log_event(
+                LOGGER,
+                "slot_quarantined",
+                slot=lease.slot,
+                reason=quarantine_reason,
+            )
+            try:
+                self._manager.recover_quarantined_slot(lease.slot)
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    "slot_quarantine_recovery_failed",
+                    slot=lease.slot,
+                    error_type=type(exc).__name__,
+                )
         self._slots.put(lease.slot)
         log_event(LOGGER, "slot_released", slot=lease.slot)
 
@@ -2574,6 +2590,22 @@ class Phase1Orchestrator:
                 finally:
                     self._run_meta_cache.pop(handle.run_id, None)
 
+    def _cleanup_and_release_slot(self, lease: _SlotLease) -> None:
+        quarantine_reason: str | None = None
+        try:
+            self._git.cleanup_slot(lease.path)
+        except Exception as exc:  # noqa: BLE001
+            quarantine_reason = _summarize_git_error(str(exc))
+            log_event(
+                LOGGER,
+                "slot_cleanup_failed",
+                repo_full_name=self._state_repo_full_name(),
+                slot=lease.slot,
+                checkout_path=str(lease.path),
+                error_type=type(exc).__name__,
+            )
+        self._slot_pool.release(lease, quarantine_reason=quarantine_reason)
+
     def _wait_for_all(self, pool: ThreadPoolExecutor) -> None:
         while True:
             self._reap_finished()
@@ -2666,10 +2698,7 @@ class Phase1Orchestrator:
             # the issue as failed in state without crashing the orchestrator loop.
             raise
         finally:
-            try:
-                self._git.cleanup_slot(lease.path)
-            finally:
-                self._slot_pool.release(lease)
+            self._cleanup_and_release_slot(lease)
 
     def _process_design_issue(
         self,
@@ -3120,10 +3149,7 @@ class Phase1Orchestrator:
             )
             raise
         finally:
-            try:
-                self._git.cleanup_slot(lease.path)
-            finally:
-                self._slot_pool.release(lease)
+            self._cleanup_and_release_slot(lease)
 
     def _process_implementation_candidate_worker(
         self,
@@ -4158,10 +4184,7 @@ class Phase1Orchestrator:
             )
             return "completed"
         finally:
-            try:
-                self._git.cleanup_slot(lease.path)
-            finally:
-                self._slot_pool.release(lease)
+            self._cleanup_and_release_slot(lease)
 
     def _feedback_terminal_status_from_state(
         self,

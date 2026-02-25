@@ -128,6 +128,7 @@ class FakeGitManager:
         self.checkpoint_persist_calls: list[tuple[Path, str, str]] = []
         self.cleanup_calls: list[Path] = []
         self.ensure_checkout_calls: list[int] = []
+        self.recover_quarantined_slot_calls: list[int] = []
         self.restore_calls: list[tuple[Path, str, str]] = []
         self.fetch_calls: list[Path] = []
         self.merge_calls: list[Path] = []
@@ -179,6 +180,10 @@ class FakeGitManager:
 
     def cleanup_slot(self, checkout_path: Path) -> None:
         self.cleanup_calls.append(checkout_path)
+
+    def recover_quarantined_slot(self, slot: int) -> Path:
+        self.recover_quarantined_slot_calls.append(slot)
+        return self.ensure_checkout(slot)
 
     def fetch_origin(self, checkout_path: Path) -> None:
         self.fetch_calls.append(checkout_path)
@@ -1024,6 +1029,34 @@ def test_slot_pool_acquire_release(tmp_path: Path) -> None:
     assert lease.path.exists()
 
     pool.release(lease)
+    lease2 = pool.acquire()
+    assert lease2.slot == 0
+
+
+def test_slot_pool_release_quarantines_and_recovers_slot(tmp_path: Path) -> None:
+    manager = FakeGitManager(tmp_path / "checkouts")
+    pool = SlotPool(manager, worker_count=1)
+
+    lease = pool.acquire()
+    pool.release(lease, quarantine_reason="cleanup failed")
+    assert manager.recover_quarantined_slot_calls == [0]
+
+    lease2 = pool.acquire()
+    assert lease2.slot == 0
+
+
+def test_slot_pool_release_still_releases_when_quarantine_recovery_fails(tmp_path: Path) -> None:
+    manager = FakeGitManager(tmp_path / "checkouts")
+    pool = SlotPool(manager, worker_count=1)
+    lease = pool.acquire()
+
+    def fail_recovery(slot: int) -> Path:
+        _ = slot
+        raise RuntimeError("recovery failed")
+
+    manager.recover_quarantined_slot = fail_recovery
+    pool.release(lease, quarantine_reason="cleanup failed")
+
     lease2 = pool.acquire()
     assert lease2.slot == 0
 
@@ -2417,6 +2450,47 @@ def test_process_issue_releases_slot_on_failure(tmp_path: Path) -> None:
 
     assert git.cleanup_calls
     # Slot should have been released; re-acquire should not block and should return slot 0.
+    lease = orch._slot_pool.acquire()
+    assert lease.slot == 0
+
+
+def test_process_issue_worker_cleanup_failure_does_not_override_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    expected = WorkResult(
+        issue_number=7,
+        branch="agent/design/7-cleanup",
+        pr_number=101,
+        pr_url="https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    def fake_process_design_issue(
+        *,
+        issue: Issue,
+        checkout_path: Path,
+        branch: str,
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
+        _ = issue, checkout_path, branch, pre_pr_last_consumed_comment_id
+        return expected
+
+    def failing_cleanup(checkout_path: Path) -> None:
+        git.cleanup_calls.append(checkout_path)
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(orch, "_process_design_issue", fake_process_design_issue)
+    monkeypatch.setattr(git, "cleanup_slot", failing_cleanup)
+
+    result = orch._process_issue(_issue(), "design_doc", branch_override=expected.branch)
+    assert result == expected
+    assert git.recover_quarantined_slot_calls == [0]
+    assert git.cleanup_calls
     lease = orch._slot_pool.acquire()
     assert lease.slot == 0
 
