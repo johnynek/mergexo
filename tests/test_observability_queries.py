@@ -249,6 +249,34 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert oq.load_metrics(db_path, window="30d").overall.terminal_count == 3
 
 
+def test_observability_queries_show_takeover_tracked_pr_as_blocked(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_completed(
+        18, "agent/design/18", 1818, "https://example/pr/1818", repo_full_name="o/repo-a"
+    )
+    store.set_issue_takeover_active(
+        issue_number=18,
+        ignore_active=True,
+        repo_full_name="o/repo-a",
+    )
+
+    # Internal lifecycle state remains tracked so processing can resume when takeover ends.
+    tracked_state_rows = store.list_tracked_pull_requests(repo_full_name="o/repo-a")
+    assert [row.pr_number for row in tracked_state_rows] == [1818]
+
+    tracked_rows = oq.load_tracked_and_blocked(db_path, repo_filter="o/repo-a", limit=20)
+    assert len(tracked_rows) == 1
+    assert tracked_rows[0].pr_number == 1818
+    assert tracked_rows[0].status == "blocked"
+    assert tracked_rows[0].blocked_reason == "ignored (takeover active)"
+
+    overview = oq.load_overview(db_path, repo_filter="o/repo-a", window="24h")
+    assert overview.blocked_prs == 1
+    assert overview.tracked_prs == 0
+
+
 def test_observability_queries_empty_state(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     StateStore(db_path)
