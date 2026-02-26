@@ -4744,6 +4744,52 @@ class Phase1Orchestrator:
             changed_files=self._github.list_pull_request_files(pull_request.number),
         )
 
+    def _feedback_turn_with_push_merge_conflict(
+        self,
+        *,
+        turn: FeedbackTurn,
+        pull_request: PullRequestSnapshot,
+        branch: str,
+        repair_round: int,
+        failure_output: str,
+    ) -> FeedbackTurn:
+        trimmed_output = failure_output.strip()
+        if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
+            trimmed_output = (
+                trimmed_output[:_REQUIRED_TEST_FAILURE_OUTPUT_LIMIT]
+                + "\n... [truncated by MergeXO]"
+            )
+        if not trimmed_output:
+            trimmed_output = "<empty>"
+
+        failure_comment = PullRequestIssueComment(
+            comment_id=-(9300 + repair_round),
+            body=(
+                "MergeXO push-time merge conflict detected.\n"
+                f"- branch: `{branch}`\n"
+                f"- repair_round: {repair_round}\n"
+                "- The remote branch changed while this turn was running.\n"
+                "- Resolve conflicts in this checkout, preserve both local and remote intent,\n"
+                "  then return commit_message so MergeXO can push.\n"
+                "- If impossible, set commit_message to null and explain why in "
+                "general_comment.\n\n"
+                "Merge output:\n"
+                f"{trimmed_output}"
+            ),
+            user_login="mergexo-system",
+            html_url="",
+            created_at="now",
+            updated_at="now",
+        )
+        return FeedbackTurn(
+            turn_key=turn.turn_key,
+            issue=turn.issue,
+            pull_request=pull_request,
+            review_comments=turn.review_comments,
+            issue_comments=turn.issue_comments + (failure_comment,),
+            changed_files=self._github.list_pull_request_files(pull_request.number),
+        )
+
     def _commit_push_feedback_with_required_tests(
         self,
         *,
@@ -4758,6 +4804,7 @@ class Phase1Orchestrator:
         current_turn = turn
         current_pr = pull_request
         repair_round = 0
+        push_merge_conflict_round = 0
 
         while current_result.commit_message:
             local_head_sha = self._git.current_head_sha(checkout_path)
@@ -4879,7 +4926,136 @@ class Phase1Orchestrator:
                     return None
                 continue
 
-            self._git.push_branch(checkout_path, tracked.branch)
+            try:
+                self._git.push_branch(checkout_path, tracked.branch)
+            except CommandError as exc:
+                detail = str(exc)
+                if not _is_merge_conflict_error(detail):
+                    raise
+                push_merge_conflict_round += 1
+                log_event(
+                    LOGGER,
+                    "feedback_push_merge_conflict_detected",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    branch=tracked.branch,
+                    repair_round=push_merge_conflict_round,
+                )
+                if push_merge_conflict_round > _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS:
+                    error = (
+                        "push-time merge conflict unresolved after automated repair attempts; "
+                        f"last failure: {_summarize_git_error(detail)}"
+                    )
+                    self._github.post_issue_comment(
+                        issue_number=tracked.pr_number,
+                        body=(
+                            "MergeXO feedback automation is blocked because push-time merge "
+                            "conflicts could not be resolved.\n"
+                            f"- branch: `{tracked.branch}`\n"
+                            f"- attempts: {_MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS}\n"
+                            f"- last failure summary: {_summarize_git_error(detail)}"
+                        ),
+                    )
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="blocked",
+                        last_seen_head_sha=current_pr.head_sha,
+                        error=error,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="push_merge_conflict_repair_limit_exceeded",
+                    )
+                    return None
+
+                current_pr = self._github.get_pull_request(tracked.pr_number)
+                if current_pr.merged:
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="merged",
+                        last_seen_head_sha=current_pr.head_sha,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_completed",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        result="pr_merged",
+                    )
+                    return None
+                if current_pr.state.lower() != "open":
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="closed",
+                        last_seen_head_sha=current_pr.head_sha,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_completed",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        result="pr_closed",
+                    )
+                    return None
+
+                current_turn = self._feedback_turn_with_push_merge_conflict(
+                    turn=current_turn,
+                    pull_request=current_pr,
+                    branch=tracked.branch,
+                    repair_round=push_merge_conflict_round,
+                    failure_output=detail,
+                )
+                repair_outcome = self._run_feedback_agent_with_git_ops(
+                    tracked=tracked,
+                    session=current_result.session,
+                    turn=current_turn,
+                    checkout_path=checkout_path,
+                    pull_request=current_pr,
+                )
+                if repair_outcome is None:
+                    return None
+
+                current_result, current_pr = repair_outcome
+                if current_result.commit_message is None:
+                    conflict_detail = (
+                        current_result.general_comment.strip()
+                        if current_result.general_comment and current_result.general_comment.strip()
+                        else "agent could not resolve push-time merge conflicts"
+                    )
+                    self._github.post_issue_comment(
+                        issue_number=tracked.pr_number,
+                        body=(
+                            "MergeXO feedback automation is blocked because push-time merge "
+                            f"conflicts could not be resolved:\n\n{conflict_detail}"
+                        ),
+                    )
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="blocked",
+                        last_seen_head_sha=current_pr.head_sha,
+                        error=conflict_detail,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="push_merge_conflict_reported_impossible",
+                    )
+                    return None
+                continue
+
             current_pr = self._github.get_pull_request(tracked.pr_number)
             if current_pr.merged:
                 self._state.mark_pr_status(

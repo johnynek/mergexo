@@ -5551,6 +5551,59 @@ def _issue_comment(comment_id: int = 22) -> PullRequestIssueComment:
     )
 
 
+def _feedback_commit_push_context(
+    tmp_path: Path,
+) -> tuple[
+    Phase1Orchestrator,
+    FakeGitManager,
+    FakeGitHub,
+    FakeState,
+    TrackedPullRequestState,
+    FeedbackTurn,
+    FeedbackResult,
+]:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=issue.number,
+        branch="agent/design/7-add-worker-scheduler",
+        status="awaiting_feedback",
+        last_seen_head_sha="head-1",
+    )
+    turn = FeedbackTurn(
+        turn_key="turn-key",
+        issue=issue,
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(),
+    )
+    result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-1"),
+        review_replies=(),
+        general_comment=None,
+        commit_message="feat: update",
+        git_ops=(),
+    )
+    return orch, git, github, state, tracked, turn, result
+
+
 def _workflow_run(
     *,
     run_id: int,
@@ -5768,6 +5821,199 @@ def test_feedback_turn_required_tests_failure_truncates_and_handles_empty_output
         failure_output="   ",
     )
     assert "Failure output:\n<empty>" in empty_turn.issue_comments[-1].body
+
+
+def test_feedback_turn_push_merge_conflict_truncates_and_handles_empty_output(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.changed_files = ("src/a.py",)
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    turn = FeedbackTurn(
+        turn_key="turn-key",
+        issue=issue,
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(),
+    )
+
+    truncated_turn = orch._feedback_turn_with_push_merge_conflict(
+        turn=turn,
+        pull_request=github.pr_snapshot,
+        branch="agent/design/7-add-worker-scheduler",
+        repair_round=1,
+        failure_output="x" * 13000,
+    )
+    assert "... [truncated by MergeXO]" in truncated_turn.issue_comments[-1].body
+    assert truncated_turn.changed_files == ("src/a.py",)
+
+    empty_turn = orch._feedback_turn_with_push_merge_conflict(
+        turn=turn,
+        pull_request=github.pr_snapshot,
+        branch="agent/design/7-add-worker-scheduler",
+        repair_round=2,
+        failure_output="   ",
+    )
+    assert "Merge output:\n<empty>" in empty_turn.issue_comments[-1].body
+
+
+def test_commit_push_feedback_re_raises_non_merge_conflict_push_error(tmp_path: Path) -> None:
+    orch, git, github, _state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    _ = github
+
+    def raise_push_error(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError("transport failed")
+
+    git.push_branch = raise_push_error  # type: ignore[method-assign]
+
+    with pytest.raises(CommandError, match="transport failed"):
+        orch._commit_push_feedback_with_required_tests(
+            tracked=tracked,
+            checkout_path=tmp_path,
+            turn=turn,
+            result=result,
+            pull_request=turn.pull_request,
+            turn_start_head="head-1",
+        )
+
+
+def test_commit_push_feedback_blocks_when_merge_conflict_repair_limit_exceeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch, git, github, state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+
+    def raise_merge_conflict(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError("Automatic merge failed; merge conflict in src/app.py")
+
+    git.push_branch = raise_merge_conflict  # type: ignore[method-assign]
+    repair_calls = {"count": 0}
+
+    def fake_run_feedback_agent_with_git_ops(
+        **kwargs: object,
+    ) -> tuple[FeedbackResult, PullRequestSnapshot]:
+        _ = kwargs
+        repair_calls["count"] += 1
+        return result, github.pr_snapshot
+
+    monkeypatch.setattr(
+        orch, "_run_feedback_agent_with_git_ops", fake_run_feedback_agent_with_git_ops
+    )
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert repair_calls["count"] == 3
+    assert state.status_updates[-1][2] == "blocked"
+    assert "push-time merge conflict unresolved" in str(state.status_updates[-1][4]).lower()
+    assert any("attempts: 3" in body for _, body in github.comments)
+
+
+def test_commit_push_feedback_marks_merged_when_pr_merges_after_push_conflict(
+    tmp_path: Path,
+) -> None:
+    orch, git, github, state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-merged",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=True,
+    )
+
+    def raise_merge_conflict(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError("Automatic merge failed; merge conflict in src/app.py")
+
+    git.push_branch = raise_merge_conflict  # type: ignore[method-assign]
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert state.status_updates == [(101, 7, "merged", "head-merged", None)]
+
+
+def test_commit_push_feedback_marks_closed_when_pr_closes_after_push_conflict(
+    tmp_path: Path,
+) -> None:
+    orch, git, github, state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-closed",
+        base_sha="base-1",
+        draft=False,
+        state="closed",
+        merged=False,
+    )
+
+    def raise_merge_conflict(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError("Automatic merge failed; merge conflict in src/app.py")
+
+    git.push_branch = raise_merge_conflict  # type: ignore[method-assign]
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert state.status_updates == [(101, 7, "closed", "head-closed", None)]
+
+
+def test_commit_push_feedback_returns_none_when_merge_conflict_repair_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch, git, _github, _state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+
+    def raise_merge_conflict(checkout_path: Path, branch: str) -> None:
+        _ = checkout_path, branch
+        raise CommandError("Automatic merge failed; merge conflict in src/app.py")
+
+    git.push_branch = raise_merge_conflict  # type: ignore[method-assign]
+    monkeypatch.setattr(orch, "_run_feedback_agent_with_git_ops", lambda **kwargs: None)
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
 
 
 def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
@@ -7693,6 +7939,158 @@ def test_feedback_turn_retries_required_tests_failure_before_push(
     assert len(git.commit_calls) == 2
     assert len(git.push_calls) == 1
     assert run_calls == 2
+
+
+def test_feedback_turn_retries_push_merge_conflict_before_push(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_results = [
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-1"),
+            review_replies=(),
+            general_comment=None,
+            commit_message="feat: first pass",
+            git_ops=(),
+        ),
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-2"),
+            review_replies=(ReviewReply(review_comment_id=11, body="Resolved merge conflict"),),
+            general_comment="Merged remote updates and resolved conflicts.",
+            commit_message="feat: resolve merge conflict",
+            git_ops=(),
+        ),
+    ]
+
+    original_push = git.push_branch
+    push_attempts = 0
+
+    def push_with_merge_conflict(checkout_path: Path, branch: str) -> None:
+        nonlocal push_attempts
+        push_attempts += 1
+        original_push(checkout_path, branch)
+        if push_attempts == 1:
+            raise CommandError("Automatic merge failed; fix conflicts and then commit the result")
+
+    git.push_branch = push_with_merge_conflict  # type: ignore[method-assign]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert push_attempts == 2
+    assert len(agent.feedback_calls) == 2
+    second_turn = agent.feedback_calls[1][1]
+    assert any(
+        "push-time merge conflict detected" in comment.body.lower()
+        for comment in second_turn.issue_comments
+    )
+    assert len(git.commit_calls) == 2
+    assert len(git.push_calls) == 2
+    assert state.list_pending_feedback_events(101) == ()
+
+
+def test_feedback_turn_blocks_when_push_merge_conflict_reported_impossible(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+
+    agent = FakeAgent()
+    agent.feedback_results = [
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-1"),
+            review_replies=(),
+            general_comment=None,
+            commit_message="feat: first pass",
+            git_ops=(),
+        ),
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-2"),
+            review_replies=(),
+            general_comment="I cannot safely resolve these merge conflicts.",
+            commit_message=None,
+            git_ops=(),
+        ),
+    ]
+
+    original_push = git.push_branch
+    push_attempts = 0
+
+    def push_with_merge_conflict(checkout_path: Path, branch: str) -> None:
+        nonlocal push_attempts
+        push_attempts += 1
+        original_push(checkout_path, branch)
+        raise CommandError("Automatic merge failed; merge conflict in src/app.py")
+
+    git.push_branch = push_with_merge_conflict  # type: ignore[method-assign]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert push_attempts == 1
+    assert len(agent.feedback_calls) == 2
+    second_turn = agent.feedback_calls[1][1]
+    assert any(
+        "push-time merge conflict detected" in comment.body.lower()
+        for comment in second_turn.issue_comments
+    )
+    assert len(git.commit_calls) == 1
+    assert len(git.push_calls) == 1
+    assert len(state.list_pending_feedback_events(101)) == 1
+    assert state.list_tracked_pull_requests() == ()
+    assert any(
+        "merge conflicts could not be resolved" in body.lower() for _, body in github.comments
+    )
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT status, error FROM issue_runs WHERE issue_number = ?", (issue.number,)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "blocked"
+        assert "cannot safely resolve" in str(row[1]).lower()
+    finally:
+        conn.close()
 
 
 def test_feedback_turn_blocks_when_required_tests_reported_impossible(
