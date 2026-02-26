@@ -16,6 +16,7 @@ from mergexo.github_gateway import GitHubGateway
 from mergexo.observability import configure_logging
 from mergexo.observability_tui import run_observability_tui
 from mergexo.orchestrator import Phase1Orchestrator
+from mergexo.process_lock import writer_process_lock
 from mergexo.service_runner import run_service
 from mergexo.state import StateStore
 
@@ -150,11 +151,20 @@ def main() -> None:
     args = parser.parse_args(_argv_with_default_command(tuple(sys.argv[1:])))
     config = load_config(args.config)
     configure_logging(_effective_verbose_mode(args), state_dir=config.runtime.base_dir)
+    if _requires_writer_lock(args):
+        with writer_process_lock(
+            base_dir=config.runtime.base_dir,
+            command=_writer_lock_command_name(args),
+        ):
+            _dispatch_command(config, args)
+        return
+    _dispatch_command(config, args)
 
+
+def _dispatch_command(config: AppConfig, args: argparse.Namespace) -> None:
     if args.command == "console":
         _cmd_console(config)
         return
-
     if args.command == "init":
         _cmd_init(config)
         return
@@ -170,8 +180,21 @@ def main() -> None:
     if args.command == "feedback":
         _cmd_feedback(config, args)
         return
-
     raise RuntimeError(f"Unknown command: {args.command}")
+
+
+def _requires_writer_lock(args: argparse.Namespace) -> bool:
+    if args.command in {"console", "init", "run", "service"}:
+        return True
+    if args.command != "feedback":
+        return False
+    return args.feedback_command == "blocked" and args.blocked_command == "reset"
+
+
+def _writer_lock_command_name(args: argparse.Namespace) -> str:
+    if args.command == "feedback":
+        return f"feedback {args.feedback_command} {args.blocked_command}"
+    return str(args.command)
 
 
 def _argv_with_default_command(argv: tuple[str, ...]) -> tuple[str, ...]:
@@ -278,11 +301,6 @@ def _cmd_service(config: AppConfig, *, once: bool) -> None:
 
 def _cmd_top(config: AppConfig) -> None:
     config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
-    state = StateStore(_state_db_path(config))
-    state.reconcile_unfinished_agent_runs()
-    state.prune_observability_history(
-        retention_days=config.runtime.observability_history_retention_days
-    )
     run_observability_tui(
         db_path=_state_db_path(config),
         refresh_seconds=config.runtime.observability_refresh_seconds,
