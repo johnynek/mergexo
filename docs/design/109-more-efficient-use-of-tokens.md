@@ -77,8 +77,9 @@ From local Codex CLI behavior (`codex-cli 0.105.0`):
 1. `--model` is supported on both `codex exec` and `codex exec resume`.
 2. There is no dedicated `--reasoning-effort` flag.
 3. Reasoning effort is set via config override argument: `-c model_reasoning_effort='<effort>'`.
-4. Valid efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-5. `codex exec resume` accepts `-c` overrides, so reasoning effort can be applied to feedback turns too.
+4. `-c` overrides the same key loaded from config/profile for that invocation only (it does not persist edits to config files).
+5. Valid efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
+6. `codex exec resume` accepts `-c` overrides, so reasoning effort can be applied to feedback turns too.
 
 ## Proposed architecture
 
