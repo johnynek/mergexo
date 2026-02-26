@@ -42,7 +42,12 @@ from mergexo.feedback_loop import (
     parse_operator_command,
 )
 from mergexo.git_ops import GitRepoManager
-from mergexo.github_gateway import CompareCommitsStatus, GitHubGateway, GitHubPollingError
+from mergexo.github_gateway import (
+    CompareCommitsStatus,
+    GitHubAuthenticationError,
+    GitHubGateway,
+    GitHubPollingError,
+)
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -96,6 +101,7 @@ _ACTIONS_ACTIVE_STATUSES = frozenset({"queued", "in_progress", "waiting", "reque
 _ACTIONS_GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 _RESTART_OPERATION_NAME = "restart"
 _RESTART_PENDING_STATUSES = {"pending", "running"}
+_GITHUB_AUTH_FAILURE_POLL_THRESHOLD = 3
 _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "flow blocked:",
     "required pre-push tests failed before pushing design branch",
@@ -313,6 +319,10 @@ class Phase1Orchestrator:
         self._authorized_operator_logins = {
             login.strip().lower() for login in self._repo.operator_logins if login.strip()
         }
+        self._consecutive_github_auth_failure_polls = 0
+        self._current_poll_had_auth_error = False
+        self._github_auth_shutdown_pending = False
+        self._last_github_auth_error: str | None = None
 
     def run(self, *, once: bool) -> None:
         with logging_repo_context(self._repo.full_name):
@@ -342,6 +352,7 @@ class Phase1Orchestrator:
     def poll_once(self, pool: ThreadPoolExecutor, *, allow_enqueue: bool = True) -> None:
         with logging_repo_context(self._repo.full_name):
             self._ensure_poll_setup()
+            self._current_poll_had_auth_error = False
             log_event(
                 LOGGER,
                 "poll_started",
@@ -353,12 +364,17 @@ class Phase1Orchestrator:
 
             poll_had_github_errors = False
             restart_pending = self._is_restart_pending()
+            auth_shutdown_pending = self._github_auth_shutdown_pending
             # Restart drain mode is a hard ingestion stop for this process. Once restart is
             # pending we skip operator-command scans and all enqueue paths so no new GitHub
             # messages are consumed while draining. The only remaining work here is reaping
             # finished futures so terminal state is checkpointed in sqlite before supervisor
             # handoff/re-exec.
-            if self._config.runtime.enable_github_operations and not restart_pending:
+            if (
+                self._config.runtime.enable_github_operations
+                and not restart_pending
+                and not auth_shutdown_pending
+            ):
                 if not self._run_poll_step(
                     step_name="scan_operator_commands",
                     fn=self._scan_operator_commands,
@@ -367,7 +383,8 @@ class Phase1Orchestrator:
 
             if not restart_pending:
                 restart_pending = self._is_restart_pending()
-            enqueue_allowed = allow_enqueue and not restart_pending
+            auth_shutdown_pending = self._github_auth_shutdown_pending
+            enqueue_allowed = allow_enqueue and not restart_pending and not auth_shutdown_pending
 
             if enqueue_allowed:
                 # TODO remove migration after updates
@@ -415,6 +432,8 @@ class Phase1Orchestrator:
                         fn=self._scan_post_pr_source_issue_comment_redirects,
                     ):
                         poll_had_github_errors = True
+            if not self._current_poll_had_auth_error and not self._github_auth_shutdown_pending:
+                self._consecutive_github_auth_failure_polls = 0
 
             log_event(
                 LOGGER,
@@ -422,7 +441,9 @@ class Phase1Orchestrator:
                 running_issue_count=len(self._running),
                 running_feedback_count=len(self._running_feedback),
                 draining_for_restart=not enqueue_allowed,
+                draining_for_github_auth=self._github_auth_shutdown_pending,
                 poll_had_github_errors=poll_had_github_errors,
+                consecutive_github_auth_failure_polls=self._consecutive_github_auth_failure_polls,
             )
 
     def pending_work_count(self) -> int:
@@ -435,6 +456,15 @@ class Phase1Orchestrator:
 
     def in_flight_work_count(self) -> int:
         return self._work_limiter.in_flight()
+
+    def github_auth_shutdown_pending(self) -> bool:
+        return self._github_auth_shutdown_pending
+
+    def github_auth_shutdown_reason(self) -> str:
+        reason = (self._last_github_auth_error or "").strip()
+        if reason:
+            return reason
+        return "GitHub CLI is not authenticated. Run `gh auth login` and restart MergeXO."
 
     def _ensure_poll_setup(self) -> None:
         if self._poll_setup_done:
@@ -504,6 +534,25 @@ class Phase1Orchestrator:
             fn()
             return True
         except GitHubPollingError as exc:
+            if isinstance(exc, GitHubAuthenticationError):
+                if not self._current_poll_had_auth_error:
+                    self._current_poll_had_auth_error = True
+                    self._consecutive_github_auth_failure_polls += 1
+                self._last_github_auth_error = str(exc)
+                if (
+                    not self._github_auth_shutdown_pending
+                    and self._consecutive_github_auth_failure_polls
+                    >= _GITHUB_AUTH_FAILURE_POLL_THRESHOLD
+                ):
+                    self._github_auth_shutdown_pending = True
+                    log_event(
+                        LOGGER,
+                        "github_auth_shutdown_pending",
+                        repo_full_name=self._state_repo_full_name(),
+                        consecutive_failure_polls=self._consecutive_github_auth_failure_polls,
+                        threshold=_GITHUB_AUTH_FAILURE_POLL_THRESHOLD,
+                        error=str(exc),
+                    )
             log_event(
                 LOGGER,
                 "poll_step_failed",
@@ -511,6 +560,7 @@ class Phase1Orchestrator:
                 step=step_name,
                 error_type=type(exc).__name__,
                 error=str(exc),
+                github_auth_failure=isinstance(exc, GitHubAuthenticationError),
             )
             return False
 

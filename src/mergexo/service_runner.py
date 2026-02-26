@@ -37,6 +37,9 @@ from mergexo.state import StateStore
 LOGGER = logging.getLogger("mergexo.service_runner")
 _RESTART_OPERATION_NAME = "restart"
 _RESTART_PENDING_STATUSES = {"pending", "running"}
+_DEFAULT_GITHUB_AUTH_SHUTDOWN_DETAIL = (
+    "GitHub CLI is not authenticated. Run `gh auth login` and restart MergeXO."
+)
 
 
 ServiceSignalKind = Literal[
@@ -91,6 +94,7 @@ class ServiceRunner:
             )
 
             with ThreadPoolExecutor(max_workers=self.config.runtime.worker_count) as pool:
+                auth_shutdown_detail: str | None = None
                 if once:
                     for index, (repo, _, _) in enumerate(runtimes):
                         if self._should_stop():
@@ -100,11 +104,17 @@ class ServiceRunner:
                             orchestrator=orchestrators[index],
                             pool=pool,
                             work_limiter=work_limiter,
-                            allow_enqueue=True,
+                            allow_enqueue=auth_shutdown_detail is None,
+                        )
+                        auth_shutdown_detail = self._update_auth_shutdown_detail(
+                            current_detail=auth_shutdown_detail,
+                            orchestrator=orchestrators[index],
+                            repo=repo,
                         )
                     if (
                         self._total_pending_futures(orchestrators) == 0
                         and not self._restart_operation_is_pending()
+                        and auth_shutdown_detail is None
                     ):
                         return
 
@@ -122,6 +132,11 @@ class ServiceRunner:
                                 work_limiter=work_limiter,
                                 allow_enqueue=False,
                             )
+                            auth_shutdown_detail = self._update_auth_shutdown_detail(
+                                current_detail=auth_shutdown_detail,
+                                orchestrator=orchestrators[index],
+                                repo=repo,
+                            )
                         restart_drain_started_at_monotonic, should_exit = (
                             self._process_global_restart_drain(
                                 orchestrators=orchestrators,
@@ -131,6 +146,11 @@ class ServiceRunner:
                         )
                         if should_exit:
                             return
+                        if (
+                            auth_shutdown_detail is not None
+                            and self._total_pending_futures(orchestrators) == 0
+                        ):
+                            raise RuntimeError(auth_shutdown_detail)
                         if self._total_pending_futures(orchestrators) == 0:
                             return
                         if self._wait_for_stop(0.1):
@@ -151,7 +171,15 @@ class ServiceRunner:
                         orchestrator=orchestrators[poll_index],
                         pool=pool,
                         work_limiter=work_limiter,
-                        allow_enqueue=not self._restart_operation_is_pending(),
+                        allow_enqueue=(
+                            auth_shutdown_detail is None
+                            and not self._restart_operation_is_pending()
+                        ),
+                    )
+                    auth_shutdown_detail = self._update_auth_shutdown_detail(
+                        current_detail=auth_shutdown_detail,
+                        orchestrator=orchestrators[poll_index],
+                        repo=repo,
                     )
                     restart_drain_started_at_monotonic, should_exit = (
                         self._process_global_restart_drain(
@@ -163,6 +191,12 @@ class ServiceRunner:
                     if should_exit:
                         return
                     poll_index = (poll_index + 1) % repo_count
+                    if auth_shutdown_detail is not None:
+                        if self._total_pending_futures(orchestrators) == 0:
+                            raise RuntimeError(auth_shutdown_detail)
+                        if self._wait_for_stop(0.1):
+                            return
+                        continue
                     if self._wait_for_stop(self.config.runtime.poll_interval_seconds):
                         return
         except Exception as exc:
@@ -217,6 +251,46 @@ class ServiceRunner:
             self._emit_signal(ServiceSignal(kind="poll_completed", repo_full_name=repo.full_name))
             if pending_after < pending_before:
                 self._emit_signal(ServiceSignal(kind="work_reaped", repo_full_name=repo.full_name))
+
+    def _update_auth_shutdown_detail(
+        self,
+        *,
+        current_detail: str | None,
+        orchestrator: object,
+        repo: RepoConfig,
+    ) -> str | None:
+        if current_detail is not None:
+            return current_detail
+        if not self._orchestrator_github_auth_shutdown_pending(orchestrator):
+            return None
+        detail = self._orchestrator_github_auth_shutdown_reason(orchestrator)
+        log_event(
+            LOGGER,
+            "service_github_auth_shutdown_started",
+            repo_full_name=repo.full_name,
+            detail=detail,
+        )
+        return detail
+
+    def _orchestrator_github_auth_shutdown_pending(self, orchestrator: object) -> bool:
+        pending_getter = getattr(orchestrator, "github_auth_shutdown_pending", None)
+        if not callable(pending_getter):
+            return False
+        try:
+            return bool(pending_getter())
+        except Exception:
+            return False
+
+    def _orchestrator_github_auth_shutdown_reason(self, orchestrator: object) -> str:
+        reason_getter = getattr(orchestrator, "github_auth_shutdown_reason", None)
+        if callable(reason_getter):
+            try:
+                reason = str(reason_getter()).strip()
+            except Exception:
+                reason = ""
+            if reason:
+                return reason
+        return _DEFAULT_GITHUB_AUTH_SHUTDOWN_DETAIL
 
     def _total_pending_futures(self, orchestrators: tuple[Phase1Orchestrator, ...]) -> int:
         return sum(orchestrator.pending_work_count() for orchestrator in orchestrators)

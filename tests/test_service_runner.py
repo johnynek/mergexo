@@ -744,6 +744,177 @@ def test_service_runner_once_drains_pending_work_with_enqueue_disabled(
     assert allow_enqueue_calls == [True, False]
 
 
+def test_service_runner_shuts_down_after_github_auth_drain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    allow_enqueue_calls: list[bool] = []
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 1
+            self.auth_pending = False
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool
+            allow_enqueue_calls.append(allow_enqueue)
+            if allow_enqueue:
+                self.auth_pending = True
+                return
+            self.pending = 0
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+        def github_auth_shutdown_pending(self) -> bool:
+            return self.auth_pending
+
+        def github_auth_shutdown_reason(self) -> str:
+            return "gh is not authenticated"
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr("mergexo.service_runner.time.sleep", lambda seconds: None)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    with pytest.raises(RuntimeError, match="gh is not authenticated"):
+        runner.run(once=True)
+
+    assert allow_enqueue_calls == [True, False]
+
+
+def test_service_runner_auth_drain_continuous_wait_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    wait_calls: list[float] = []
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 1
+            self.auth_pending = True
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+        def github_auth_shutdown_pending(self) -> bool:
+            return self.auth_pending
+
+        def github_auth_shutdown_reason(self) -> str:
+            return "gh is not authenticated"
+
+    wait_outcomes = iter((False, True))
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(ServiceRunner, "_should_stop", lambda self: False)
+
+    def fake_wait(self, timeout_seconds: float) -> bool:  # type: ignore[no-untyped-def]
+        wait_calls.append(timeout_seconds)
+        return next(wait_outcomes)
+
+    monkeypatch.setattr(ServiceRunner, "_wait_for_stop", fake_wait)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    runner.run(once=False)
+
+    assert wait_calls[:2] == [0.1, 0.1]
+
+
+def test_service_runner_auth_drain_continuous_raises_when_drained(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+
+    class FakeOrchestrator:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            _ = args, kwargs
+            self.pending = 0
+            self.auth_pending = True
+
+        def poll_once(self, pool, *, allow_enqueue: bool) -> None:  # type: ignore[no-untyped-def]
+            _ = pool, allow_enqueue
+
+        def queue_counts(self) -> tuple[int, int]:
+            return self.pending, 0
+
+        def pending_work_count(self) -> int:
+            return self.pending
+
+        def github_auth_shutdown_pending(self) -> bool:
+            return self.auth_pending
+
+        def github_auth_shutdown_reason(self) -> str:
+            return "gh is not authenticated"
+
+    monkeypatch.setattr("mergexo.service_runner.Phase1Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(ServiceRunner, "_should_stop", lambda self: False)
+    monkeypatch.setattr(ServiceRunner, "_wait_for_stop", lambda self, timeout_seconds: False)
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    with pytest.raises(RuntimeError, match="gh is not authenticated"):
+        runner.run(once=False)
+
+
+def test_service_runner_auth_shutdown_helper_fallbacks(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    class BadPending:
+        def github_auth_shutdown_pending(self) -> bool:
+            raise RuntimeError("boom")
+
+    class BadReason:
+        def github_auth_shutdown_reason(self) -> str:
+            raise RuntimeError("boom")
+
+    assert runner._orchestrator_github_auth_shutdown_pending(BadPending()) is False
+    assert (
+        runner._orchestrator_github_auth_shutdown_reason(BadReason())
+        == "GitHub CLI is not authenticated. Run `gh auth login` and restart MergeXO."
+    )
+
+
 def test_service_runner_multi_repo_restart_returns_when_handled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
