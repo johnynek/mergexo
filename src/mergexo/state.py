@@ -26,6 +26,10 @@ _LEGACY_SCHEMA_REINIT_MESSAGE = (
     "Detected a legacy state schema that is incompatible with multi-repo support. "
     "Reinitialize state: stop MergeXO, remove the old state DB, run `mergexo init`, then restart."
 )
+_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
+_TRANSIENT_RETRY_INITIAL_DELAY_SECONDS = 30
+_TRANSIENT_RETRY_MAX_DELAY_SECONDS = 300
+_STALE_RUNNING_RETRY_ERROR = "stale_running_issue_without_active_run"
 PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
 AgentRunKind = Literal["issue_flow", "implementation_flow", "pre_pr_followup", "feedback_turn"]
 AgentRunTerminalStatus = Literal[
@@ -244,6 +248,9 @@ class StateStore:
                     pr_number INTEGER,
                     pr_url TEXT,
                     error TEXT,
+                    last_failure_class TEXT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at TEXT NULL,
                     active_run_id TEXT NULL,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, issue_number)
@@ -256,6 +263,27 @@ class StateStore:
                     """
                     ALTER TABLE issue_runs
                     ADD COLUMN active_run_id TEXT NULL
+                    """
+                )
+            if "last_failure_class" not in issue_run_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_runs
+                    ADD COLUMN last_failure_class TEXT NULL
+                    """
+                )
+            if "retry_count" not in issue_run_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_runs
+                    ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            if "next_retry_at" not in issue_run_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_runs
+                    ADD COLUMN next_retry_at TEXT NULL
                     """
                 )
             conn.execute(
@@ -690,8 +718,55 @@ class StateStore:
                 """,
                 (repo_key, issue_number, branch, run_key),
             )
+            branch_for_run = branch
             if claimed.rowcount <= 0:
-                return None
+                claimed = conn.execute(
+                    """
+                    UPDATE issue_runs
+                    SET
+                        status = 'running',
+                        branch = COALESCE(?, branch),
+                        error = NULL,
+                        active_run_id = ?,
+                        next_retry_at = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND issue_number = ?
+                      AND status = 'failed'
+                      AND pr_number IS NULL
+                      AND active_run_id IS NULL
+                      AND retry_count > 0
+                      AND retry_count < ?
+                      AND (
+                            last_failure_class IN ('github_error', 'unknown')
+                            OR error = ?
+                        )
+                      AND (
+                            next_retry_at IS NULL
+                            OR next_retry_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        )
+                    """,
+                    (
+                        branch,
+                        run_key,
+                        repo_key,
+                        issue_number,
+                        _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                        _STALE_RUNNING_RETRY_ERROR,
+                    ),
+                )
+                if claimed.rowcount <= 0:
+                    return None
+                row = conn.execute(
+                    """
+                    SELECT branch
+                    FROM issue_runs
+                    WHERE repo_full_name = ? AND issue_number = ?
+                    """,
+                    (repo_key, issue_number),
+                ).fetchone()
+                if row is not None and isinstance(row[0], str):
+                    branch_for_run = row[0]
             self._insert_agent_run_start(
                 conn=conn,
                 run_id=run_key,
@@ -700,7 +775,7 @@ class StateStore:
                 issue_number=issue_number,
                 pr_number=None,
                 flow=flow,
-                branch=branch,
+                branch=branch_for_run,
                 started_at=started_at,
                 meta_json=meta_json,
             )
@@ -792,6 +867,9 @@ class StateStore:
                     branch=COALESCE(excluded.branch, issue_runs.branch),
                     error=NULL,
                     active_run_id=excluded.active_run_id,
+                    last_failure_class=NULL,
+                    retry_count=0,
+                    next_retry_at=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, branch, run_key),
@@ -1069,7 +1147,14 @@ class StateStore:
                     UPDATE issue_runs AS i
                     SET
                         status = 'failed',
-                        error = COALESCE(i.error, 'stale_running_issue_without_active_run'),
+                        error = COALESCE(i.error, ?),
+                        last_failure_class = 'unknown',
+                        retry_count = COALESCE(i.retry_count, 0) + 1,
+                        next_retry_at = CASE
+                            WHEN COALESCE(i.retry_count, 0) + 1 < ?
+                            THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 seconds')
+                            ELSE NULL
+                        END,
                         active_run_id = NULL,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE i.status = 'running'
@@ -1080,7 +1165,11 @@ class StateStore:
                               AND a.issue_number = i.issue_number
                               AND a.finished_at IS NULL
                         )
-                    """
+                    """,
+                    (
+                        _STALE_RUNNING_RETRY_ERROR,
+                        _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                    ),
                 )
                 reconciled_count += max(cursor.rowcount, 0)
             else:
@@ -1204,7 +1293,14 @@ class StateStore:
                     UPDATE issue_runs AS i
                     SET
                         status = 'failed',
-                        error = COALESCE(i.error, 'stale_running_issue_without_active_run'),
+                        error = COALESCE(i.error, ?),
+                        last_failure_class = 'unknown',
+                        retry_count = COALESCE(i.retry_count, 0) + 1,
+                        next_retry_at = CASE
+                            WHEN COALESCE(i.retry_count, 0) + 1 < ?
+                            THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 seconds')
+                            ELSE NULL
+                        END,
                         active_run_id = NULL,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE i.status = 'running'
@@ -1217,7 +1313,11 @@ class StateStore:
                               AND a.finished_at IS NULL
                         )
                     """,
-                    (repo_key,),
+                    (
+                        _STALE_RUNNING_RETRY_ERROR,
+                        _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                        repo_key,
+                    ),
                 )
                 reconciled_count += max(cursor.rowcount, 0)
         return reconciled_count
@@ -1652,6 +1752,9 @@ class StateStore:
                     status='running',
                     error=NULL,
                     active_run_id=NULL,
+                    last_failure_class=NULL,
+                    retry_count=0,
+                    next_retry_at=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number),
@@ -1691,6 +1794,9 @@ class StateStore:
                 pr_url=excluded.pr_url,
                 error=NULL,
                 active_run_id=NULL,
+                last_failure_class=NULL,
+                retry_count=0,
+                next_retry_at=NULL,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             """,
             (repo_full_name, issue_number, branch, pr_number, pr_url),
@@ -1753,21 +1859,81 @@ class StateStore:
             )
 
     def mark_failed(
-        self, issue_number: int, error: str, *, repo_full_name: str | None = None
+        self,
+        issue_number: int,
+        error: str,
+        *,
+        failure_class: AgentRunFailureClass | None = None,
+        retryable: bool = False,
+        repo_full_name: str | None = None,
     ) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
+        effective_failure_class = (
+            failure_class if failure_class is not None else ("unknown" if retryable else None)
+        )
+        next_retry_count = 0
+        retry_delay_modifier: str | None = None
         with self._lock, self._connect() as conn:
+            if retryable:
+                existing_row = conn.execute(
+                    """
+                    SELECT retry_count
+                    FROM issue_runs
+                    WHERE repo_full_name = ? AND issue_number = ?
+                    """,
+                    (repo_key, issue_number),
+                ).fetchone()
+                previous_retry_count = (
+                    int(existing_row[0])
+                    if existing_row is not None and isinstance(existing_row[0], int)
+                    else 0
+                )
+                next_retry_count = previous_retry_count + 1
+                if next_retry_count < _TRANSIENT_RETRY_MAX_ATTEMPTS:
+                    retry_delay_modifier = (
+                        f"+{_transient_retry_delay_seconds(next_retry_count)} seconds"
+                    )
             conn.execute(
                 """
-                INSERT INTO issue_runs(repo_full_name, issue_number, status, error)
-                VALUES(?, ?, 'failed', ?)
+                INSERT INTO issue_runs(
+                    repo_full_name,
+                    issue_number,
+                    status,
+                    error,
+                    last_failure_class,
+                    retry_count,
+                    next_retry_at
+                )
+                VALUES(
+                    ?,
+                    ?,
+                    'failed',
+                    ?,
+                    ?,
+                    ?,
+                    CASE
+                        WHEN ? IS NULL THEN NULL
+                        ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
+                    END
+                )
                 ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
                     status='failed',
                     error=excluded.error,
                     active_run_id=NULL,
+                    last_failure_class=excluded.last_failure_class,
+                    retry_count=excluded.retry_count,
+                    next_retry_at=excluded.next_retry_at,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
-                (repo_key, issue_number, error),
+                (
+                    repo_key,
+                    issue_number,
+                    error,
+                    effective_failure_class,
+                    next_retry_count,
+                    retry_delay_modifier,
+                    retry_delay_modifier,
+                ),
             )
             conn.execute(
                 """
@@ -1809,6 +1975,9 @@ class StateStore:
                     pr_url=NULL,
                     error=excluded.error,
                     active_run_id=NULL,
+                    last_failure_class=NULL,
+                    retry_count=0,
+                    next_retry_at=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, branch, waiting_reason),
@@ -3113,6 +3282,9 @@ class StateStore:
                     status='awaiting_feedback',
                     error=NULL,
                     active_run_id=NULL,
+                    last_failure_class=NULL,
+                    retry_count=0,
+                    next_retry_at=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 issue_keys,
@@ -3172,6 +3344,9 @@ class StateStore:
                     status=excluded.status,
                     error=excluded.error,
                     active_run_id=NULL,
+                    last_failure_class=NULL,
+                    retry_count=0,
+                    next_retry_at=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number, status, error),
@@ -3346,6 +3521,9 @@ class StateStore:
                     status='awaiting_feedback',
                     error=NULL,
                     active_run_id=NULL,
+                    last_failure_class=NULL,
+                    retry_count=0,
+                    next_retry_at=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 """,
                 (repo_key, issue_number),
@@ -3527,6 +3705,13 @@ def _normalize_repo_full_name(repo_full_name: str | None) -> str:
     if not normalized:
         return _DEFAULT_REPO_FULL_NAME
     return normalized
+
+
+def _transient_retry_delay_seconds(retry_count: int) -> int:
+    if retry_count < 1:
+        raise ValueError("retry_count must be >= 1")
+    delay = _TRANSIENT_RETRY_INITIAL_DELAY_SECONDS * (2 ** (retry_count - 1))
+    return min(delay, _TRANSIENT_RETRY_MAX_DELAY_SECONDS)
 
 
 def _parse_poll_cursor_row(

@@ -26,6 +26,7 @@ from mergexo.state import (
     _parse_runtime_operation_row,
     _parse_runtime_operation_status,
     _table_columns,
+    _transient_retry_delay_seconds,
 )
 
 
@@ -61,6 +62,38 @@ def _get_active_run_id(db_path: Path, issue_number: int) -> str | None:
         active_run_id = row[0]
         assert active_run_id is None or isinstance(active_run_id, str)
         return active_run_id
+    finally:
+        conn.close()
+
+
+def _get_issue_run_retry_state(
+    db_path: Path, issue_number: int
+) -> tuple[str, str | None, str | None, int, str | None, str | None]:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                status,
+                error,
+                last_failure_class,
+                retry_count,
+                next_retry_at,
+                active_run_id
+            FROM issue_runs
+            WHERE issue_number = ?
+            """,
+            (issue_number,),
+        ).fetchone()
+        assert row is not None
+        status, error, last_failure_class, retry_count, next_retry_at, active_run_id = row
+        assert isinstance(status, str)
+        assert error is None or isinstance(error, str)
+        assert last_failure_class is None or isinstance(last_failure_class, str)
+        assert isinstance(retry_count, int)
+        assert next_retry_at is None or isinstance(next_retry_at, str)
+        assert active_run_id is None or isinstance(active_run_id, str)
+        return status, error, last_failure_class, retry_count, next_retry_at, active_run_id
     finally:
         conn.close()
 
@@ -167,6 +200,9 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         assert "terminal_status" in run_history_columns
         assert "duration_seconds" in run_history_columns
         assert "active_run_id" in issue_run_columns
+        assert "last_failure_class" in issue_run_columns
+        assert "retry_count" in issue_run_columns
+        assert "next_retry_at" in issue_run_columns
         assert "state_applied" in outbox_columns
         assert "result_json" in outbox_columns
     finally:
@@ -228,6 +264,115 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
     assert _get_active_run_id(db_path, 99) == "run-99"
     store.mark_failed(99, "boom")
     assert _get_active_run_id(db_path, 99) is None
+
+
+def test_state_store_claim_new_issue_run_start_retries_transient_failed_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.record_issue_run_start(
+        run_kind="issue_flow",
+        issue_number=7,
+        flow="design_doc",
+        branch="agent/design/7-old",
+        run_id="run-7-initial",
+    )
+    store.mark_failed(
+        7,
+        "GitHub polling GET failed for path /x: boom",
+        failure_class="github_error",
+        retryable=True,
+    )
+    status, error, last_failure_class, retry_count, next_retry_at, active_run_id = (
+        _get_issue_run_retry_state(db_path, 7)
+    )
+    assert status == "failed"
+    assert error is not None
+    assert last_failure_class == "github_error"
+    assert retry_count == 1
+    assert next_retry_at is not None
+    assert active_run_id is None
+
+    # Backoff gate should block immediate claim.
+    assert (
+        store.claim_new_issue_run_start(
+            issue_number=7,
+            flow="design_doc",
+            branch="agent/design/7-new",
+            run_id="run-7-retry-immediate",
+        )
+        is None
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET next_retry_at = '2000-01-01T00:00:00.000Z'
+            WHERE issue_number = ?
+            """,
+            (7,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    retry_run_id = store.claim_new_issue_run_start(
+        issue_number=7,
+        flow="design_doc",
+        branch="agent/design/7-new",
+        run_id="run-7-retry",
+    )
+    assert retry_run_id == "run-7-retry"
+    status, error, _last_failure_class, retry_count, next_retry_at, active_run_id = (
+        _get_issue_run_retry_state(db_path, 7)
+    )
+    assert status == "running"
+    assert error is None
+    assert retry_count == 1
+    assert next_retry_at is None
+    assert active_run_id == "run-7-retry"
+    assert _get_row(db_path, 7)[1] == "agent/design/7-new"
+
+
+def test_state_store_claim_new_issue_run_start_skips_non_retryable_or_exhausted_failures(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_failed(8, "required pre-push tests failed", failure_class="tests_failed")
+    assert (
+        store.claim_new_issue_run_start(
+            issue_number=8,
+            flow="design_doc",
+            branch="agent/design/8-retry",
+            run_id="run-8-retry",
+        )
+        is None
+    )
+
+    store.mark_failed(9, "transient", failure_class="unknown", retryable=True)
+    store.mark_failed(9, "transient", failure_class="unknown", retryable=True)
+    store.mark_failed(9, "transient", failure_class="unknown", retryable=True)
+    status, _error, last_failure_class, retry_count, next_retry_at, _active_run_id = (
+        _get_issue_run_retry_state(db_path, 9)
+    )
+    assert status == "failed"
+    assert last_failure_class == "unknown"
+    assert retry_count == 3
+    assert next_retry_at is None
+    assert (
+        store.claim_new_issue_run_start(
+            issue_number=9,
+            flow="design_doc",
+            branch="agent/design/9-retry",
+            run_id="run-9-retry",
+        )
+        is None
+    )
 
 
 def test_state_store_github_call_outbox_lifecycle_and_apply(tmp_path: Path) -> None:
@@ -382,6 +527,41 @@ def test_state_store_migrates_minimal_legacy_github_call_outbox_schema(tmp_path:
     assert "dedupe_key" in columns
     assert "payload_json" in columns
     assert "status" in columns
+
+
+def test_state_store_migrates_issue_runs_retry_columns(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE issue_runs (
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                branch TEXT,
+                pr_number INTEGER,
+                pr_url TEXT,
+                error TEXT,
+                active_run_id TEXT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (repo_full_name, issue_number)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _ = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = set(_table_columns(conn, "issue_runs"))
+    finally:
+        conn.close()
+    assert "last_failure_class" in columns
+    assert "retry_count" in columns
+    assert "next_retry_at" in columns
 
 
 def test_state_store_upsert_github_call_intent_raises_when_insert_not_visible(
@@ -647,6 +827,10 @@ def test_reconcile_stale_running_issue_runs_with_followups(tmp_path: Path) -> No
     assert _get_row(db_path, 3)[0] == "running"
     assert _get_row(db_path, 4)[0] == "failed"
     assert _get_row(db_path, 4)[4] == "stale_running_issue_without_active_run"
+    _, _, last_failure_class, retry_count, next_retry_at, _ = _get_issue_run_retry_state(db_path, 4)
+    assert last_failure_class == "unknown"
+    assert retry_count == 1
+    assert next_retry_at is not None
     assert _get_row(db_path, 5)[0] == "merged"
 
     assert store.finish_agent_run(run_id="run-2-active", terminal_status="interrupted")
@@ -2192,6 +2376,14 @@ def test_table_columns_skips_short_rows() -> None:
 def test_normalize_repo_full_name_blank_defaults_to_single_repo() -> None:
     assert _normalize_repo_full_name(None) == "__single_repo__"
     assert _normalize_repo_full_name("   ") == "__single_repo__"
+
+
+def test_transient_retry_delay_seconds_bounds() -> None:
+    with pytest.raises(ValueError, match="retry_count must be >= 1"):
+        _transient_retry_delay_seconds(0)
+    assert _transient_retry_delay_seconds(1) == 30
+    assert _transient_retry_delay_seconds(2) == 60
+    assert _transient_retry_delay_seconds(5) == 300
 
 
 def test_parse_github_call_outbox_row_rejects_invalid_shape() -> None:
