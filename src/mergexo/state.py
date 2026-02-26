@@ -1177,6 +1177,7 @@ class StateStore:
                 )
                 reconciled_count += max(cursor.rowcount, 0)
         return reconciled_count
+
     def upsert_github_call_intent(
         self,
         *,

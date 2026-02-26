@@ -179,6 +179,35 @@ def test_find_pull_request_by_head_returns_none_when_no_match(
     assert gateway.find_pull_request_by_head(head="agent/design/7-worker", base="main") is None
 
 
+def test_find_pull_request_by_head_rejects_non_list_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"bad": "shape"},
+    )
+    with pytest.raises(RuntimeError, match="expected list for pull request lookup"):
+        gateway.find_pull_request_by_head(head="agent/design/7-worker", base="main")
+
+
+def test_find_pull_request_by_head_skips_non_object_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: [
+            1,
+            {"number": 8, "html_url": "https://example/pr/8"},
+        ],
+    )
+    pr = gateway.find_pull_request_by_head(head="agent/design/7-worker", base="main")
+    assert pr is not None
+    assert pr.number == 8
+    assert pr.html_url == "https://example/pr/8"
+
+
 def test_find_pull_request_by_head_rejects_invalid_state() -> None:
     gateway = GitHubGateway("o", "r")
     with pytest.raises(ValueError, match="state must be 'open' or 'all'"):

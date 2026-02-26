@@ -1507,10 +1507,7 @@ def test_ensure_poll_setup_replays_pending_create_pr_calls(tmp_path: Path) -> No
     assert run_id == "run-7"
     state.upsert_github_call_intent(
         call_kind="create_pull_request",
-        dedupe_key=(
-            "create_pr:7:main:agent/design/7-add-worker-scheduler:"
-            "run-7"
-        ),
+        dedupe_key=("create_pr:7:main:agent/design/7-add-worker-scheduler:run-7"),
         payload_json=(
             '{"base":"main","body":"Design doc.\\n\\nRefs #7",'
             '"head":"agent/design/7-add-worker-scheduler",'
@@ -1582,10 +1579,7 @@ def test_ensure_poll_setup_replays_in_progress_create_pr_calls_without_duplicate
     )
     intent = state.upsert_github_call_intent(
         call_kind="create_pull_request",
-        dedupe_key=(
-            "create_pr:7:main:agent/design/7-add-worker-scheduler:"
-            "run-7"
-        ),
+        dedupe_key=("create_pr:7:main:agent/design/7-add-worker-scheduler:run-7"),
         payload_json=(
             '{"base":"main","body":"Design doc.\\n\\nRefs #7",'
             '"head":"agent/design/7-add-worker-scheduler",'
@@ -1625,6 +1619,363 @@ def test_ensure_poll_setup_replays_in_progress_create_pr_calls_without_duplicate
         repo_full_name=cfg.repo.full_name,
     )
     assert replayable == ()
+
+
+@pytest.mark.parametrize(
+    ("payload_json", "message"),
+    [
+        ("[]", "Invalid create_pull_request outbox payload"),
+        (
+            '{"title":"Design doc","head":"agent/design/7-worker","base":"main","body":"Design body"}',
+            "missing issue_number",
+        ),
+        (
+            '{"issue_number":7,"head":"agent/design/7-worker","base":"main","body":"Design body"}',
+            "missing title",
+        ),
+        (
+            '{"issue_number":7,"title":"Design doc","base":"main","body":"Design body"}',
+            "missing head",
+        ),
+        (
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker","body":"Design body"}',
+            "missing base",
+        ),
+        (
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker","base":"main"}',
+            "missing body",
+        ),
+    ],
+)
+def test_parse_create_pr_outbox_payload_validation(
+    tmp_path: Path, payload_json: str, message: str
+) -> None:
+    orch = Phase1Orchestrator(
+        _config(tmp_path),
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    with pytest.raises(RuntimeError, match=message):
+        orch._parse_create_pr_outbox_payload(payload_json)
+
+
+def test_pull_request_from_outbox_result_validation_paths(tmp_path: Path) -> None:
+    orch = Phase1Orchestrator(
+        _config(tmp_path),
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    assert orch._pull_request_from_outbox_result(None) is None
+    assert orch._pull_request_from_outbox_result("[]") is None
+    assert (
+        orch._pull_request_from_outbox_result('{"pr_number":"bad","pr_url":"https://example/pr/1"}')
+        is None
+    )
+    assert orch._pull_request_from_outbox_result('{"pr_number":1,"pr_url":1}') is None
+    parsed = orch._pull_request_from_outbox_result(
+        '{"pr_number":123,"pr_url":"https://example/pr/123"}'
+    )
+    assert parsed is not None
+    assert parsed.number == 123
+    assert parsed.html_url == "https://example/pr/123"
+
+
+def test_find_existing_pull_request_for_branch_handles_missing_or_legacy_finder(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    setattr(github, "find_pull_request_by_head", 7)
+    assert (
+        orch._find_existing_pull_request_for_branch(
+            head="agent/design/7-worker",
+            base="main",
+        )
+        is None
+    )
+
+    legacy_gh = FakeGitHub([])
+
+    def legacy_finder_without_state(*, head: str, base: str | None = None) -> PullRequest | None:
+        _ = head, base
+        return PullRequest(number=222, html_url="https://example/pr/222")
+
+    setattr(legacy_gh, "find_pull_request_by_head", legacy_finder_without_state)
+    legacy_orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=legacy_gh,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    pr = legacy_orch._find_existing_pull_request_for_branch(
+        head="agent/design/7-worker",
+        base="main",
+    )
+    assert pr is not None
+    assert pr.number == 222
+
+    class LegacyAllFallbackGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.call_count = 0
+
+        def find_pull_request_by_head(
+            self,
+            *,
+            head: str,
+            base: str | None = None,
+            state: str = "open",
+        ) -> PullRequest | None:
+            _ = head, base, state
+            self.call_count += 1
+            if self.call_count == 1:
+                return None
+            if self.call_count == 2:
+                raise TypeError("state not supported")
+            return PullRequest(number=333, html_url="https://example/pr/333")
+
+    all_fallback_gh = LegacyAllFallbackGitHub()
+    all_fallback_orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=all_fallback_gh,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    pr = all_fallback_orch._find_existing_pull_request_for_branch(
+        head="agent/design/7-worker",
+        base="main",
+    )
+    assert pr is not None
+    assert pr.number == 333
+    assert all_fallback_gh.call_count == 3
+
+
+def test_execute_create_pr_outbox_call_uses_succeeded_result_without_github_call(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    github = FakeGitHub([_issue(7, "Design issue")])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    entry = GitHubCallOutboxState(
+        call_id=1,
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7-worker:run-7",
+        payload_json=(
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker",'
+            '"base":"main","body":"Design body"}'
+        ),
+        status="succeeded",
+        state_applied=False,
+        attempt_count=1,
+        last_error=None,
+        result_json='{"pr_number":101,"pr_url":"https://example/pr/101"}',
+        run_id="run-7",
+        issue_number=7,
+        branch="agent/design/7-worker",
+        pr_number=101,
+        created_at="2026-02-26T00:00:00.000Z",
+        updated_at="2026-02-26T00:00:00.000Z",
+    )
+
+    pr = orch._execute_create_pr_outbox_call(entry)
+    assert pr.number == 101
+    assert pr.html_url == "https://example/pr/101"
+    assert github.created_prs == []
+
+
+def test_execute_create_pr_outbox_call_repairs_succeeded_rows_missing_result_payload(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7-worker:run-7",
+        payload_json=(
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker",'
+            '"base":"main","body":"Design body"}'
+        ),
+        run_id="run-7",
+        issue_number=7,
+        branch="agent/design/7-worker",
+        repo_full_name=cfg.repo.full_name,
+    )
+    entry = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )[0]
+    assert state.mark_github_call_succeeded(
+        call_id=entry.call_id,
+        result_json="[]",
+        repo_full_name=cfg.repo.full_name,
+    )
+    succeeded_entry = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )[0]
+
+    github = FakeGitHub([_issue(7, "Design issue")])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    pr = orch._execute_create_pr_outbox_call(succeeded_entry)
+    assert pr.number == 101
+    replayable = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert len(replayable) == 1
+    assert replayable[0].status == "succeeded"
+    assert replayable[0].result_json == '{"pr_number": 101, "pr_url": "https://example/pr/101"}'
+
+
+def test_execute_create_pr_outbox_call_recovers_after_create_error(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    issue = _issue(7, "Design issue")
+    state.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7-worker:run-7",
+        payload_json=(
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker",'
+            '"base":"main","body":"Design body"}'
+        ),
+        run_id="run-7",
+        issue_number=7,
+        branch="agent/design/7-worker",
+        repo_full_name=cfg.repo.full_name,
+    )
+    entry = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )[0]
+
+    class RecoverAfterCreateErrorGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__([issue])
+            self.lookup_call_count = 0
+
+        def find_pull_request_by_head(
+            self, *, head: str, base: str | None = None, state: str = "open"
+        ) -> PullRequest | None:
+            _ = head, base, state
+            self.lookup_call_count += 1
+            if self.lookup_call_count == 3:
+                return PullRequest(number=212, html_url="https://example/pr/212")
+            return None
+
+        def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
+            _ = title, head, base, body
+            raise RuntimeError("create failed after side effects")
+
+    github = RecoverAfterCreateErrorGitHub()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    pr = orch._execute_create_pr_outbox_call(entry)
+    assert pr.number == 212
+    replayable = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert len(replayable) == 1
+    assert replayable[0].status == "succeeded"
+    assert replayable[0].pr_number == 212
+
+
+def test_replay_pending_create_pr_calls_reraises_github_polling_errors(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7-worker:run-7",
+        payload_json=(
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker",'
+            '"base":"main","body":"Design body"}'
+        ),
+        run_id="run-7",
+        issue_number=7,
+        branch="agent/design/7-worker",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    class PollingErrorGitHub(FakeGitHub):
+        def find_pull_request_by_head(
+            self, *, head: str, base: str | None = None, state: str = "open"
+        ) -> PullRequest | None:
+            _ = head, base, state
+            return None
+
+        def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
+            _ = title, head, base, body
+            raise GitHubPollingError("temporary outage")
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=PollingErrorGitHub([_issue(7, "Design issue")]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    with pytest.raises(GitHubPollingError, match="temporary outage"):
+        orch._replay_pending_create_pr_calls()
+
+
+def test_replay_pending_create_pr_calls_logs_and_continues_on_parse_error(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7-worker:run-7",
+        payload_json="[]",
+        run_id="run-7",
+        issue_number=7,
+        branch="agent/design/7-worker",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(7, "Design issue")]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    assert orch._replay_pending_create_pr_calls() == 0
+    replayable = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert len(replayable) == 1
+    assert replayable[0].status == "pending"
 
 
 @given(st.text())
