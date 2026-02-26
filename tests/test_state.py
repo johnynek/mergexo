@@ -375,6 +375,143 @@ def test_state_store_claim_new_issue_run_start_skips_non_retryable_or_exhausted_
     )
 
 
+def test_state_store_claim_implementation_issue_run_start_is_single_claim_and_preconditioned(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(8, "agent/design/8-foo", 101, "https://example/pr/101")
+    store.mark_pr_status(
+        pr_number=101, issue_number=8, status="merged", last_seen_head_sha="head-1"
+    )
+
+    run_id = store.claim_implementation_issue_run_start(
+        issue_number=8,
+        branch="agent/impl/8-foo",
+        run_id="impl-run-8",
+    )
+    assert run_id == "impl-run-8"
+    status, branch, _pr_number, _pr_url, error = _get_row(db_path, 8)
+    assert status == "running"
+    assert branch == "agent/impl/8-foo"
+    assert error is None
+    assert _get_active_run_id(db_path, 8) == "impl-run-8"
+    assert (
+        store.claim_implementation_issue_run_start(
+            issue_number=8,
+            branch="agent/impl/8-foo-racing-claim",
+            run_id="impl-run-8-race",
+        )
+        is None
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        history_rows = conn.execute(
+            """
+            SELECT run_id, run_kind, flow, branch
+            FROM agent_run_history
+            WHERE issue_number = ?
+            ORDER BY started_at ASC
+            """,
+            (8,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert history_rows == [
+        ("impl-run-8", "implementation_flow", "implementation", "agent/impl/8-foo")
+    ]
+
+    # Only merged design runs are eligible implementation claim targets.
+    store.mark_completed(9, "agent/design/9-bar", 109, "https://example/pr/109")
+    assert (
+        store.claim_implementation_issue_run_start(
+            issue_number=9,
+            branch="agent/impl/9-bar",
+            run_id="impl-run-9",
+        )
+        is None
+    )
+
+
+def test_state_store_claim_pre_pr_followup_run_start_is_single_claim_and_requires_followup_state(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-worker",
+        context_json='{"flow":"bugfix"}',
+        waiting_reason="bugfix flow blocked: waiting for details",
+    )
+
+    run_id = store.claim_pre_pr_followup_run_start(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-worker",
+        run_id="followup-run-7",
+    )
+    assert run_id == "followup-run-7"
+    status, branch, _pr_number, _pr_url, error = _get_row(db_path, 7)
+    assert status == "running"
+    assert branch == "agent/bugfix/7-worker"
+    assert error is None
+    assert _get_active_run_id(db_path, 7) == "followup-run-7"
+    assert (
+        store.claim_pre_pr_followup_run_start(
+            issue_number=7,
+            flow="bugfix",
+            branch="agent/bugfix/7-worker-racing-claim",
+            run_id="followup-run-7-race",
+        )
+        is None
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO issue_runs(
+                repo_full_name,
+                issue_number,
+                status,
+                branch,
+                error
+            )
+            VALUES(?, ?, 'awaiting_issue_followup', ?, ?)
+            """,
+            ("", 8, "agent/bugfix/8-worker", "bugfix flow blocked: waiting for details"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert (
+        store.claim_pre_pr_followup_run_start(
+            issue_number=8,
+            flow="bugfix",
+            branch="agent/bugfix/8-worker",
+            run_id="followup-run-8",
+        )
+        is None
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        missing_followup_history = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM agent_run_history
+            WHERE run_id = ?
+            """,
+            ("followup-run-8",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert missing_followup_history is not None
+    assert missing_followup_history[0] == 0
+
+
 def test_state_store_github_call_outbox_lifecycle_and_apply(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
