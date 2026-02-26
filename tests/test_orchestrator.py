@@ -521,6 +521,8 @@ class FakeState:
         self._github_call_id_by_dedupe: dict[str, int] = {}
         self.claim_blocked_implementation_issue_numbers: set[int] = set()
         self.claim_blocked_pre_pr_followup_issue_numbers: set[int] = set()
+        self.claim_blocked_feedback_pr_numbers: set[int] = set()
+        self.released_feedback_claims: list[tuple[int, str]] = []
 
     def _github_call_state(self, row: dict[str, object]) -> GitHubCallOutboxState:
         return GitHubCallOutboxState(
@@ -769,6 +771,35 @@ class FakeState:
         run_key = run_id or f"pre_pr_followup:{issue_number}:{len(self.run_starts) + 1}"
         self.run_starts.append(("pre_pr_followup", run_key, issue_number, None))
         return run_key
+
+    def claim_feedback_turn_start(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        _ = branch, meta_json, started_at, repo_full_name
+        if pr_number in self.claim_blocked_feedback_pr_numbers:
+            return None
+        run_key = run_id or f"feedback_turn:{issue_number}:{len(self.run_starts) + 1}"
+        self.run_starts.append(("feedback_turn", run_key, issue_number, pr_number))
+        return run_key
+
+    def release_feedback_turn_claim(
+        self,
+        *,
+        pr_number: int,
+        run_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        self.released_feedback_claims.append((pr_number, run_id))
+        return True
 
     def mark_running(self, issue_number: int, *, repo_full_name: str | None = None) -> None:
         _ = repo_full_name
@@ -6961,6 +6992,17 @@ def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) ->
     orch._enqueue_feedback_work(pool)
     assert pool.submitted == []
 
+    # Cross-process contention path: claim is lost after candidate listing.
+    orch._running = {}
+    orch._running_feedback = {}
+    pool.submitted.clear()
+    state.tracked = [state.tracked[0]]
+    state.claim_blocked_feedback_pr_numbers = {101}
+    starts_before = len(state.run_starts)
+    orch._enqueue_feedback_work(pool)
+    assert pool.submitted == []
+    assert len(state.run_starts) == starts_before
+
 
 def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
@@ -6978,6 +7020,7 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
 
     orch._reap_finished()
     assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
+    assert state.released_feedback_claims == [(101, "run-bad")]
 
 
 def test_reap_finished_keeps_feedback_tracked_on_github_polling_error(tmp_path: Path) -> None:
@@ -7004,6 +7047,7 @@ def test_reap_finished_keeps_feedback_tracked_on_github_polling_error(tmp_path: 
             "GitHub polling GET failed for path /x: boom",
         )
     ]
+    assert state.released_feedback_claims == [(101, "run-poll")]
 
 
 def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
@@ -7023,6 +7067,7 @@ def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
     orch._reap_finished()
     assert orch._running_feedback == {}
     assert state.status_updates == []
+    assert state.released_feedback_claims == [(101, "run-ok")]
 
 
 def test_feedback_turn_marks_merged_pr_and_stops_tracking(tmp_path: Path) -> None:
