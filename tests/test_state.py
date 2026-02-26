@@ -66,6 +66,21 @@ def _get_active_run_id(db_path: Path, issue_number: int) -> str | None:
         conn.close()
 
 
+def _get_pr_feedback_active_run_id(db_path: Path, pr_number: int) -> str | None:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT active_run_id FROM pr_feedback_state WHERE pr_number = ?",
+            (pr_number,),
+        ).fetchone()
+        assert row is not None
+        active_run_id = row[0]
+        assert active_run_id is None or isinstance(active_run_id, str)
+        return active_run_id
+    finally:
+        conn.close()
+
+
 def _get_issue_run_retry_state(
     db_path: Path, issue_number: int
 ) -> tuple[str, str | None, str | None, int, str | None, str | None]:
@@ -196,10 +211,12 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         run_history_columns = set(_table_columns(conn, "agent_run_history"))
         issue_run_columns = set(_table_columns(conn, "issue_runs"))
         outbox_columns = set(_table_columns(conn, "github_call_outbox"))
+        pr_feedback_columns = set(_table_columns(conn, "pr_feedback_state"))
         assert "run_id" in run_history_columns
         assert "terminal_status" in run_history_columns
         assert "duration_seconds" in run_history_columns
         assert "active_run_id" in issue_run_columns
+        assert "active_run_id" in pr_feedback_columns
         assert "last_failure_class" in issue_run_columns
         assert "retry_count" in issue_run_columns
         assert "next_retry_at" in issue_run_columns
@@ -1130,6 +1147,115 @@ def test_feedback_event_ingest_and_finalize(tmp_path: Path) -> None:
         assert int(processed_count[0]) == 3
     finally:
         conn.close()
+
+
+def test_state_store_claim_feedback_turn_start_is_single_claim_and_releaseable(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100")
+
+    run_id = store.claim_feedback_turn_start(
+        pr_number=100,
+        issue_number=7,
+        branch="agent/design/7",
+        run_id="feedback-run-100",
+    )
+    assert run_id == "feedback-run-100"
+    assert _get_pr_feedback_active_run_id(db_path, 100) == "feedback-run-100"
+    assert (
+        store.claim_feedback_turn_start(
+            pr_number=100,
+            issue_number=7,
+            branch="agent/design/7",
+            run_id="feedback-run-100-race",
+        )
+        is None
+    )
+    assert store.list_tracked_pull_requests() == ()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        history_rows = conn.execute(
+            """
+            SELECT run_id, run_kind, issue_number, pr_number, flow, branch
+            FROM agent_run_history
+            WHERE run_id = ?
+            """,
+            ("feedback-run-100",),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert history_rows == [
+        ("feedback-run-100", "feedback_turn", 7, 100, None, "agent/design/7"),
+    ]
+
+    assert store.release_feedback_turn_claim(pr_number=100, run_id="feedback-run-100")
+    assert not store.release_feedback_turn_claim(pr_number=100, run_id="feedback-run-100")
+    assert _get_pr_feedback_active_run_id(db_path, 100) is None
+    tracked = store.list_tracked_pull_requests()
+    assert len(tracked) == 1
+    assert tracked[0].pr_number == 100
+
+
+def test_state_store_reconcile_unfinished_agent_runs_clears_feedback_claims(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100")
+    run_id = store.claim_feedback_turn_start(
+        pr_number=100,
+        issue_number=7,
+        branch="agent/design/7",
+        run_id="feedback-run-100",
+    )
+    assert run_id == "feedback-run-100"
+    assert store.list_tracked_pull_requests() == ()
+
+    reconciled = store.reconcile_unfinished_agent_runs()
+    assert reconciled == 1
+    assert _get_pr_feedback_active_run_id(db_path, 100) is None
+    tracked = store.list_tracked_pull_requests()
+    assert len(tracked) == 1
+    assert tracked[0].pr_number == 100
+    terminal_status, failure_class, _error, _finished_at, _duration_seconds = (
+        _get_agent_run_history_row(db_path, "feedback-run-100")
+    )
+    assert terminal_status == "interrupted"
+    assert failure_class == "unknown"
+
+
+def test_state_store_migrates_pr_feedback_state_active_run_id_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE pr_feedback_state (
+                repo_full_name TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                issue_number INTEGER NOT NULL,
+                branch TEXT NOT NULL,
+                status TEXT NOT NULL,
+                last_seen_head_sha TEXT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (repo_full_name, pr_number)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _ = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = set(_table_columns(conn, "pr_feedback_state"))
+    finally:
+        conn.close()
+    assert "active_run_id" in columns
 
 
 def test_poll_cursor_and_action_token_lifecycle(tmp_path: Path) -> None:

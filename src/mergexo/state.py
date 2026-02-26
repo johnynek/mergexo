@@ -396,11 +396,20 @@ class StateStore:
                     branch TEXT NOT NULL,
                     status TEXT NOT NULL,
                     last_seen_head_sha TEXT NULL,
+                    active_run_id TEXT NULL,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, pr_number)
                 )
                 """
             )
+            pr_feedback_columns = _table_columns(conn, "pr_feedback_state")
+            if "active_run_id" not in pr_feedback_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE pr_feedback_state
+                    ADD COLUMN active_run_id TEXT NULL
+                    """
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS operator_commands (
@@ -916,6 +925,80 @@ class StateStore:
             repo_full_name=repo_full_name,
         )
 
+    def claim_feedback_turn_start(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        run_key = run_id if run_id is not None else uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            claimed = conn.execute(
+                """
+                UPDATE pr_feedback_state
+                SET active_run_id = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND pr_number = ?
+                  AND issue_number = ?
+                  AND status = 'awaiting_feedback'
+                  AND active_run_id IS NULL
+                """,
+                (run_key, repo_key, pr_number, issue_number),
+            )
+            if claimed.rowcount <= 0:
+                return None
+            row = conn.execute(
+                """
+                SELECT branch
+                FROM pr_feedback_state
+                WHERE repo_full_name = ? AND pr_number = ?
+                """,
+                (repo_key, pr_number),
+            ).fetchone()
+            branch_for_run = row[0] if row is not None and isinstance(row[0], str) else branch
+            self._insert_agent_run_start(
+                conn=conn,
+                run_id=run_key,
+                repo_full_name=repo_key,
+                run_kind="feedback_turn",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                flow=None,
+                branch=branch_for_run,
+                started_at=started_at,
+                meta_json=meta_json,
+            )
+        return run_key
+
+    def release_feedback_turn_claim(
+        self,
+        *,
+        pr_number: int,
+        run_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE pr_feedback_state
+                SET active_run_id = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND pr_number = ?
+                  AND active_run_id = ?
+                """,
+                (repo_key, pr_number, run_id),
+            )
+        return cursor.rowcount > 0
+
     def _insert_agent_run_start(
         self,
         *,
@@ -1121,6 +1204,20 @@ class StateStore:
                         )
                     """
                 )
+                conn.execute(
+                    """
+                    UPDATE pr_feedback_state
+                    SET active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE active_run_id IS NOT NULL
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.run_id = pr_feedback_state.active_run_id
+                              AND a.finished_at IS NULL
+                        )
+                    """
+                )
             else:
                 cursor = conn.execute(
                     """
@@ -1152,6 +1249,22 @@ class StateStore:
                             SELECT 1
                             FROM agent_run_history AS a
                             WHERE a.run_id = issue_runs.active_run_id
+                              AND a.finished_at IS NULL
+                        )
+                    """,
+                    (repo_key,),
+                )
+                conn.execute(
+                    """
+                    UPDATE pr_feedback_state
+                    SET active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND active_run_id IS NOT NULL
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.run_id = pr_feedback_state.active_run_id
                               AND a.finished_at IS NULL
                         )
                     """,
@@ -1950,6 +2063,7 @@ class StateStore:
                 issue_number=excluded.issue_number,
                 branch=excluded.branch,
                 status='awaiting_feedback',
+                active_run_id=NULL,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             """,
             (repo_full_name, pr_number, issue_number, branch),
@@ -3186,6 +3300,7 @@ class StateStore:
                     SELECT repo_full_name, pr_number, issue_number, branch, status, last_seen_head_sha
                     FROM pr_feedback_state
                     WHERE status = 'awaiting_feedback'
+                      AND active_run_id IS NULL
                     ORDER BY updated_at ASC, repo_full_name ASC, pr_number ASC
                     """
                 ).fetchall()
@@ -3195,6 +3310,7 @@ class StateStore:
                     SELECT repo_full_name, pr_number, issue_number, branch, status, last_seen_head_sha
                     FROM pr_feedback_state
                     WHERE status = 'awaiting_feedback'
+                      AND active_run_id IS NULL
                       AND repo_full_name = ?
                     ORDER BY updated_at ASC, pr_number ASC
                     """,
@@ -3389,6 +3505,7 @@ class StateStore:
                     """
                     UPDATE pr_feedback_state
                     SET status = 'awaiting_feedback',
+                        active_run_id = NULL,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE repo_full_name = ? AND pr_number = ?
                     """,
@@ -3400,6 +3517,7 @@ class StateStore:
                     UPDATE pr_feedback_state
                     SET status = 'awaiting_feedback',
                         last_seen_head_sha = ?,
+                        active_run_id = NULL,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE repo_full_name = ? AND pr_number = ?
                     """,
@@ -3642,6 +3760,7 @@ class StateStore:
                 UPDATE pr_feedback_state
                 SET status='awaiting_feedback',
                     last_seen_head_sha=?,
+                    active_run_id=NULL,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE repo_full_name=? AND pr_number=?
                 """,
