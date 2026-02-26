@@ -49,6 +49,21 @@ def _get_row(
         conn.close()
 
 
+def _get_active_run_id(db_path: Path, issue_number: int) -> str | None:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT active_run_id FROM issue_runs WHERE issue_number = ?",
+            (issue_number,),
+        ).fetchone()
+        assert row is not None
+        active_run_id = row[0]
+        assert active_run_id is None or isinstance(active_run_id, str)
+        return active_run_id
+    finally:
+        conn.close()
+
+
 def _get_agent_run_history_row(
     db_path: Path, run_id: str
 ) -> tuple[str, str | None, str | None, str | None, float | None]:
@@ -129,9 +144,11 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         assert "agent_run_history" in tables
         assert "pr_status_history" in tables
         run_history_columns = set(_table_columns(conn, "agent_run_history"))
+        issue_run_columns = set(_table_columns(conn, "issue_runs"))
         assert "run_id" in run_history_columns
         assert "terminal_status" in run_history_columns
         assert "duration_seconds" in run_history_columns
+        assert "active_run_id" in issue_run_columns
     finally:
         conn.close()
 
@@ -179,10 +196,33 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
     assert duration_seconds is not None
     assert 99.0 <= duration_seconds <= 101.0
 
+    issue_run_id = store.record_issue_run_start(
+        run_kind="issue_flow",
+        issue_number=99,
+        flow="design_doc",
+        branch="agent/design/99-x",
+        run_id="run-99",
+    )
+    assert issue_run_id == "run-99"
+    assert _get_row(db_path, 99)[0] == "running"
+    assert _get_active_run_id(db_path, 99) == "run-99"
+    store.mark_failed(99, "boom")
+    assert _get_active_run_id(db_path, 99) is None
+
 
 def test_state_store_reconcile_and_prune_observability_history(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
+    store.record_issue_run_start(
+        run_kind="issue_flow",
+        issue_number=11,
+        flow="design_doc",
+        branch="agent/design/11",
+        run_id="stale-running-row",
+        started_at="2026-01-01T00:00:00.000Z",
+        repo_full_name="o/repo-a",
+    )
+    assert _get_active_run_id(db_path, 11) == "stale-running-row"
     store.record_agent_run_start(
         run_kind="issue_flow",
         issue_number=1,
@@ -194,13 +234,14 @@ def test_state_store_reconcile_and_prune_observability_history(tmp_path: Path) -
         repo_full_name="o/repo-a",
     )
     reconciled = store.reconcile_unfinished_agent_runs(repo_full_name="o/repo-a")
-    assert reconciled == 1
+    assert reconciled == 2
     terminal_status, failure_class, _error, _finished_at, duration_seconds = (
         _get_agent_run_history_row(db_path, "stale-run")
     )
     assert terminal_status == "interrupted"
     assert failure_class == "unknown"
     assert duration_seconds is not None
+    assert _get_active_run_id(db_path, 11) is None
     store.record_agent_run_start(
         run_kind="issue_flow",
         issue_number=3,
@@ -320,13 +361,30 @@ def test_reconcile_stale_running_issue_runs_with_followups(tmp_path: Path) -> No
     store.mark_running(3, repo_full_name="o/repo-b")
 
     store.mark_running(4, repo_full_name="o/repo-a")
+    store.mark_completed(
+        5,
+        "agent/design/5-worker",
+        105,
+        "https://example/pr/105",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_pr_status(
+        pr_number=105,
+        issue_number=5,
+        status="merged",
+        last_seen_head_sha="head-5",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_running(5, repo_full_name="o/repo-a")
 
-    assert store.reconcile_stale_running_issue_runs_with_followups(repo_full_name="o/repo-a") == 1
+    assert store.reconcile_stale_running_issue_runs_with_followups(repo_full_name="o/repo-a") == 3
     assert _get_row(db_path, 1)[0] == "awaiting_issue_followup"
     assert _get_row(db_path, 1)[4] == "bugfix flow blocked: waiting for steps to reproduce"
     assert _get_row(db_path, 2)[0] == "running"
     assert _get_row(db_path, 3)[0] == "running"
-    assert _get_row(db_path, 4)[0] == "running"
+    assert _get_row(db_path, 4)[0] == "failed"
+    assert _get_row(db_path, 4)[4] == "stale_running_issue_without_active_run"
+    assert _get_row(db_path, 5)[0] == "merged"
 
     assert store.finish_agent_run(run_id="run-2-active", terminal_status="interrupted")
     assert store.reconcile_stale_running_issue_runs_with_followups() == 2
@@ -334,7 +392,7 @@ def test_reconcile_stale_running_issue_runs_with_followups(tmp_path: Path) -> No
     assert _get_row(db_path, 2)[4] == "small-job flow blocked: waiting for acceptance criteria"
     assert _get_row(db_path, 3)[0] == "awaiting_issue_followup"
     assert _get_row(db_path, 3)[4] == "implementation flow blocked: waiting on source issue context"
-    assert _get_row(db_path, 4)[0] == "running"
+    assert _get_row(db_path, 4)[0] == "failed"
 
 
 def test_state_store_pr_status_history_and_pull_request_status_lookup(tmp_path: Path) -> None:

@@ -587,6 +587,24 @@ class FakeState:
         _ = retention_days, repo_full_name
         return 0, 0
 
+    def record_issue_run_start(
+        self,
+        *,
+        run_kind: str,
+        issue_number: int,
+        flow: str,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str:
+        _ = flow, branch, meta_json, started_at, repo_full_name
+        self.running.append(issue_number)
+        run_key = run_id or f"{run_kind}:{issue_number}:{len(self.run_starts) + 1}"
+        self.run_starts.append((run_kind, run_key, issue_number, None))
+        return run_key
+
     def record_agent_run_start(
         self,
         *,
