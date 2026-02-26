@@ -170,6 +170,35 @@ def test_writer_process_lock_release_paths(tmp_path: Path, monkeypatch: pytest.M
     lock.release()
 
 
+def test_writer_process_lock_release_skips_replacement_lock_when_inode_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = _lock_path(tmp_path)
+    lock = process_lock_module._WriterProcessLock(lock_path=lock_path, command="run")
+
+    lock.acquire()
+    original_inode = lock._inode
+    assert original_inode is not None
+    os.unlink(lock_path)
+    lock_path.write_text("{}", encoding="utf-8")
+
+    class _StatResult:
+        st_ino = original_inode
+
+    original_stat = Path.stat
+
+    def fake_stat(path_obj: Path) -> object:
+        if path_obj == lock._lock_path:
+            return _StatResult()
+        return original_stat(path_obj)
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "stat", fake_stat)
+        lock.release()
+
+    assert lock_path.exists()
+
+
 def test_clear_stale_lock_handles_unlink_races(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

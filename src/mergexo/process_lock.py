@@ -7,6 +7,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import secrets
 from typing import Iterator
 
 
@@ -22,6 +23,7 @@ class _LockOwner:
     pid: int | None
     command: str | None
     started_at: str | None
+    token: str | None
 
 
 @contextmanager
@@ -39,9 +41,11 @@ class _WriterProcessLock:
         self._lock_path = lock_path
         self._command = command
         self._inode: int | None = None
+        self._token: str | None = None
 
     def acquire(self) -> None:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._token = None
         for _ in range(2):
             try:
                 fd = os.open(
@@ -57,10 +61,12 @@ class _WriterProcessLock:
             try:
                 stat_result = os.fstat(fd)
                 self._inode = stat_result.st_ino
+                lock_token = secrets.token_hex(16)
                 payload = {
                     "pid": os.getpid(),
                     "command": self._command,
                     "started_at": _utc_now_iso8601(),
+                    "token": lock_token,
                 }
                 os.write(fd, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
                 os.fsync(fd)
@@ -73,23 +79,33 @@ class _WriterProcessLock:
                     except FileNotFoundError:
                         pass
                 self._inode = None
+                self._token = None
                 raise
             else:
                 os.close(fd)
+                self._token = lock_token
                 return
 
         raise ProcessLockError(self._active_lock_error_message())
 
     def release(self) -> None:
-        if self._inode is None:
+        if self._inode is None or self._token is None:
+            self._token = None
             return
         try:
             current = self._lock_path.stat()
         except FileNotFoundError:
             self._inode = None
+            self._token = None
             return
         if current.st_ino != self._inode:
             self._inode = None
+            self._token = None
+            return
+        owner = _read_lock_owner(self._lock_path)
+        if owner.token != self._token:
+            self._inode = None
+            self._token = None
             return
         try:
             os.unlink(self._lock_path)
@@ -97,6 +113,7 @@ class _WriterProcessLock:
             pass
         finally:
             self._inode = None
+            self._token = None
 
     def _clear_stale_lock_if_dead_owner(self) -> bool:
         owner = _read_lock_owner(self._lock_path)
@@ -132,24 +149,31 @@ def _read_lock_owner(lock_path: Path) -> _LockOwner:
     try:
         payload_text = lock_path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        return _LockOwner(pid=None, command=None, started_at=None)
+        return _LockOwner(pid=None, command=None, started_at=None, token=None)
     except OSError:
-        return _LockOwner(pid=None, command=None, started_at=None)
+        return _LockOwner(pid=None, command=None, started_at=None, token=None)
     if not payload_text:
-        return _LockOwner(pid=None, command=None, started_at=None)
+        return _LockOwner(pid=None, command=None, started_at=None, token=None)
     try:
         payload = json.loads(payload_text)
     except json.JSONDecodeError:
-        return _LockOwner(pid=None, command=None, started_at=None)
+        return _LockOwner(pid=None, command=None, started_at=None, token=None)
     if not isinstance(payload, dict):
-        return _LockOwner(pid=None, command=None, started_at=None)
+        return _LockOwner(pid=None, command=None, started_at=None, token=None)
     raw_pid = payload.get("pid")
     raw_command = payload.get("command")
     raw_started_at = payload.get("started_at")
+    raw_token = payload.get("token")
     owner_pid = raw_pid if isinstance(raw_pid, int) else None
     owner_command = raw_command if isinstance(raw_command, str) else None
     owner_started_at = raw_started_at if isinstance(raw_started_at, str) else None
-    return _LockOwner(pid=owner_pid, command=owner_command, started_at=owner_started_at)
+    owner_token = raw_token if isinstance(raw_token, str) else None
+    return _LockOwner(
+        pid=owner_pid,
+        command=owner_command,
+        started_at=owner_started_at,
+        token=owner_token,
+    )
 
 
 def _pid_is_running(pid: int) -> bool:
