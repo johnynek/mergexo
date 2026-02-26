@@ -138,6 +138,14 @@ Assume one repo with labels:
    - MergeXO creates `agent/small/122-...` and runs scoped direct changes.
    - PR body uses `Fixes #122`.
 
+4. Human takeover flow (`agent:ignore`):
+   - Issue `#123` starts in bugfix flow and already has an open PR `#205`.
+   - Maintainer adds label `agent:ignore` on issue `#123`.
+   - MergeXO pauses enqueue/feedback/redirect automation for that issue + linked PR while takeover is active.
+   - Maintainer (or realtime agent pair) pushes manual commits, updates PR `#205`, and resolves review comments directly.
+   - Maintainer removes `agent:ignore` after manual takeover work is done.
+   - Maintainer leaves a fresh PR or source-issue comment after label removal; MergeXO resumes from that post-takeover boundary without replaying takeover-period comments.
+
 For both direct flows, MergeXO asks the agent to follow `coding_guidelines_path` and runs `required_tests` before each push when configured.
 
 ## Workflow Details
