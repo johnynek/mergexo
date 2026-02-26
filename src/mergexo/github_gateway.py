@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 import json
 import logging
+import time
 from typing import Literal, cast
 from urllib.parse import urlencode
 
@@ -17,16 +18,33 @@ from mergexo.models import (
     WorkflowRunSnapshot,
 )
 from mergexo.observability import log_event
-from mergexo.shell import run
+from mergexo.shell import CommandError, run
 
 
 LOGGER = logging.getLogger("mergexo.github_gateway")
 CompareCommitsStatus = Literal["ahead", "identical", "behind", "diverged"]
 _ACTIONS_GREEN_CONCLUSIONS = {"success", "neutral", "skipped"}
+_GH_API_MAX_ATTEMPTS = 3
+_GH_API_INITIAL_RETRY_DELAY_SECONDS = 2.0
+_GH_API_MAX_RETRY_DELAY_SECONDS = 10.0
+_GH_AUTH_ERROR_HINTS = (
+    "authentication failed",
+    "bad credentials",
+    "gh auth login",
+    "not logged into any github hosts",
+    "requires authentication",
+)
+_GH_AUTHENTICATION_ERROR_MESSAGE = (
+    "GitHub CLI is not authenticated. Run `gh auth login` and restart MergeXO."
+)
 
 
 class GitHubPollingError(RuntimeError):
     """Recoverable GitHub polling failure; caller should retry next poll."""
+
+
+class GitHubAuthenticationError(GitHubPollingError):
+    """GitHub CLI authentication appears unavailable."""
 
 
 @dataclass(frozen=True)
@@ -622,25 +640,40 @@ class GitHubGateway:
         if method_upper != "GET":
             raise ValueError("_api_text currently only supports GET")
         cmd = ["gh", "api", "--method", method_upper, "--include", path]
-        raw = run(cmd, check=False)
-        try:
-            status_code, _headers, body = _parse_http_response(raw)
-            if status_code < 200 or status_code >= 300:
-                message = body.strip() or "<empty>"
-                raise RuntimeError(
-                    f"GitHub API text request failed with status {status_code}: {message}"
+        for attempt in range(1, _GH_API_MAX_ATTEMPTS + 1):
+            raw = ""
+            try:
+                raw = run(cmd, check=False)
+                status_code, _headers, body = _parse_http_response(raw)
+                if status_code < 200 or status_code >= 300:
+                    message = body.strip() or "<empty>"
+                    raise RuntimeError(
+                        f"GitHub API text request failed with status {status_code}: {message}"
+                    )
+                return body
+            except Exception as exc:
+                wrapped = self._classify_github_failure(
+                    method=method_upper,
+                    path=path,
+                    exc=exc,
+                    raw=raw,
+                    probe_auth=attempt >= _GH_API_MAX_ATTEMPTS,
                 )
-            return body
-        except Exception as exc:
-            log_event(
-                LOGGER,
-                "github_poll_get_failed",
-                path=path,
-                error_type=type(exc).__name__,
-                error=str(exc),
-                raw_preview=_preview_for_log(raw),
-            )
-            raise GitHubPollingError(f"GitHub polling GET failed for path {path}: {exc}") from exc
+                log_event(
+                    LOGGER,
+                    "github_poll_get_failed",
+                    path=path,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    raw_preview=_preview_for_log(raw),
+                    attempt=attempt,
+                    max_attempts=_GH_API_MAX_ATTEMPTS,
+                    retrying=attempt < _GH_API_MAX_ATTEMPTS,
+                )
+                if attempt >= _GH_API_MAX_ATTEMPTS:
+                    raise wrapped from exc
+                self._sleep_before_retry(attempt=attempt, method=method_upper, path=path)
+        raise RuntimeError("Unreachable GitHub API text retry state")
 
     def _api_json(self, method: str, path: str, payload: dict[str, object] | None = None) -> object:
         method_upper = method.upper()
@@ -650,49 +683,143 @@ class GitHubGateway:
             if etag:
                 cmd.extend(["--header", f"If-None-Match: {etag}"])
             cmd.extend(["--include", path])
+            for attempt in range(1, _GH_API_MAX_ATTEMPTS + 1):
+                raw = ""
+                try:
+                    raw = run(cmd, check=False)
+                    status_code, headers, body = _parse_http_response(raw)
 
-            raw = run(cmd, check=False)
-            try:
-                status_code, headers, body = _parse_http_response(raw)
+                    if status_code == 304:
+                        cached_payload = self._cached_get_payload_by_path.get(path)
+                        if cached_payload is None:
+                            raise RuntimeError(f"GitHub returned 304 for uncached path: {path}")
+                        return cached_payload
 
-                if status_code == 304:
-                    cached_payload = self._cached_get_payload_by_path.get(path)
-                    if cached_payload is None:
-                        raise RuntimeError(f"GitHub returned 304 for uncached path: {path}")
-                    return cached_payload
+                    if status_code < 200 or status_code >= 300:
+                        message = body.strip() or "<empty>"
+                        raise RuntimeError(
+                            f"GitHub API request failed with status {status_code}: {message}"
+                        )
 
-                if status_code < 200 or status_code >= 300:
-                    message = body.strip() or "<empty>"
-                    raise RuntimeError(
-                        f"GitHub API request failed with status {status_code}: {message}"
+                    payload_obj = json.loads(body)
+                    etag = headers.get("etag")
+                    if etag:
+                        self._etags_by_path[path] = etag
+                        self._cached_get_payload_by_path[path] = payload_obj
+                    return payload_obj
+                except Exception as exc:
+                    wrapped = self._classify_github_failure(
+                        method=method_upper,
+                        path=path,
+                        exc=exc,
+                        raw=raw,
+                        probe_auth=attempt >= _GH_API_MAX_ATTEMPTS,
                     )
-
-                payload_obj = json.loads(body)
-                etag = headers.get("etag")
-                if etag:
-                    self._etags_by_path[path] = etag
-                    self._cached_get_payload_by_path[path] = payload_obj
-                return payload_obj
-            except Exception as exc:
-                log_event(
-                    LOGGER,
-                    "github_poll_get_failed",
-                    path=path,
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                    raw_preview=_preview_for_log(raw),
-                )
-                raise GitHubPollingError(
-                    f"GitHub polling GET failed for path {path}: {exc}"
-                ) from exc
+                    log_event(
+                        LOGGER,
+                        "github_poll_get_failed",
+                        path=path,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        raw_preview=_preview_for_log(raw),
+                        attempt=attempt,
+                        max_attempts=_GH_API_MAX_ATTEMPTS,
+                        retrying=attempt < _GH_API_MAX_ATTEMPTS,
+                    )
+                    if attempt >= _GH_API_MAX_ATTEMPTS:
+                        raise wrapped from exc
+                    self._sleep_before_retry(attempt=attempt, method=method_upper, path=path)
+            raise RuntimeError("Unreachable GitHub API JSON GET retry state")
 
         cmd = ["gh", "api", "--method", method_upper, path]
         stdin_payload: str | None = None
         if payload is not None:
             cmd.extend(["--input", "-"])
             stdin_payload = json.dumps(payload)
-        raw = run(cmd, input_text=stdin_payload)
-        return json.loads(raw)
+        for attempt in range(1, _GH_API_MAX_ATTEMPTS + 1):
+            raw = ""
+            try:
+                raw = run(cmd, input_text=stdin_payload)
+                return json.loads(raw)
+            except Exception as exc:
+                wrapped = self._classify_github_failure(
+                    method=method_upper,
+                    path=path,
+                    exc=exc,
+                    raw=raw,
+                    probe_auth=attempt >= _GH_API_MAX_ATTEMPTS,
+                )
+                log_event(
+                    LOGGER,
+                    "github_api_call_failed",
+                    method=method_upper,
+                    path=path,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    raw_preview=_preview_for_log(raw),
+                    attempt=attempt,
+                    max_attempts=_GH_API_MAX_ATTEMPTS,
+                    retrying=attempt < _GH_API_MAX_ATTEMPTS,
+                )
+                if attempt >= _GH_API_MAX_ATTEMPTS:
+                    raise wrapped from exc
+                self._sleep_before_retry(attempt=attempt, method=method_upper, path=path)
+        raise RuntimeError("Unreachable GitHub API JSON retry state")
+
+    def _classify_github_failure(
+        self,
+        *,
+        method: str,
+        path: str,
+        exc: Exception,
+        raw: str,
+        probe_auth: bool,
+    ) -> GitHubPollingError:
+        if self._is_authentication_error_text(str(exc)):
+            return GitHubAuthenticationError(
+                f"{_GH_AUTHENTICATION_ERROR_MESSAGE} (while calling {method} {path})"
+            )
+        if raw and self._is_authentication_error_text(raw):
+            return GitHubAuthenticationError(
+                f"{_GH_AUTHENTICATION_ERROR_MESSAGE} (while calling {method} {path})"
+            )
+        if probe_auth and self._auth_status_indicates_not_authenticated():
+            return GitHubAuthenticationError(
+                f"{_GH_AUTHENTICATION_ERROR_MESSAGE} (while calling {method} {path})"
+            )
+        if method == "GET":
+            return GitHubPollingError(f"GitHub polling GET failed for path {path}: {exc}")
+        return GitHubPollingError(f"GitHub API {method} failed for path {path}: {exc}")
+
+    def _auth_status_indicates_not_authenticated(self) -> bool:
+        try:
+            run(["gh", "auth", "status"])
+            return False
+        except CommandError as exc:
+            return self._is_authentication_error_text(str(exc))
+        except Exception:
+            return False
+
+    def _sleep_before_retry(self, *, attempt: int, method: str, path: str) -> None:
+        delay_seconds = min(
+            _GH_API_INITIAL_RETRY_DELAY_SECONDS * (2 ** max(0, attempt - 1)),
+            _GH_API_MAX_RETRY_DELAY_SECONDS,
+        )
+        log_event(
+            LOGGER,
+            "github_api_retry_scheduled",
+            method=method,
+            path=path,
+            attempt=attempt,
+            delay_seconds=delay_seconds,
+        )
+        time.sleep(delay_seconds)
+
+    def _is_authentication_error_text(self, text: str) -> bool:
+        normalized = text.strip().lower()
+        if not normalized:
+            return False
+        return any(hint in normalized for hint in _GH_AUTH_ERROR_HINTS)
 
 
 def _parse_http_response(raw: str) -> tuple[int, dict[str, str], str]:

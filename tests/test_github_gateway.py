@@ -7,6 +7,7 @@ import pytest
 
 from mergexo.github_gateway import (
     CompareCommitsStatus,
+    GitHubAuthenticationError,
     GitHubGateway,
     GitHubPollingError,
     _as_bool,
@@ -22,6 +23,12 @@ from mergexo.github_gateway import (
 )
 from mergexo.models import Issue, WorkflowJobSnapshot
 from mergexo.observability import configure_logging
+from mergexo.shell import CommandError
+
+
+@pytest.fixture(autouse=True)
+def _disable_gateway_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mergexo.github_gateway.time.sleep", lambda _: None)
 
 
 def test_list_open_issues_with_any_labels_dedupes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -891,6 +898,92 @@ def test_api_json_get_wraps_malformed_http_as_polling_error(
     assert "event=github_poll_get_failed" in text
     assert "path=/path" in text
     assert "raw_preview=not-http" in text
+
+
+def test_api_json_get_raises_authentication_error_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"api": 0, "auth": 0}
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cwd, input_text, check
+        if cmd[:3] == ["gh", "auth", "status"]:
+            calls["auth"] += 1
+            raise CommandError("gh: not logged into any GitHub hosts. Run gh auth login")
+        calls["api"] += 1
+        return "not-http"
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+    gateway = GitHubGateway("o", "r")
+
+    with pytest.raises(GitHubAuthenticationError, match="not authenticated"):
+        gateway._api_json("GET", "/path")
+
+    assert calls["api"] == 3
+    assert calls["auth"] == 1
+
+
+def test_api_json_post_retries_command_failures_and_wraps_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        nonlocal calls
+        calls += 1
+        raise CommandError("Authentication failed. Run gh auth login")
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+    gateway = GitHubGateway("o", "r")
+
+    with pytest.raises(GitHubAuthenticationError, match="not authenticated"):
+        gateway._api_json("POST", "/path", payload={"k": "v"})
+
+    assert calls == 3
+
+
+def test_api_helpers_raise_unreachable_runtime_when_max_attempts_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mergexo.github_gateway._GH_API_MAX_ATTEMPTS", 0)
+    gateway = GitHubGateway("o", "r")
+
+    with pytest.raises(RuntimeError, match="Unreachable GitHub API text retry state"):
+        gateway._api_text("GET", "/path")
+    with pytest.raises(RuntimeError, match="Unreachable GitHub API JSON GET retry state"):
+        gateway._api_json("GET", "/path")
+    with pytest.raises(RuntimeError, match="Unreachable GitHub API JSON retry state"):
+        gateway._api_json("POST", "/path")
+
+
+def test_classify_github_failure_handles_raw_auth_text_and_non_get_methods() -> None:
+    gateway = GitHubGateway("o", "r")
+
+    from_raw = gateway._classify_github_failure(
+        method="POST",
+        path="/x",
+        exc=RuntimeError("boom"),
+        raw="Authentication failed. Run gh auth login",
+        probe_auth=False,
+    )
+    assert isinstance(from_raw, GitHubAuthenticationError)
+
+    non_get = gateway._classify_github_failure(
+        method="PATCH",
+        path="/x",
+        exc=RuntimeError("boom"),
+        raw="",
+        probe_auth=False,
+    )
+    assert isinstance(non_get, GitHubPollingError)
+    assert "GitHub API PATCH failed for path /x" in str(non_get)
+
+    assert gateway._is_authentication_error_text("") is False
 
 
 def test_api_json_get_rejects_not_modified_without_cached_payload(

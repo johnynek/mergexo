@@ -31,7 +31,7 @@ from mergexo.feedback_loop import (
     compute_source_issue_redirect_token,
     parse_operator_command,
 )
-from mergexo.github_gateway import GitHubGateway, GitHubPollingError
+from mergexo.github_gateway import GitHubAuthenticationError, GitHubGateway, GitHubPollingError
 from mergexo.models import (
     GeneratedDesign,
     Issue,
@@ -5165,6 +5165,56 @@ def test_poll_once_respects_allow_enqueue_and_restart_pending(
     monkeypatch.setattr(orch, "_is_restart_pending", lambda: True)
     orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
     assert calls == {"scan": 1, "new": 0, "impl": 0, "feedback": 0}
+
+
+def test_poll_once_disables_enqueue_after_repeated_github_auth_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    calls = {"scan": 0, "new": 0}
+
+    def fail_scan() -> None:
+        calls["scan"] += 1
+        raise GitHubAuthenticationError("gh is not authenticated")
+
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    monkeypatch.setattr(orch, "_scan_operator_commands", fail_scan)
+    monkeypatch.setattr(orch, "_repair_stale_running_runs", lambda: None)
+    monkeypatch.setattr(orch, "_repair_failed_no_staged_change_runs", lambda: None)
+    monkeypatch.setattr(
+        orch, "_enqueue_new_work", lambda pool: calls.__setitem__("new", calls["new"] + 1)
+    )
+    monkeypatch.setattr(orch, "_enqueue_implementation_work", lambda pool: None)
+    monkeypatch.setattr(orch, "_enqueue_feedback_work", lambda pool: None)
+
+    for _ in range(3):
+        orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+
+    assert calls["scan"] == 3
+    assert calls["new"] == 2
+    assert orch.github_auth_shutdown_pending() is True
+    assert "not authenticated" in orch.github_auth_shutdown_reason().lower()
+
+
+def test_github_auth_shutdown_reason_defaults_when_empty(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    assert "not authenticated" in orch.github_auth_shutdown_reason().lower()
 
 
 def test_poll_once_runs_actions_monitor_before_feedback(
