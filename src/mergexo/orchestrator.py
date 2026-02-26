@@ -2729,9 +2729,12 @@ class Phase1Orchestrator:
                         )
                         continue
 
+                    failure_class = _failure_class_for_exception(exc)
                     self._state.mark_failed(
                         issue_number=issue_number,
                         error=str(exc),
+                        failure_class=failure_class,
+                        retryable=_is_transient_issue_failure_class(failure_class),
                         repo_full_name=self._state_repo_full_name(),
                     )
                     log_event(
@@ -2744,7 +2747,7 @@ class Phase1Orchestrator:
                         self._state.finish_agent_run(
                             run_id=metadata.run_id,
                             terminal_status="failed",
-                            failure_class=_failure_class_for_exception(exc),
+                            failure_class=failure_class,
                             error=str(exc),
                         )
                 finally:
@@ -5601,6 +5604,10 @@ def _failure_class_for_exception(exc: Exception) -> AgentRunFailureClass:
     if isinstance(exc, CommandError):
         return "agent_error"
     return "unknown"
+
+
+def _is_transient_issue_failure_class(failure_class: AgentRunFailureClass) -> bool:
+    return failure_class in {"github_error", "unknown"}
 
 
 def _resolve_issue_flow(

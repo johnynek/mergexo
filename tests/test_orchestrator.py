@@ -751,9 +751,15 @@ class FakeState:
         self._pr_status_by_pr[pr_number] = "awaiting_feedback"
 
     def mark_failed(
-        self, *, issue_number: int, error: str, repo_full_name: str | None = None
+        self,
+        *,
+        issue_number: int,
+        error: str,
+        failure_class: str | None = None,
+        retryable: bool = False,
+        repo_full_name: str | None = None,
     ) -> None:
-        _ = repo_full_name
+        _ = repo_full_name, failure_class, retryable
         self.failed.append((issue_number, error))
 
     def save_agent_session(
