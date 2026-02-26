@@ -43,6 +43,7 @@ observability_history_retention_days = 120
 [repo]
 owner = "johnynek"
 name = "repo"
+ignore_label = "agent:pause"
 coding_guidelines_path = "docs/guidelines.md"
 required_tests = "scripts/required-tests.sh"
 pr_actions_feedback_policy = "first_fail"
@@ -95,6 +96,7 @@ extra_args = ["--repo-mode"]
     assert loaded.repo.trigger_label == "agent:design"
     assert loaded.repo.bugfix_label == "agent:bugfix"
     assert loaded.repo.small_job_label == "agent:small-job"
+    assert loaded.repo.ignore_label == "agent:pause"
     assert loaded.repo.design_docs_dir == "docs/design"
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
@@ -157,12 +159,14 @@ coding_guidelines_path = "docs/python_style.md"
     assert by_id["mergexo"].full_name == "johnynek/mergexo"
     assert by_id["mergexo"].allowed_users == frozenset({"alice", "bob"})
     assert by_id["mergexo"].pr_actions_feedback_policy == "never"
+    assert by_id["mergexo"].ignore_label == "agent:ignore"
 
     assert by_id["bosatsu"].name == "bosatsu"
     assert by_id["bosatsu"].full_name == "johnynek/bosatsu"
     # owner default when allowed_users omitted in multi-repo mode
     assert by_id["bosatsu"].allowed_users == frozenset({"johnynek"})
     assert by_id["bosatsu"].pr_actions_feedback_policy is None
+    assert by_id["bosatsu"].ignore_label == "agent:ignore"
 
 
 @pytest.mark.parametrize("policy", ["never", "first_fail", "all_complete"])
@@ -361,6 +365,7 @@ coding_guidelines_path = "docs/python_style.md"
     )
     loaded = config.load_config(cfg_path)
     assert loaded.repo.allowed_users == frozenset({"owner"})
+    assert loaded.repo.ignore_label == "agent:ignore"
 
 
 def test_load_config_legacy_repo_allowed_users_overrides_auth(tmp_path: Path) -> None:
@@ -873,6 +878,7 @@ def test_repo_auth_and_app_config_helpers() -> None:
         remote_url="https://example.invalid/repo.git",
     )
     assert repo.effective_remote_url == "https://example.invalid/repo.git"
+    assert repo.ignore_label == "agent:ignore"
     assert repo.allows("") is False
     assert repo.allows(" alice ")
 

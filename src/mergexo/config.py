@@ -51,6 +51,7 @@ class RepoConfig:
     pr_actions_feedback_policy: PrActionsFeedbackPolicy | None = None
     operations_issue_number: int | None = None
     operator_logins: tuple[str, ...] = ()
+    ignore_label: str = "agent:ignore"
 
     @property
     def full_name(self) -> str:
@@ -307,6 +308,7 @@ def _parse_repo_config(
         ),
         operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
         operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
+        ignore_label=_str_with_default(repo_data, "ignore_label", "agent:ignore"),
     )
 
 

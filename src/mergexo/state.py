@@ -122,6 +122,14 @@ class IssueCommentCursorState:
 
 
 @dataclass(frozen=True)
+class IssueTakeoverState:
+    issue_number: int
+    ignore_active: bool
+    updated_at: str
+    repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
 class LegacyFailedIssueRunState:
     issue_number: int
     branch: str | None
@@ -323,6 +331,32 @@ class StateStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS issue_takeover_state (
+                    repo_full_name TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    ignore_active INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, issue_number)
+                )
+                """
+            )
+            issue_takeover_columns = _table_columns(conn, "issue_takeover_state")
+            if "ignore_active" not in issue_takeover_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_takeover_state
+                    ADD COLUMN ignore_active INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            if "updated_at" not in issue_takeover_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_takeover_state
+                    ADD COLUMN updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    """
+                )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS github_comment_poll_cursors (
                     repo_full_name TEXT NOT NULL,
                     surface TEXT NOT NULL,
@@ -408,6 +442,20 @@ class StateStore:
                     """
                     ALTER TABLE pr_feedback_state
                     ADD COLUMN active_run_id TEXT NULL
+                    """
+                )
+            if "takeover_review_floor_comment_id" not in pr_feedback_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE pr_feedback_state
+                    ADD COLUMN takeover_review_floor_comment_id INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            if "takeover_issue_floor_comment_id" not in pr_feedback_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE pr_feedback_state
+                    ADD COLUMN takeover_issue_floor_comment_id INTEGER NOT NULL DEFAULT 0
                     """
                 )
             conn.execute(
@@ -2445,6 +2493,214 @@ class StateStore:
             )
             for row_repo_full_name, issue_number, branch, updated_at in rows
         )
+
+    def get_issue_takeover_state(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> IssueTakeoverState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ignore_active, updated_at
+                FROM issue_takeover_state
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            ).fetchone()
+        if row is None:
+            return IssueTakeoverState(
+                repo_full_name=repo_key,
+                issue_number=issue_number,
+                ignore_active=False,
+                updated_at="",
+            )
+
+        ignore_active, updated_at = row
+        if not isinstance(ignore_active, int):
+            raise RuntimeError("Invalid ignore_active value stored in issue_takeover_state")
+        if not isinstance(updated_at, str):
+            raise RuntimeError("Invalid updated_at value stored in issue_takeover_state")
+        return IssueTakeoverState(
+            repo_full_name=repo_key,
+            issue_number=issue_number,
+            ignore_active=bool(ignore_active),
+            updated_at=updated_at,
+        )
+
+    def get_issue_takeover_active(
+        self,
+        issue_number: int,
+        *,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        return self.get_issue_takeover_state(
+            issue_number,
+            repo_full_name=repo_full_name,
+        ).ignore_active
+
+    def set_issue_takeover_active(
+        self,
+        *,
+        issue_number: int,
+        ignore_active: bool,
+        repo_full_name: str | None = None,
+    ) -> IssueTakeoverState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO issue_takeover_state(
+                    repo_full_name,
+                    issue_number,
+                    ignore_active
+                )
+                VALUES(?, ?, ?)
+                ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
+                    ignore_active = excluded.ignore_active,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (repo_key, issue_number, int(ignore_active)),
+            )
+        return self.get_issue_takeover_state(issue_number, repo_full_name=repo_key)
+
+    def list_active_issue_takeovers(
+        self,
+        *,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT issue_number
+                FROM issue_takeover_state
+                WHERE repo_full_name = ? AND ignore_active = 1
+                ORDER BY issue_number ASC
+                """,
+                (repo_key,),
+            ).fetchall()
+        issue_numbers: list[int] = []
+        for (issue_number,) in rows:
+            if not isinstance(issue_number, int):
+                raise RuntimeError("Invalid issue_number value stored in issue_takeover_state")
+            issue_numbers.append(issue_number)
+        return tuple(issue_numbers)
+
+    def list_feedback_pr_numbers_for_issue(
+        self,
+        *,
+        issue_number: int,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT pr_number
+                FROM pr_feedback_state
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND status IN ('awaiting_feedback', 'blocked')
+                ORDER BY pr_number ASC
+                """,
+                (repo_key, issue_number),
+            ).fetchall()
+        pr_numbers: list[int] = []
+        for (pr_number,) in rows:
+            if not isinstance(pr_number, int):
+                raise RuntimeError("Invalid pr_number value stored in pr_feedback_state")
+            pr_numbers.append(pr_number)
+        return tuple(pr_numbers)
+
+    def get_pr_takeover_comment_floors(
+        self,
+        *,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, int]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT takeover_review_floor_comment_id, takeover_issue_floor_comment_id
+                FROM pr_feedback_state
+                WHERE repo_full_name = ? AND pr_number = ?
+                """,
+                (repo_key, pr_number),
+            ).fetchone()
+        if row is None:
+            return 0, 0
+        review_floor, issue_floor = row
+        if not isinstance(review_floor, int):
+            raise RuntimeError(
+                "Invalid takeover_review_floor_comment_id value stored in pr_feedback_state"
+            )
+        if not isinstance(issue_floor, int):
+            raise RuntimeError(
+                "Invalid takeover_issue_floor_comment_id value stored in pr_feedback_state"
+            )
+        return review_floor, issue_floor
+
+    def advance_pr_takeover_comment_floors(
+        self,
+        *,
+        pr_number: int,
+        review_floor_comment_id: int,
+        issue_floor_comment_id: int,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, int]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE pr_feedback_state
+                SET
+                    takeover_review_floor_comment_id = CASE
+                        WHEN takeover_review_floor_comment_id > ?
+                        THEN takeover_review_floor_comment_id
+                        ELSE ?
+                    END,
+                    takeover_issue_floor_comment_id = CASE
+                        WHEN takeover_issue_floor_comment_id > ?
+                        THEN takeover_issue_floor_comment_id
+                        ELSE ?
+                    END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND pr_number = ?
+                """,
+                (
+                    review_floor_comment_id,
+                    review_floor_comment_id,
+                    issue_floor_comment_id,
+                    issue_floor_comment_id,
+                    repo_key,
+                    pr_number,
+                ),
+            )
+        return self.get_pr_takeover_comment_floors(
+            pr_number=pr_number,
+            repo_full_name=repo_key,
+        )
+
+    def mark_pending_feedback_events_processed_for_pr(
+        self,
+        *,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> int:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE feedback_events
+                SET processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND pr_number = ?
+                  AND processed_at IS NULL
+                """,
+                (repo_key, pr_number),
+            )
+        return cursor.rowcount
 
     def get_issue_comment_cursor(
         self, issue_number: int, *, repo_full_name: str | None = None
