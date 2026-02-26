@@ -111,6 +111,7 @@ def load_overview(
 ) -> OverviewStats:
     with _connect(db_path) as conn:
         repo_clause, repo_params = _repo_filter_sql(repo_filter)
+        pr_repo_clause, pr_repo_params = _repo_filter_sql(repo_filter, prefix="p")
         issue_repo_clause, issue_repo_params = _repo_filter_sql(repo_filter, prefix="i")
         active_rows = conn.execute(
             f"""
@@ -132,9 +133,18 @@ def load_overview(
             SELECT
                 (
                     SELECT COUNT(*)
-                    FROM pr_feedback_state
-                    WHERE status = 'blocked'
-                      {repo_clause}
+                    FROM pr_feedback_state AS p
+                    LEFT JOIN issue_takeover_state AS t
+                        ON t.repo_full_name = p.repo_full_name
+                       AND t.issue_number = p.issue_number
+                    WHERE (
+                        p.status = 'blocked'
+                        OR (
+                            p.status = 'awaiting_feedback'
+                            AND COALESCE(t.ignore_active, 0) = 1
+                        )
+                    )
+                      {pr_repo_clause}
                 )
                 +
                 (
@@ -144,17 +154,21 @@ def load_overview(
                       {issue_repo_clause}
                 )
             """,
-            (*repo_params, *issue_repo_params),
+            (*pr_repo_params, *issue_repo_params),
         )
         tracked_prs = _fetch_int(
             conn,
             f"""
             SELECT COUNT(*)
-            FROM pr_feedback_state
-            WHERE status = 'awaiting_feedback'
-              {repo_clause}
+            FROM pr_feedback_state AS p
+            LEFT JOIN issue_takeover_state AS t
+                ON t.repo_full_name = p.repo_full_name
+               AND t.issue_number = p.issue_number
+            WHERE p.status = 'awaiting_feedback'
+              AND COALESCE(t.ignore_active, 0) = 0
+              {pr_repo_clause}
             """,
-            repo_params,
+            pr_repo_params,
         )
         cutoff_modifier = _window_modifier(window)
         failures = _fetch_int(
@@ -265,16 +279,28 @@ def load_tracked_and_blocked(
                     p.repo_full_name AS repo_full_name,
                     p.pr_number AS pr_number,
                     p.issue_number AS issue_number,
-                    p.status AS status,
+                    CASE
+                        WHEN p.status = 'awaiting_feedback' AND COALESCE(t.ignore_active, 0) = 1
+                        THEN 'blocked'
+                        ELSE p.status
+                    END AS status,
                     COALESCE(p.branch, '-') AS branch,
                     p.last_seen_head_sha AS last_seen_head_sha,
-                    CASE WHEN p.status = 'blocked' THEN r.error ELSE NULL END AS blocked_reason,
+                    CASE
+                        WHEN p.status = 'blocked' THEN r.error
+                        WHEN p.status = 'awaiting_feedback' AND COALESCE(t.ignore_active, 0) = 1
+                        THEN 'ignored (takeover active)'
+                        ELSE NULL
+                    END AS blocked_reason,
                     COUNT(e.event_key) AS pending_event_count,
                     p.updated_at AS updated_at
                 FROM pr_feedback_state AS p
                 LEFT JOIN issue_runs AS r
                     ON r.repo_full_name = p.repo_full_name
                    AND r.issue_number = p.issue_number
+                LEFT JOIN issue_takeover_state AS t
+                    ON t.repo_full_name = p.repo_full_name
+                   AND t.issue_number = p.issue_number
                 LEFT JOIN feedback_events AS e
                     ON e.repo_full_name = p.repo_full_name
                    AND e.pr_number = p.pr_number
@@ -288,6 +314,7 @@ def load_tracked_and_blocked(
                     p.status,
                     p.branch,
                     p.last_seen_head_sha,
+                    t.ignore_active,
                     r.error,
                     p.updated_at
 
