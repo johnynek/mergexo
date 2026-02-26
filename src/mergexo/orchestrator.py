@@ -667,14 +667,20 @@ class Phase1Orchestrator:
                 consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
                     candidate.issue_number
                 )
-                run_id = self._state.record_issue_run_start(
-                    run_kind="implementation_flow",
+                run_id = self._state.claim_implementation_issue_run_start(
                     issue_number=candidate.issue_number,
-                    flow="implementation",
                     branch=branch,
                     meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                if run_id is None:
+                    log_event(
+                        LOGGER,
+                        "implementation_skipped",
+                        issue_number=candidate.issue_number,
+                        reason="already_processed",
+                    )
+                    continue
                 self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_implementation_candidate_worker,
@@ -865,14 +871,22 @@ class Phase1Orchestrator:
                     candidate=candidate,
                 )
 
-                run_id = self._state.record_issue_run_start(
-                    run_kind="pre_pr_followup",
+                run_id = self._state.claim_pre_pr_followup_run_start(
                     issue_number=followup.issue_number,
                     flow=followup.flow,
                     branch=branch,
                     meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                if run_id is None:
+                    log_event(
+                        LOGGER,
+                        "pre_pr_followup_enqueued",
+                        repo_full_name=self._state_repo_full_name(),
+                        issue_number=followup.issue_number,
+                        reason="already_processed",
+                    )
+                    continue
                 self._initialize_run_meta_cache(run_id)
                 log_event(
                     LOGGER,

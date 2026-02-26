@@ -519,6 +519,8 @@ class FakeState:
         self._next_github_call_id = 1
         self._github_calls_by_id: dict[int, dict[str, object]] = {}
         self._github_call_id_by_dedupe: dict[str, int] = {}
+        self.claim_blocked_implementation_issue_numbers: set[int] = set()
+        self.claim_blocked_pre_pr_followup_issue_numbers: set[int] = set()
 
     def _github_call_state(self, row: dict[str, object]) -> GitHubCallOutboxState:
         return GitHubCallOutboxState(
@@ -729,6 +731,43 @@ class FakeState:
         self.running.append(issue_number)
         run_key = run_id or f"issue_flow:{issue_number}:{len(self.run_starts) + 1}"
         self.run_starts.append(("issue_flow", run_key, issue_number, None))
+        return run_key
+
+    def claim_implementation_issue_run_start(
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        _ = branch, meta_json, started_at, repo_full_name
+        if issue_number in self.claim_blocked_implementation_issue_numbers:
+            return None
+        self.running.append(issue_number)
+        run_key = run_id or f"implementation_flow:{issue_number}:{len(self.run_starts) + 1}"
+        self.run_starts.append(("implementation_flow", run_key, issue_number, None))
+        return run_key
+
+    def claim_pre_pr_followup_run_start(
+        self,
+        *,
+        issue_number: int,
+        flow: str,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        _ = flow, branch, meta_json, started_at, repo_full_name
+        if issue_number in self.claim_blocked_pre_pr_followup_issue_numbers:
+            return None
+        self.running.append(issue_number)
+        run_key = run_id or f"pre_pr_followup:{issue_number}:{len(self.run_starts) + 1}"
+        self.run_starts.append(("pre_pr_followup", run_key, issue_number, None))
         return run_key
 
     def mark_running(self, issue_number: int, *, repo_full_name: str | None = None) -> None:
@@ -3385,6 +3424,18 @@ def test_enqueue_implementation_work_paths(tmp_path: Path) -> None:
     assert state.running == []
     assert pool.submitted == []
 
+    # Cross-process claim contention path: capacity is available but state claim loses.
+    orch._running = {}
+    state.running.clear()
+    pool.submitted.clear()
+    state.implementation_candidates = [state.implementation_candidates[0]]
+    state.claim_blocked_implementation_issue_numbers = {7}
+    starts_before = len(state.run_starts)
+    orch._enqueue_implementation_work(pool)
+    assert state.running == []
+    assert pool.submitted == []
+    assert len(state.run_starts) == starts_before
+
 
 def test_shared_global_work_limiter_caps_enqueue_across_orchestrators(tmp_path: Path) -> None:
     cfg = _config(tmp_path, worker_count=1)
@@ -4018,6 +4069,70 @@ def test_enqueue_pre_pr_followup_work_enqueues_pending_comments_in_order(
     assert consumed_comment_id == 6
     assert "new direction" in submitted_issue.body
     assert "waiting for clarifications" in submitted_issue.body
+
+
+def test_enqueue_pre_pr_followup_work_skips_when_claim_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=5,
+            body="old",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-5",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=6,
+            body="new direction",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-6",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        ),
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-add-worker-scheduler",
+        context_json='{"flow":"bugfix","issue":{"number":7,"title":"Add worker scheduler","body":"Body","html_url":"https://example/issues/7","labels":["agent:bugfix"],"author_login":"issue-author"}}',
+        waiting_reason="bugfix flow blocked: waiting for clarifications",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=5,
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(
+        state,
+        "claim_pre_pr_followup_run_start",
+        lambda **kwargs: None,
+    )
+
+    class NoopPool:
+        def submit(self, *args: object, **kwargs: object) -> Future[WorkResult]:
+            _ = args, kwargs
+            raise AssertionError("submit should not be called when claim is lost")
+
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+
+    row = _issue_run_row(tmp_path / "state.db", 7)
+    assert row[0] == "awaiting_issue_followup"
 
 
 def test_enqueue_pre_pr_followup_work_legacy_mode_records_token_observation(

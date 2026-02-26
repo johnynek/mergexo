@@ -781,6 +781,141 @@ class StateStore:
             )
         return run_key
 
+    def _claim_existing_issue_run_start(
+        self,
+        *,
+        issue_number: int,
+        flow: str,
+        branch: str,
+        run_kind: Literal["implementation_flow", "pre_pr_followup"],
+        required_status: Literal["merged", "awaiting_issue_followup"],
+        require_pre_pr_followup_state: bool,
+        meta_json: str,
+        run_id: str | None,
+        started_at: str | None,
+        repo_full_name: str | None,
+    ) -> str | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        run_key = run_id if run_id is not None else uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            if require_pre_pr_followup_state:
+                claimed = conn.execute(
+                    """
+                    UPDATE issue_runs
+                    SET
+                        status = 'running',
+                        branch = COALESCE(?, branch),
+                        error = NULL,
+                        active_run_id = ?,
+                        last_failure_class = NULL,
+                        retry_count = 0,
+                        next_retry_at = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND issue_number = ?
+                      AND status = ?
+                      AND active_run_id IS NULL
+                      AND EXISTS(
+                            SELECT 1
+                            FROM pre_pr_followup_state AS p
+                            WHERE p.repo_full_name = issue_runs.repo_full_name
+                              AND p.issue_number = issue_runs.issue_number
+                        )
+                    """,
+                    (branch, run_key, repo_key, issue_number, required_status),
+                )
+            else:
+                claimed = conn.execute(
+                    """
+                    UPDATE issue_runs
+                    SET
+                        status = 'running',
+                        branch = COALESCE(?, branch),
+                        error = NULL,
+                        active_run_id = ?,
+                        last_failure_class = NULL,
+                        retry_count = 0,
+                        next_retry_at = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND issue_number = ?
+                      AND status = ?
+                      AND active_run_id IS NULL
+                    """,
+                    (branch, run_key, repo_key, issue_number, required_status),
+                )
+            if claimed.rowcount <= 0:
+                return None
+            row = conn.execute(
+                """
+                SELECT branch
+                FROM issue_runs
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            ).fetchone()
+            branch_for_run = row[0] if row is not None and isinstance(row[0], str) else branch
+            self._insert_agent_run_start(
+                conn=conn,
+                run_id=run_key,
+                repo_full_name=repo_key,
+                run_kind=run_kind,
+                issue_number=issue_number,
+                pr_number=None,
+                flow=flow,
+                branch=branch_for_run,
+                started_at=started_at,
+                meta_json=meta_json,
+            )
+        return run_key
+
+    def claim_implementation_issue_run_start(
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        return self._claim_existing_issue_run_start(
+            issue_number=issue_number,
+            flow="implementation",
+            branch=branch,
+            run_kind="implementation_flow",
+            required_status="merged",
+            require_pre_pr_followup_state=False,
+            meta_json=meta_json,
+            run_id=run_id,
+            started_at=started_at,
+            repo_full_name=repo_full_name,
+        )
+
+    def claim_pre_pr_followup_run_start(
+        self,
+        *,
+        issue_number: int,
+        flow: PrePrFollowupFlow,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        return self._claim_existing_issue_run_start(
+            issue_number=issue_number,
+            flow=flow,
+            branch=branch,
+            run_kind="pre_pr_followup",
+            required_status="awaiting_issue_followup",
+            require_pre_pr_followup_state=True,
+            meta_json=meta_json,
+            run_id=run_id,
+            started_at=started_at,
+            repo_full_name=repo_full_name,
+        )
+
     def _insert_agent_run_start(
         self,
         *,
