@@ -53,6 +53,8 @@ GitHubCommentSurface = Literal[
 ]
 ActionTokenScopeKind = Literal["pr", "issue"]
 ActionTokenStatus = Literal["planned", "posted", "observed", "failed"]
+GitHubCallKind = Literal["create_pull_request"]
+GitHubCallStatus = Literal["pending", "in_progress", "succeeded"]
 
 
 @dataclass(frozen=True)
@@ -186,6 +188,26 @@ class ActionTokenObservation:
     source: str
     comment_id: int
     updated_at: str
+
+
+@dataclass(frozen=True)
+class GitHubCallOutboxState:
+    call_id: int
+    call_kind: GitHubCallKind
+    dedupe_key: str
+    payload_json: str
+    status: GitHubCallStatus
+    state_applied: bool
+    attempt_count: int
+    last_error: str | None
+    result_json: str | None
+    run_id: str | None
+    issue_number: int | None
+    branch: str | None
+    pr_number: int | None
+    created_at: str
+    updated_at: str
+    repo_full_name: str = ""
 
 
 class StateStore:
@@ -450,6 +472,161 @@ class StateStore:
                 ON pr_status_history(repo_full_name, changed_at)
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS github_call_outbox (
+                    call_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo_full_name TEXT NOT NULL,
+                    call_kind TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    state_applied INTEGER NOT NULL DEFAULT 0,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NULL,
+                    result_json TEXT NULL,
+                    run_id TEXT NULL,
+                    issue_number INTEGER NULL,
+                    branch TEXT NULL,
+                    pr_number INTEGER NULL,
+                    claimed_at TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    UNIQUE (repo_full_name, dedupe_key)
+                )
+                """
+            )
+            outbox_columns = _table_columns(conn, "github_call_outbox")
+            if "repo_full_name" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN repo_full_name TEXT NOT NULL DEFAULT '__single_repo__'
+                    """
+                )
+            if "call_kind" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN call_kind TEXT NOT NULL DEFAULT 'create_pull_request'
+                    """
+                )
+            if "dedupe_key" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''
+                    """
+                )
+            if "payload_json" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'
+                    """
+                )
+            if "status" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'
+                    """
+                )
+            if "state_applied" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN state_applied INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            if "attempt_count" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            if "last_error" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN last_error TEXT NULL
+                    """
+                )
+            if "result_json" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN result_json TEXT NULL
+                    """
+                )
+            if "run_id" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN run_id TEXT NULL
+                    """
+                )
+            if "issue_number" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN issue_number INTEGER NULL
+                    """
+                )
+            if "branch" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN branch TEXT NULL
+                    """
+                )
+            if "pr_number" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN pr_number INTEGER NULL
+                    """
+                )
+            if "claimed_at" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN claimed_at TEXT NULL
+                    """
+                )
+            if "created_at" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    """
+                )
+            if "updated_at" not in outbox_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE github_call_outbox
+                    ADD COLUMN updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    """
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_github_call_outbox_replay
+                ON github_call_outbox(
+                    repo_full_name,
+                    call_kind,
+                    status,
+                    state_applied,
+                    created_at
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_github_call_outbox_run
+                ON github_call_outbox(repo_full_name, run_id)
+                """
+            )
 
     def _assert_not_legacy_schema(self, conn: sqlite3.Connection) -> None:
         if _table_exists(conn, "issue_runs"):
@@ -484,6 +661,50 @@ class StateStore:
                     (repo_key, issue_number),
                 ).fetchone()
         return row is None
+
+    def claim_new_issue_run_start(
+        self,
+        *,
+        issue_number: int,
+        flow: str,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        run_key = run_id if run_id is not None else uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            claimed = conn.execute(
+                """
+                INSERT INTO issue_runs(
+                    repo_full_name,
+                    issue_number,
+                    status,
+                    branch,
+                    active_run_id
+                )
+                VALUES(?, ?, 'running', ?, ?)
+                ON CONFLICT(repo_full_name, issue_number) DO NOTHING
+                """,
+                (repo_key, issue_number, branch, run_key),
+            )
+            if claimed.rowcount <= 0:
+                return None
+            self._insert_agent_run_start(
+                conn=conn,
+                run_id=run_key,
+                repo_full_name=repo_key,
+                run_kind="issue_flow",
+                issue_number=issue_number,
+                pr_number=None,
+                flow=flow,
+                branch=branch,
+                started_at=started_at,
+                meta_json=meta_json,
+            )
+        return run_key
 
     def _insert_agent_run_start(
         self,
@@ -1001,6 +1222,308 @@ class StateStore:
                 reconciled_count += max(cursor.rowcount, 0)
         return reconciled_count
 
+    def upsert_github_call_intent(
+        self,
+        *,
+        call_kind: GitHubCallKind,
+        dedupe_key: str,
+        payload_json: str,
+        run_id: str | None = None,
+        issue_number: int | None = None,
+        branch: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> GitHubCallOutboxState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    repo_full_name,
+                    call_id,
+                    call_kind,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    state_applied,
+                    attempt_count,
+                    last_error,
+                    result_json,
+                    run_id,
+                    issue_number,
+                    branch,
+                    pr_number,
+                    created_at,
+                    updated_at
+                FROM github_call_outbox
+                WHERE repo_full_name = ? AND dedupe_key = ?
+                """,
+                (repo_key, dedupe_key),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO github_call_outbox(
+                        repo_full_name,
+                        call_kind,
+                        dedupe_key,
+                        payload_json,
+                        status,
+                        run_id,
+                        issue_number,
+                        branch
+                    )
+                    VALUES(?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        repo_key,
+                        call_kind,
+                        dedupe_key,
+                        payload_json,
+                        run_id,
+                        issue_number,
+                        branch,
+                    ),
+                )
+                row = conn.execute(
+                    """
+                    SELECT
+                        repo_full_name,
+                        call_id,
+                        call_kind,
+                        dedupe_key,
+                        payload_json,
+                        status,
+                        state_applied,
+                        attempt_count,
+                        last_error,
+                        result_json,
+                        run_id,
+                        issue_number,
+                        branch,
+                        pr_number,
+                        created_at,
+                        updated_at
+                    FROM github_call_outbox
+                    WHERE repo_full_name = ? AND dedupe_key = ?
+                    """,
+                    (repo_key, dedupe_key),
+                ).fetchone()
+        if row is None:
+            raise RuntimeError("Unable to persist GitHub call intent")
+        return _parse_github_call_outbox_row(row)
+
+    def mark_github_call_in_progress(
+        self,
+        *,
+        call_id: int,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE github_call_outbox
+                SET
+                    status = 'in_progress',
+                    attempt_count = attempt_count + 1,
+                    claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND call_id = ?
+                  AND status IN ('pending', 'in_progress')
+                """,
+                (repo_key, call_id),
+            )
+        return cursor.rowcount > 0
+
+    def mark_github_call_pending_retry(
+        self,
+        *,
+        call_id: int,
+        error: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE github_call_outbox
+                SET
+                    status = 'pending',
+                    last_error = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND call_id = ?
+                """,
+                (error, repo_key, call_id),
+            )
+        return cursor.rowcount > 0
+
+    def mark_github_call_succeeded(
+        self,
+        *,
+        call_id: int,
+        result_json: str,
+        pr_number: int | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE github_call_outbox
+                SET
+                    status = 'succeeded',
+                    result_json = ?,
+                    pr_number = COALESCE(?, pr_number),
+                    last_error = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND call_id = ?
+                """,
+                (result_json, pr_number, repo_key, call_id),
+            )
+        return cursor.rowcount > 0
+
+    def list_replayable_github_calls(
+        self,
+        *,
+        call_kind: GitHubCallKind,
+        repo_full_name: str | None = None,
+    ) -> tuple[GitHubCallOutboxState, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    repo_full_name,
+                    call_id,
+                    call_kind,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    state_applied,
+                    attempt_count,
+                    last_error,
+                    result_json,
+                    run_id,
+                    issue_number,
+                    branch,
+                    pr_number,
+                    created_at,
+                    updated_at
+                FROM github_call_outbox
+                WHERE repo_full_name = ?
+                  AND call_kind = ?
+                  AND (
+                        status IN ('pending', 'in_progress')
+                        OR (status = 'succeeded' AND state_applied = 0)
+                    )
+                ORDER BY created_at ASC, call_id ASC
+                """,
+                (repo_key, call_kind),
+            ).fetchall()
+        return tuple(_parse_github_call_outbox_row(row) for row in rows)
+
+    def mark_create_pr_call_state_applied(
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> int:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE github_call_outbox
+                SET
+                    state_applied = 1,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND call_kind = 'create_pull_request'
+                  AND issue_number = ?
+                  AND branch = ?
+                  AND pr_number = ?
+                  AND status = 'succeeded'
+                  AND state_applied = 0
+                """,
+                (repo_key, issue_number, branch, pr_number),
+            )
+        return cursor.rowcount
+
+    def apply_succeeded_create_pr_call(
+        self,
+        *,
+        call_id: int,
+        issue_number: int,
+        branch: str,
+        pr_number: int,
+        pr_url: str,
+        run_id: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT status, state_applied, run_id
+                FROM github_call_outbox
+                WHERE repo_full_name = ? AND call_id = ?
+                """,
+                (repo_key, call_id),
+            ).fetchone()
+            if row is None:
+                return False
+            status, state_applied, stored_run_id = row
+            if status != "succeeded":
+                return False
+            if int(state_applied) != 0:
+                return False
+
+            self._upsert_completed_issue_state(
+                conn=conn,
+                repo_full_name=repo_key,
+                issue_number=issue_number,
+                branch=branch,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                history_reason=None,
+            )
+            effective_run_id = run_id if run_id is not None else cast(str | None, stored_run_id)
+            if effective_run_id is not None:
+                conn.execute(
+                    """
+                    UPDATE agent_run_history
+                    SET
+                        finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        terminal_status = 'completed',
+                        failure_class = NULL,
+                        error = NULL,
+                        duration_seconds = MAX(
+                            0.0,
+                            (
+                                julianday(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                                - julianday(started_at)
+                            ) * 86400.0
+                        )
+                    WHERE run_id = ?
+                      AND finished_at IS NULL
+                    """,
+                    (effective_run_id,),
+                )
+            conn.execute(
+                """
+                UPDATE github_call_outbox
+                SET
+                    pr_number = ?,
+                    state_applied = 1,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND call_id = ?
+                """,
+                (pr_number, repo_key, call_id),
+            )
+        return True
+
     def prune_observability_history(
         self,
         *,
@@ -1134,6 +1657,80 @@ class StateStore:
                 (repo_key, issue_number),
             )
 
+    def _upsert_completed_issue_state(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        repo_full_name: str,
+        issue_number: int,
+        branch: str,
+        pr_number: int,
+        pr_url: str,
+        history_reason: str | None,
+    ) -> None:
+        previous_status = _select_pr_feedback_status(
+            conn=conn,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+        )
+        conn.execute(
+            """
+            INSERT INTO issue_runs(
+                repo_full_name,
+                issue_number,
+                status,
+                branch,
+                pr_number,
+                pr_url
+            )
+            VALUES(?, ?, 'awaiting_feedback', ?, ?, ?)
+            ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
+                status='awaiting_feedback',
+                branch=excluded.branch,
+                pr_number=excluded.pr_number,
+                pr_url=excluded.pr_url,
+                error=NULL,
+                active_run_id=NULL,
+                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            (repo_full_name, issue_number, branch, pr_number, pr_url),
+        )
+        conn.execute(
+            """
+            INSERT INTO pr_feedback_state(
+                repo_full_name,
+                pr_number,
+                issue_number,
+                branch,
+                status
+            )
+            VALUES(?, ?, ?, ?, 'awaiting_feedback')
+            ON CONFLICT(repo_full_name, pr_number) DO UPDATE SET
+                issue_number=excluded.issue_number,
+                branch=excluded.branch,
+                status='awaiting_feedback',
+                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            (repo_full_name, pr_number, issue_number, branch),
+        )
+        conn.execute(
+            """
+            DELETE FROM pre_pr_followup_state
+            WHERE repo_full_name = ? AND issue_number = ?
+            """,
+            (repo_full_name, issue_number),
+        )
+        _append_pr_status_history(
+            conn=conn,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            from_status=previous_status,
+            to_status="awaiting_feedback",
+            reason=history_reason,
+            detail=None,
+        )
+
     def mark_completed(
         self,
         issue_number: int,
@@ -1145,67 +1742,14 @@ class StateStore:
     ) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
         with self._lock, self._connect() as conn:
-            previous_status = _select_pr_feedback_status(
+            self._upsert_completed_issue_state(
                 conn=conn,
                 repo_full_name=repo_key,
-                pr_number=pr_number,
-            )
-            conn.execute(
-                """
-                INSERT INTO issue_runs(
-                    repo_full_name,
-                    issue_number,
-                    status,
-                    branch,
-                    pr_number,
-                    pr_url
-                )
-                VALUES(?, ?, 'awaiting_feedback', ?, ?, ?)
-                ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
-                    status='awaiting_feedback',
-                    branch=excluded.branch,
-                    pr_number=excluded.pr_number,
-                    pr_url=excluded.pr_url,
-                    error=NULL,
-                    active_run_id=NULL,
-                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                """,
-                (repo_key, issue_number, branch, pr_number, pr_url),
-            )
-            conn.execute(
-                """
-                INSERT INTO pr_feedback_state(
-                    repo_full_name,
-                    pr_number,
-                    issue_number,
-                    branch,
-                    status
-                )
-                VALUES(?, ?, ?, ?, 'awaiting_feedback')
-                ON CONFLICT(repo_full_name, pr_number) DO UPDATE SET
-                    issue_number=excluded.issue_number,
-                    branch=excluded.branch,
-                    status='awaiting_feedback',
-                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                """,
-                (repo_key, pr_number, issue_number, branch),
-            )
-            conn.execute(
-                """
-                DELETE FROM pre_pr_followup_state
-                WHERE repo_full_name = ? AND issue_number = ?
-                """,
-                (repo_key, issue_number),
-            )
-            _append_pr_status_history(
-                conn=conn,
-                repo_full_name=repo_key,
-                pr_number=pr_number,
                 issue_number=issue_number,
-                from_status=previous_status,
-                to_status="awaiting_feedback",
-                reason="issue_run_completed",
-                detail=None,
+                branch=branch,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                history_reason="issue_run_completed",
             )
 
     def mark_failed(
@@ -3197,6 +3741,91 @@ def _parse_operator_command_name(value: object) -> OperatorCommandName:
     if value not in {"unblock", "restart", "help", "invalid"}:
         raise RuntimeError(f"Unknown command value stored in operator_commands: {value}")
     return cast(OperatorCommandName, value)
+
+
+def _parse_github_call_kind(value: object) -> GitHubCallKind:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid call_kind value stored in github_call_outbox")
+    if value not in {"create_pull_request"}:
+        raise RuntimeError(f"Unknown call_kind value stored in github_call_outbox: {value}")
+    return cast(GitHubCallKind, value)
+
+
+def _parse_github_call_status(value: object) -> GitHubCallStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in github_call_outbox")
+    if value not in {"pending", "in_progress", "succeeded"}:
+        raise RuntimeError(f"Unknown status value stored in github_call_outbox: {value}")
+    return cast(GitHubCallStatus, value)
+
+
+def _parse_github_call_outbox_row(row: object) -> GitHubCallOutboxState:
+    if not isinstance(row, tuple) or len(row) != 16:
+        raise RuntimeError("Invalid github_call_outbox row width")
+    (
+        repo_full_name,
+        call_id,
+        call_kind,
+        dedupe_key,
+        payload_json,
+        status,
+        state_applied,
+        attempt_count,
+        last_error,
+        result_json,
+        run_id,
+        issue_number,
+        branch,
+        pr_number,
+        created_at,
+        updated_at,
+    ) = row
+    if not isinstance(repo_full_name, str):
+        raise RuntimeError("Invalid repo_full_name value stored in github_call_outbox")
+    if not isinstance(call_id, int):
+        raise RuntimeError("Invalid call_id value stored in github_call_outbox")
+    if not isinstance(dedupe_key, str):
+        raise RuntimeError("Invalid dedupe_key value stored in github_call_outbox")
+    if not isinstance(payload_json, str):
+        raise RuntimeError("Invalid payload_json value stored in github_call_outbox")
+    if not isinstance(state_applied, int):
+        raise RuntimeError("Invalid state_applied value stored in github_call_outbox")
+    if not isinstance(attempt_count, int):
+        raise RuntimeError("Invalid attempt_count value stored in github_call_outbox")
+    if last_error is not None and not isinstance(last_error, str):
+        raise RuntimeError("Invalid last_error value stored in github_call_outbox")
+    if result_json is not None and not isinstance(result_json, str):
+        raise RuntimeError("Invalid result_json value stored in github_call_outbox")
+    if run_id is not None and not isinstance(run_id, str):
+        raise RuntimeError("Invalid run_id value stored in github_call_outbox")
+    if issue_number is not None and not isinstance(issue_number, int):
+        raise RuntimeError("Invalid issue_number value stored in github_call_outbox")
+    if branch is not None and not isinstance(branch, str):
+        raise RuntimeError("Invalid branch value stored in github_call_outbox")
+    if pr_number is not None and not isinstance(pr_number, int):
+        raise RuntimeError("Invalid pr_number value stored in github_call_outbox")
+    if not isinstance(created_at, str):
+        raise RuntimeError("Invalid created_at value stored in github_call_outbox")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in github_call_outbox")
+    return GitHubCallOutboxState(
+        call_id=call_id,
+        call_kind=_parse_github_call_kind(call_kind),
+        dedupe_key=dedupe_key,
+        payload_json=payload_json,
+        status=_parse_github_call_status(status),
+        state_applied=state_applied != 0,
+        attempt_count=attempt_count,
+        last_error=last_error,
+        result_json=result_json,
+        run_id=run_id,
+        issue_number=issue_number,
+        branch=branch,
+        pr_number=pr_number,
+        created_at=created_at,
+        updated_at=updated_at,
+        repo_full_name=repo_full_name,
+    )
 
 
 def _parse_operator_command_status(value: object) -> OperatorCommandStatus:

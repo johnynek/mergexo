@@ -158,6 +158,61 @@ class GitHubGateway:
         )
         return PullRequest(number=number, html_url=html_url)
 
+    def find_pull_request_by_head(
+        self,
+        *,
+        head: str,
+        base: str | None = None,
+        state: Literal["open", "all"] = "open",
+    ) -> PullRequest | None:
+        if state not in {"open", "all"}:
+            raise ValueError("state must be 'open' or 'all'")
+        query_items: dict[str, str] = {
+            "state": state,
+            "head": f"{self.owner}:{head}",
+            "per_page": "100",
+        }
+        if base is not None:
+            query_items["base"] = base
+        path = f"/repos/{self.owner}/{self.name}/pulls?{urlencode(query_items)}"
+        payload = self._api_json("GET", path)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected list for pull request lookup")
+
+        candidates: list[PullRequest] = []
+        for item in payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            number = _as_int(item_obj.get("number"), field="number")
+            html_url = _as_string(item_obj.get("html_url"))
+            candidates.append(PullRequest(number=number, html_url=html_url))
+
+        if not candidates:
+            log_event(
+                LOGGER,
+                "github_read",
+                endpoint="pull_request_lookup_by_head",
+                head=head,
+                base=base,
+                state=state,
+                found=False,
+            )
+            return None
+
+        selected = max(candidates, key=lambda pr: pr.number)
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="pull_request_lookup_by_head",
+            head=head,
+            base=base,
+            state=state,
+            found=True,
+            pr_number=selected.number,
+        )
+        return selected
+
     def get_issue(self, issue_number: int) -> Issue:
         path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}"
         payload = self._api_json("GET", path)

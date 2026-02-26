@@ -16,6 +16,7 @@ from mergexo.state import (
     _parse_action_token_scope_kind,
     _parse_action_token_status,
     _parse_github_comment_surface,
+    _parse_github_call_outbox_row,
     _parse_operator_command_name,
     _parse_operator_command_row,
     _parse_poll_cursor_row,
@@ -95,14 +96,29 @@ def test_state_store_transitions_and_feedback_tracking(tmp_path: Path) -> None:
 
     assert store.can_enqueue(42) is True
 
-    store.mark_running(42)
+    run_id = store.claim_new_issue_run_start(
+        issue_number=42,
+        flow="design_doc",
+        branch="agent/design/42-worker",
+        run_id="run-42",
+    )
+    assert run_id == "run-42"
+    assert (
+        store.claim_new_issue_run_start(
+            issue_number=42,
+            flow="design_doc",
+            branch="agent/design/42-worker",
+            run_id="run-42-duplicate",
+        )
+        is None
+    )
     assert store.can_enqueue(42) is False
     assert _get_row(db_path, 42)[0] == "running"
 
     store.mark_failed(42, "boom")
     status, branch, pr_number, pr_url, error = _get_row(db_path, 42)
     assert status == "failed"
-    assert branch is None
+    assert branch == "agent/design/42-worker"
     assert pr_number is None
     assert pr_url is None
     assert error == "boom"
@@ -143,12 +159,16 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         }
         assert "agent_run_history" in tables
         assert "pr_status_history" in tables
+        assert "github_call_outbox" in tables
         run_history_columns = set(_table_columns(conn, "agent_run_history"))
         issue_run_columns = set(_table_columns(conn, "issue_runs"))
+        outbox_columns = set(_table_columns(conn, "github_call_outbox"))
         assert "run_id" in run_history_columns
         assert "terminal_status" in run_history_columns
         assert "duration_seconds" in run_history_columns
         assert "active_run_id" in issue_run_columns
+        assert "state_applied" in outbox_columns
+        assert "result_json" in outbox_columns
     finally:
         conn.close()
 
@@ -208,6 +228,249 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
     assert _get_active_run_id(db_path, 99) == "run-99"
     store.mark_failed(99, "boom")
     assert _get_active_run_id(db_path, 99) is None
+
+
+def test_state_store_github_call_outbox_lifecycle_and_apply(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    repo = "o/repo-a"
+    run_id = store.record_issue_run_start(
+        run_kind="issue_flow",
+        issue_number=7,
+        flow="design_doc",
+        branch="agent/design/7-foo",
+        run_id="run-7",
+        repo_full_name=repo,
+    )
+    assert run_id == "run-7"
+
+    intent = store.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7-foo:run-7",
+        payload_json=(
+            '{"base":"main","body":"Design doc.\\n\\nRefs #7",'
+            '"head":"agent/design/7-foo","issue_number":7,'
+            '"title":"Design doc for #7: Add scheduler"}'
+        ),
+        run_id=run_id,
+        issue_number=7,
+        branch="agent/design/7-foo",
+        repo_full_name=repo,
+    )
+    assert intent.status == "pending"
+    assert intent.state_applied is False
+
+    assert store.mark_github_call_in_progress(call_id=intent.call_id, repo_full_name=repo)
+    assert store.mark_github_call_pending_retry(
+        call_id=intent.call_id,
+        error="network timeout",
+        repo_full_name=repo,
+    )
+    assert store.mark_github_call_in_progress(call_id=intent.call_id, repo_full_name=repo)
+    assert store.mark_github_call_succeeded(
+        call_id=intent.call_id,
+        result_json='{"pr_number":101,"pr_url":"https://example/pr/101"}',
+        pr_number=101,
+        repo_full_name=repo,
+    )
+
+    replayable_before = store.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=repo,
+    )
+    assert len(replayable_before) == 1
+    assert replayable_before[0].status == "succeeded"
+    assert replayable_before[0].state_applied is False
+
+    assert store.apply_succeeded_create_pr_call(
+        call_id=intent.call_id,
+        issue_number=7,
+        branch="agent/design/7-foo",
+        pr_number=101,
+        pr_url="https://example/pr/101",
+        run_id=run_id,
+        repo_full_name=repo,
+    )
+    assert _get_row(db_path, 7)[0] == "awaiting_feedback"
+    terminal_status, _failure_class, _error, _finished_at, _duration_seconds = (
+        _get_agent_run_history_row(db_path, run_id)
+    )
+    assert terminal_status == "completed"
+    tracked = store.list_tracked_pull_requests(repo_full_name=repo)
+    assert len(tracked) == 1
+    assert tracked[0].pr_number == 101
+    assert tracked[0].issue_number == 7
+
+    assert (
+        store.mark_create_pr_call_state_applied(
+            issue_number=7,
+            branch="agent/design/7-foo",
+            pr_number=101,
+            repo_full_name=repo,
+        )
+        == 0
+    )
+    replayable_after = store.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=repo,
+    )
+    assert replayable_after == ()
+
+
+def test_state_store_migrates_legacy_github_call_outbox_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE github_call_outbox (
+                call_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_full_name TEXT NOT NULL,
+                call_kind TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _ = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = set(_table_columns(conn, "github_call_outbox"))
+    finally:
+        conn.close()
+    assert "state_applied" in columns
+    assert "attempt_count" in columns
+    assert "last_error" in columns
+    assert "result_json" in columns
+    assert "run_id" in columns
+    assert "issue_number" in columns
+    assert "branch" in columns
+    assert "pr_number" in columns
+    assert "claimed_at" in columns
+    assert "created_at" in columns
+    assert "updated_at" in columns
+
+
+def test_state_store_migrates_minimal_legacy_github_call_outbox_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE github_call_outbox (
+                call_id INTEGER PRIMARY KEY AUTOINCREMENT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _ = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = set(_table_columns(conn, "github_call_outbox"))
+    finally:
+        conn.close()
+    assert "repo_full_name" in columns
+    assert "call_kind" in columns
+    assert "dedupe_key" in columns
+    assert "payload_json" in columns
+    assert "status" in columns
+
+
+def test_state_store_upsert_github_call_intent_raises_when_insert_not_visible(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TRIGGER delete_outbox_after_insert
+            AFTER INSERT ON github_call_outbox
+            BEGIN
+                DELETE FROM github_call_outbox WHERE call_id = NEW.call_id;
+            END
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="Unable to persist GitHub call intent"):
+        store.upsert_github_call_intent(
+            call_kind="create_pull_request",
+            dedupe_key="create_pr:7:main:agent/design/7:run-7",
+            payload_json='{"issue_number":7,"title":"t","head":"h","base":"main","body":"b"}',
+            run_id="run-7",
+            issue_number=7,
+            branch="agent/design/7",
+        )
+
+
+def test_state_store_apply_succeeded_create_pr_call_rejects_invalid_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    assert (
+        store.apply_succeeded_create_pr_call(
+            call_id=999,
+            issue_number=7,
+            branch="agent/design/7",
+            pr_number=101,
+            pr_url="https://example/pr/101",
+        )
+        is False
+    )
+
+    intent = store.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7:run-7",
+        payload_json='{"issue_number":7,"title":"t","head":"h","base":"main","body":"b"}',
+        run_id="run-7",
+        issue_number=7,
+        branch="agent/design/7",
+    )
+    assert (
+        store.apply_succeeded_create_pr_call(
+            call_id=intent.call_id,
+            issue_number=7,
+            branch="agent/design/7",
+            pr_number=101,
+            pr_url="https://example/pr/101",
+        )
+        is False
+    )
+
+    assert store.mark_github_call_succeeded(
+        call_id=intent.call_id,
+        result_json='{"pr_number":101,"pr_url":"https://example/pr/101"}',
+        pr_number=101,
+    )
+    assert store.apply_succeeded_create_pr_call(
+        call_id=intent.call_id,
+        issue_number=7,
+        branch="agent/design/7",
+        pr_number=101,
+        pr_url="https://example/pr/101",
+    )
+    assert (
+        store.apply_succeeded_create_pr_call(
+            call_id=intent.call_id,
+            issue_number=7,
+            branch="agent/design/7",
+            pr_number=101,
+            pr_url="https://example/pr/101",
+        )
+        is False
+    )
 
 
 def test_state_store_reconcile_and_prune_observability_history(tmp_path: Path) -> None:
@@ -1929,3 +2192,57 @@ def test_table_columns_skips_short_rows() -> None:
 def test_normalize_repo_full_name_blank_defaults_to_single_repo() -> None:
     assert _normalize_repo_full_name(None) == "__single_repo__"
     assert _normalize_repo_full_name("   ") == "__single_repo__"
+
+
+def test_parse_github_call_outbox_row_rejects_invalid_shape() -> None:
+    with pytest.raises(RuntimeError, match="row width"):
+        _parse_github_call_outbox_row(("only-one-value",))
+
+
+@pytest.mark.parametrize(
+    ("index", "bad_value", "message"),
+    [
+        (2, 1, "Invalid call_kind"),
+        (2, "unknown", "Unknown call_kind"),
+        (5, 1, "Invalid status"),
+        (5, "unknown", "Unknown status"),
+        (0, 1, "repo_full_name"),
+        (1, "x", "call_id"),
+        (3, 1, "dedupe_key"),
+        (4, 1, "payload_json"),
+        (6, "0", "state_applied"),
+        (7, "0", "attempt_count"),
+        (8, 1, "last_error"),
+        (9, 1, "result_json"),
+        (10, 1, "run_id"),
+        (11, "x", "issue_number"),
+        (12, 1, "branch"),
+        (13, "x", "pr_number"),
+        (14, 1, "created_at"),
+        (15, 1, "updated_at"),
+    ],
+)
+def test_parse_github_call_outbox_row_rejects_invalid_field_types(
+    index: int, bad_value: object, message: str
+) -> None:
+    row: list[object] = [
+        "o/repo-a",
+        7,
+        "create_pull_request",
+        "create_pr:7:main:agent/design/7:run-7",
+        '{"issue_number":7,"title":"t","head":"h","base":"main","body":"b"}',
+        "pending",
+        0,
+        0,
+        None,
+        None,
+        "run-7",
+        7,
+        "agent/design/7",
+        101,
+        "2026-02-26T00:00:00.000Z",
+        "2026-02-26T00:00:00.000Z",
+    ]
+    row[index] = bad_value
+    with pytest.raises(RuntimeError, match=message):
+        _parse_github_call_outbox_row(tuple(row))

@@ -53,6 +53,7 @@ from mergexo.models import (
     PrActionsFeedbackPolicy,
     RestartMode,
     PullRequestIssueComment,
+    PullRequest,
     PullRequestSnapshot,
     PullRequestReviewComment,
     WorkflowJobSnapshot,
@@ -72,6 +73,7 @@ from mergexo.state import (
     AgentRunFailureClass,
     ActionTokenObservation,
     ActionTokenState,
+    GitHubCallOutboxState,
     GitHubCommentSurface,
     GitHubCommentPollCursorState,
     ImplementationCandidateState,
@@ -156,6 +158,15 @@ class _IncrementalCommentScan:
     fetched: tuple[PullRequestIssueComment | PullRequestReviewComment, ...]
     new: tuple[PullRequestIssueComment | PullRequestReviewComment, ...]
     cursor_update: PollCursorUpdate
+
+
+@dataclass(frozen=True)
+class _CreatePullRequestOutboxPayload:
+    issue_number: int
+    title: str
+    head: str
+    base: str
+    body: str
 
 
 class DirectFlowError(RuntimeError):
@@ -429,6 +440,23 @@ class Phase1Orchestrator:
         if self._poll_setup_done:
             return
         self._git.ensure_layout()
+        replayed_create_pr_call_count = 0
+
+        def replay_create_pr_calls() -> None:
+            nonlocal replayed_create_pr_call_count
+            replayed_create_pr_call_count = self._replay_pending_create_pr_calls()
+
+        self._run_poll_step(
+            step_name="replay_pending_create_pr_calls",
+            fn=replay_create_pr_calls,
+        )
+        if replayed_create_pr_call_count > 0:
+            log_event(
+                LOGGER,
+                "pending_create_pr_calls_replayed",
+                repo_full_name=self._state_repo_full_name(),
+                replayed_count=replayed_create_pr_call_count,
+            )
         reconciled_count = self._state.reconcile_unfinished_agent_runs(
             repo_full_name=self._state_repo_full_name()
         )
@@ -540,17 +568,6 @@ class Phase1Orchestrator:
                         )
                         continue
 
-                if not self._state.can_enqueue(
-                    issue.number, repo_full_name=self._state_repo_full_name()
-                ):
-                    log_event(
-                        LOGGER,
-                        "issue_skipped",
-                        issue_number=issue.number,
-                        reason="already_processed",
-                    )
-                    continue
-
                 branch = _branch_for_issue_flow(flow=flow, issue=issue)
                 context_json = self._serialize_pre_pr_context_for_issue(
                     issue=issue,
@@ -560,14 +577,21 @@ class Phase1Orchestrator:
                 consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
                     issue.number
                 )
-                run_id = self._state.record_issue_run_start(
-                    run_kind="issue_flow",
+                run_id = self._state.claim_new_issue_run_start(
                     issue_number=issue.number,
                     flow=flow,
                     branch=branch,
                     meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                if run_id is None:
+                    log_event(
+                        LOGGER,
+                        "issue_skipped",
+                        issue_number=issue.number,
+                        reason="already_processed",
+                    )
+                    continue
                 self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_issue_worker,
@@ -1174,7 +1198,9 @@ class Phase1Orchestrator:
 
         title, body, flow_label = _recovery_pr_payload_for_issue(issue=issue, branch=branch)
         try:
-            pr = self._github.create_pull_request(
+            pr = self._create_pull_request_with_outbox(
+                issue_number=issue.number,
+                run_id=None,
                 title=title,
                 head=branch,
                 base=self._repo.default_branch,
@@ -1196,6 +1222,12 @@ class Phase1Orchestrator:
             branch=branch,
             pr_number=pr.number,
             pr_url=pr.html_url,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        self._state.mark_create_pr_call_state_applied(
+            issue_number=issue.number,
+            branch=branch,
+            pr_number=pr.number,
             repo_full_name=self._state_repo_full_name(),
         )
 
@@ -1224,6 +1256,208 @@ class Phase1Orchestrator:
             pr_number=pr.number,
             flow=flow_label,
         )
+
+    def _create_pr_dedupe_key(
+        self,
+        *,
+        issue_number: int,
+        head: str,
+        base: str,
+        run_id: str | None,
+    ) -> str:
+        run_key = run_id if run_id is not None else "no-run-id"
+        return f"create_pr:{issue_number}:{base}:{head}:{run_key}"
+
+    def _parse_create_pr_outbox_payload(self, payload_json: str) -> _CreatePullRequestOutboxPayload:
+        payload_obj = json.loads(payload_json)
+        if not isinstance(payload_obj, dict):
+            raise RuntimeError("Invalid create_pull_request outbox payload")
+        issue_number = payload_obj.get("issue_number")
+        title = payload_obj.get("title")
+        head = payload_obj.get("head")
+        base = payload_obj.get("base")
+        body = payload_obj.get("body")
+        if not isinstance(issue_number, int):
+            raise RuntimeError("create_pull_request outbox payload is missing issue_number")
+        if not isinstance(title, str):
+            raise RuntimeError("create_pull_request outbox payload is missing title")
+        if not isinstance(head, str):
+            raise RuntimeError("create_pull_request outbox payload is missing head")
+        if not isinstance(base, str):
+            raise RuntimeError("create_pull_request outbox payload is missing base")
+        if not isinstance(body, str):
+            raise RuntimeError("create_pull_request outbox payload is missing body")
+        return _CreatePullRequestOutboxPayload(
+            issue_number=issue_number,
+            title=title,
+            head=head,
+            base=base,
+            body=body,
+        )
+
+    def _pull_request_from_outbox_result(self, result_json: str | None) -> PullRequest | None:
+        if result_json is None:
+            return None
+        result_obj = json.loads(result_json)
+        if not isinstance(result_obj, dict):
+            return None
+        pr_number = result_obj.get("pr_number")
+        pr_url = result_obj.get("pr_url")
+        if not isinstance(pr_number, int):
+            return None
+        if not isinstance(pr_url, str):
+            return None
+        return PullRequest(number=pr_number, html_url=pr_url)
+
+    def _find_existing_pull_request_for_branch(
+        self,
+        *,
+        head: str,
+        base: str,
+    ) -> PullRequest | None:
+        finder = getattr(self._github, "find_pull_request_by_head", None)
+        if not callable(finder):
+            return None
+        try:
+            existing = finder(head=head, base=base, state="open")
+        except TypeError:
+            existing = finder(head=head, base=base)
+        if existing is not None:
+            return existing
+        try:
+            return finder(head=head, base=base, state="all")
+        except TypeError:
+            return finder(head=head, base=base)
+
+    def _execute_create_pr_outbox_call(self, entry: GitHubCallOutboxState) -> PullRequest:
+        payload = self._parse_create_pr_outbox_payload(entry.payload_json)
+        if entry.status == "succeeded":
+            completed = self._pull_request_from_outbox_result(entry.result_json)
+            if completed is not None:
+                return completed
+            self._state.mark_github_call_pending_retry(
+                call_id=entry.call_id,
+                error="create_pull_request outbox row was succeeded without result payload",
+                repo_full_name=self._state_repo_full_name(),
+            )
+
+        self._state.mark_github_call_in_progress(
+            call_id=entry.call_id,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        try:
+            pr = self._find_existing_pull_request_for_branch(head=payload.head, base=payload.base)
+            if pr is None:
+                try:
+                    pr = self._github.create_pull_request(
+                        title=payload.title,
+                        head=payload.head,
+                        base=payload.base,
+                        body=payload.body,
+                    )
+                except Exception:
+                    recovered = self._find_existing_pull_request_for_branch(
+                        head=payload.head,
+                        base=payload.base,
+                    )
+                    if recovered is None:
+                        raise
+                    pr = recovered
+            self._state.mark_github_call_succeeded(
+                call_id=entry.call_id,
+                result_json=json.dumps(
+                    {"pr_number": pr.number, "pr_url": pr.html_url},
+                    sort_keys=True,
+                ),
+                pr_number=pr.number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return pr
+        except Exception as exc:  # noqa: BLE001
+            self._state.mark_github_call_pending_retry(
+                call_id=entry.call_id,
+                error=str(exc),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            raise
+
+    def _create_pull_request_with_outbox(
+        self,
+        *,
+        issue_number: int,
+        run_id: str | None,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+    ) -> PullRequest:
+        dedupe_key = self._create_pr_dedupe_key(
+            issue_number=issue_number,
+            head=head,
+            base=base,
+            run_id=run_id,
+        )
+        entry = self._state.upsert_github_call_intent(
+            call_kind="create_pull_request",
+            dedupe_key=dedupe_key,
+            payload_json=json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "title": title,
+                    "head": head,
+                    "base": base,
+                    "body": body,
+                },
+                sort_keys=True,
+            ),
+            run_id=run_id,
+            issue_number=issue_number,
+            branch=head,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return self._execute_create_pr_outbox_call(entry)
+
+    def _replay_pending_create_pr_calls(self) -> int:
+        replayed_count = 0
+        entries = self._state.list_replayable_github_calls(
+            call_kind="create_pull_request",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        for entry in entries:
+            try:
+                payload = self._parse_create_pr_outbox_payload(entry.payload_json)
+                pr = self._execute_create_pr_outbox_call(entry)
+                applied = self._state.apply_succeeded_create_pr_call(
+                    call_id=entry.call_id,
+                    issue_number=payload.issue_number,
+                    branch=payload.head,
+                    pr_number=pr.number,
+                    pr_url=pr.html_url,
+                    run_id=entry.run_id,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if applied:
+                    replayed_count += 1
+                    log_event(
+                        LOGGER,
+                        "pending_create_pr_call_applied",
+                        repo_full_name=self._state_repo_full_name(),
+                        issue_number=payload.issue_number,
+                        branch=payload.head,
+                        pr_number=pr.number,
+                        call_id=entry.call_id,
+                    )
+            except GitHubPollingError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    "pending_create_pr_call_replay_failed",
+                    repo_full_name=self._state_repo_full_name(),
+                    call_id=entry.call_id,
+                    error_type=type(exc).__name__,
+                )
+        return replayed_count
 
     def _has_capacity_locked(self) -> bool:
         local_active = len(self._running) + len(self._running_feedback)
@@ -2408,6 +2642,12 @@ class Phase1Orchestrator:
                         pr_url=result.pr_url,
                         repo_full_name=result.repo_full_name or self._repo.full_name,
                     )
+                    self._state.mark_create_pr_call_state_applied(
+                        issue_number=result.issue_number,
+                        branch=result.branch,
+                        pr_number=result.pr_number,
+                        repo_full_name=result.repo_full_name or self._repo.full_name,
+                    )
                     log_event(
                         LOGGER,
                         "issue_processing_completed",
@@ -2774,7 +3014,9 @@ class Phase1Orchestrator:
             last_consumed_comment_id=pre_pr_last_consumed_comment_id,
         )
 
-        pr = self._github.create_pull_request(
+        pr = self._create_pull_request_with_outbox(
+            issue_number=issue.number,
+            run_id=run_id,
             title=f"Design doc for #{issue.number}: {generated.title}",
             head=branch,
             base=self._repo.default_branch,
@@ -2913,7 +3155,9 @@ class Phase1Orchestrator:
             last_consumed_comment_id=pre_pr_last_consumed_comment_id,
         )
 
-        pr = self._github.create_pull_request(
+        pr = self._create_pull_request_with_outbox(
+            issue_number=issue.number,
+            run_id=run_id,
             title=start_result.pr_title,
             head=branch,
             base=self._repo.default_branch,
@@ -3081,7 +3325,9 @@ class Phase1Orchestrator:
                 if candidate.design_pr_url
                 else ""
             )
-            pr = self._github.create_pull_request(
+            pr = self._create_pull_request_with_outbox(
+                issue_number=issue.number,
+                run_id=run_id,
                 title=start_result.pr_title,
                 head=branch,
                 base=self._repo.default_branch,
