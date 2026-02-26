@@ -264,6 +264,130 @@ def test_main_unknown_command_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         cli.main()
 
 
+def test_main_acquires_writer_lock_for_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    called: dict[str, object] = {}
+
+    class FakeParser:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
+            return SimpleNamespace(command="run", config=Path("cfg.toml"), once=True, verbose=False)
+
+    class FakeLock:
+        def __enter__(self) -> None:
+            called["lock_entered"] = True
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type, exc, tb
+            called["lock_exited"] = True
+
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "writer_process_lock",
+        lambda *, base_dir, command: (
+            called.update({"lock_base_dir": base_dir, "lock_command": command}) or FakeLock()
+        ),
+    )
+    monkeypatch.setattr(cli, "_cmd_run", lambda c, once: called.setdefault("run", (c, once)))
+
+    cli.main()
+
+    assert called["lock_entered"] is True
+    assert called["lock_exited"] is True
+    assert called["lock_base_dir"] == cfg.runtime.base_dir
+    assert called["lock_command"] == "run"
+    assert called["run"] == (cfg, True)
+
+
+def test_main_skips_writer_lock_for_top(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path)
+    called: dict[str, object] = {}
+
+    class FakeParser:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
+            return SimpleNamespace(command="top", config=Path("cfg.toml"), verbose=False)
+
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "writer_process_lock",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError(f"lock should not run: {kwargs}")),
+    )
+    monkeypatch.setattr(cli, "_cmd_top", lambda c: called.setdefault("top", c))
+
+    cli.main()
+    assert called["top"] == cfg
+
+
+def test_main_acquires_writer_lock_for_feedback_reset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path)
+    called: dict[str, object] = {}
+
+    class FakeParser:
+        def parse_args(self, argv: tuple[str, ...]) -> SimpleNamespace:
+            _ = argv
+            return SimpleNamespace(
+                command="feedback",
+                config=Path("cfg.toml"),
+                feedback_command="blocked",
+                blocked_command="reset",
+                pr=[12],
+                all=False,
+                yes=False,
+                dry_run=True,
+                head_sha=None,
+                repo=None,
+                verbose=False,
+            )
+
+    class FakeLock:
+        def __enter__(self) -> None:
+            called["lock_entered"] = True
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type, exc, tb
+            called["lock_exited"] = True
+
+    monkeypatch.setattr(cli, "build_parser", lambda: FakeParser())
+    monkeypatch.setattr(cli, "load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda verbose, state_dir=None: called.update({"verbose": verbose, "state_dir": state_dir}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "writer_process_lock",
+        lambda *, base_dir, command: (
+            called.update({"lock_base_dir": base_dir, "lock_command": command}) or FakeLock()
+        ),
+    )
+    monkeypatch.setattr(cli, "_cmd_feedback", lambda c, a: called.setdefault("feedback", (c, a)))
+
+    cli.main()
+
+    assert called["lock_entered"] is True
+    assert called["lock_exited"] is True
+    assert called["lock_command"] == "feedback blocked reset"
+    assert called["feedback"][0] == cfg
+
+
 def test_main_defaults_verbose_to_false_when_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -595,20 +719,11 @@ def test_cmd_top_runs_tui_with_runtime_settings(
         codex=cfg.codex,
     )
     called: dict[str, object] = {}
-
-    class FakeState:
-        def __init__(self, path: Path) -> None:
-            called["state_path"] = path
-
-        def reconcile_unfinished_agent_runs(self) -> int:
-            called["reconciled"] = True
-            return 1
-
-        def prune_observability_history(self, *, retention_days: int) -> tuple[int, int]:
-            called["retention_days"] = retention_days
-            return 2, 3
-
-    monkeypatch.setattr(cli, "StateStore", FakeState)
+    monkeypatch.setattr(
+        cli,
+        "StateStore",
+        lambda p: (_ for _ in ()).throw(RuntimeError(f"StateStore should not be used: {p}")),
+    )
     monkeypatch.setattr(
         cli,
         "run_observability_tui",
@@ -617,8 +732,6 @@ def test_cmd_top_runs_tui_with_runtime_settings(
 
     cli._cmd_top(cfg)
 
-    assert called["reconciled"] is True
-    assert called["retention_days"] == 45
     top_call = called["top"]
     assert isinstance(top_call, dict)
     assert top_call["refresh_seconds"] == 5
