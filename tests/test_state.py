@@ -213,7 +213,6 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
     store.mark_failed(99, "boom")
     assert _get_active_run_id(db_path, 99) is None
 
-
 def test_state_store_github_call_outbox_lifecycle_and_apply(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
@@ -338,7 +337,6 @@ def test_state_store_migrates_legacy_github_call_outbox_schema(tmp_path: Path) -
     assert "claimed_at" in columns
     assert "created_at" in columns
     assert "updated_at" in columns
-
 
 def test_state_store_reconcile_and_prune_observability_history(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
