@@ -100,6 +100,7 @@ from mergexo.shell import CommandError
 from mergexo.state import (
     ActionTokenScopeKind,
     ActionTokenState,
+    GitHubCallOutboxState,
     GitHubCommentSurface,
     GitHubCommentPollCursorState,
     ImplementationCandidateState,
@@ -235,6 +236,7 @@ class FakeGitHub:
         self.workflow_jobs_by_run_id: dict[int, tuple[WorkflowJobSnapshot, ...]] = {}
         self.failed_run_log_tails: dict[int, dict[str, str | None]] = {}
         self.failed_log_tail_calls: list[tuple[int, int]] = []
+        self.pr_lookup_by_head_base: dict[tuple[str, str], PullRequest] = {}
 
     def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
         self.requested_labels = labels
@@ -252,7 +254,24 @@ class FakeGitHub:
             state="open",
             merged=False,
         )
-        return PullRequest(number=101, html_url="https://example/pr/101")
+        pr = PullRequest(number=101, html_url="https://example/pr/101")
+        self.pr_lookup_by_head_base[(head, base)] = pr
+        return pr
+
+    def find_pull_request_by_head(
+        self,
+        *,
+        head: str,
+        base: str | None = None,
+        state: str = "open",
+    ) -> PullRequest | None:
+        _ = state
+        if base is None:
+            for (candidate_head, _candidate_base), pr in self.pr_lookup_by_head_base.items():
+                if candidate_head == head:
+                    return pr
+            return None
+        return self.pr_lookup_by_head_base.get((head, base))
 
     def post_issue_comment(self, issue_number: int, body: str) -> None:
         self.comments.append((issue_number, body))
@@ -497,6 +516,196 @@ class FakeState:
         self._pr_status_by_pr: dict[int, str] = {}
         self._action_tokens: dict[str, ActionTokenState] = {}
         self._poll_cursors: dict[tuple[str, int], GitHubCommentPollCursorState] = {}
+        self._next_github_call_id = 1
+        self._github_calls_by_id: dict[int, dict[str, object]] = {}
+        self._github_call_id_by_dedupe: dict[str, int] = {}
+
+    def _github_call_state(self, row: dict[str, object]) -> GitHubCallOutboxState:
+        return GitHubCallOutboxState(
+            call_id=cast(int, row["call_id"]),
+            call_kind=cast(str, row["call_kind"]),
+            dedupe_key=cast(str, row["dedupe_key"]),
+            payload_json=cast(str, row["payload_json"]),
+            status=cast(str, row["status"]),
+            state_applied=cast(bool, row["state_applied"]),
+            attempt_count=cast(int, row["attempt_count"]),
+            last_error=cast(str | None, row["last_error"]),
+            result_json=cast(str | None, row["result_json"]),
+            run_id=cast(str | None, row["run_id"]),
+            issue_number=cast(int | None, row["issue_number"]),
+            branch=cast(str | None, row["branch"]),
+            pr_number=cast(int | None, row["pr_number"]),
+            created_at=cast(str, row["created_at"]),
+            updated_at=cast(str, row["updated_at"]),
+            repo_full_name=cast(str, row["repo_full_name"]),
+        )
+
+    def upsert_github_call_intent(
+        self,
+        *,
+        call_kind: str,
+        dedupe_key: str,
+        payload_json: str,
+        run_id: str | None = None,
+        issue_number: int | None = None,
+        branch: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> GitHubCallOutboxState:
+        _ = repo_full_name
+        existing_id = self._github_call_id_by_dedupe.get(dedupe_key)
+        if existing_id is not None:
+            return self._github_call_state(self._github_calls_by_id[existing_id])
+        call_id = self._next_github_call_id
+        self._next_github_call_id += 1
+        row: dict[str, object] = {
+            "call_id": call_id,
+            "call_kind": call_kind,
+            "dedupe_key": dedupe_key,
+            "payload_json": payload_json,
+            "status": "pending",
+            "state_applied": False,
+            "attempt_count": 0,
+            "last_error": None,
+            "result_json": None,
+            "run_id": run_id,
+            "issue_number": issue_number,
+            "branch": branch,
+            "pr_number": None,
+            "created_at": "now",
+            "updated_at": "now",
+            "repo_full_name": "",
+        }
+        self._github_calls_by_id[call_id] = row
+        self._github_call_id_by_dedupe[dedupe_key] = call_id
+        return self._github_call_state(row)
+
+    def mark_github_call_in_progress(
+        self,
+        *,
+        call_id: int,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        row = self._github_calls_by_id.get(call_id)
+        if row is None:
+            return False
+        status = cast(str, row["status"])
+        if status not in {"pending", "in_progress"}:
+            return False
+        row["status"] = "in_progress"
+        row["attempt_count"] = cast(int, row["attempt_count"]) + 1
+        row["updated_at"] = "now"
+        return True
+
+    def mark_github_call_pending_retry(
+        self,
+        *,
+        call_id: int,
+        error: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        row = self._github_calls_by_id.get(call_id)
+        if row is None:
+            return False
+        row["status"] = "pending"
+        row["last_error"] = error
+        row["updated_at"] = "now"
+        return True
+
+    def mark_github_call_succeeded(
+        self,
+        *,
+        call_id: int,
+        result_json: str,
+        pr_number: int | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        row = self._github_calls_by_id.get(call_id)
+        if row is None:
+            return False
+        row["status"] = "succeeded"
+        row["result_json"] = result_json
+        row["pr_number"] = pr_number
+        row["last_error"] = None
+        row["updated_at"] = "now"
+        return True
+
+    def list_replayable_github_calls(
+        self,
+        *,
+        call_kind: str,
+        repo_full_name: str | None = None,
+    ) -> tuple[GitHubCallOutboxState, ...]:
+        _ = repo_full_name
+        entries: list[GitHubCallOutboxState] = []
+        for row in self._github_calls_by_id.values():
+            if row["call_kind"] != call_kind:
+                continue
+            status = cast(str, row["status"])
+            if status in {"pending", "in_progress"} or (
+                status == "succeeded" and cast(bool, row["state_applied"]) is False
+            ):
+                entries.append(self._github_call_state(row))
+        entries.sort(key=lambda item: item.call_id)
+        return tuple(entries)
+
+    def mark_create_pr_call_state_applied(
+        self,
+        *,
+        issue_number: int,
+        branch: str,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> int:
+        _ = repo_full_name
+        updated = 0
+        for row in self._github_calls_by_id.values():
+            if row["call_kind"] != "create_pull_request":
+                continue
+            if row["issue_number"] != issue_number:
+                continue
+            if row["branch"] != branch:
+                continue
+            if row["pr_number"] != pr_number:
+                continue
+            if row["status"] != "succeeded":
+                continue
+            if cast(bool, row["state_applied"]):
+                continue
+            row["state_applied"] = True
+            row["updated_at"] = "now"
+            updated += 1
+        return updated
+
+    def apply_succeeded_create_pr_call(
+        self,
+        *,
+        call_id: int,
+        issue_number: int,
+        branch: str,
+        pr_number: int,
+        pr_url: str,
+        run_id: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = run_id, repo_full_name
+        row = self._github_calls_by_id.get(call_id)
+        if row is None:
+            return False
+        if row["status"] != "succeeded" or cast(bool, row["state_applied"]):
+            return False
+        row["state_applied"] = True
+        row["updated_at"] = "now"
+        self.mark_completed(
+            issue_number=issue_number,
+            branch=branch,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            repo_full_name=repo_full_name,
+        )
+        return True
 
     def can_enqueue(self, issue_number: int, *, repo_full_name: str | None = None) -> bool:
         _ = repo_full_name
@@ -1281,6 +1490,141 @@ def test_ensure_poll_setup_logs_when_stale_runs_reconciled(tmp_path: Path) -> No
         agent=FakeAgent(),
     )
     orch._ensure_poll_setup()
+
+
+def test_ensure_poll_setup_replays_pending_create_pr_calls(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    issue = _issue()
+    run_id = state.record_issue_run_start(
+        run_kind="issue_flow",
+        issue_number=issue.number,
+        flow="design_doc",
+        branch="agent/design/7-add-worker-scheduler",
+        run_id="run-7",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert run_id == "run-7"
+    state.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key=(
+            "create_pr:7:main:agent/design/7-add-worker-scheduler:"
+            "run-7"
+        ),
+        payload_json=(
+            '{"base":"main","body":"Design doc.\\n\\nRefs #7",'
+            '"head":"agent/design/7-add-worker-scheduler",'
+            '"issue_number":7,'
+            '"title":"Design doc for #7: Design Title"}'
+        ),
+        run_id="run-7",
+        issue_number=issue.number,
+        branch="agent/design/7-add-worker-scheduler",
+        repo_full_name=cfg.repo.full_name,
+    )
+    github = FakeGitHub([issue])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    orch._ensure_poll_setup()
+
+    tracked = state.list_tracked_pull_requests(repo_full_name=cfg.repo.full_name)
+    assert len(tracked) == 1
+    assert tracked[0].issue_number == issue.number
+    assert tracked[0].pr_number == 101
+    assert github.created_prs == [
+        (
+            "Design doc for #7: Design Title",
+            "agent/design/7-add-worker-scheduler",
+            "main",
+            "Design doc.\n\nRefs #7",
+        )
+    ]
+    replayable = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert replayable == ()
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        run_row = conn.execute(
+            """
+            SELECT terminal_status
+            FROM agent_run_history
+            WHERE run_id = ?
+            """,
+            ("run-7",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert run_row is not None
+    assert run_row[0] == "completed"
+
+
+def test_ensure_poll_setup_replays_in_progress_create_pr_calls_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = StateStore(tmp_path / "state.db")
+    issue = _issue()
+    state.record_issue_run_start(
+        run_kind="issue_flow",
+        issue_number=issue.number,
+        flow="design_doc",
+        branch="agent/design/7-add-worker-scheduler",
+        run_id="run-7",
+        repo_full_name=cfg.repo.full_name,
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key=(
+            "create_pr:7:main:agent/design/7-add-worker-scheduler:"
+            "run-7"
+        ),
+        payload_json=(
+            '{"base":"main","body":"Design doc.\\n\\nRefs #7",'
+            '"head":"agent/design/7-add-worker-scheduler",'
+            '"issue_number":7,'
+            '"title":"Design doc for #7: Design Title"}'
+        ),
+        run_id="run-7",
+        issue_number=issue.number,
+        branch="agent/design/7-add-worker-scheduler",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert state.mark_github_call_in_progress(
+        call_id=intent.call_id,
+        repo_full_name=cfg.repo.full_name,
+    )
+    github = FakeGitHub([issue])
+    github.pr_lookup_by_head_base[("agent/design/7-add-worker-scheduler", "main")] = PullRequest(
+        number=212,
+        html_url="https://example/pr/212",
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    orch._ensure_poll_setup()
+
+    assert github.created_prs == []
+    tracked = state.list_tracked_pull_requests(repo_full_name=cfg.repo.full_name)
+    assert len(tracked) == 1
+    assert tracked[0].pr_number == 212
+    replayable = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert replayable == ()
 
 
 @given(st.text())

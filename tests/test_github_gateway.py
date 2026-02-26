@@ -143,6 +143,48 @@ def test_create_pull_request_and_comment(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls[2][2] == {"body": "reply", "in_reply_to": 55}
 
 
+def test_find_pull_request_by_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        assert method == "GET"
+        parsed = urlparse(path)
+        params = parse_qs(parsed.query)
+        assert params["head"] == ["o:agent/design/7-worker"]
+        assert params["base"] == ["main"]
+        assert params["state"] == ["open"]
+        return [
+            {"number": 99, "html_url": "https://example/pr/99"},
+            {"number": 101, "html_url": "https://example/pr/101"},
+        ]
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    pr = gateway.find_pull_request_by_head(head="agent/design/7-worker", base="main")
+    assert pr is not None
+    assert pr.number == 101
+    assert pr.html_url == "https://example/pr/101"
+
+
+def test_find_pull_request_by_head_returns_none_when_no_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+    assert gateway.find_pull_request_by_head(head="agent/design/7-worker", base="main") is None
+
+
+def test_find_pull_request_by_head_rejects_invalid_state() -> None:
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(ValueError, match="state must be 'open' or 'all'"):
+        gateway.find_pull_request_by_head(head="h", state="closed")  # type: ignore[arg-type]
+
+
 def test_get_issue_parses_object(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway = GitHubGateway("o", "r")
 
