@@ -711,6 +711,26 @@ class FakeState:
         _ = repo_full_name
         return issue_number in self.allowed
 
+    def claim_new_issue_run_start(
+        self,
+        *,
+        issue_number: int,
+        flow: str,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        _ = flow, branch, meta_json, started_at, repo_full_name
+        if issue_number not in self.allowed:
+            return None
+        self.allowed.discard(issue_number)
+        self.running.append(issue_number)
+        run_key = run_id or f"issue_flow:{issue_number}:{len(self.run_starts) + 1}"
+        self.run_starts.append(("issue_flow", run_key, issue_number, None))
+        return run_key
+
     def mark_running(self, issue_number: int, *, repo_full_name: str | None = None) -> None:
         _ = repo_full_name
         self.running.append(issue_number)

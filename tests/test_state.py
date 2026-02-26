@@ -96,14 +96,29 @@ def test_state_store_transitions_and_feedback_tracking(tmp_path: Path) -> None:
 
     assert store.can_enqueue(42) is True
 
-    store.mark_running(42)
+    run_id = store.claim_new_issue_run_start(
+        issue_number=42,
+        flow="design_doc",
+        branch="agent/design/42-worker",
+        run_id="run-42",
+    )
+    assert run_id == "run-42"
+    assert (
+        store.claim_new_issue_run_start(
+            issue_number=42,
+            flow="design_doc",
+            branch="agent/design/42-worker",
+            run_id="run-42-duplicate",
+        )
+        is None
+    )
     assert store.can_enqueue(42) is False
     assert _get_row(db_path, 42)[0] == "running"
 
     store.mark_failed(42, "boom")
     status, branch, pr_number, pr_url, error = _get_row(db_path, 42)
     assert status == "failed"
-    assert branch is None
+    assert branch == "agent/design/42-worker"
     assert pr_number is None
     assert pr_url is None
     assert error == "boom"

@@ -568,17 +568,6 @@ class Phase1Orchestrator:
                         )
                         continue
 
-                if not self._state.can_enqueue(
-                    issue.number, repo_full_name=self._state_repo_full_name()
-                ):
-                    log_event(
-                        LOGGER,
-                        "issue_skipped",
-                        issue_number=issue.number,
-                        reason="already_processed",
-                    )
-                    continue
-
                 branch = _branch_for_issue_flow(flow=flow, issue=issue)
                 context_json = self._serialize_pre_pr_context_for_issue(
                     issue=issue,
@@ -588,14 +577,21 @@ class Phase1Orchestrator:
                 consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
                     issue.number
                 )
-                run_id = self._state.record_issue_run_start(
-                    run_kind="issue_flow",
+                run_id = self._state.claim_new_issue_run_start(
                     issue_number=issue.number,
                     flow=flow,
                     branch=branch,
                     meta_json=_DEFAULT_RUN_META_JSON,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                if run_id is None:
+                    log_event(
+                        LOGGER,
+                        "issue_skipped",
+                        issue_number=issue.number,
+                        reason="already_processed",
+                    )
+                    continue
                 self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_issue_worker,

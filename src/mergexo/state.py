@@ -662,6 +662,50 @@ class StateStore:
                 ).fetchone()
         return row is None
 
+    def claim_new_issue_run_start(
+        self,
+        *,
+        issue_number: int,
+        flow: str,
+        branch: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        run_key = run_id if run_id is not None else uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            claimed = conn.execute(
+                """
+                INSERT INTO issue_runs(
+                    repo_full_name,
+                    issue_number,
+                    status,
+                    branch,
+                    active_run_id
+                )
+                VALUES(?, ?, 'running', ?, ?)
+                ON CONFLICT(repo_full_name, issue_number) DO NOTHING
+                """,
+                (repo_key, issue_number, branch, run_key),
+            )
+            if claimed.rowcount <= 0:
+                return None
+            self._insert_agent_run_start(
+                conn=conn,
+                run_id=run_key,
+                repo_full_name=repo_key,
+                run_kind="issue_flow",
+                issue_number=issue_number,
+                pr_number=None,
+                flow=flow,
+                branch=branch,
+                started_at=started_at,
+                meta_json=meta_json,
+            )
+        return run_key
+
     def _insert_agent_run_start(
         self,
         *,
