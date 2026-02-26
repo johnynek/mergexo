@@ -42,14 +42,24 @@ Example invariants:
 3. Avoid in-place mutation of shared state in orchestrator logic.
 4. If mutation is required for performance, isolate it and document why.
 
-## 5. Practical coding rules
+## 5. Robustness and safety policy
+
+1. Safety is the top priority for message handling and database operations.
+2. Design message processing and database writes to be crash-safe against abrupt termination
+   (power loss, process kill, kernel crash).
+3. Treat remote branch state as externally mutable: re-read and validate branch state before
+   acting, and handle divergence explicitly.
+4. Assume multiple MergeXO processes may run at once; use locking, transactions, and idempotent
+   handlers to prevent duplicate or conflicting effects.
+
+## 6. Practical coding rules
 
 1. Keep side effects at boundaries (GitHub API, git subprocesses, filesystem IO).
 2. Keep core decision logic deterministic and easy to replay in tests.
 3. Prefer small, composable functions and explicit data flow.
 4. Favor total functions over exception-driven control flow where practical.
 
-## 6. Suggested dependency baseline
+## 7. Suggested dependency baseline
 
 1. Runtime:
    - `pyrsistent`
@@ -60,7 +70,7 @@ Example invariants:
    - `pytest`
    - `pytest-cov`
 
-## 7. Development workflow
+## 8. Development workflow
 
 1. In worker environments, set a temporary UV cache before running `uv` commands: `export UV_CACHE_DIR=/tmp/uv-cache`.
 2. Add/update dependencies with `uv`.
