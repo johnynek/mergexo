@@ -41,6 +41,8 @@ default_branch = "main"
 trigger_label = "agent:design"
 bugfix_label = "agent:bugfix"
 small_job_label = "agent:small-job"
+# Human takeover label; while present MergeXO pauses automation for this source issue/linked PR.
+ignore_label = "agent:ignore"
 # Required path (repo-relative) to coding + testing guidelines agents should follow
 coding_guidelines_path = "docs/python_style.md"
 # Optional repo-relative or absolute path to an executable required before each push.

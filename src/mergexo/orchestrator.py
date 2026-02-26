@@ -323,6 +323,9 @@ class Phase1Orchestrator:
         self._current_poll_had_auth_error = False
         self._github_auth_shutdown_pending = False
         self._last_github_auth_error: str | None = None
+        self._poll_issue_cache: dict[int, Issue] = {}
+        self._poll_takeover_synced_issue_numbers: set[int] = set()
+        self._poll_takeover_active_issue_numbers: set[int] = set()
 
     def run(self, *, once: bool) -> None:
         with logging_repo_context(self._repo.full_name):
@@ -353,6 +356,9 @@ class Phase1Orchestrator:
         with logging_repo_context(self._repo.full_name):
             self._ensure_poll_setup()
             self._current_poll_had_auth_error = False
+            self._poll_issue_cache.clear()
+            self._poll_takeover_synced_issue_numbers.clear()
+            self._poll_takeover_active_issue_numbers.clear()
             log_event(
                 LOGGER,
                 "poll_started",
@@ -387,6 +393,11 @@ class Phase1Orchestrator:
             enqueue_allowed = allow_enqueue and not restart_pending and not auth_shutdown_pending
 
             if enqueue_allowed:
+                if not self._run_poll_step(
+                    step_name="sync_takeover_states",
+                    fn=self._sync_takeover_states,
+                ):
+                    poll_had_github_errors = True
                 # TODO remove migration after updates
                 if not self._run_poll_step(
                     step_name="repair_stale_running_runs",
@@ -564,11 +575,161 @@ class Phase1Orchestrator:
             )
             return False
 
+    def _sync_takeover_states(self) -> None:
+        repo_full_name = self._state_repo_full_name()
+        issue_numbers = set(self._state.list_active_issue_takeovers(repo_full_name=repo_full_name))
+        issue_numbers.update(
+            followup.issue_number
+            for followup in self._state.list_pre_pr_followups(repo_full_name=repo_full_name)
+        )
+        issue_numbers.update(
+            candidate.issue_number
+            for candidate in self._state.list_implementation_candidates(
+                repo_full_name=repo_full_name
+            )
+        )
+        issue_numbers.update(
+            tracked.issue_number
+            for tracked in self._state.list_tracked_pull_requests(repo_full_name=repo_full_name)
+        )
+        issue_numbers.update(
+            blocked.issue_number
+            for blocked in self._state.list_blocked_pull_requests(repo_full_name=repo_full_name)
+        )
+        for issue_number in sorted(issue_numbers):
+            self._sync_takeover_state_for_issue(issue_number=issue_number)
+
+    def _is_takeover_active(self, *, issue_number: int, issue: Issue | None = None) -> bool:
+        return self._sync_takeover_state_for_issue(issue_number=issue_number, issue=issue)
+
+    def _sync_takeover_state_for_issue(
+        self, *, issue_number: int, issue: Issue | None = None
+    ) -> bool:
+        if issue is not None:
+            self._poll_issue_cache[issue_number] = issue
+        if issue_number in self._poll_takeover_synced_issue_numbers:
+            return issue_number in self._poll_takeover_active_issue_numbers
+
+        issue_snapshot = self._issue_snapshot_for_poll(issue_number=issue_number, issue=issue)
+        ignore_label_active = self._repo.ignore_label in set(issue_snapshot.labels)
+        repo_full_name = self._state_repo_full_name()
+        was_active = self._state.get_issue_takeover_active(
+            issue_number=issue_number,
+            repo_full_name=repo_full_name,
+        )
+        if ignore_label_active or was_active:
+            # During takeover we continuously move comment floors/cursors forward so
+            # comments from the takeover period are never replayed on resume.
+            self._snapshot_takeover_comment_boundaries(
+                issue_number=issue_number,
+                clear_pending_feedback=ignore_label_active and not was_active,
+            )
+
+        if ignore_label_active != was_active:
+            self._state.set_issue_takeover_active(
+                issue_number=issue_number,
+                ignore_active=ignore_label_active,
+                repo_full_name=repo_full_name,
+            )
+            log_event(
+                LOGGER,
+                "issue_takeover_state_changed",
+                repo_full_name=repo_full_name,
+                issue_number=issue_number,
+                ignore_label=self._repo.ignore_label,
+                from_active=was_active,
+                to_active=ignore_label_active,
+            )
+
+        self._poll_takeover_synced_issue_numbers.add(issue_number)
+        if ignore_label_active:
+            self._poll_takeover_active_issue_numbers.add(issue_number)
+        else:
+            self._poll_takeover_active_issue_numbers.discard(issue_number)
+        return ignore_label_active
+
+    def _issue_snapshot_for_poll(self, *, issue_number: int, issue: Issue | None = None) -> Issue:
+        if issue is not None:
+            self._poll_issue_cache[issue_number] = issue
+            return issue
+        cached = self._poll_issue_cache.get(issue_number)
+        if cached is not None:
+            return cached
+        snapshot = self._github.get_issue(issue_number)
+        self._poll_issue_cache[issue_number] = snapshot
+        return snapshot
+
+    def _snapshot_takeover_comment_boundaries(
+        self,
+        *,
+        issue_number: int,
+        clear_pending_feedback: bool,
+    ) -> None:
+        repo_full_name = self._state_repo_full_name()
+        issue_comments = self._github.list_issue_comments(issue_number)
+        issue_comment_id_max = max((comment.comment_id for comment in issue_comments), default=0)
+        self._state.advance_pre_pr_last_consumed_comment_id(
+            issue_number=issue_number,
+            comment_id=issue_comment_id_max,
+            repo_full_name=repo_full_name,
+        )
+        self._state.advance_post_pr_last_redirected_comment_id(
+            issue_number=issue_number,
+            comment_id=issue_comment_id_max,
+            repo_full_name=repo_full_name,
+        )
+
+        pr_numbers = self._state.list_feedback_pr_numbers_for_issue(
+            issue_number=issue_number,
+            repo_full_name=repo_full_name,
+        )
+        cleared_event_count = 0
+        for pr_number in pr_numbers:
+            review_comments = self._github.list_pull_request_review_comments(pr_number)
+            issue_thread_comments = self._github.list_pull_request_issue_comments(pr_number)
+            review_comment_id_max = max(
+                (comment.comment_id for comment in review_comments),
+                default=0,
+            )
+            issue_thread_comment_id_max = max(
+                (comment.comment_id for comment in issue_thread_comments),
+                default=0,
+            )
+            self._state.advance_pr_takeover_comment_floors(
+                pr_number=pr_number,
+                review_floor_comment_id=review_comment_id_max,
+                issue_floor_comment_id=issue_thread_comment_id_max,
+                repo_full_name=repo_full_name,
+            )
+            if clear_pending_feedback:
+                cleared_event_count += self._state.mark_pending_feedback_events_processed_for_pr(
+                    pr_number=pr_number,
+                    repo_full_name=repo_full_name,
+                )
+        log_event(
+            LOGGER,
+            "issue_takeover_boundaries_synced",
+            repo_full_name=repo_full_name,
+            issue_number=issue_number,
+            issue_comment_floor=issue_comment_id_max,
+            linked_pr_count=len(pr_numbers),
+            pending_feedback_events_cleared=cleared_event_count,
+        )
+
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
         labels = _trigger_labels(self._repo)
         issues = self._github.list_open_issues_with_any_labels(labels)
         log_event(LOGGER, "issues_fetched", issue_count=len(issues), label_count=len(labels))
         for issue in issues:
+            if self._is_takeover_active(issue_number=issue.number, issue=issue):
+                log_event(
+                    LOGGER,
+                    "issue_skipped",
+                    issue_number=issue.number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
             if not self._is_issue_author_allowed(
                 issue_number=issue.number,
                 author_login=issue.author_login,
@@ -587,6 +748,7 @@ class Phase1Orchestrator:
                 design_label=self._repo.trigger_label,
                 bugfix_label=self._repo.bugfix_label,
                 small_job_label=self._repo.small_job_label,
+                ignore_label=self._repo.ignore_label,
             )
             if flow is None:
                 log_event(
@@ -686,6 +848,15 @@ class Phase1Orchestrator:
             candidate_count=len(candidates),
         )
         for candidate in candidates:
+            if self._is_takeover_active(issue_number=candidate.issue_number):
+                log_event(
+                    LOGGER,
+                    "implementation_skipped",
+                    issue_number=candidate.issue_number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
             capacity_reserved = False
             try:
                 with self._running_lock:
@@ -708,7 +879,7 @@ class Phase1Orchestrator:
                         continue
 
                 branch = _branch_for_implementation_candidate(candidate)
-                issue = self._github.get_issue(candidate.issue_number)
+                issue = self._issue_snapshot_for_poll(issue_number=candidate.issue_number)
                 context_json = self._serialize_pre_pr_context_for_implementation(
                     issue=issue,
                     candidate=candidate,
@@ -767,6 +938,16 @@ class Phase1Orchestrator:
         )
         log_event(LOGGER, "feedback_scan_started", tracked_pr_count=len(tracked_prs))
         for tracked in tracked_prs:
+            if self._is_takeover_active(issue_number=tracked.issue_number):
+                log_event(
+                    LOGGER,
+                    "feedback_turn_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
             capacity_reserved = False
             try:
                 with self._running_lock:
@@ -825,6 +1006,16 @@ class Phase1Orchestrator:
             return
 
         for followup in followups:
+            if self._is_takeover_active(issue_number=followup.issue_number):
+                log_event(
+                    LOGGER,
+                    "pre_pr_followup_enqueued",
+                    repo_full_name=self._state_repo_full_name(),
+                    issue_number=followup.issue_number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
             capacity_reserved = False
             try:
                 with self._running_lock:
@@ -1010,6 +1201,16 @@ class Phase1Orchestrator:
             policy=policy,
         )
         for tracked in tracked_prs:
+            if self._is_takeover_active(issue_number=tracked.issue_number):
+                log_event(
+                    LOGGER,
+                    "actions_monitor_skipped",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
             pr = self._github.get_pull_request(tracked.pr_number)
             if pr.merged or pr.state.lower() != "open":
                 continue
@@ -1096,6 +1297,17 @@ class Phase1Orchestrator:
             return
 
         for issue_number, pr_number in sorted(redirect_targets.items()):
+            if self._is_takeover_active(issue_number=issue_number):
+                log_event(
+                    LOGGER,
+                    "source_issue_redirect_skipped",
+                    repo_full_name=self._state_repo_full_name(),
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
             if self._incremental_comment_fetch_enabled():
                 incremental_scan = self._scan_incremental_issue_comments(
                     issue_number=issue_number,
@@ -1190,6 +1402,8 @@ class Phase1Orchestrator:
             repo_full_name=self._state_repo_full_name()
         )
         for legacy in legacy_runs:
+            if self._is_takeover_active(issue_number=legacy.issue_number):
+                continue
             if not _is_recoverable_pre_pr_error(legacy.error or ""):
                 continue
             issue = self._github.get_issue(legacy.issue_number)
@@ -1199,6 +1413,7 @@ class Phase1Orchestrator:
                 design_label=self._repo.trigger_label,
                 bugfix_label=self._repo.bugfix_label,
                 small_job_label=self._repo.small_job_label,
+                ignore_label=self._repo.ignore_label,
             )
             if flow is None:
                 continue
@@ -1260,6 +1475,17 @@ class Phase1Orchestrator:
     # TODO remove migration after updates
     def _recover_missing_pr_branch(self, *, issue_number: int, branch: str) -> None:
         issue = self._github.get_issue(issue_number)
+        if self._is_takeover_active(issue_number=issue.number, issue=issue):
+            log_event(
+                LOGGER,
+                "failed_branch_pr_repair_skipped",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue.number,
+                branch=branch,
+                reason="ignore_label_active",
+                ignore_label=self._repo.ignore_label,
+            )
+            return
         if not self._is_issue_author_allowed(
             issue_number=issue.number,
             author_login=issue.author_login,
@@ -1544,15 +1770,28 @@ class Phase1Orchestrator:
         issue_numbers = self._operator_issue_numbers_to_scan()
         if not issue_numbers:
             return
-        blocked_pr_numbers = {
-            blocked.pr_number
+        blocked_pr_issue_numbers = {
+            blocked.pr_number: blocked.issue_number
             for blocked in self._state.list_blocked_pull_requests(
                 repo_full_name=self._state_repo_full_name()
             )
         }
 
         for issue_number in issue_numbers:
-            source_pr_number = issue_number if issue_number in blocked_pr_numbers else None
+            source_issue_number = blocked_pr_issue_numbers.get(issue_number)
+            if source_issue_number is not None and self._is_takeover_active(
+                issue_number=source_issue_number
+            ):
+                log_event(
+                    LOGGER,
+                    "operator_command_scan_skipped",
+                    issue_number=issue_number,
+                    source_issue_number=source_issue_number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
+            source_pr_number = issue_number if source_issue_number is not None else None
             if self._incremental_comment_fetch_enabled():
                 incremental_scan = self._scan_incremental_issue_comments(
                     issue_number=issue_number,
@@ -4123,7 +4362,17 @@ class Phase1Orchestrator:
                 )
                 return "closed"
 
-            issue = self._github.get_issue(tracked.issue_number)
+            issue = self._issue_snapshot_for_poll(issue_number=tracked.issue_number)
+            if self._is_takeover_active(issue_number=tracked.issue_number, issue=issue):
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                return "completed"
             if not self._repo.allows(issue.author_login):
                 reason = "unauthorized_issue_author"
                 error = "feedback ignored because issue author is not allowed by repo.allowed_users"
@@ -4203,6 +4452,12 @@ class Phase1Orchestrator:
                     comments=tuple(issue_comments),
                 )
             changed_files = self._github.list_pull_request_files(tracked.pr_number)
+            review_floor_comment_id, issue_floor_comment_id = (
+                self._state.get_pr_takeover_comment_floors(
+                    pr_number=tracked.pr_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            )
 
             previous_pending = self._state.list_pending_feedback_events(
                 tracked.pr_number,
@@ -4212,11 +4467,13 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 issue_number=tracked.issue_number,
                 comments=review_comments,
+                takeover_review_floor_comment_id=review_floor_comment_id,
             )
             normalized_issue = self._normalize_issue_events(
                 pr_number=tracked.pr_number,
                 issue_number=tracked.issue_number,
                 comments=issue_comments,
+                takeover_issue_floor_comment_id=issue_floor_comment_id,
             )
             self._state.ingest_feedback_scan_batch(
                 events=tuple(event for event, _ in normalized_review)
@@ -5317,9 +5574,12 @@ class Phase1Orchestrator:
         pr_number: int,
         issue_number: int,
         comments: list[PullRequestReviewComment],
+        takeover_review_floor_comment_id: int = 0,
     ) -> list[tuple[FeedbackEventRecord, PullRequestReviewComment]]:
         normalized: list[tuple[FeedbackEventRecord, PullRequestReviewComment]] = []
         for comment in comments:
+            if comment.comment_id <= takeover_review_floor_comment_id:
+                continue
             if is_bot_login(comment.user_login):
                 continue
             if not self._repo.allows(comment.user_login):
@@ -5370,9 +5630,12 @@ class Phase1Orchestrator:
         pr_number: int,
         issue_number: int,
         comments: list[PullRequestIssueComment],
+        takeover_issue_floor_comment_id: int = 0,
     ) -> list[tuple[FeedbackEventRecord, PullRequestIssueComment]]:
         normalized: list[tuple[FeedbackEventRecord, PullRequestIssueComment]] = []
         for comment in comments:
+            if comment.comment_id <= takeover_issue_floor_comment_id:
+                continue
             if is_bot_login(comment.user_login):
                 continue
             if not self._repo.allows(comment.user_login):
@@ -5703,12 +5966,14 @@ def _infer_pre_pr_flow_from_issue_and_error(
     design_label: str,
     bugfix_label: str,
     small_job_label: str,
+    ignore_label: str | None = None,
 ) -> PrePrFlow | None:
     resolved = _resolve_issue_flow(
         issue=issue,
         design_label=design_label,
         bugfix_label=bugfix_label,
         small_job_label=small_job_label,
+        ignore_label=ignore_label,
     )
     if resolved is not None:
         return resolved
@@ -5868,8 +6133,11 @@ def _resolve_issue_flow(
     design_label: str,
     bugfix_label: str,
     small_job_label: str,
+    ignore_label: str | None = None,
 ) -> IssueFlow | None:
     issue_labels = set(issue.labels)
+    if ignore_label and ignore_label in issue_labels:
+        return None
     if bugfix_label in issue_labels:
         return "bugfix"
     if small_job_label in issue_labels:

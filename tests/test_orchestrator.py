@@ -516,6 +516,9 @@ class FakeState:
         self._pr_status_by_pr: dict[int, str] = {}
         self._action_tokens: dict[str, ActionTokenState] = {}
         self._poll_cursors: dict[tuple[str, int], GitHubCommentPollCursorState] = {}
+        self._issue_comment_cursors: dict[int, tuple[int, int]] = {}
+        self._takeover_active_issue_numbers: set[int] = set()
+        self._takeover_comment_floors_by_pr: dict[int, tuple[int, int]] = {}
         self._next_github_call_id = 1
         self._github_calls_by_id: dict[int, dict[str, object]] = {}
         self._github_call_id_by_dedupe: dict[str, int] = {}
@@ -523,6 +526,7 @@ class FakeState:
         self.claim_blocked_pre_pr_followup_issue_numbers: set[int] = set()
         self.claim_blocked_feedback_pr_numbers: set[int] = set()
         self.released_feedback_claims: list[tuple[int, str]] = []
+        self.cleared_feedback_event_pr_numbers: list[int] = []
 
     def _github_call_state(self, row: dict[str, object]) -> GitHubCallOutboxState:
         return GitHubCallOutboxState(
@@ -864,6 +868,97 @@ class FakeState:
         _ = repo_full_name
         return tuple(self.implementation_candidates)
 
+    def list_pre_pr_followups(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[PrePrFollowupState, ...]:
+        _ = repo_full_name
+        return ()
+
+    def get_issue_takeover_active(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> bool:
+        _ = repo_full_name
+        return issue_number in self._takeover_active_issue_numbers
+
+    def set_issue_takeover_active(
+        self,
+        *,
+        issue_number: int,
+        ignore_active: bool,
+        repo_full_name: str | None = None,
+    ) -> object:
+        _ = repo_full_name
+        if ignore_active:
+            self._takeover_active_issue_numbers.add(issue_number)
+        else:
+            self._takeover_active_issue_numbers.discard(issue_number)
+        return cast(
+            object,
+            type(
+                "IssueTakeoverState",
+                (),
+                {
+                    "repo_full_name": repo_full_name or "",
+                    "issue_number": issue_number,
+                    "ignore_active": ignore_active,
+                    "updated_at": "now",
+                },
+            )(),
+        )
+
+    def list_active_issue_takeovers(self, *, repo_full_name: str | None = None) -> tuple[int, ...]:
+        _ = repo_full_name
+        return tuple(sorted(self._takeover_active_issue_numbers))
+
+    def list_feedback_pr_numbers_for_issue(
+        self,
+        *,
+        issue_number: int,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, ...]:
+        _ = repo_full_name
+        return tuple(
+            sorted(
+                tracked.pr_number
+                for tracked in self.tracked
+                if tracked.issue_number == issue_number
+            )
+        )
+
+    def get_pr_takeover_comment_floors(
+        self,
+        *,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, int]:
+        _ = repo_full_name
+        return self._takeover_comment_floors_by_pr.get(pr_number, (0, 0))
+
+    def advance_pr_takeover_comment_floors(
+        self,
+        *,
+        pr_number: int,
+        review_floor_comment_id: int,
+        issue_floor_comment_id: int,
+        repo_full_name: str | None = None,
+    ) -> tuple[int, int]:
+        _ = repo_full_name
+        review_floor, issue_floor = self._takeover_comment_floors_by_pr.get(pr_number, (0, 0))
+        next_review_floor = max(review_floor, review_floor_comment_id)
+        next_issue_floor = max(issue_floor, issue_floor_comment_id)
+        self._takeover_comment_floors_by_pr[pr_number] = (next_review_floor, next_issue_floor)
+        return next_review_floor, next_issue_floor
+
+    def mark_pending_feedback_events_processed_for_pr(
+        self,
+        *,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> int:
+        _ = repo_full_name
+        self.cleared_feedback_event_pr_numbers.append(pr_number)
+        return 0
+
     def list_legacy_failed_issue_runs_without_pr(
         self, *, repo_full_name: str | None = None
     ) -> tuple[object, ...]:
@@ -1034,6 +1129,50 @@ class FakeState:
         _ = repo_full_name, reason, detail
         self.status_updates.append((pr_number, issue_number, status, last_seen_head_sha, error))
         self._pr_status_by_pr[pr_number] = status
+
+    def get_issue_comment_cursor(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> object:
+        _ = repo_full_name
+        pre_pr, post_pr = self._issue_comment_cursors.get(issue_number, (0, 0))
+        return cast(
+            object,
+            type(
+                "IssueCommentCursorState",
+                (),
+                {
+                    "repo_full_name": repo_full_name or "",
+                    "issue_number": issue_number,
+                    "pre_pr_last_consumed_comment_id": pre_pr,
+                    "post_pr_last_redirected_comment_id": post_pr,
+                    "updated_at": "now",
+                },
+            )(),
+        )
+
+    def advance_pre_pr_last_consumed_comment_id(
+        self,
+        *,
+        issue_number: int,
+        comment_id: int,
+        repo_full_name: str | None = None,
+    ) -> object:
+        _ = repo_full_name
+        pre_pr, post_pr = self._issue_comment_cursors.get(issue_number, (0, 0))
+        self._issue_comment_cursors[issue_number] = (max(pre_pr, comment_id), post_pr)
+        return self.get_issue_comment_cursor(issue_number, repo_full_name=repo_full_name)
+
+    def advance_post_pr_last_redirected_comment_id(
+        self,
+        *,
+        issue_number: int,
+        comment_id: int,
+        repo_full_name: str | None = None,
+    ) -> object:
+        _ = repo_full_name
+        pre_pr, post_pr = self._issue_comment_cursors.get(issue_number, (0, 0))
+        self._issue_comment_cursors[issue_number] = (pre_pr, max(post_pr, comment_id))
+        return self.get_issue_comment_cursor(issue_number, repo_full_name=repo_full_name)
 
     def ingest_feedback_events(self, events: object, *, repo_full_name: str | None = None) -> None:
         _ = events, repo_full_name
@@ -1233,6 +1372,7 @@ def _config(
     restart_supported_modes: tuple[str, ...] = ("git_checkout",),
     operations_issue_number: int | None = None,
     operator_logins: tuple[str, ...] = (),
+    ignore_label: str = "agent:ignore",
     allowed_users: tuple[str, ...] = ("issue-author", "reviewer"),
     required_tests: str | None = None,
     test_file_regex: tuple[str, ...] | None = None,
@@ -1277,6 +1417,7 @@ def _config(
                 pr_actions_feedback_policy=pr_actions_feedback_policy,
                 operations_issue_number=operations_issue_number,
                 operator_logins=operator_logins,
+                ignore_label=ignore_label,
             ),
         ),
         codex=CodexConfig(enabled=True, model=None, sandbox=None, profile=None, extra_args=()),
@@ -2105,8 +2246,19 @@ def test_flow_helpers() -> None:
             design_label=cfg.trigger_label,
             bugfix_label=cfg.bugfix_label,
             small_job_label=cfg.small_job_label,
+            ignore_label=cfg.ignore_label,
         )
         == "bugfix"
+    )
+    assert (
+        _resolve_issue_flow(
+            issue=_issue(labels=("agent:bugfix", cfg.ignore_label)),
+            design_label=cfg.trigger_label,
+            bugfix_label=cfg.bugfix_label,
+            small_job_label=cfg.small_job_label,
+            ignore_label=cfg.ignore_label,
+        )
+        is None
     )
     assert _issue_branch(flow="design_doc", issue_number=7, slug="x") == "agent/design/7-x"
     assert _issue_branch(flow="bugfix", issue_number=7, slug="x") == "agent/bugfix/7-x"
@@ -3468,6 +3620,31 @@ def test_enqueue_implementation_work_paths(tmp_path: Path) -> None:
     assert len(state.run_starts) == starts_before
 
 
+def test_enqueue_implementation_work_skips_takeover_issue(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:design", "agent:ignore"))
+    github = FakeGitHub([issue])
+    state = FakeState()
+    state.implementation_candidates = [
+        ImplementationCandidateState(
+            issue_number=issue.number,
+            design_branch="agent/design/7-a",
+            design_pr_number=41,
+            design_pr_url="https://example/pr/41",
+        )
+    ]
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class FakePool:
+        def submit(self, fn, candidate, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, candidate, extra
+            raise AssertionError("implementation worker should not be submitted for takeover issue")
+
+    orch._enqueue_implementation_work(FakePool())
+    assert state.running == []
+
+
 def test_shared_global_work_limiter_caps_enqueue_across_orchestrators(tmp_path: Path) -> None:
     cfg = _config(tmp_path, worker_count=1)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -3585,6 +3762,46 @@ def test_enqueue_new_work_skips_issues_without_matching_labels(tmp_path: Path) -
 
     orch._enqueue_new_work(FakePool())
     assert state.running == []
+
+
+def test_enqueue_new_work_skips_issues_with_ignore_label(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    git = FakeGitManager(tmp_path / "checkouts")
+    ignored_issue = _issue(1, "Ignored", labels=("agent:design", "agent:ignore"))
+    github = FakeGitHub([ignored_issue])
+    state = FakeState(allowed={1})
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class FakePool:
+        def submit(self, fn, issue, flow, *extra):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, extra
+            raise AssertionError("submit should not be called for ignored issues")
+
+    orch._enqueue_new_work(FakePool())
+
+    assert state.running == []
+    assert 1 in state._takeover_active_issue_numbers
+
+
+def test_sync_takeover_states_processes_known_issue_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, worker_count=1)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    state = FakeState()
+    state._takeover_active_issue_numbers.add(7)
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    seen: list[int] = []
+
+    def _record_sync(*, issue_number: int, issue: Issue | None = None) -> bool:
+        _ = issue
+        seen.append(issue_number)
+        return False
+
+    monkeypatch.setattr(orch, "_sync_takeover_state_for_issue", _record_sync)
+    orch._sync_takeover_states()
+    assert seen == [7]
 
 
 def test_reap_finished_marks_success_and_failure(tmp_path: Path) -> None:
@@ -3951,6 +4168,19 @@ def test_recover_missing_pr_branch_returns_for_unauthorized_issue_author(tmp_pat
     assert state.completed == []
 
 
+def test_recover_missing_pr_branch_skips_takeover_issue(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, ignore_label="agent:ignore")
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(number=7, labels=("agent:bugfix", "agent:ignore"))])
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._recover_missing_pr_branch(issue_number=7, branch="agent/bugfix/7-one")
+
+    assert github.created_prs == []
+    assert 7 in state._takeover_active_issue_numbers
+
+
 def test_recover_missing_pr_branch_handles_pr_create_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -4166,6 +4396,115 @@ def test_enqueue_pre_pr_followup_work_skips_when_claim_is_lost(
     assert row[0] == "awaiting_issue_followup"
 
 
+def test_enqueue_pre_pr_followup_work_skips_takeover_issue(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix", "agent:ignore"))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=45,
+            body="Please continue",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-45",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=issue.number,
+        flow="bugfix",
+        branch="agent/bugfix/7-add-worker-scheduler",
+        context_json="{}",
+        waiting_reason="bugfix flow blocked: waiting for details",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class NoopPool:
+        def submit(self, *args: object, **kwargs: object) -> Future[WorkResult]:
+            _ = args, kwargs
+            raise AssertionError("submit should not be called for takeover followups")
+
+    orch._enqueue_pre_pr_followup_work(NoopPool())
+    followups = state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name)
+    assert len(followups) == 1
+    cursor = state.get_issue_comment_cursor(issue.number, repo_full_name=cfg.repo.full_name)
+    assert cursor.pre_pr_last_consumed_comment_id == 45
+
+
+def test_takeover_resume_processes_only_comments_after_resume_boundary(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    active_issue = _issue(labels=("agent:bugfix", "agent:ignore"))
+    github = FakeGitHub([active_issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=40,
+            body="takeover comment",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-40",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-add-worker-scheduler",
+        context_json="{}",
+        waiting_reason="bugfix flow blocked: waiting for details",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    assert orch._is_takeover_active(issue_number=7, issue=active_issue) is True
+    cursor_during_takeover = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor_during_takeover.pre_pr_last_consumed_comment_id == 40
+
+    resumed_issue = _issue(labels=("agent:bugfix",))
+    github.issues = [resumed_issue]
+    orch._poll_issue_cache.clear()
+    orch._poll_takeover_synced_issue_numbers.clear()
+    orch._poll_takeover_active_issue_numbers.clear()
+    assert orch._is_takeover_active(issue_number=7, issue=resumed_issue) is False
+
+    github.issue_comments.append(
+        PullRequestIssueComment(
+            comment_id=41,
+            body="resume comment",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-41",
+            created_at="2026-02-23T00:01:00Z",
+            updated_at="2026-02-23T00:01:00Z",
+        )
+    )
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.submitted_comment_ids: list[int] = []
+
+        def submit(self, fn, issue, flow, branch, consumed_comment_id_max):  # type: ignore[no-untyped-def]
+            _ = fn, issue, flow, branch
+            self.submitted_comment_ids.append(consumed_comment_id_max)
+            fut: Future[WorkResult] = Future()
+            fut.set_result(
+                WorkResult(
+                    issue_number=7,
+                    branch="agent/bugfix/7-add-worker-scheduler",
+                    pr_number=101,
+                    pr_url="https://example/pr/101",
+                )
+            )
+            return fut
+
+    pool = FakePool()
+    orch._enqueue_pre_pr_followup_work(pool)
+    assert pool.submitted_comment_ids == [41]
+
+
 def test_enqueue_pre_pr_followup_work_legacy_mode_records_token_observation(
     tmp_path: Path,
 ) -> None:
@@ -4345,12 +4684,85 @@ def test_post_pr_source_issue_comment_redirects_are_idempotent_and_filtered(
     token = compute_source_issue_redirect_token(issue_number=7, pr_number=101, comment_id=30)
     assert token in redirected_body
     assert "no longer actioned" in redirected_body
-
     cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
     assert cursor.post_pr_last_redirected_comment_id == 32
 
+    # Second scan should skip all comments at or below the stored cursor.
     orch._scan_post_pr_source_issue_comment_redirects()
     assert len(github.comments) == 1
+
+
+def test_post_pr_source_issue_comment_redirects_skip_takeover_issue(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix", "agent:ignore"))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=30,
+            body="Please update status.",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-30",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/bugfix/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert github.comments == []
+    cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor.post_pr_last_redirected_comment_id == 30
+    assert state.get_issue_takeover_active(7, repo_full_name=cfg.repo.full_name) is True
+
+    orch._scan_post_pr_source_issue_comment_redirects()
+    assert github.comments == []
+
+
+def test_post_pr_source_redirects_ingest_action_token_observations(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:bugfix",))
+    github = FakeGitHub([issue])
+    token = "a" * 64
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=30,
+            body=f"automation marker\n\n<!-- mergexo-action:{token} -->",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-30",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/bugfix/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._scan_post_pr_source_issue_comment_redirects()
+    observed = state.get_action_token(token, repo_full_name=cfg.repo.full_name)
+    assert observed is not None
+    assert observed.status == "observed"
 
 
 def test_post_pr_source_redirects_incremental_bootstrap_skips_history(
@@ -4448,6 +4860,32 @@ def test_adopt_legacy_failed_pre_pr_runs_moves_recoverable_rows_to_followup_wait
     assert followups[0].flow == "small_job"
     cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
     assert cursor.pre_pr_last_consumed_comment_id == 99
+
+
+def test_adopt_legacy_failed_pre_pr_runs_skips_takeover_issues(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:small-job", "agent:ignore"))
+    github = FakeGitHub([issue])
+    state = StateStore(tmp_path / "state.db")
+    state.mark_failed(
+        issue_number=7,
+        error="small-job flow blocked: environment issue",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._adopt_legacy_failed_pre_pr_runs()
+
+    row = _issue_run_row(tmp_path / "state.db", 7)
+    assert row[0] == "failed"
+    assert state.list_pre_pr_followups(repo_full_name=cfg.repo.full_name) == ()
 
 
 def test_run_once_with_issue_comment_routing_invokes_followup_and_redirect_scans(
@@ -6306,6 +6744,44 @@ def test_monitor_pr_actions_skips_enqueue_while_runs_active(tmp_path: Path) -> N
     assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
 
 
+def test_monitor_pr_actions_skips_takeover_issues(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:design", "agent:ignore"))
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7001,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T01:00:00Z",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._monitor_pr_actions()
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+
+
 def test_monitor_pr_actions_never_policy_skips_enqueue(tmp_path: Path) -> None:
     cfg = _config(
         tmp_path,
@@ -7233,6 +7709,32 @@ def test_run_once_invokes_feedback_enqueue(tmp_path: Path, monkeypatch: pytest.M
     assert calls["feedback"] == 1
 
 
+def test_enqueue_feedback_work_skips_takeover_issues(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(labels=("agent:design", "agent:ignore"))])
+    state = FakeState()
+    state.tracked = [
+        TrackedPullRequestState(
+            pr_number=101,
+            issue_number=7,
+            branch="agent/design/7",
+            status="awaiting_feedback",
+            last_seen_head_sha=None,
+        )
+    ]
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class FakePool:
+        def submit(self, fn, tracked):  # type: ignore[no-untyped-def]
+            _ = fn, tracked
+            raise AssertionError("feedback worker should not be submitted for takeover issues")
+
+    starts_before = len(state.run_starts)
+    orch._enqueue_feedback_work(FakePool())
+    assert len(state.run_starts) == starts_before
+
+
 def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) -> None:
     cfg = _config(tmp_path, worker_count=3)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -7402,6 +7904,58 @@ def test_feedback_turn_marks_merged_pr_and_stops_tracking(tmp_path: Path) -> Non
     tracked = _tracked_state_from_store(state)
     orch._process_feedback_turn(tracked)
     assert state.list_tracked_pull_requests() == ()
+
+
+def test_feedback_turn_skips_when_takeover_ignore_label_is_active(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:design", "agent:ignore"))
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment(comment_id=13)]
+    github.issue_comments = [_issue_comment(comment_id=23)]
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:review:11:2026-02-21T00:00:00Z",
+                pr_number=101,
+                issue_number=issue.number,
+                kind="review",
+                comment_id=11,
+                updated_at="2026-02-21T00:00:00Z",
+            ),
+        ),
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    tracked = _tracked_state_from_store(state)
+    result = orch._process_feedback_turn(tracked)
+    assert result == "completed"
+    assert state.get_issue_takeover_active(issue.number, repo_full_name=cfg.repo.full_name) is True
+    assert state.get_pr_takeover_comment_floors(
+        pr_number=101,
+        repo_full_name=cfg.repo.full_name,
+    ) == (13, 23)
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
 
 
 def test_feedback_turn_blocks_when_session_missing(tmp_path: Path) -> None:
@@ -8488,6 +9042,31 @@ def test_normalize_filters_tokenized_comments(tmp_path: Path) -> None:
     assert normalized_issue[0][0].kind == "issue"
 
 
+def test_normalize_filters_comments_at_or_below_takeover_comment_floors(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg, state=FakeState(), github=github, git_manager=git, agent=FakeAgent()
+    )
+
+    normalized_review = orch._normalize_review_events(
+        pr_number=10,
+        issue_number=20,
+        comments=[_review_comment(comment_id=4), _review_comment(comment_id=5)],
+        takeover_review_floor_comment_id=4,
+    )
+    normalized_issue = orch._normalize_issue_events(
+        pr_number=10,
+        issue_number=20,
+        comments=[_issue_comment(comment_id=8), _issue_comment(comment_id=9)],
+        takeover_issue_floor_comment_id=8,
+    )
+
+    assert tuple(event.comment_id for event, _ in normalized_review) == (5,)
+    assert tuple(event.comment_id for event, _ in normalized_issue) == (9,)
+
+
 def test_fetch_remote_action_tokens_reads_recent_pr_comment_surfaces(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -9201,8 +9780,14 @@ def _operator_issue_comment(
 
 
 class OperatorGitHub:
-    def __init__(self, threads: dict[int, list[PullRequestIssueComment]]) -> None:
+    def __init__(
+        self,
+        threads: dict[int, list[PullRequestIssueComment]],
+        *,
+        issues: dict[int, Issue] | None = None,
+    ) -> None:
         self._threads = {issue_number: list(items) for issue_number, items in threads.items()}
+        self._issues = dict(issues or {})
         self.posted_comments: list[tuple[int, str]] = []
         self._next_comment_id = 5000
 
@@ -9225,6 +9810,108 @@ class OperatorGitHub:
                 updated_at="now",
             )
         )
+
+    def get_issue(self, issue_number: int) -> Issue:
+        issue = self._issues.get(issue_number)
+        if issue is not None:
+            return issue
+        return Issue(
+            number=issue_number,
+            title=f"Issue {issue_number}",
+            body="Body",
+            html_url=f"https://example/issues/{issue_number}",
+            labels=(),
+            author_login="issue-author",
+        )
+
+
+def test_scan_operator_commands_returns_when_no_issue_numbers(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True, operator_logins=("alice",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub({})
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._scan_operator_commands()
+    assert github.posted_comments == []
+
+
+def test_scan_operator_commands_skips_blocked_pr_threads_during_takeover(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True, operator_logins=("alice",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    source_issue = _issue(number=7, labels=("agent:design", "agent:ignore"))
+    github = FakeGitHub([source_issue])
+    github.issue_comments = [
+        _operator_issue_comment(
+            comment_id=10,
+            body="/mergexo help",
+            user_login="alice",
+            updated_at="2026-02-22T12:00:00Z",
+            issue_number=101,
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        7, "agent/design/7-worker", 101, "https://example/pr/101", repo_full_name=cfg.repo.full_name
+    )
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        last_seen_head_sha="head-1",
+        error="blocked",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._scan_operator_commands()
+
+    assert state.get_operator_command("101:10:2026-02-22T12:00:00Z") is None
+    assert github.comments == []
+
+
+def test_scan_operator_commands_ingests_action_token_observations(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    token = "b" * 64
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=10,
+                    body=f"status marker\n\n<!-- mergexo-action:{token} -->",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:00:00Z",
+                    issue_number=77,
+                )
+            ]
+        }
+    )
+    state = StateStore(tmp_path / "state.db")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+
+    orch._scan_operator_commands()
+    observed = state.get_action_token(token, repo_full_name=cfg.repo.full_name)
+    assert observed is not None
+    assert observed.status == "observed"
+    assert github.posted_comments == []
 
 
 def test_operator_scan_incremental_bootstrap_skips_history(tmp_path: Path) -> None:

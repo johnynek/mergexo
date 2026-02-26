@@ -217,11 +217,16 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         assert "duration_seconds" in run_history_columns
         assert "active_run_id" in issue_run_columns
         assert "active_run_id" in pr_feedback_columns
+        assert "takeover_review_floor_comment_id" in pr_feedback_columns
+        assert "takeover_issue_floor_comment_id" in pr_feedback_columns
         assert "last_failure_class" in issue_run_columns
         assert "retry_count" in issue_run_columns
         assert "next_retry_at" in issue_run_columns
         assert "state_applied" in outbox_columns
         assert "result_json" in outbox_columns
+        takeover_columns = set(_table_columns(conn, "issue_takeover_state"))
+        assert "ignore_active" in takeover_columns
+        assert "updated_at" in takeover_columns
     finally:
         conn.close()
 
@@ -1256,6 +1261,8 @@ def test_state_store_migrates_pr_feedback_state_active_run_id_column(tmp_path: P
     finally:
         conn.close()
     assert "active_run_id" in columns
+    assert "takeover_review_floor_comment_id" in columns
+    assert "takeover_issue_floor_comment_id" in columns
 
 
 def test_poll_cursor_and_action_token_lifecycle(tmp_path: Path) -> None:
@@ -1509,6 +1516,226 @@ def test_pre_pr_followup_state_and_issue_comment_cursors(tmp_path: Path) -> None
 
     store.clear_pre_pr_followup_state(7)
     assert store.list_pre_pr_followups() == ()
+
+
+def test_issue_takeover_state_and_feedback_comment_floors(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    assert store.get_issue_takeover_active(7) is False
+    takeover = store.set_issue_takeover_active(issue_number=7, ignore_active=True)
+    assert takeover.issue_number == 7
+    assert takeover.ignore_active is True
+    assert store.get_issue_takeover_active(7) is True
+    assert store.list_active_issue_takeovers() == (7,)
+
+    takeover_off = store.set_issue_takeover_active(issue_number=7, ignore_active=False)
+    assert takeover_off.ignore_active is False
+    assert store.get_issue_takeover_active(7) is False
+    assert store.list_active_issue_takeovers() == ()
+
+    store.mark_completed(7, "agent/design/7", 101, "https://example/pr/101")
+    assert store.get_pr_takeover_comment_floors(pr_number=101) == (0, 0)
+
+    floors = store.advance_pr_takeover_comment_floors(
+        pr_number=101,
+        review_floor_comment_id=11,
+        issue_floor_comment_id=21,
+    )
+    assert floors == (11, 21)
+    floors = store.advance_pr_takeover_comment_floors(
+        pr_number=101,
+        review_floor_comment_id=9,
+        issue_floor_comment_id=20,
+    )
+    assert floors == (11, 21)
+
+    store.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:review:1:2026-02-21T00:00:00Z",
+                pr_number=101,
+                issue_number=7,
+                kind="review",
+                comment_id=1,
+                updated_at="2026-02-21T00:00:00Z",
+            ),
+            FeedbackEventRecord(
+                event_key="101:issue:2:2026-02-21T00:01:00Z",
+                pr_number=101,
+                issue_number=7,
+                kind="issue",
+                comment_id=2,
+                updated_at="2026-02-21T00:01:00Z",
+            ),
+        )
+    )
+    assert len(store.list_pending_feedback_events(101)) == 2
+    assert store.mark_pending_feedback_events_processed_for_pr(pr_number=101) == 2
+    assert store.list_pending_feedback_events(101) == ()
+
+
+def test_takeover_state_methods_reject_invalid_column_types(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    repo_key = _normalize_repo_full_name(None)
+    assert store.get_pr_takeover_comment_floors(pr_number=404) == (0, 0)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO issue_takeover_state(
+                repo_full_name, issue_number, ignore_active, updated_at
+            ) VALUES(?, ?, ?, ?)
+            """,
+            (repo_key, 7, 1.5, "2026-02-26T00:00:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="ignore_active"):
+        store.get_issue_takeover_state(7)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE issue_takeover_state SET ignore_active = 1, updated_at = ? WHERE repo_full_name = ? AND issue_number = ?",
+            (b"\x00", repo_key, 7),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="updated_at"):
+        store.get_issue_takeover_state(7)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "DELETE FROM issue_takeover_state WHERE repo_full_name = ?",
+            (repo_key,),
+        )
+        conn.execute(
+            """
+            INSERT INTO issue_takeover_state(
+                repo_full_name, issue_number, ignore_active, updated_at
+            ) VALUES(?, ?, ?, ?)
+            """,
+            (repo_key, "bad", 1, "2026-02-26T00:00:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="issue_number"):
+        store.list_active_issue_takeovers()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO pr_feedback_state(
+                repo_full_name,
+                pr_number,
+                issue_number,
+                branch,
+                status,
+                last_seen_head_sha,
+                active_run_id
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (repo_key, "bad", 7, "agent/design/7", "blocked", None, None),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="pr_number"):
+        store.list_feedback_pr_numbers_for_issue(issue_number=7)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO pr_feedback_state(
+                repo_full_name,
+                pr_number,
+                issue_number,
+                branch,
+                status,
+                last_seen_head_sha,
+                active_run_id,
+                takeover_review_floor_comment_id,
+                takeover_issue_floor_comment_id
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (repo_key, 101, 7, "agent/design/7", "blocked", None, None, "bad", 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="takeover_review_floor_comment_id"):
+        store.get_pr_takeover_comment_floors(pr_number=101)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE pr_feedback_state
+            SET takeover_review_floor_comment_id = ?, takeover_issue_floor_comment_id = ?
+            WHERE repo_full_name = ? AND pr_number = ?
+            """,
+            (0, "bad", repo_key, 101),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="takeover_issue_floor_comment_id"):
+        store.get_pr_takeover_comment_floors(pr_number=101)
+
+
+def test_state_store_migrates_takeover_columns_and_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE issue_takeover_state (
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                PRIMARY KEY (repo_full_name, issue_number)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE pr_feedback_state (
+                repo_full_name TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                issue_number INTEGER NOT NULL,
+                branch TEXT NOT NULL,
+                status TEXT NOT NULL,
+                last_seen_head_sha TEXT NULL,
+                active_run_id TEXT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (repo_full_name, pr_number)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _ = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        issue_takeover_columns = set(_table_columns(conn, "issue_takeover_state"))
+        pr_feedback_columns = set(_table_columns(conn, "pr_feedback_state"))
+    finally:
+        conn.close()
+
+    assert "ignore_active" in issue_takeover_columns
+    assert "updated_at" in issue_takeover_columns
+    assert "takeover_review_floor_comment_id" in pr_feedback_columns
+    assert "takeover_issue_floor_comment_id" in pr_feedback_columns
 
 
 def test_pre_pr_followup_state_migrates_last_checkpoint_sha_column(tmp_path: Path) -> None:

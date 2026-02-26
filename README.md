@@ -100,15 +100,17 @@ This is the recommended first run because it gives you both orchestration and vi
 
 MergeXO reads these repo labels:
 
+- `ignore_label` (human takeover pause)
 - `trigger_label` (default design flow)
 - `bugfix_label` (direct bugfix)
 - `small_job_label` (direct small job)
 
 If multiple labels are present, precedence is deterministic:
 
-1. `bugfix_label`
-2. `small_job_label`
-3. `trigger_label`
+1. `ignore_label`
+2. `bugfix_label`
+3. `small_job_label`
+4. `trigger_label`
 
 ### Example User Story
 
@@ -237,6 +239,19 @@ Recommended rollout:
    - comment during active retry
    - issue comment after PR exists (redirect only)
 3. expand once stable
+
+### PR Takeover (Human Override)
+
+Use this when a human wants to pause MergeXO for a specific source issue and linked PR work.
+
+1. Add `repo.ignore_label` (default: `agent:ignore`) to the source issue.
+2. MergeXO pauses automation for that source issue and linked PR:
+   - no new intake/implementation/follow-up/feedback enqueue
+   - no CI feedback enqueue
+   - no post-PR source-issue redirects
+3. Comments posted while takeover is active are intentionally not replayed later.
+4. Remove the label to resume automation.
+5. After removing the label, leave a fresh comment to trigger the next turn.
 
 ### GitHub Actions Feedback Monitoring
 
@@ -370,6 +385,7 @@ Do not mix both shapes in one file.
 | `trigger_label` | no | `"agent:design"` | design flow trigger |
 | `bugfix_label` | no | `"agent:bugfix"` | bugfix flow trigger |
 | `small_job_label` | no | `"agent:small-job"` | small-job flow trigger |
+| `ignore_label` | no | `"agent:ignore"` | human takeover label; preempts all automation while present |
 | `coding_guidelines_path` | yes | none | repo-relative path for coding/testing guidance |
 | `design_docs_dir` | no | `"docs/design"` | design doc output directory |
 | `allowed_users` | no | `[owner]` | normalized lowercase allowlist |
@@ -472,4 +488,4 @@ usage: mergexo feedback blocked reset [-h] (--pr PR | --all) [--yes] [--dry-run]
 
 - `bugfix` and `small_job` PR bodies include `Fixes #<issue_number>`.
 - `design_doc` PR bodies include `Refs #<issue_number>`.
-- If multiple trigger labels are present, precedence is `bugfix` > `small_job` > `design_doc`.
+- If multiple flow labels are present, precedence is `ignore` > `bugfix` > `small_job` > `design_doc`.
