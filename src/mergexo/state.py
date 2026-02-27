@@ -896,10 +896,33 @@ class StateStore:
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE repo_full_name = ?
                       AND issue_number = ?
-                      AND status = ?
                       AND active_run_id IS NULL
+                      AND (
+                            status = ?
+                            OR (
+                                status = 'failed'
+                                AND retry_count > 0
+                                AND retry_count < ?
+                                AND (
+                                      last_failure_class IN ('github_error', 'unknown')
+                                      OR error = ?
+                                )
+                                AND (
+                                      next_retry_at IS NULL
+                                      OR next_retry_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                                )
+                            )
+                        )
                     """,
-                    (branch, run_key, repo_key, issue_number, required_status),
+                    (
+                        branch,
+                        run_key,
+                        repo_key,
+                        issue_number,
+                        required_status,
+                        _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                        _STALE_RUNNING_RETRY_ERROR,
+                    ),
                 )
             if claimed.rowcount <= 0:
                 return None
@@ -3687,27 +3710,85 @@ class StateStore:
     ) -> tuple[ImplementationCandidateState, ...]:
         repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
         with self._lock, self._connect() as conn:
+            query = """
+                SELECT
+                    i.repo_full_name,
+                    i.issue_number,
+                    COALESCE(
+                        CASE WHEN i.branch LIKE 'agent/design/%' THEN i.branch END,
+                        (
+                            SELECT p.branch
+                            FROM pr_feedback_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                              AND p.status = 'merged'
+                              AND p.branch LIKE 'agent/design/%'
+                            ORDER BY p.updated_at DESC, p.pr_number DESC
+                            LIMIT 1
+                        )
+                    ) AS design_branch,
+                    COALESCE(
+                        CASE
+                            WHEN i.pr_number IS NOT NULL AND i.branch LIKE 'agent/design/%'
+                            THEN i.pr_number
+                        END,
+                        (
+                            SELECT p.pr_number
+                            FROM pr_feedback_state AS p
+                            WHERE p.repo_full_name = i.repo_full_name
+                              AND p.issue_number = i.issue_number
+                              AND p.status = 'merged'
+                              AND p.branch LIKE 'agent/design/%'
+                            ORDER BY p.updated_at DESC, p.pr_number DESC
+                            LIMIT 1
+                        ),
+                        i.pr_number
+                    ) AS design_pr_number,
+                    i.pr_url
+                FROM issue_runs AS i
+                WHERE (
+                        (i.status = 'merged' AND i.branch LIKE 'agent/design/%')
+                        OR (
+                            i.status = 'failed'
+                            AND i.active_run_id IS NULL
+                            AND i.retry_count > 0
+                            AND i.retry_count < ?
+                            AND (
+                                  i.last_failure_class IN ('github_error', 'unknown')
+                                  OR i.error = ?
+                            )
+                            AND (
+                                  i.next_retry_at IS NULL
+                                  OR i.next_retry_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                            )
+                            AND EXISTS(
+                                SELECT 1
+                                FROM pr_feedback_state AS p
+                                WHERE p.repo_full_name = i.repo_full_name
+                                  AND p.issue_number = i.issue_number
+                                  AND p.status = 'merged'
+                                  AND p.branch LIKE 'agent/design/%'
+                            )
+                        )
+                    )
+            """
             if repo_key is None:
                 rows = conn.execute(
-                    """
-                    SELECT repo_full_name, issue_number, branch, pr_number, pr_url
-                    FROM issue_runs
-                    WHERE status = 'merged'
-                      AND branch LIKE 'agent/design/%'
-                    ORDER BY updated_at ASC, repo_full_name ASC, issue_number ASC
-                    """
+                    query + " ORDER BY i.updated_at ASC, i.repo_full_name ASC, i.issue_number ASC",
+                    (
+                        _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                        _STALE_RUNNING_RETRY_ERROR,
+                    ),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
-                    SELECT repo_full_name, issue_number, branch, pr_number, pr_url
-                    FROM issue_runs
-                    WHERE status = 'merged'
-                      AND branch LIKE 'agent/design/%'
-                      AND repo_full_name = ?
-                    ORDER BY updated_at ASC, issue_number ASC
-                    """,
-                    (repo_key,),
+                    query
+                    + " AND i.repo_full_name = ? ORDER BY i.updated_at ASC, i.issue_number ASC",
+                    (
+                        _TRANSIENT_RETRY_MAX_ATTEMPTS,
+                        _STALE_RUNNING_RETRY_ERROR,
+                        repo_key,
+                    ),
                 ).fetchall()
         return tuple(
             ImplementationCandidateState(

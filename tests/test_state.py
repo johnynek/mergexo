@@ -456,6 +456,64 @@ def test_state_store_claim_implementation_issue_run_start_is_single_claim_and_pr
     )
 
 
+def test_state_store_claim_implementation_issue_run_start_retries_transient_failed_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(12, "agent/design/12-foo", 112, "https://example/pr/112")
+    store.mark_pr_status(
+        pr_number=112, issue_number=12, status="merged", last_seen_head_sha="head-12"
+    )
+
+    initial_run = store.claim_implementation_issue_run_start(
+        issue_number=12,
+        branch="agent/impl/12-foo",
+        run_id="impl-run-12-initial",
+    )
+    assert initial_run == "impl-run-12-initial"
+    store.mark_failed(
+        12,
+        "GitHub API call failed",
+        failure_class="github_error",
+        retryable=True,
+    )
+    assert (
+        store.claim_implementation_issue_run_start(
+            issue_number=12,
+            branch="agent/impl/12-foo-retry",
+            run_id="impl-run-12-retry-immediate",
+        )
+        is None
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET next_retry_at = '2000-01-01T00:00:00.000Z'
+            WHERE issue_number = ?
+            """,
+            (12,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    retry_run = store.claim_implementation_issue_run_start(
+        issue_number=12,
+        branch="agent/impl/12-foo-retry",
+        run_id="impl-run-12-retry",
+    )
+    assert retry_run == "impl-run-12-retry"
+    status, branch, _pr_number, _pr_url, error = _get_row(db_path, 12)
+    assert status == "running"
+    assert branch == "agent/impl/12-foo-retry"
+    assert error is None
+    assert _get_active_run_id(db_path, 12) == "impl-run-12-retry"
+
+
 def test_state_store_claim_pre_pr_followup_run_start_is_single_claim_and_requires_followup_state(
     tmp_path: Path,
 ) -> None:
@@ -1853,6 +1911,54 @@ def test_list_implementation_candidates_reads_merged_design_runs(tmp_path: Path)
     assert candidate.design_branch == "agent/design/8-foo"
     assert candidate.design_pr_number == 101
     assert candidate.design_pr_url == "https://example/pr/101"
+
+
+def test_list_implementation_candidates_includes_retryable_failed_implementation_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(10, "agent/design/10-foo", 110, "https://example/pr/110")
+    store.mark_pr_status(
+        pr_number=110, issue_number=10, status="merged", last_seen_head_sha="head-10"
+    )
+    run_id = store.claim_implementation_issue_run_start(
+        issue_number=10,
+        branch="agent/impl/10-foo",
+        run_id="impl-run-10",
+    )
+    assert run_id == "impl-run-10"
+    store.mark_failed(
+        10,
+        "GitHub API call failed",
+        failure_class="github_error",
+        retryable=True,
+    )
+
+    # Backoff gate should prevent immediate retry scheduling.
+    assert store.list_implementation_candidates() == ()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET next_retry_at = '2000-01-01T00:00:00.000Z'
+            WHERE issue_number = ?
+            """,
+            (10,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    candidates = store.list_implementation_candidates()
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.issue_number == 10
+    assert candidate.design_branch == "agent/design/10-foo"
+    assert candidate.design_pr_number == 110
+    assert candidate.design_pr_url == "https://example/pr/110"
 
 
 def test_list_implementation_candidates_repo_filter(tmp_path: Path) -> None:
