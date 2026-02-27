@@ -4463,6 +4463,9 @@ class Phase1Orchestrator:
                 tracked.pr_number,
                 repo_full_name=self._state_repo_full_name(),
             )
+            # PR feedback is sourced from both GitHub comment surfaces:
+            # review comments (`/pulls/{pr}/comments`) and PR thread comments
+            # (`/issues/{pr}/comments`).
             normalized_review = self._normalize_review_events(
                 pr_number=tracked.pr_number,
                 issue_number=tracked.issue_number,
@@ -4542,6 +4545,8 @@ class Phase1Orchestrator:
                 + pending_issue_events
                 + actionable_actions_events
             )
+            # Only unprocessed events are passed into the turn payload so each
+            # comment/update is handled once per unique event key.
             pending_review_comments = tuple(
                 comment
                 for normalized_event, comment in normalized_review
