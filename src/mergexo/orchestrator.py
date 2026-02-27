@@ -938,6 +938,39 @@ class Phase1Orchestrator:
         )
         log_event(LOGGER, "feedback_scan_started", tracked_pr_count=len(tracked_prs))
         for tracked in tracked_prs:
+            pr = self._github.get_pull_request(tracked.pr_number)
+            if pr.merged:
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="merged",
+                    last_seen_head_sha=pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_merged",
+                )
+                continue
+            if pr.state.lower() != "open":
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="closed",
+                    last_seen_head_sha=pr.head_sha,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "feedback_turn_completed",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    result="pr_closed",
+                )
+                continue
             if self._is_takeover_active(issue_number=tracked.issue_number):
                 log_event(
                     LOGGER,

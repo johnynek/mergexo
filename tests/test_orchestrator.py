@@ -14,6 +14,7 @@ from typing import cast
 from hypothesis import given, strategies as st
 import pytest
 
+from mergexo import observability_queries as oq
 from mergexo.agent_adapter import (
     AgentSession,
     DirectStartResult,
@@ -7787,6 +7788,94 @@ def test_enqueue_feedback_work_skips_takeover_issues(tmp_path: Path) -> None:
     assert len(state.run_starts) == starts_before
 
 
+def test_enqueue_feedback_work_marks_takeover_merged_pr_terminal(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:design", "agent:ignore"))
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-merged",
+        base_sha="base-1",
+        draft=False,
+        state="closed",
+        merged=True,
+    )
+    db_path = tmp_path / "state.db"
+    state = StateStore(db_path)
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class FakePool:
+        def submit(self, fn, tracked):  # type: ignore[no-untyped-def]
+            _ = fn, tracked
+            raise AssertionError("feedback worker should not be submitted for merged PRs")
+
+    orch._enqueue_feedback_work(FakePool())
+
+    assert state.list_tracked_pull_requests(repo_full_name=cfg.repo.full_name) == ()
+    pr_status = state.get_pull_request_status(101, repo_full_name=cfg.repo.full_name)
+    assert pr_status is not None
+    assert pr_status.status == "merged"
+    outcomes = oq.load_terminal_issue_outcomes(db_path, cfg.repo.full_name, limit=10)
+    assert len(outcomes) == 1
+    assert outcomes[0].issue_number == issue.number
+    assert outcomes[0].pr_number == 101
+    assert outcomes[0].status == "merged"
+
+
+def test_enqueue_feedback_work_marks_takeover_closed_pr_terminal(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=("agent:design", "agent:ignore"))
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-closed",
+        base_sha="base-1",
+        draft=False,
+        state="closed",
+        merged=False,
+    )
+    db_path = tmp_path / "state.db"
+    state = StateStore(db_path)
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class FakePool:
+        def submit(self, fn, tracked):  # type: ignore[no-untyped-def]
+            _ = fn, tracked
+            raise AssertionError("feedback worker should not be submitted for closed PRs")
+
+    orch._enqueue_feedback_work(FakePool())
+
+    assert state.list_tracked_pull_requests(repo_full_name=cfg.repo.full_name) == ()
+    pr_status = state.get_pull_request_status(101, repo_full_name=cfg.repo.full_name)
+    assert pr_status is not None
+    assert pr_status.status == "closed"
+    outcomes = oq.load_terminal_issue_outcomes(db_path, cfg.repo.full_name, limit=10)
+    assert len(outcomes) == 1
+    assert outcomes[0].issue_number == issue.number
+    assert outcomes[0].pr_number == 101
+    assert outcomes[0].status == "closed"
+
+
 def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) -> None:
     cfg = _config(tmp_path, worker_count=3)
     git = FakeGitManager(tmp_path / "checkouts")
@@ -7809,6 +7898,16 @@ def test_enqueue_feedback_work_handles_duplicate_and_capacity(tmp_path: Path) ->
             last_seen_head_sha=None,
         ),
     ]
+    github.get_pull_request = lambda pr_number: PullRequestSnapshot(  # type: ignore[method-assign]
+        number=pr_number,
+        title=f"PR {pr_number}",
+        body="Body",
+        head_sha=f"head-{pr_number}",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     class FakePool:
