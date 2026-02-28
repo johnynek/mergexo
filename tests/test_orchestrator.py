@@ -317,9 +317,7 @@ class FakeGitHub:
         assert pr_number == self.pr_snapshot.number
         return list(self.review_comments)
 
-    def list_pull_request_review_summaries(
-        self, pr_number: int
-    ) -> list[PullRequestIssueComment]:
+    def list_pull_request_review_summaries(self, pr_number: int) -> list[PullRequestIssueComment]:
         assert pr_number == self.pr_snapshot.number
         return list(self.review_summaries)
 
@@ -4513,6 +4511,54 @@ def test_takeover_resume_processes_only_comments_after_resume_boundary(tmp_path:
     assert pool.submitted_comment_ids == [41]
 
 
+def test_snapshot_takeover_boundaries_updates_review_summary_cursor(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_summaries = [
+        PullRequestIssueComment(
+            comment_id=30,
+            body="older review summary",
+            user_login="reviewer",
+            html_url="https://example/reviews/30",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=31,
+            body="newer review summary",
+            user_login="reviewer",
+            html_url="https://example/reviews/31",
+            created_at="2026-02-23T00:01:00Z",
+            updated_at="2026-02-23T00:01:00Z",
+        ),
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._snapshot_takeover_comment_boundaries(
+        issue_number=issue.number,
+        clear_pending_feedback=False,
+    )
+
+    summary_cursor = state.get_poll_cursor(
+        surface="pr_review_summaries",
+        scope_number=101,
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert summary_cursor is not None
+    assert summary_cursor.last_comment_id == 31
+    assert summary_cursor.last_updated_at == "2026-02-23T00:01:00Z"
+
+
 def test_enqueue_pre_pr_followup_work_legacy_mode_records_token_observation(
     tmp_path: Path,
 ) -> None:
@@ -6566,6 +6612,58 @@ def test_feedback_turn_incremental_scan_handles_same_second_boundaries(tmp_path:
     )
     assert review_cursor_again is not None
     assert review_cursor_again.last_comment_id == 12
+
+
+def test_feedback_turn_incremental_includes_new_pr_issue_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_incremental_comment_fetch=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment(comment_id=11)]
+    github.issue_comments = [_issue_comment(comment_id=21)]
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 1
+    first_turn = agent.feedback_calls[0][1]
+    assert tuple(comment.comment_id for comment in first_turn.review_comments) == (11,)
+    assert tuple(comment.comment_id for comment in first_turn.issue_comments) == (21,)
+
+    github.issue_comments.append(_issue_comment(comment_id=22))
+    tracked_again = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked_again)
+
+    assert len(agent.feedback_calls) == 2
+    second_turn = agent.feedback_calls[1][1]
+    assert tuple(comment.comment_id for comment in second_turn.issue_comments) == (22,)
 
 
 def test_feedback_turn_ingests_review_summary_comments(tmp_path: Path) -> None:
@@ -9235,6 +9333,61 @@ def test_normalize_filters_comments_at_or_below_takeover_comment_floors(tmp_path
 
     assert tuple(event.comment_id for event, _ in normalized_review) == (5,)
     assert tuple(event.comment_id for event, _ in normalized_issue) == (9,)
+
+
+def test_normalize_review_summary_filters_bot_unauthorized_and_tokenized(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, allowed_users=("issue-author", "reviewer"))
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg, state=FakeState(), github=github, git_manager=git, agent=FakeAgent()
+    )
+    marker = "<!-- mergexo-action:" + ("a" * 64) + " -->"
+    comments = [
+        PullRequestIssueComment(
+            comment_id=1,
+            body="bot summary",
+            user_login="mergexo[bot]",
+            html_url="https://example/reviews/1",
+            created_at="t1",
+            updated_at="t1",
+        ),
+        PullRequestIssueComment(
+            comment_id=2,
+            body="outsider summary",
+            user_login="outsider",
+            html_url="https://example/reviews/2",
+            created_at="t2",
+            updated_at="t2",
+        ),
+        PullRequestIssueComment(
+            comment_id=3,
+            body=marker,
+            user_login="reviewer",
+            html_url="https://example/reviews/3",
+            created_at="t3",
+            updated_at="t3",
+        ),
+        PullRequestIssueComment(
+            comment_id=4,
+            body="valid summary feedback",
+            user_login="reviewer",
+            html_url="https://example/reviews/4",
+            created_at="t4",
+            updated_at="t4",
+        ),
+    ]
+
+    normalized = orch._normalize_review_summary_events(
+        pr_number=10,
+        issue_number=20,
+        comments=comments,
+    )
+
+    assert tuple(event.comment_id for event, _ in normalized) == (4,)
+    assert normalized[0][0].kind == "review_summary"
 
 
 def test_fetch_remote_action_tokens_reads_recent_pr_comment_surfaces(tmp_path: Path) -> None:

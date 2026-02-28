@@ -4508,41 +4508,49 @@ class Phase1Orchestrator:
                     review_summary_scan.cursor_update,
                     issue_scan.cursor_update,
                 )
-                token_observations = self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_REVIEW_COMMENTS,
-                    comments=review_scan.fetched,
-                ) + self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_REVIEW_SUMMARIES,
-                    comments=review_summary_scan.fetched,
-                ) + self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_ISSUE_COMMENTS,
-                    comments=issue_scan.fetched,
+                token_observations = (
+                    self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_COMMENTS,
+                        comments=review_scan.fetched,
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_SUMMARIES,
+                        comments=review_summary_scan.fetched,
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_ISSUE_COMMENTS,
+                        comments=issue_scan.fetched,
+                    )
                 )
             else:
                 review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
                 issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
                 cursor_updates = (review_summary_scan.cursor_update,)
-                token_observations = self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_REVIEW_COMMENTS,
-                    comments=tuple(review_comments),
-                ) + self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_REVIEW_SUMMARIES,
-                    comments=review_summary_scan.fetched,
-                ) + self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_ISSUE_COMMENTS,
-                    comments=tuple(issue_comments),
+                token_observations = (
+                    self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_COMMENTS,
+                        comments=tuple(review_comments),
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_SUMMARIES,
+                        comments=review_summary_scan.fetched,
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_ISSUE_COMMENTS,
+                        comments=tuple(issue_comments),
+                    )
                 )
             changed_files = self._github.list_pull_request_files(tracked.pr_number)
             review_floor_comment_id, issue_floor_comment_id = (
@@ -4556,6 +4564,9 @@ class Phase1Orchestrator:
                 tracked.pr_number,
                 repo_full_name=self._state_repo_full_name(),
             )
+            # PR feedback is sourced from both GitHub comment surfaces:
+            # review comments (`/pulls/{pr}/comments`) and PR thread comments
+            # (`/issues/{pr}/comments`).
             normalized_review = self._normalize_review_events(
                 pr_number=tracked.pr_number,
                 issue_number=tracked.issue_number,
@@ -4598,9 +4609,7 @@ class Phase1Orchestrator:
                 pending_review_summary_events,
                 pending_issue_events,
                 pending_actions_events,
-            ) = (
-                self._partition_pending_feedback_events(pending_events)
-            )
+            ) = self._partition_pending_feedback_events(pending_events)
             (
                 actionable_actions_events,
                 actions_synthetic_comments,
@@ -4648,6 +4657,8 @@ class Phase1Orchestrator:
                 + pending_issue_events
                 + actionable_actions_events
             )
+            # Only unprocessed events are passed into the turn payload so each
+            # comment/update is handled once per unique event key.
             pending_review_comments = tuple(
                 comment
                 for normalized_event, comment in normalized_review

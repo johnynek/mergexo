@@ -505,6 +505,13 @@ def test_list_pull_request_review_summaries_paginates_and_filters(
                     "html_url": "https://example/reviews/12",
                     "submitted_at": "2026-02-22T00:00:02Z",
                 },
+                {
+                    "id": 999,
+                    "body": "missing submitted_at should be ignored",
+                    "state": "COMMENTED",
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/reviews/999",
+                },
             ] + [
                 {
                     "id": item_id,
