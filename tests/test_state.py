@@ -1463,6 +1463,19 @@ def test_ingest_feedback_scan_batch_updates_events_tokens_and_cursors(tmp_path: 
     assert observed.status == "observed"
 
 
+def test_ingest_feedback_scan_batch_noop_when_all_inputs_empty(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.ingest_feedback_scan_batch(events=(), cursor_updates=(), token_observations=())
+    assert (
+        store.get_poll_cursor(
+            surface="pr_review_comments",
+            scope_number=101,
+            repo_full_name="o/repo",
+        )
+        is None
+    )
+
+
 def test_seed_feedback_cursors_from_full_scan(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.seed_feedback_cursors_from_full_scan(
@@ -2734,6 +2747,7 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
 
     with pytest.raises(RuntimeError, match="Invalid surface value"):
         _parse_github_comment_surface(1)
+    assert _parse_github_comment_surface("pr_review_summaries") == "pr_review_summaries"
     with pytest.raises(RuntimeError, match="Unknown surface value"):
         _parse_github_comment_surface("other")
 

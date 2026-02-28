@@ -51,6 +51,7 @@ AgentRunFailureClass = Literal[
 GitHubCommentSurface = Literal[
     "pr_review_comments",
     "pr_issue_comments",
+    "pr_review_summaries",
     "issue_pre_pr_followups",
     "issue_post_pr_redirects",
     "issue_operator_commands",
@@ -4642,6 +4643,7 @@ def _parse_github_comment_surface(value: object) -> GitHubCommentSurface:
     if value not in {
         "pr_review_comments",
         "pr_issue_comments",
+        "pr_review_summaries",
         "issue_pre_pr_followups",
         "issue_post_pr_redirects",
         "issue_operator_commands",

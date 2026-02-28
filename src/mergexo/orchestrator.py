@@ -111,6 +111,7 @@ _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
 _PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(r"(bugfix|small-job|implementation) flow blocked:")
 _COMMENT_CURSOR_EPOCH = "1970-01-01T00:00:00Z"
 _SURFACE_PR_REVIEW_COMMENTS: GitHubCommentSurface = "pr_review_comments"
+_SURFACE_PR_REVIEW_SUMMARIES: GitHubCommentSurface = "pr_review_summaries"
 _SURFACE_PR_ISSUE_COMMENTS: GitHubCommentSurface = "pr_issue_comments"
 _SURFACE_ISSUE_PRE_PR_FOLLOWUPS: GitHubCommentSurface = "issue_pre_pr_followups"
 _SURFACE_ISSUE_POST_PR_REDIRECTS: GitHubCommentSurface = "issue_post_pr_redirects"
@@ -686,6 +687,7 @@ class Phase1Orchestrator:
         cleared_event_count = 0
         for pr_number in pr_numbers:
             review_comments = self._github.list_pull_request_review_comments(pr_number)
+            review_summaries = self._github.list_pull_request_review_summaries(pr_number)
             issue_thread_comments = self._github.list_pull_request_issue_comments(pr_number)
             review_comment_id_max = max(
                 (comment.comment_id for comment in review_comments),
@@ -695,6 +697,24 @@ class Phase1Orchestrator:
                 (comment.comment_id for comment in issue_thread_comments),
                 default=0,
             )
+            if review_summaries:
+                latest_review_summary = max(
+                    review_summaries,
+                    key=lambda comment: (
+                        _normalize_timestamp_for_compare(comment.updated_at),
+                        comment.comment_id,
+                    ),
+                )
+                self._state.upsert_poll_cursor(
+                    surface=_SURFACE_PR_REVIEW_SUMMARIES,
+                    scope_number=pr_number,
+                    last_updated_at=_normalize_timestamp_for_compare(
+                        latest_review_summary.updated_at
+                    ),
+                    last_comment_id=latest_review_summary.comment_id,
+                    bootstrap_complete=True,
+                    repo_full_name=repo_full_name,
+                )
             self._state.advance_pr_takeover_comment_floors(
                 pr_number=pr_number,
                 review_floor_comment_id=review_comment_id_max,
@@ -2704,6 +2724,29 @@ class Phase1Orchestrator:
             bootstrap_mode="process_all",
         )
 
+    def _scan_incremental_pr_review_summaries(self, *, pr_number: int) -> _IncrementalCommentScan:
+        cursor = self._load_poll_cursor(
+            surface=_SURFACE_PR_REVIEW_SUMMARIES,
+            scope_number=pr_number,
+        )
+        log_event(
+            LOGGER,
+            "incremental_scan_started",
+            repo_full_name=self._state_repo_full_name(),
+            surface=_SURFACE_PR_REVIEW_SUMMARIES,
+            scope_number=pr_number,
+            since=None,
+            bootstrap_complete=cursor.bootstrap_complete,
+        )
+        comments = tuple(self._github.list_pull_request_review_summaries(pr_number))
+        return self._build_incremental_scan(
+            surface=_SURFACE_PR_REVIEW_SUMMARIES,
+            scope_number=pr_number,
+            cursor=cursor,
+            comments=comments,
+            bootstrap_mode="process_all",
+        )
+
     def _scan_incremental_pr_issue_comments(self, *, pr_number: int) -> _IncrementalCommentScan:
         cursor = self._load_poll_cursor(
             surface=_SURFACE_PR_ISSUE_COMMENTS,
@@ -4449,6 +4492,12 @@ class Phase1Orchestrator:
                     )
                     return "blocked"
 
+            review_summary_scan = self._scan_incremental_pr_review_summaries(
+                pr_number=tracked.pr_number
+            )
+            review_summary_comments = [
+                cast(PullRequestIssueComment, c) for c in review_summary_scan.new
+            ]
             if self._incremental_comment_fetch_enabled():
                 review_scan = self._scan_incremental_pr_review_comments(pr_number=tracked.pr_number)
                 issue_scan = self._scan_incremental_pr_issue_comments(pr_number=tracked.pr_number)
@@ -4456,33 +4505,52 @@ class Phase1Orchestrator:
                 issue_comments = [cast(PullRequestIssueComment, c) for c in issue_scan.new]
                 cursor_updates: tuple[PollCursorUpdate, ...] = (
                     review_scan.cursor_update,
+                    review_summary_scan.cursor_update,
                     issue_scan.cursor_update,
                 )
-                token_observations = self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_REVIEW_COMMENTS,
-                    comments=review_scan.fetched,
-                ) + self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_ISSUE_COMMENTS,
-                    comments=issue_scan.fetched,
+                token_observations = (
+                    self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_COMMENTS,
+                        comments=review_scan.fetched,
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_SUMMARIES,
+                        comments=review_summary_scan.fetched,
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_ISSUE_COMMENTS,
+                        comments=issue_scan.fetched,
+                    )
                 )
             else:
                 review_comments = self._github.list_pull_request_review_comments(tracked.pr_number)
                 issue_comments = self._github.list_pull_request_issue_comments(tracked.pr_number)
-                cursor_updates = ()
-                token_observations = self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_REVIEW_COMMENTS,
-                    comments=tuple(review_comments),
-                ) + self._action_token_observations_from_comments(
-                    scope_kind="pr",
-                    scope_number=tracked.pr_number,
-                    source=_SURFACE_PR_ISSUE_COMMENTS,
-                    comments=tuple(issue_comments),
+                cursor_updates = (review_summary_scan.cursor_update,)
+                token_observations = (
+                    self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_COMMENTS,
+                        comments=tuple(review_comments),
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_REVIEW_SUMMARIES,
+                        comments=review_summary_scan.fetched,
+                    )
+                    + self._action_token_observations_from_comments(
+                        scope_kind="pr",
+                        scope_number=tracked.pr_number,
+                        source=_SURFACE_PR_ISSUE_COMMENTS,
+                        comments=tuple(issue_comments),
+                    )
                 )
             changed_files = self._github.list_pull_request_files(tracked.pr_number)
             review_floor_comment_id, issue_floor_comment_id = (
@@ -4511,8 +4579,14 @@ class Phase1Orchestrator:
                 comments=issue_comments,
                 takeover_issue_floor_comment_id=issue_floor_comment_id,
             )
+            normalized_review_summaries = self._normalize_review_summary_events(
+                pr_number=tracked.pr_number,
+                issue_number=tracked.issue_number,
+                comments=review_summary_comments,
+            )
             self._state.ingest_feedback_scan_batch(
                 events=tuple(event for event, _ in normalized_review)
+                + tuple(event for event, _ in normalized_review_summaries)
                 + tuple(event for event, _ in normalized_issue),
                 cursor_updates=cursor_updates,
                 token_observations=token_observations,
@@ -4530,9 +4604,12 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 pending_count=len(pending_events),
             )
-            pending_review_events, pending_issue_events, pending_actions_events = (
-                self._partition_pending_feedback_events(pending_events)
-            )
+            (
+                pending_review_events,
+                pending_review_summary_events,
+                pending_issue_events,
+                pending_actions_events,
+            ) = self._partition_pending_feedback_events(pending_events)
             (
                 actionable_actions_events,
                 actions_synthetic_comments,
@@ -4546,6 +4623,7 @@ class Phase1Orchestrator:
             pending_event_key_set = {
                 event.event_key
                 for event in pending_review_events
+                + pending_review_summary_events
                 + pending_issue_events
                 + actionable_actions_events
             }
@@ -4575,6 +4653,7 @@ class Phase1Orchestrator:
             pending_event_keys = tuple(
                 event.event_key
                 for event in pending_review_events
+                + pending_review_summary_events
                 + pending_issue_events
                 + actionable_actions_events
             )
@@ -4586,6 +4665,10 @@ class Phase1Orchestrator:
                 if normalized_event.event_key in pending_event_key_set
             )
             pending_issue_comments = tuple(
+                comment
+                for normalized_event, comment in normalized_review_summaries
+                if normalized_event.event_key in pending_event_key_set
+            ) + tuple(
                 comment
                 for normalized_event, comment in normalized_issue
                 if normalized_event.event_key in pending_event_key_set
@@ -4818,18 +4901,27 @@ class Phase1Orchestrator:
         tuple[PendingFeedbackEvent, ...],
         tuple[PendingFeedbackEvent, ...],
         tuple[PendingFeedbackEvent, ...],
+        tuple[PendingFeedbackEvent, ...],
     ]:
         review_events: list[PendingFeedbackEvent] = []
+        review_summary_events: list[PendingFeedbackEvent] = []
         issue_events: list[PendingFeedbackEvent] = []
         actions_events: list[PendingFeedbackEvent] = []
         for pending in pending_events:
             if pending.kind == "review":
                 review_events.append(pending)
+            elif pending.kind == "review_summary":
+                review_summary_events.append(pending)
             elif pending.kind == "issue":
                 issue_events.append(pending)
             elif pending.kind == "actions":
                 actions_events.append(pending)
-        return tuple(review_events), tuple(issue_events), tuple(actions_events)
+        return (
+            tuple(review_events),
+            tuple(review_summary_events),
+            tuple(issue_events),
+            tuple(actions_events),
+        )
 
     def _resolve_actions_feedback_events(
         self,
@@ -5710,6 +5802,59 @@ class Phase1Orchestrator:
                         pr_number=pr_number,
                         issue_number=issue_number,
                         kind="issue",
+                        comment_id=comment.comment_id,
+                        updated_at=comment.updated_at,
+                    ),
+                    comment,
+                )
+            )
+        return normalized
+
+    def _normalize_review_summary_events(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        comments: list[PullRequestIssueComment],
+    ) -> list[tuple[FeedbackEventRecord, PullRequestIssueComment]]:
+        normalized: list[tuple[FeedbackEventRecord, PullRequestIssueComment]] = []
+        for comment in comments:
+            if is_bot_login(comment.user_login):
+                continue
+            if not self._repo.allows(comment.user_login):
+                log_event(
+                    LOGGER,
+                    "auth_feedback_ignored",
+                    pr_number=pr_number,
+                    comment_id=comment.comment_id,
+                    kind="review_summary",
+                    user_login=comment.user_login,
+                )
+                continue
+            if has_action_token(comment.body):
+                continue
+            log_event(
+                LOGGER,
+                "monitored_comment_detected",
+                repo_full_name=self._state_repo_full_name(),
+                issue_number=issue_number,
+                pr_number=pr_number,
+                comment_kind="review_summary",
+                comment_id=comment.comment_id,
+                comment_url=comment.html_url,
+            )
+            normalized.append(
+                (
+                    FeedbackEventRecord(
+                        event_key=event_key(
+                            pr_number=pr_number,
+                            kind="review_summary",
+                            comment_id=comment.comment_id,
+                            updated_at=comment.updated_at,
+                        ),
+                        pr_number=pr_number,
+                        issue_number=issue_number,
+                        kind="review_summary",
                         comment_id=comment.comment_id,
                         updated_at=comment.updated_at,
                     ),

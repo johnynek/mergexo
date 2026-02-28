@@ -530,6 +530,53 @@ class GitHubGateway:
         )
         return comments
 
+    def list_pull_request_review_summaries(self, pr_number: int) -> list[PullRequestIssueComment]:
+        summaries: list[PullRequestIssueComment] = []
+        page = 1
+        while True:
+            path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/reviews?per_page=100&page={page}"
+            payload = self._api_json("GET", path)
+            if not isinstance(payload, list):
+                raise RuntimeError(
+                    "Unexpected GitHub response: expected list of pull request reviews"
+                )
+
+            for item in payload:
+                item_obj = _as_object_dict(item)
+                if item_obj is None:
+                    continue
+                state = _as_string(item_obj.get("state")).strip().lower()
+                if state not in {"commented", "changes_requested"}:
+                    continue
+                body = _as_string(item_obj.get("body")).strip()
+                if not body:
+                    continue
+                submitted_at = _as_string(item_obj.get("submitted_at"))
+                if not submitted_at:
+                    continue
+                user_obj = _as_object_dict(item_obj.get("user"))
+                summaries.append(
+                    PullRequestIssueComment(
+                        comment_id=_as_int(item_obj.get("id"), field="id"),
+                        body=body,
+                        user_login=_as_string(user_obj.get("login") if user_obj else None),
+                        html_url=_as_string(item_obj.get("html_url")),
+                        created_at=submitted_at,
+                        updated_at=submitted_at,
+                    )
+                )
+            if len(payload) < 100:
+                break
+            page += 1
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="pull_request_review_summaries",
+            pr_number=pr_number,
+            count=len(summaries),
+        )
+        return summaries
+
     def list_pull_request_issue_comments(
         self,
         pr_number: int,
