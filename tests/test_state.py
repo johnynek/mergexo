@@ -2734,6 +2734,7 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
 
     with pytest.raises(RuntimeError, match="Invalid surface value"):
         _parse_github_comment_surface(1)
+    assert _parse_github_comment_surface("pr_review_summaries") == "pr_review_summaries"
     with pytest.raises(RuntimeError, match="Unknown surface value"):
         _parse_github_comment_surface("other")
 

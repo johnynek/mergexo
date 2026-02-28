@@ -337,6 +337,18 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
                     "updated_at": "t2",
                 },
             ]
+        if path.endswith("/pulls/9/reviews?per_page=100&page=1"):
+            return [
+                "skip",
+                {
+                    "id": 33,
+                    "body": "Top-level review summary",
+                    "state": "COMMENTED",
+                    "user": {"login": "reviewer"},
+                    "html_url": "http://review-summary",
+                    "submitted_at": "t2.5",
+                },
+            ]
         if path.endswith("/issues/9/comments?per_page=100&page=1"):
             return [
                 "skip",
@@ -356,6 +368,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     pr = gateway.get_pull_request(9)
     files = gateway.list_pull_request_files(9)
     review_comments = gateway.list_pull_request_review_comments(9)
+    review_summaries = gateway.list_pull_request_review_summaries(9)
     issue_comments = gateway.list_pull_request_issue_comments(9)
     issue_comments_direct = gateway.list_issue_comments(9)
 
@@ -366,6 +379,8 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert files == ("src/a.py", "README.md")
     assert review_comments[0].comment_id == 11
     assert review_comments[0].user_login == "reviewer"
+    assert review_summaries[0].comment_id == 33
+    assert review_summaries[0].body == "Top-level review summary"
     assert issue_comments[0].comment_id == 22
     assert issue_comments_direct[0].comment_id == 22
 
@@ -441,6 +456,85 @@ def test_list_pull_request_review_comments_paginates_with_since(
     assert len(comments) == 102
     assert comments[0].comment_id == 1
     assert comments[-1].comment_id == 102
+    assert seen_pages == [1, 2]
+
+
+def test_list_pull_request_review_summaries_paginates_and_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    seen_pages: list[int] = []
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, payload
+        assert method == "GET"
+        assert path.startswith("/repos/o/r/pulls/9/reviews?")
+        parsed = urlparse(path)
+        query = parse_qs(parsed.query)
+        assert query["per_page"] == ["100"]
+        page = int(query["page"][0])
+        seen_pages.append(page)
+        if page == 1:
+            return [
+                {
+                    "id": 10,
+                    "body": "needs work",
+                    "state": "COMMENTED",
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/reviews/10",
+                    "submitted_at": "2026-02-22T00:00:00Z",
+                },
+                {
+                    "id": 11,
+                    "body": "",
+                    "state": "COMMENTED",
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/reviews/11",
+                    "submitted_at": "2026-02-22T00:00:01Z",
+                },
+                {
+                    "id": 12,
+                    "body": "looks good",
+                    "state": "APPROVED",
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/reviews/12",
+                    "submitted_at": "2026-02-22T00:00:02Z",
+                },
+            ] + [
+                {
+                    "id": item_id,
+                    "body": f"summary-{item_id}",
+                    "state": "COMMENTED",
+                    "user": {"login": "reviewer"},
+                    "html_url": f"https://example/reviews/{item_id}",
+                    "submitted_at": "2026-02-22T00:00:03Z",
+                }
+                for item_id in range(13, 111)
+            ]
+        if page == 2:
+            return [
+                {
+                    "id": 111,
+                    "body": "changes requested",
+                    "state": "CHANGES_REQUESTED",
+                    "user": {"login": "reviewer"},
+                    "html_url": "https://example/reviews/111",
+                    "submitted_at": "2026-02-22T00:00:04Z",
+                }
+            ]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    summaries = gateway.list_pull_request_review_summaries(9)
+    assert len(summaries) == 100
+    assert summaries[0].comment_id == 10
+    assert summaries[-1].comment_id == 111
+    assert all(summary.body for summary in summaries)
     assert seen_pages == [1, 2]
 
 
@@ -764,6 +858,7 @@ def test_get_failed_run_log_tails_returns_empty_when_no_failed_jobs(
         ("get_pull_request", [], "expected object"),
         ("list_pull_request_files", {}, "expected list"),
         ("list_pull_request_review_comments", {}, "expected list"),
+        ("list_pull_request_review_summaries", {}, "expected list"),
         ("list_pull_request_issue_comments", {}, "expected list"),
         ("list_issue_comments", {}, "expected list"),
     ],
@@ -1083,6 +1178,8 @@ def test_gateway_emits_read_and_write_logs(
             return [{"filename": "src/a.py"}]
         if method == "GET" and path.endswith("/pulls/9/comments?per_page=100&page=1"):
             return []
+        if method == "GET" and path.endswith("/pulls/9/reviews?per_page=100&page=1"):
+            return []
         if method == "GET" and path.endswith("/issues/9/comments?per_page=100&page=1"):
             return []
         if method == "GET" and path.endswith("/compare/base...head"):
@@ -1098,6 +1195,7 @@ def test_gateway_emits_read_and_write_logs(
     gateway.list_open_issues_with_label("agent:design")
     gateway.list_pull_request_files(9)
     gateway.list_pull_request_review_comments(9)
+    gateway.list_pull_request_review_summaries(9)
     gateway.list_pull_request_issue_comments(9)
     gateway.list_issue_comments(9)
     gateway.compare_commits("base", "head")

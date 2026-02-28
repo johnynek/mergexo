@@ -218,6 +218,7 @@ class FakeGitHub:
         self.comments: list[tuple[int, str]] = []
         self.review_replies: list[tuple[int, int, str]] = []
         self.review_comments: list[PullRequestReviewComment] = []
+        self.review_summaries: list[PullRequestIssueComment] = []
         self.issue_comments: list[PullRequestIssueComment] = []
         self.changed_files: tuple[str, ...] = ()
         self.pr_snapshot = PullRequestSnapshot(
@@ -315,6 +316,12 @@ class FakeGitHub:
         _ = since
         assert pr_number == self.pr_snapshot.number
         return list(self.review_comments)
+
+    def list_pull_request_review_summaries(
+        self, pr_number: int
+    ) -> list[PullRequestIssueComment]:
+        assert pr_number == self.pr_snapshot.number
+        return list(self.review_summaries)
 
     def list_pull_request_issue_comments(
         self, pr_number: int, *, since: str | None = None
@@ -6559,6 +6566,70 @@ def test_feedback_turn_incremental_scan_handles_same_second_boundaries(tmp_path:
     )
     assert review_cursor_again is not None
     assert review_cursor_again.last_comment_id == 12
+
+
+def test_feedback_turn_ingests_review_summary_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_summaries = [
+        PullRequestIssueComment(
+            comment_id=31,
+            body="Please split this feedback into the cache package.",
+            user_login="reviewer",
+            html_url="https://example/review/31",
+            created_at="2026-02-21T00:00:00Z",
+            updated_at="2026-02-21T00:00:00Z",
+        )
+    ]
+
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 1
+    turn = agent.feedback_calls[0][1]
+    assert turn.review_comments == ()
+    assert any(
+        comment.comment_id == 31
+        and "Please split this feedback into the cache package." in comment.body
+        for comment in turn.issue_comments
+    )
+
+    summary_cursor = state.get_poll_cursor(
+        surface="pr_review_summaries",
+        scope_number=101,
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert summary_cursor is not None
+    assert summary_cursor.last_comment_id == 31
 
 
 def test_feedback_turn_incremental_resets_invalid_future_cursor(tmp_path: Path) -> None:

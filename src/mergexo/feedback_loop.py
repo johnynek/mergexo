@@ -9,7 +9,7 @@ from typing import Literal
 ACTION_TOKEN_PATTERN = re.compile(r"<!--\s*mergexo-action:([0-9a-f]{64})\s*-->")
 _OPERATOR_COMMAND_PATTERN = re.compile(r"(?mi)^\s*/mergexo(?:\s+(.+))?\s*$")
 _HEAD_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{7,64}")
-FeedbackKind = Literal["review", "issue", "actions"]
+FeedbackKind = Literal["review", "issue", "review_summary", "actions"]
 OperatorCommandName = Literal["unblock", "restart", "help", "invalid"]
 
 
