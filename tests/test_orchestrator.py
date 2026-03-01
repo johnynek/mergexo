@@ -3531,6 +3531,85 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
     orch._enqueue_new_work(pool)
 
 
+def test_enqueue_new_work_passes_existing_issue_comments_on_first_invocation(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, worker_count=1, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = Issue(
+        number=1,
+        title="One",
+        body="Issue body",
+        html_url="https://example/issues/1",
+        labels=("agent:design",),
+        author_login="issue-author",
+    )
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=5,
+            body="first comment",
+            user_login="reviewer",
+            html_url="https://example/issues/1#issuecomment-5",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=6,
+            body="second comment",
+            user_login="reviewer",
+            html_url="https://example/issues/1#issuecomment-6",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        ),
+    ]
+    state = FakeState(allowed={1})
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.submitted: list[tuple[Issue, IssueFlow, int]] = []
+
+        def submit(
+            self,
+            fn,
+            issue_arg,
+            flow_arg,
+            branch_arg,
+            consumed_comment_id_max,
+        ):  # type: ignore[no-untyped-def]
+            _ = fn, branch_arg
+            fut: Future[WorkResult] = Future()
+            fut.set_result(
+                WorkResult(
+                    issue_number=issue_arg.number,
+                    branch="b",
+                    pr_number=9,
+                    pr_url="u",
+                )
+            )
+            self.submitted.append((issue_arg, flow_arg, consumed_comment_id_max))
+            return fut
+
+    pool = FakePool()
+    orch._enqueue_new_work(pool)
+
+    assert len(pool.submitted) == 1
+    submitted_issue, submitted_flow, consumed_comment_id_max = pool.submitted[0]
+    assert submitted_flow == "design_doc"
+    assert consumed_comment_id_max == 6
+    assert "Issue body" in submitted_issue.body
+    assert "Ordered issue comments at first invocation:" in submitted_issue.body
+    assert "first comment" in submitted_issue.body
+    assert "second comment" in submitted_issue.body
+    assert submitted_issue.body.index("first comment") < submitted_issue.body.index(
+        "second comment"
+    )
+
+    cursor = state.get_issue_comment_cursor(1)
+    assert cursor.pre_pr_last_consumed_comment_id == 6
+
+
 def test_enqueue_new_work_skips_unauthorized_issue_authors(tmp_path: Path) -> None:
     cfg = _config(tmp_path, worker_count=2, allowed_users=("reviewer",))
     git = FakeGitManager(tmp_path / "checkouts")

@@ -11,7 +11,7 @@ import queue
 import re
 import threading
 import time
-from typing import Callable, Literal, cast
+from typing import Callable, Literal, Sequence, cast
 
 from mergexo.agent_adapter import (
     AgentAdapter,
@@ -801,13 +801,19 @@ class Phase1Orchestrator:
                         continue
 
                 branch = _branch_for_issue_flow(flow=flow, issue=issue)
-                context_json = self._serialize_pre_pr_context_for_issue(
+                source_issue_comments = self._github.list_issue_comments(issue.number)
+                run_issue = self._augment_issue_with_first_invocation_source_comments(
                     issue=issue,
+                    comments=source_issue_comments,
+                )
+                context_json = self._serialize_pre_pr_context_for_issue(
+                    issue=run_issue,
                     flow=flow,
                     branch=branch,
                 )
                 consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
-                    issue.number
+                    issue.number,
+                    comments=source_issue_comments,
                 )
                 run_id = self._state.claim_new_issue_run_start(
                     issue_number=issue.number,
@@ -827,7 +833,7 @@ class Phase1Orchestrator:
                 self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_issue_worker,
-                    issue,
+                    run_issue,
                     flow,
                     branch,
                     consumed_comment_id_max,
@@ -4170,17 +4176,53 @@ class Phase1Orchestrator:
             return False
         return True
 
-    def _capture_run_start_comment_id_if_enabled(self, issue_number: int) -> int:
+    def _capture_run_start_comment_id_if_enabled(
+        self,
+        issue_number: int,
+        *,
+        comments: Sequence[PullRequestIssueComment] | None = None,
+    ) -> int:
         if not self._config.runtime.enable_issue_comment_routing:
             return 0
-        comments = self._github.list_issue_comments(issue_number)
-        run_start_comment_id = max((comment.comment_id for comment in comments), default=0)
+        source_comments = (
+            self._github.list_issue_comments(issue_number) if comments is None else comments
+        )
+        run_start_comment_id = max((comment.comment_id for comment in source_comments), default=0)
         self._state.advance_pre_pr_last_consumed_comment_id(
             issue_number=issue_number,
             comment_id=run_start_comment_id,
             repo_full_name=self._state_repo_full_name(),
         )
         return run_start_comment_id
+
+    def _augment_issue_with_first_invocation_source_comments(
+        self,
+        *,
+        issue: Issue,
+        comments: Sequence[PullRequestIssueComment],
+    ) -> Issue:
+        if not comments:
+            return issue
+
+        comment_lines = [
+            (
+                f"- @{comment.user_login} ({comment.created_at}) [{comment.html_url}]"
+                f"\n{comment.body.strip() or '<empty>'}"
+            )
+            for comment in sorted(comments, key=lambda item: item.comment_id)
+        ]
+        comment_section = "\n\n".join(comment_lines)
+        context = "Ordered issue comments at first invocation:\n" + comment_section
+        base_body = issue.body.strip()
+        merged_body = f"{base_body}\n\n{context}" if base_body else context
+        return Issue(
+            number=issue.number,
+            title=issue.title,
+            body=merged_body,
+            html_url=issue.html_url,
+            labels=issue.labels,
+            author_login=issue.author_login,
+        )
 
     def _serialize_pre_pr_context_for_issue(
         self,
