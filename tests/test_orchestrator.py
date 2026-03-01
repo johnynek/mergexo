@@ -7569,7 +7569,8 @@ def test_feedback_turn_blocks_legacy_tracked_pr_when_issue_author_unauthorized(
     orch._process_feedback_turn(tracked)
 
     assert agent.feedback_calls == []
-    assert github.comments == []
+    assert len(github.comments) == 1
+    assert "not allowed by `repo.allowed_users`" in github.comments[0][1]
     assert github.review_replies == []
     assert state.list_pending_feedback_events(101) == ()
     assert state.list_tracked_pull_requests() == ()
@@ -8165,6 +8166,8 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
 
     orch._reap_finished()
     assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
+    assert len(github.comments) == 1
+    assert "unexpected error occurred" in github.comments[0][1].lower()
     assert state.released_feedback_claims == [(101, "run-bad")]
 
 
@@ -8377,7 +8380,9 @@ def test_feedback_turn_commit_no_staged_changes_blocks_and_keeps_event_pending(
     assert len(state.list_pending_feedback_events(101)) == 1
     assert state.list_tracked_pull_requests() == ()
     assert github.review_replies == []
-    assert github.comments == []
+    assert len(github.comments) == 1
+    assert "feedback automation is blocked" in github.comments[0][1].lower()
+    assert "no new staged changes or local commits" in github.comments[0][1].lower()
 
     conn = sqlite3.connect(tmp_path / "state.db")
     try:
@@ -8389,6 +8394,69 @@ def test_feedback_turn_commit_no_staged_changes_blocks_and_keeps_event_pending(
         assert "no staged changes" in str(row[1]).lower()
     finally:
         conn.close()
+
+
+def test_feedback_turn_commit_no_staged_changes_allows_agent_local_commit(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.review_comments = [_review_comment()]
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-456"),
+        review_replies=(ReviewReply(review_comment_id=11, body="Done"),),
+        general_comment="Updated in latest commit.",
+        commit_message="chore: noop",
+        git_ops=(),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    def raise_no_staged_after_local_commit(checkout_path: Path, message: str) -> None:
+        _ = checkout_path, message
+        git.current_head_sha_value = "head-2"
+        raise RuntimeError("No staged changes to commit")
+
+    git.commit_all = raise_no_staged_after_local_commit  # type: ignore[method-assign]
+    git.is_ancestor_results[("head-1", "head-2")] = True
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(state.list_pending_feedback_events(101)) == 0
+    assert len(state.list_tracked_pull_requests()) == 1
+    assert len(git.push_calls) == 1
+    assert len(github.review_replies) == 1
+    assert any("updated in latest commit" in body.lower() for _, body in github.comments)
+    assert all("feedback automation is blocked" not in body.lower() for _, body in github.comments)
 
 
 def test_feedback_turn_blocks_on_pre_finalize_remote_history_rewrite(tmp_path: Path) -> None:
@@ -9879,6 +9947,8 @@ def test_run_feedback_agent_with_git_ops_blocks_when_request_batch_too_large(
             "agent requested too many git operations in one round; max=4",
         )
     ]
+    assert len(github.comments) == 1
+    assert "too many git operations" in github.comments[0][1].lower()
     assert len(agent.feedback_calls) == 1
     assert git.fetch_calls == []
 
@@ -9938,6 +10008,8 @@ def test_run_feedback_agent_with_git_ops_blocks_when_round_limit_exceeded(tmp_pa
             "agent exceeded maximum git-op follow-up rounds; max=3",
         )
     ]
+    assert len(github.comments) == 1
+    assert "follow-up rounds exceeded the safety limit" in github.comments[0][1].lower()
 
 
 def test_run_feedback_agent_with_git_ops_stops_when_pr_merged_after_git_op(tmp_path: Path) -> None:
