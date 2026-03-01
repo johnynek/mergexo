@@ -3191,25 +3191,26 @@ class Phase1Orchestrator:
                         )
                         continue
 
-                    self._state.mark_pr_status(
+                    error = str(exc)
+                    self._mark_feedback_blocked(
                         pr_number=pr_number,
                         issue_number=handle.issue_number,
-                        status="blocked",
-                        error=str(exc),
-                        repo_full_name=self._state_repo_full_name(),
-                    )
-                    log_event(
-                        LOGGER,
-                        "feedback_turn_blocked",
-                        issue_number=handle.issue_number,
-                        pr_number=pr_number,
                         reason=type(exc).__name__,
+                        error=error,
+                        comment_body=(
+                            "MergeXO feedback loop is blocked because an unexpected error "
+                            "occurred while processing this PR.\n\n"
+                            f"- error type: `{type(exc).__name__}`\n"
+                            f"- detail: `{_summarize_git_error(error)}`\n\n"
+                            "Action: inspect logs, resolve the underlying issue, then reset "
+                            "blocked feedback state."
+                        ),
                     )
                     self._state.finish_agent_run(
                         run_id=handle.run_id,
                         terminal_status="failed",
                         failure_class=_failure_class_for_exception(exc),
-                        error=str(exc),
+                        error=error,
                     )
                 finally:
                     self._state.release_feedback_turn_claim(
@@ -4494,13 +4495,18 @@ class Phase1Orchestrator:
             if not self._repo.allows(issue.author_login):
                 reason = "unauthorized_issue_author"
                 error = "feedback ignored because issue author is not allowed by repo.allowed_users"
-                self._state.mark_pr_status(
+                self._mark_feedback_blocked(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
-                    status="blocked",
-                    last_seen_head_sha=pr.head_sha,
+                    reason=reason,
                     error=error,
-                    repo_full_name=self._state_repo_full_name(),
+                    last_seen_head_sha=pr.head_sha,
+                    comment_body=(
+                        "MergeXO feedback loop is blocked because the source issue author "
+                        f"`{issue.author_login}` is not allowed by `repo.allowed_users`.\n\n"
+                        "Action: have an allowed user continue feedback on this PR, or update "
+                        "`repo.allowed_users`, then reset blocked feedback state."
+                    ),
                 )
                 log_event(
                     LOGGER,
@@ -4508,13 +4514,6 @@ class Phase1Orchestrator:
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
                     author_login=issue.author_login,
-                    reason=reason,
-                )
-                log_event(
-                    LOGGER,
-                    "feedback_turn_blocked",
-                    issue_number=tracked.issue_number,
-                    pr_number=tracked.pr_number,
                     reason=reason,
                 )
                 return "blocked"
@@ -4725,27 +4724,16 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
             )
             if session_row is None:
-                self._github.post_issue_comment(
-                    issue_number=tracked.pr_number,
-                    body=(
+                self._mark_feedback_blocked(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    reason="missing_agent_session",
+                    error="missing saved agent session",
+                    last_seen_head_sha=pr.head_sha,
+                    comment_body=(
                         "MergeXO feedback loop is blocked for this PR because no saved "
                         f"agent session was found for issue #{tracked.issue_number}."
                     ),
-                )
-                self._state.mark_pr_status(
-                    pr_number=tracked.pr_number,
-                    issue_number=tracked.issue_number,
-                    status="blocked",
-                    last_seen_head_sha=pr.head_sha,
-                    error="missing saved agent session",
-                    repo_full_name=self._state_repo_full_name(),
-                )
-                log_event(
-                    LOGGER,
-                    "feedback_turn_blocked",
-                    issue_number=tracked.issue_number,
-                    pr_number=tracked.pr_number,
-                    reason="missing_agent_session",
                 )
                 return "blocked"
             session = AgentSession(adapter=session_row[0], thread_id=session_row[1])
@@ -5247,32 +5235,55 @@ class Phase1Orchestrator:
                     state_head_sha=turn_start_head,
                 )
                 return None
+            log_event(
+                LOGGER,
+                "feedback_commit_phase_started",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                branch=tracked.branch,
+                turn_start_head_sha=turn_start_head,
+                local_head_sha=local_head_sha,
+            )
 
             try:
                 self._git.commit_all(checkout_path, current_result.commit_message)
             except RuntimeError as exc:
-                if _is_no_staged_changes_error(exc):
+                if not _is_no_staged_changes_error(exc):
+                    raise
+                local_head_after_noop = self._git.current_head_sha(checkout_path)
+                if local_head_after_noop != turn_start_head and self._git.is_ancestor(
+                    checkout_path, turn_start_head, local_head_after_noop
+                ):
+                    log_event(
+                        LOGGER,
+                        "feedback_agent_local_commit_detected",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        branch=tracked.branch,
+                        turn_start_head_sha=turn_start_head,
+                        local_head_before_sha=local_head_sha,
+                        local_head_after_sha=local_head_after_noop,
+                    )
+                else:
                     error = (
                         "agent returned commit_message but no staged changes were found; "
                         "feedback turn requires repo edits before posting replies"
                     )
-                    self._state.mark_pr_status(
+                    self._mark_feedback_blocked(
                         pr_number=tracked.pr_number,
                         issue_number=tracked.issue_number,
-                        status="blocked",
-                        last_seen_head_sha=current_pr.head_sha,
-                        error=error,
-                        repo_full_name=self._state_repo_full_name(),
-                    )
-                    log_event(
-                        LOGGER,
-                        "feedback_turn_blocked",
-                        issue_number=tracked.issue_number,
-                        pr_number=tracked.pr_number,
                         reason="commit_message_without_changes",
+                        error=error,
+                        last_seen_head_sha=current_pr.head_sha,
+                        comment_body=(
+                            "MergeXO feedback automation is blocked because the agent "
+                            "returned `commit_message` but no new staged changes or local "
+                            "commits were detected.\n\n"
+                            "Action: request concrete file edits (or explicit `git_ops`), "
+                            "then reset blocked feedback state."
+                        ),
                     )
                     return None
-                raise
 
             required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
             if required_tests_error is not None:
@@ -5587,20 +5598,19 @@ class Phase1Orchestrator:
                     "agent requested too many git operations in one round; "
                     f"max={_MAX_FEEDBACK_GIT_OPS_PER_ROUND}"
                 )
-                self._state.mark_pr_status(
+                self._mark_feedback_blocked(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
-                    status="blocked",
-                    last_seen_head_sha=current_pr.head_sha,
-                    error=error,
-                    repo_full_name=self._state_repo_full_name(),
-                )
-                log_event(
-                    LOGGER,
-                    "feedback_turn_blocked",
-                    issue_number=tracked.issue_number,
-                    pr_number=tracked.pr_number,
                     reason="too_many_git_ops_requested",
+                    error=error,
+                    last_seen_head_sha=current_pr.head_sha,
+                    comment_body=(
+                        "MergeXO feedback automation is blocked because the agent requested too "
+                        "many git operations in one response.\n"
+                        f"- max allowed per round: {_MAX_FEEDBACK_GIT_OPS_PER_ROUND}\n\n"
+                        "Action: request a smaller sequence of `git_ops`, or apply edits "
+                        "directly and finalize."
+                    ),
                 )
                 return None
 
@@ -5610,20 +5620,19 @@ class Phase1Orchestrator:
                     "agent exceeded maximum git-op follow-up rounds; "
                     f"max={_MAX_FEEDBACK_GIT_OP_ROUNDS}"
                 )
-                self._state.mark_pr_status(
+                self._mark_feedback_blocked(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
-                    status="blocked",
-                    last_seen_head_sha=current_pr.head_sha,
-                    error=error,
-                    repo_full_name=self._state_repo_full_name(),
-                )
-                log_event(
-                    LOGGER,
-                    "feedback_turn_blocked",
-                    issue_number=tracked.issue_number,
-                    pr_number=tracked.pr_number,
                     reason="git_op_round_limit_exceeded",
+                    error=error,
+                    last_seen_head_sha=current_pr.head_sha,
+                    comment_body=(
+                        "MergeXO feedback automation is blocked because git-operation follow-up "
+                        "rounds exceeded the safety limit.\n"
+                        f"- max follow-up rounds: {_MAX_FEEDBACK_GIT_OP_ROUNDS}\n\n"
+                        "Action: ask for direct file edits and finalization, then reset blocked "
+                        "feedback state."
+                    ),
                 )
                 return None
 
@@ -5911,6 +5920,60 @@ class Phase1Orchestrator:
         if older_sha == newer_sha:
             return "identical"
         return self._github.compare_commits(older_sha, newer_sha)
+
+    def _post_feedback_block_comment(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        reason: str,
+        body: str,
+    ) -> None:
+        try:
+            self._github.post_issue_comment(issue_number=pr_number, body=body)
+        except Exception as exc:  # noqa: BLE001
+            # Blocking state transitions should remain durable even if comment posting fails.
+            log_event(
+                LOGGER,
+                "feedback_block_comment_failed",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                reason=reason,
+                error_type=type(exc).__name__,
+            )
+
+    def _mark_feedback_blocked(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        reason: str,
+        error: str,
+        last_seen_head_sha: str | None = None,
+        comment_body: str | None = None,
+    ) -> None:
+        if comment_body:
+            self._post_feedback_block_comment(
+                pr_number=pr_number,
+                issue_number=issue_number,
+                reason=reason,
+                body=comment_body,
+            )
+        self._state.mark_pr_status(
+            pr_number=pr_number,
+            issue_number=issue_number,
+            status="blocked",
+            last_seen_head_sha=last_seen_head_sha,
+            error=error,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        log_event(
+            LOGGER,
+            "feedback_turn_blocked",
+            issue_number=issue_number,
+            pr_number=pr_number,
+            reason=reason,
+        )
 
     def _block_feedback_history_rewrite(
         self,
