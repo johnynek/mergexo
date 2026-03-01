@@ -8171,6 +8171,31 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
     assert state.released_feedback_claims == [(101, "run-bad")]
 
 
+def test_mark_feedback_blocked_survives_comment_post_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    def raise_post_failure(issue_number: int, body: str) -> None:
+        _ = issue_number, body
+        raise RuntimeError("post failed")
+
+    github.post_issue_comment = raise_post_failure  # type: ignore[method-assign]
+
+    orch._mark_feedback_blocked(
+        pr_number=101,
+        issue_number=7,
+        reason="test_block_reason",
+        error="blocked for test",
+        comment_body="test block message",
+    )
+
+    assert state.status_updates == [(101, 7, "blocked", None, "blocked for test")]
+
+
 def test_reap_finished_keeps_feedback_tracked_on_github_polling_error(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
