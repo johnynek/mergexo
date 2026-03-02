@@ -261,7 +261,13 @@ Return JSON only with this object shape:
     {{"review_comment_id": 123, "body": "reply body"}}
   ],
   "general_comment": "optional summary comment for the PR",
-  "commit_message": "optional commit message if code changes are needed"
+  "commit_message": "optional commit message if code changes are needed",
+  "flaky_test_report": {{
+    "run_id": 123456789,
+    "title": "meaningful flaky test issue title",
+    "summary": "why this failure appears unrelated to current PR and how to reproduce",
+    "relevant_log_excerpt": "direct CI log excerpt supporting flaky classification"
+  }}
 }}
 
 Rules:
@@ -275,6 +281,10 @@ Rules:
 - Reply to specific review comments using their exact review_comment_id.
 - Do not invent IDs.
 - Use review_replies to summarize what changed and where.
+- Set flaky_test_report only when the failure is an unrelated flaky CI test and you are confident.
+- flaky_test_report must include run_id/title/summary/relevant_log_excerpt with concrete reproduction details.
+- If flaky_test_report is non-null, commit_message MUST be null.
+- If uncertain whether it is flaky, leave flaky_test_report as null and continue normal remediation.
 - Allowed git_ops are exactly: `fetch_origin`, `merge_origin_default_branch`.
 - If you need MergeXO to run one of those git operations (for example because of sandbox git metadata limits), request it via git_ops and set commit_message to null for that response.
 - When git_ops are requested, do not post proposal-only review replies yet; wait for the follow-up turn with operation results and then implement/finalize.

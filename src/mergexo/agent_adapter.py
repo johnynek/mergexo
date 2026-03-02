@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from mergexo.models import (
+    FlakyTestReport,
     GeneratedDesign,
     Issue,
     PullRequestIssueComment,
@@ -56,6 +57,7 @@ class FeedbackResult:
     general_comment: str | None
     commit_message: str | None
     git_ops: tuple[GitOpRequest, ...]
+    flaky_test_report: FlakyTestReport | None = None
 
 
 @dataclass(frozen=True)

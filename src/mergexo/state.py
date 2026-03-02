@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import threading
@@ -60,6 +61,11 @@ ActionTokenScopeKind = Literal["pr", "issue"]
 ActionTokenStatus = Literal["planned", "posted", "observed", "failed"]
 GitHubCallKind = Literal["create_pull_request"]
 GitHubCallStatus = Literal["pending", "in_progress", "succeeded"]
+PrFlakeStatus = Literal[
+    "awaiting_rerun_result",
+    "resolved_after_rerun",
+    "blocked_after_second_failure",
+]
 
 
 @dataclass(frozen=True)
@@ -221,6 +227,26 @@ class GitHubCallOutboxState:
     created_at: str
     updated_at: str
     repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class PrFlakeState:
+    repo_full_name: str
+    pr_number: int
+    issue_number: int
+    head_sha: str
+    run_id: int
+    initial_run_updated_at: str
+    status: PrFlakeStatus
+    flake_issue_number: int
+    flake_issue_url: str
+    report_title: str
+    report_summary: str
+    report_excerpt: str
+    full_log_context_markdown: str
+    rerun_requested_at: str | None
+    created_at: str
+    updated_at: str
 
 
 class StateStore:
@@ -459,6 +485,29 @@ class StateStore:
                     ADD COLUMN takeover_issue_floor_comment_id INTEGER NOT NULL DEFAULT 0
                     """
                 )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pr_flake_state (
+                    repo_full_name TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    run_id INTEGER NOT NULL,
+                    initial_run_updated_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    flake_issue_number INTEGER NOT NULL,
+                    flake_issue_url TEXT NOT NULL,
+                    report_title TEXT NOT NULL,
+                    report_summary TEXT NOT NULL,
+                    report_excerpt TEXT NOT NULL,
+                    full_log_context_markdown TEXT NOT NULL,
+                    rerun_requested_at TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, pr_number)
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS operator_commands (
@@ -2060,6 +2109,232 @@ class StateStore:
             else None,
             updated_at=str(updated_at),
         )
+
+    def upsert_pr_flake_state(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        head_sha: str,
+        run_id: int,
+        initial_run_updated_at: str,
+        status: PrFlakeStatus,
+        flake_issue_number: int,
+        flake_issue_url: str,
+        report_title: str,
+        report_summary: str,
+        report_excerpt: str,
+        full_log_context_markdown: str,
+        rerun_requested_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO pr_flake_state(
+                    repo_full_name,
+                    pr_number,
+                    issue_number,
+                    head_sha,
+                    run_id,
+                    initial_run_updated_at,
+                    status,
+                    flake_issue_number,
+                    flake_issue_url,
+                    report_title,
+                    report_summary,
+                    report_excerpt,
+                    full_log_context_markdown,
+                    rerun_requested_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo_full_name, pr_number) DO UPDATE SET
+                    issue_number=excluded.issue_number,
+                    head_sha=excluded.head_sha,
+                    run_id=excluded.run_id,
+                    initial_run_updated_at=excluded.initial_run_updated_at,
+                    status=excluded.status,
+                    flake_issue_number=excluded.flake_issue_number,
+                    flake_issue_url=excluded.flake_issue_url,
+                    report_title=excluded.report_title,
+                    report_summary=excluded.report_summary,
+                    report_excerpt=excluded.report_excerpt,
+                    full_log_context_markdown=excluded.full_log_context_markdown,
+                    rerun_requested_at=COALESCE(
+                        excluded.rerun_requested_at,
+                        pr_flake_state.rerun_requested_at
+                    ),
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (
+                    repo_key,
+                    pr_number,
+                    issue_number,
+                    head_sha,
+                    run_id,
+                    initial_run_updated_at,
+                    status,
+                    flake_issue_number,
+                    flake_issue_url,
+                    report_title,
+                    report_summary,
+                    report_excerpt,
+                    full_log_context_markdown,
+                    rerun_requested_at,
+                ),
+            )
+        state = self.get_pr_flake_state(pr_number, repo_full_name=repo_key)
+        if state is None:
+            raise RuntimeError(f"Missing pr_flake_state row for pr_number={pr_number}")
+        return state
+
+    def get_pr_flake_state(
+        self,
+        pr_number: int,
+        *,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState | None:
+        with self._lock, self._connect() as conn:
+            if repo_full_name is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        repo_full_name,
+                        pr_number,
+                        issue_number,
+                        head_sha,
+                        run_id,
+                        initial_run_updated_at,
+                        status,
+                        flake_issue_number,
+                        flake_issue_url,
+                        report_title,
+                        report_summary,
+                        report_excerpt,
+                        full_log_context_markdown,
+                        rerun_requested_at,
+                        created_at,
+                        updated_at
+                    FROM pr_flake_state
+                    WHERE pr_number = ?
+                    ORDER BY repo_full_name ASC
+                    """,
+                    (pr_number,),
+                ).fetchall()
+                if not rows:
+                    row = None
+                else:
+                    if len(rows) > 1:
+                        raise RuntimeError(
+                            f"Multiple pr_flake_state rows found for pr_number={pr_number}; "
+                            "specify repo_full_name."
+                        )
+                    row = rows[0]
+            else:
+                repo_key = _normalize_repo_full_name(repo_full_name)
+                row = conn.execute(
+                    """
+                    SELECT
+                        repo_full_name,
+                        pr_number,
+                        issue_number,
+                        head_sha,
+                        run_id,
+                        initial_run_updated_at,
+                        status,
+                        flake_issue_number,
+                        flake_issue_url,
+                        report_title,
+                        report_summary,
+                        report_excerpt,
+                        full_log_context_markdown,
+                        rerun_requested_at,
+                        created_at,
+                        updated_at
+                    FROM pr_flake_state
+                    WHERE repo_full_name = ? AND pr_number = ?
+                    """,
+                    (repo_key, pr_number),
+                ).fetchone()
+        if row is None:
+            return None
+        return _parse_pr_flake_state_row(row)
+
+    def get_active_pr_flake_state(
+        self,
+        pr_number: int,
+        *,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState | None:
+        state = self.get_pr_flake_state(pr_number, repo_full_name=repo_full_name)
+        if state is None:
+            return None
+        if state.status != "awaiting_rerun_result":
+            return None
+        return state
+
+    def set_pr_flake_state_status(
+        self,
+        *,
+        pr_number: int,
+        status: PrFlakeStatus,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE pr_flake_state
+                SET status = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND pr_number = ?
+                """,
+                (status, repo_key, pr_number),
+            )
+        if cursor.rowcount <= 0:
+            return None
+        return self.get_pr_flake_state(pr_number, repo_full_name=repo_key)
+
+    def mark_pr_flake_rerun_requested(
+        self,
+        *,
+        pr_number: int,
+        rerun_requested_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        requested_at = rerun_requested_at or _now_iso_utc()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE pr_flake_state
+                SET rerun_requested_at = COALESCE(rerun_requested_at, ?),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND pr_number = ?
+                """,
+                (requested_at, repo_key, pr_number),
+            )
+        if cursor.rowcount <= 0:
+            return None
+        return self.get_pr_flake_state(pr_number, repo_full_name=repo_key)
+
+    def clear_pr_flake_state(
+        self,
+        *,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM pr_flake_state
+                WHERE repo_full_name = ? AND pr_number = ?
+                """,
+                (repo_key, pr_number),
+            )
+        return cursor.rowcount > 0
 
     def mark_running(self, issue_number: int, *, repo_full_name: str | None = None) -> None:
         repo_key = _normalize_repo_full_name(repo_full_name)
@@ -3942,6 +4217,14 @@ class StateStore:
                 """,
                 (repo_key, issue_number, status, error),
             )
+            if status in {"merged", "closed"}:
+                conn.execute(
+                    """
+                    DELETE FROM pr_flake_state
+                    WHERE repo_full_name = ? AND pr_number = ?
+                    """,
+                    (repo_key, pr_number),
+                )
             _append_pr_status_history(
                 conn=conn,
                 repo_full_name=repo_key,
@@ -4299,11 +4582,82 @@ def _normalize_repo_full_name(repo_full_name: str | None) -> str:
     return normalized
 
 
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _transient_retry_delay_seconds(retry_count: int) -> int:
     if retry_count < 1:
         raise ValueError("retry_count must be >= 1")
     delay = _TRANSIENT_RETRY_INITIAL_DELAY_SECONDS * (2 ** (retry_count - 1))
     return min(delay, _TRANSIENT_RETRY_MAX_DELAY_SECONDS)
+
+
+def _parse_pr_flake_state_row(row: tuple[object, ...]) -> PrFlakeState:
+    if len(row) != 16:
+        raise RuntimeError("Invalid pr_flake_state row width")
+    (
+        repo_full_name,
+        pr_number,
+        issue_number,
+        head_sha,
+        run_id,
+        initial_run_updated_at,
+        status,
+        flake_issue_number,
+        flake_issue_url,
+        report_title,
+        report_summary,
+        report_excerpt,
+        full_log_context_markdown,
+        rerun_requested_at,
+        created_at,
+        updated_at,
+    ) = row
+    if not isinstance(repo_full_name, str):
+        raise RuntimeError("Invalid repo_full_name value stored in pr_flake_state")
+    for field_name, value in (
+        ("pr_number", pr_number),
+        ("issue_number", issue_number),
+        ("run_id", run_id),
+        ("flake_issue_number", flake_issue_number),
+    ):
+        if not isinstance(value, int):
+            raise RuntimeError(f"Invalid {field_name} value stored in pr_flake_state")
+    for field_name, value in (
+        ("head_sha", head_sha),
+        ("initial_run_updated_at", initial_run_updated_at),
+        ("status", status),
+        ("flake_issue_url", flake_issue_url),
+        ("report_title", report_title),
+        ("report_summary", report_summary),
+        ("report_excerpt", report_excerpt),
+        ("full_log_context_markdown", full_log_context_markdown),
+        ("created_at", created_at),
+        ("updated_at", updated_at),
+    ):
+        if not isinstance(value, str):
+            raise RuntimeError(f"Invalid {field_name} value stored in pr_flake_state")
+    if rerun_requested_at is not None and not isinstance(rerun_requested_at, str):
+        raise RuntimeError("Invalid rerun_requested_at value stored in pr_flake_state")
+    return PrFlakeState(
+        repo_full_name=repo_full_name,
+        pr_number=cast(int, pr_number),
+        issue_number=cast(int, issue_number),
+        head_sha=cast(str, head_sha),
+        run_id=cast(int, run_id),
+        initial_run_updated_at=cast(str, initial_run_updated_at),
+        status=_parse_pr_flake_status(status),
+        flake_issue_number=cast(int, flake_issue_number),
+        flake_issue_url=cast(str, flake_issue_url),
+        report_title=cast(str, report_title),
+        report_summary=cast(str, report_summary),
+        report_excerpt=cast(str, report_excerpt),
+        full_log_context_markdown=cast(str, full_log_context_markdown),
+        rerun_requested_at=rerun_requested_at,
+        created_at=cast(str, created_at),
+        updated_at=cast(str, updated_at),
+    )
 
 
 def _parse_poll_cursor_row(
@@ -4650,6 +5004,18 @@ def _parse_github_comment_surface(value: object) -> GitHubCommentSurface:
     }:
         raise RuntimeError(f"Unknown surface value stored in github_comment_poll_cursors: {value}")
     return cast(GitHubCommentSurface, value)
+
+
+def _parse_pr_flake_status(value: object) -> PrFlakeStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in pr_flake_state")
+    if value not in {
+        "awaiting_rerun_result",
+        "resolved_after_rerun",
+        "blocked_after_second_failure",
+    }:
+        raise RuntimeError(f"Unknown status value stored in pr_flake_state: {value}")
+    return cast(PrFlakeStatus, value)
 
 
 def _parse_action_token_scope_kind(value: object) -> ActionTokenScopeKind:

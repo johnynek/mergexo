@@ -12,6 +12,7 @@ from mergexo.codex_adapter import (
     _extract_final_agent_message,
     _extract_thread_id,
     _filter_resume_extra_args,
+    _parse_flaky_test_report,
     _parse_git_ops,
     _optional_output_text,
     _parse_event_line,
@@ -391,6 +392,7 @@ def test_respond_to_feedback_happy_path(
     assert result.general_comment == "Updated"
     assert result.commit_message == "fix: update"
     assert result.git_ops == ()
+    assert result.flaky_test_report is None
     stderr = capsys.readouterr().err
     assert "event=feedback_agent_call_started issue_number=1 pr_number=8" in stderr
     assert (
@@ -578,3 +580,104 @@ def test_parse_git_ops_validation() -> None:
         _parse_git_ops(["bad"])
     with pytest.raises(RuntimeError, match="must be one of"):
         _parse_git_ops([{"op": "unknown"}])
+
+
+def test_parse_flaky_test_report_validation() -> None:
+    assert _parse_flaky_test_report(None) is None
+    parsed = _parse_flaky_test_report(
+        {
+            "run_id": 7001,
+            "title": "Flaky unit test in scheduler shard",
+            "summary": "Fails intermittently without code changes.",
+            "relevant_log_excerpt": "AssertionError: expected 1 got 0",
+        }
+    )
+    assert parsed is not None
+    assert parsed.run_id == 7001
+    assert parsed.title == "Flaky unit test in scheduler shard"
+
+    with pytest.raises(RuntimeError, match="object or null"):
+        _parse_flaky_test_report("bad")
+    with pytest.raises(RuntimeError, match="must be an integer"):
+        _parse_flaky_test_report({"run_id": "7001"})
+    with pytest.raises(RuntimeError, match="must be >= 1"):
+        _parse_flaky_test_report(
+            {
+                "run_id": 0,
+                "title": "x",
+                "summary": "y",
+                "relevant_log_excerpt": "z",
+            }
+        )
+    with pytest.raises(RuntimeError, match="title must be a non-empty string"):
+        _parse_flaky_test_report(
+            {
+                "run_id": 1,
+                "title": " ",
+                "summary": "y",
+                "relevant_log_excerpt": "z",
+            }
+        )
+    with pytest.raises(RuntimeError, match="summary must be a non-empty string"):
+        _parse_flaky_test_report(
+            {
+                "run_id": 1,
+                "title": "x",
+                "summary": " ",
+                "relevant_log_excerpt": "z",
+            }
+        )
+    with pytest.raises(RuntimeError, match="relevant_log_excerpt must be a non-empty string"):
+        _parse_flaky_test_report(
+            {
+                "run_id": 1,
+                "title": "x",
+                "summary": "y",
+                "relevant_log_excerpt": " ",
+            }
+        )
+
+
+def test_respond_to_feedback_rejects_flaky_report_with_commit_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        message_payload = json.dumps(
+            {
+                "review_replies": [],
+                "general_comment": None,
+                "commit_message": "fix: should not be present",
+                "flaky_test_report": {
+                    "run_id": 7001,
+                    "title": "Flaky run",
+                    "summary": "Likely unrelated flake",
+                    "relevant_log_excerpt": "traceback",
+                },
+            }
+        )
+        return (
+            '{"type":"thread.started","thread_id":"thread-resumed"}\n'
+            + json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": message_payload},
+                }
+            )
+            + "\n"
+        )
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(RuntimeError, match="cannot set commit_message"):
+        adapter.respond_to_feedback(
+            session=AgentSession(adapter="codex", thread_id="thread-abc"),
+            turn=_feedback_turn(),
+            cwd=tmp_path,
+        )

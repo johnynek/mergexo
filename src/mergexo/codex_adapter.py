@@ -18,7 +18,7 @@ from mergexo.agent_adapter import (
     ReviewReply,
 )
 from mergexo.config import CodexConfig
-from mergexo.models import GeneratedDesign, Issue
+from mergexo.models import FlakyTestReport, GeneratedDesign, Issue
 from mergexo.observability import log_event
 from mergexo.prompts import (
     build_bugfix_prompt,
@@ -252,6 +252,11 @@ class CodexAdapter(AgentAdapter):
             general_comment = _optional_output_text(payload.get("general_comment"))
             commit_message = _optional_output_text(payload.get("commit_message"))
             git_ops = _parse_git_ops(payload.get("git_ops"))
+            flaky_test_report = _parse_flaky_test_report(payload.get("flaky_test_report"))
+            if flaky_test_report is not None and commit_message is not None:
+                raise RuntimeError(
+                    "Codex response cannot set commit_message when flaky_test_report is present"
+                )
 
             resumed_thread_id = _extract_thread_id(raw_events) or session.thread_id
         except Exception as exc:  # noqa: BLE001
@@ -292,6 +297,7 @@ class CodexAdapter(AgentAdapter):
             general_comment=general_comment,
             commit_message=commit_message,
             git_ops=tuple(git_ops),
+            flaky_test_report=flaky_test_report,
         )
 
     def _run_design_turn(self, *, prompt: str, cwd: Path) -> tuple[GeneratedDesign, str | None]:
@@ -600,6 +606,37 @@ def _parse_git_ops(value: object) -> list[GitOpRequest]:
             continue
         raise RuntimeError("git_ops op must be one of: fetch_origin, merge_origin_default_branch")
     return requests
+
+
+def _parse_flaky_test_report(value: object) -> FlakyTestReport | None:
+    if value is None:
+        return None
+    payload = _as_object_dict(value)
+    if payload is None:
+        raise RuntimeError("flaky_test_report must be an object or null")
+
+    run_id = payload.get("run_id")
+    title = payload.get("title")
+    summary = payload.get("summary")
+    relevant_log_excerpt = payload.get("relevant_log_excerpt")
+
+    if not isinstance(run_id, int):
+        raise RuntimeError("flaky_test_report.run_id must be an integer")
+    if run_id < 1:
+        raise RuntimeError("flaky_test_report.run_id must be >= 1")
+    if not isinstance(title, str) or not title.strip():
+        raise RuntimeError("flaky_test_report.title must be a non-empty string")
+    if not isinstance(summary, str) or not summary.strip():
+        raise RuntimeError("flaky_test_report.summary must be a non-empty string")
+    if not isinstance(relevant_log_excerpt, str) or not relevant_log_excerpt.strip():
+        raise RuntimeError("flaky_test_report.relevant_log_excerpt must be a non-empty string")
+
+    return FlakyTestReport(
+        run_id=run_id,
+        title=title.strip(),
+        summary=summary.strip(),
+        relevant_log_excerpt=relevant_log_excerpt.strip(),
+    )
 
 
 def _as_object_dict(value: object) -> dict[str, object] | None:
