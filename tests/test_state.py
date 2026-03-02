@@ -19,6 +19,8 @@ from mergexo.state import (
     _parse_github_call_outbox_row,
     _parse_operator_command_name,
     _parse_operator_command_row,
+    _parse_pr_flake_state_row,
+    _parse_pr_flake_status,
     _parse_poll_cursor_row,
     _parse_operator_command_status,
     _parse_pre_pr_followup_flow,
@@ -208,10 +210,12 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         assert "agent_run_history" in tables
         assert "pr_status_history" in tables
         assert "github_call_outbox" in tables
+        assert "pr_flake_state" in tables
         run_history_columns = set(_table_columns(conn, "agent_run_history"))
         issue_run_columns = set(_table_columns(conn, "issue_runs"))
         outbox_columns = set(_table_columns(conn, "github_call_outbox"))
         pr_feedback_columns = set(_table_columns(conn, "pr_feedback_state"))
+        pr_flake_columns = set(_table_columns(conn, "pr_flake_state"))
         assert "run_id" in run_history_columns
         assert "terminal_status" in run_history_columns
         assert "duration_seconds" in run_history_columns
@@ -224,6 +228,10 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         assert "next_retry_at" in issue_run_columns
         assert "state_applied" in outbox_columns
         assert "result_json" in outbox_columns
+        assert "head_sha" in pr_flake_columns
+        assert "run_id" in pr_flake_columns
+        assert "status" in pr_flake_columns
+        assert "flake_issue_url" in pr_flake_columns
         takeover_columns = set(_table_columns(conn, "issue_takeover_state"))
         assert "ignore_active" in takeover_columns
         assert "updated_at" in takeover_columns
@@ -2145,6 +2153,210 @@ def test_reset_blocked_pull_requests_noop_paths(tmp_path: Path) -> None:
 
     assert store.reset_blocked_pull_requests(pr_numbers=()) == 0
     assert store.reset_blocked_pull_requests(pr_numbers=(999,)) == 0
+
+
+def test_pr_flake_state_lifecycle(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100")
+
+    state = store.upsert_pr_flake_state(
+        pr_number=100,
+        issue_number=7,
+        head_sha="head-1",
+        run_id=7001,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flaky scheduler shard",
+        report_summary="Likely unrelated flaky timeout.",
+        report_excerpt="TimeoutError: queue did not drain",
+        full_log_context_markdown="MergeXO GitHub Actions failure context:",
+    )
+    assert state.pr_number == 100
+    assert state.status == "awaiting_rerun_result"
+
+    active = store.get_active_pr_flake_state(100)
+    assert active is not None
+    assert active.run_id == 7001
+
+    requested = store.mark_pr_flake_rerun_requested(pr_number=100)
+    assert requested is not None
+    assert requested.rerun_requested_at is not None
+
+    resolved = store.set_pr_flake_state_status(pr_number=100, status="resolved_after_rerun")
+    assert resolved is not None
+    assert resolved.status == "resolved_after_rerun"
+    assert store.get_active_pr_flake_state(100) is None
+
+    blocked = store.set_pr_flake_state_status(
+        pr_number=100,
+        status="blocked_after_second_failure",
+    )
+    assert blocked is not None
+    assert blocked.status == "blocked_after_second_failure"
+
+    assert store.clear_pr_flake_state(pr_number=100)
+    assert store.get_pr_flake_state(100) is None
+    assert not store.clear_pr_flake_state(pr_number=100)
+
+
+def test_pr_flake_state_clears_on_closed_or_merged_status(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100")
+    store.upsert_pr_flake_state(
+        pr_number=100,
+        issue_number=7,
+        head_sha="head-1",
+        run_id=7001,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flaky scheduler shard",
+        report_summary="Likely unrelated flaky timeout.",
+        report_excerpt="TimeoutError: queue did not drain",
+        full_log_context_markdown="MergeXO GitHub Actions failure context:",
+    )
+    assert store.get_pr_flake_state(100) is not None
+
+    store.mark_pr_status(
+        pr_number=100,
+        issue_number=7,
+        status="closed",
+    )
+    assert store.get_pr_flake_state(100) is None
+
+
+def test_parse_pr_flake_status_rejects_unknown_values() -> None:
+    assert _parse_pr_flake_status("awaiting_rerun_result") == "awaiting_rerun_result"
+    with pytest.raises(RuntimeError, match="Invalid status value stored in pr_flake_state"):
+        _parse_pr_flake_status(123)
+    with pytest.raises(RuntimeError, match="Unknown status value stored in pr_flake_state"):
+        _parse_pr_flake_status("bad")
+
+
+def test_pr_flake_state_helpers_cover_error_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100", repo_full_name="o/a")
+
+    def force_missing(pr_number: int, *, repo_full_name: str | None = None):  # type: ignore[no-untyped-def]
+        _ = pr_number, repo_full_name
+        return None
+
+    monkeypatch.setattr(store, "get_pr_flake_state", force_missing)
+    with pytest.raises(RuntimeError, match="Missing pr_flake_state row"):
+        store.upsert_pr_flake_state(
+            pr_number=100,
+            issue_number=7,
+            head_sha="head-1",
+            run_id=7001,
+            initial_run_updated_at="2026-02-21T02:00:00Z",
+            status="awaiting_rerun_result",
+            flake_issue_number=88,
+            flake_issue_url="https://example/issues/88",
+            report_title="Flaky scheduler shard",
+            report_summary="Likely unrelated flaky timeout.",
+            report_excerpt="TimeoutError: queue did not drain",
+            full_log_context_markdown="MergeXO GitHub Actions failure context:",
+            repo_full_name="o/a",
+        )
+
+    fresh_store = StateStore(db_path)
+    assert (
+        fresh_store.set_pr_flake_state_status(
+            pr_number=999,
+            status="blocked_after_second_failure",
+            repo_full_name="o/a",
+        )
+        is None
+    )
+    assert (
+        fresh_store.mark_pr_flake_rerun_requested(
+            pr_number=999,
+            repo_full_name="o/a",
+        )
+        is None
+    )
+
+
+def test_get_pr_flake_state_requires_repo_when_multiple_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(7, "agent/design/7", 100, "https://example/pr/100", repo_full_name="o/a")
+    store.mark_completed(9, "agent/design/9", 100, "https://example/pr/100", repo_full_name="o/b")
+    store.upsert_pr_flake_state(
+        pr_number=100,
+        issue_number=7,
+        head_sha="head-a",
+        run_id=7001,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flake A",
+        report_summary="A",
+        report_excerpt="A",
+        full_log_context_markdown="ctx",
+        repo_full_name="o/a",
+    )
+    store.upsert_pr_flake_state(
+        pr_number=100,
+        issue_number=9,
+        head_sha="head-b",
+        run_id=7002,
+        initial_run_updated_at="2026-02-21T02:01:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=89,
+        flake_issue_url="https://example/issues/89",
+        report_title="Flake B",
+        report_summary="B",
+        report_excerpt="B",
+        full_log_context_markdown="ctx",
+        repo_full_name="o/b",
+    )
+
+    with pytest.raises(RuntimeError, match="specify repo_full_name"):
+        store.get_pr_flake_state(100)
+
+
+def test_parse_pr_flake_state_row_validation_errors() -> None:
+    valid_row: tuple[object, ...] = (
+        "o/repo",
+        100,
+        7,
+        "head-1",
+        7001,
+        "2026-02-21T02:00:00Z",
+        "awaiting_rerun_result",
+        88,
+        "https://example/issues/88",
+        "Flaky scheduler shard",
+        "Likely unrelated flaky timeout.",
+        "TimeoutError: queue did not drain",
+        "MergeXO GitHub Actions failure context:",
+        None,
+        "2026-02-21T02:01:00Z",
+        "2026-02-21T02:01:01Z",
+    )
+    parsed = _parse_pr_flake_state_row(valid_row)
+    assert parsed.pr_number == 100
+
+    with pytest.raises(RuntimeError, match="Invalid pr_flake_state row width"):
+        _parse_pr_flake_state_row(valid_row[:-1])
+    with pytest.raises(RuntimeError, match="Invalid repo_full_name value"):
+        _parse_pr_flake_state_row((123, *valid_row[1:]))
+    with pytest.raises(RuntimeError, match="Invalid pr_number value"):
+        _parse_pr_flake_state_row((valid_row[0], "bad", *valid_row[2:]))
+    with pytest.raises(RuntimeError, match="Invalid head_sha value"):
+        _parse_pr_flake_state_row((*valid_row[:3], 5, *valid_row[4:]))
+    with pytest.raises(RuntimeError, match="Invalid rerun_requested_at value"):
+        _parse_pr_flake_state_row((*valid_row[:13], 7, *valid_row[14:]))
 
 
 def test_state_store_connection_rolls_back_on_error(tmp_path: Path) -> None:

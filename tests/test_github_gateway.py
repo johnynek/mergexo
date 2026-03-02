@@ -150,6 +150,112 @@ def test_create_pull_request_and_comment(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls[2][2] == {"body": "reply", "in_reply_to": 55}
 
 
+def test_create_issue_parses_response_and_omits_labels_when_not_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_api(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
+        _ = self
+        calls.append((method, path, payload))
+        return {
+            "number": 44,
+            "title": "Flaky scheduler test",
+            "body": "Details",
+            "html_url": "https://example/issues/44",
+            "labels": [],
+            "user": {"login": "mergexo[bot]"},
+        }
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+
+    created = gateway.create_issue(
+        title="Flaky scheduler test",
+        body="Details",
+        labels=None,
+    )
+
+    assert created.number == 44
+    assert created.html_url == "https://example/issues/44"
+    assert created.author_login == "mergexo[bot]"
+    assert calls[0][0] == "POST"
+    assert calls[0][1].endswith("/issues")
+    assert calls[0][2] == {"title": "Flaky scheduler test", "body": "Details"}
+
+
+def test_create_issue_includes_labels_and_skips_bad_label_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_api(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
+        _ = self
+        calls.append((method, path, payload))
+        return {
+            "number": 45,
+            "title": "Flaky scheduler test",
+            "body": "Details",
+            "html_url": "https://example/issues/45",
+            "labels": ["bad", {"name": "flake"}],
+            "user": {"login": "mergexo[bot]"},
+        }
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    created = gateway.create_issue(
+        title="Flaky scheduler test",
+        body="Details",
+        labels=("no-labels-on-purpose",),
+    )
+
+    assert created.number == 45
+    assert created.labels == ("flake",)
+    assert calls[0][2] == {
+        "title": "Flaky scheduler test",
+        "body": "Details",
+        "labels": ["no-labels-on-purpose"],
+    }
+
+
+def test_create_issue_rejects_non_object_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+    with pytest.raises(RuntimeError, match="expected object for issue"):
+        gateway.create_issue(title="x", body="y")
+
+
+def test_rerun_workflow_run_failed_jobs_uses_rerun_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_no_response(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        _ = self
+        calls.append((method, path, payload))
+
+    monkeypatch.setattr(GitHubGateway, "_api_no_response", fake_no_response)
+    gateway.rerun_workflow_run_failed_jobs(7001)
+
+    assert calls == [
+        (
+            "POST",
+            "/repos/o/r/actions/runs/7001/rerun-failed-jobs",
+            None,
+        )
+    ]
+
+
 def test_find_pull_request_by_head(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway = GitHubGateway("o", "r")
 
@@ -919,6 +1025,74 @@ def test_api_json_invokes_gh_api(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "--input" in calls[1][0]
     assert calls[1][1] == '{"k": "v"}'
     assert calls[1][2] is True
+
+
+def test_api_no_response_invokes_gh_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[list[str], str | None, bool]] = []
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cwd
+        calls.append((cmd, input_text, check))
+        return ""
+
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+    gateway = GitHubGateway("o", "r")
+
+    gateway._api_no_response("POST", "/path")
+    gateway._api_no_response("POST", "/path", payload={"k": "v"})
+
+    assert calls[0][0] == ["gh", "api", "--method", "POST", "/path"]
+    assert calls[0][1] is None
+    assert calls[0][2] is True
+    assert "--input" in calls[1][0]
+    assert calls[1][1] == '{"k": "v"}'
+
+
+def test_api_no_response_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = {"count": 0}
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("boom once")
+        return ""
+
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+
+    gateway._api_no_response("POST", "/path")
+    assert attempts["count"] == 2
+
+
+def test_api_no_response_raises_wrapped_error_after_max_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = {"count": 0}
+
+    def fake_run(
+        cmd: list[str], *, cwd=None, input_text: str | None = None, check: bool = True
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        attempts["count"] += 1
+        raise RuntimeError("still failing")
+
+    gateway = GitHubGateway("o", "r")
+    monkeypatch.setattr("mergexo.github_gateway.run", fake_run)
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_classify_github_failure",
+        lambda self, **kwargs: GitHubPollingError("wrapped"),
+    )
+    monkeypatch.setattr(GitHubGateway, "_sleep_before_retry", lambda self, **kwargs: None)
+
+    with pytest.raises(GitHubPollingError, match="wrapped"):
+        gateway._api_no_response("POST", "/path")
+    assert attempts["count"] == 3
 
 
 def test_api_json_get_uses_if_none_match_and_reuses_cached_payload(

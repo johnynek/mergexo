@@ -3,6 +3,7 @@ from __future__ import annotations
 from mergexo.agent_adapter import FeedbackTurn
 from mergexo import __version__
 from mergexo.models import (
+    FlakyTestReport,
     GeneratedDesign,
     Issue,
     OperatorCommandRecord,
@@ -101,6 +102,12 @@ def test_model_dataclasses_and_version() -> None:
         conclusion="failure",
         html_url="https://example/jobs/21",
     )
+    flaky_report = FlakyTestReport(
+        run_id=777,
+        title="Flaky scheduler shard",
+        summary="Intermittent timeout in shard 2.",
+        relevant_log_excerpt="TimeoutError: queue did not drain",
+    )
 
     assert __version__ == "0.1.0"
     assert issue.labels == ("x",)
@@ -114,6 +121,7 @@ def test_model_dataclasses_and_version() -> None:
     assert runtime_op.mode == "git_checkout"
     assert workflow_run.run_id == 11
     assert workflow_job.job_id == 21
+    assert flaky_report.run_id == 777
 
 
 def test_build_design_prompt_contains_required_contract() -> None:
@@ -195,6 +203,9 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "Keep history append-only" in prompt
     assert "If CI failure context from GitHub Actions is present" in prompt
     assert "A non-null commit_message is the ready-to-push signal." in prompt
+    assert '"flaky_test_report"' in prompt
+    assert '"relevant_log_excerpt"' in prompt
+    assert "If flaky_test_report is non-null, commit_message MUST be null." in prompt
 
 
 def test_build_bugfix_prompt_requires_regression_tests() -> None:

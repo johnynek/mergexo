@@ -74,6 +74,16 @@ def compute_general_comment_token(*, turn_key: str, body: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def compute_flake_detected_token(*, pr_number: int, run_id: int, flake_issue_number: int) -> str:
+    payload = f"{pr_number}:flake_detected:{run_id}:{flake_issue_number}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_flake_blocked_token(*, pr_number: int, run_id: int, flake_issue_number: int) -> str:
+    payload = f"{pr_number}:flake_blocked:{run_id}:{flake_issue_number}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def compute_history_rewrite_token(
     *, pr_number: int, expected_head_sha: str, observed_head_sha: str, reason: str
 ) -> str:

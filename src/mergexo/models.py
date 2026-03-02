@@ -63,6 +63,14 @@ class WorkflowJobSnapshot:
 
 
 @dataclass(frozen=True)
+class FlakyTestReport:
+    run_id: int
+    title: str
+    summary: str
+    relevant_log_excerpt: str
+
+
+@dataclass(frozen=True)
 class PullRequestReviewComment:
     comment_id: int
     body: str

@@ -34,6 +34,7 @@ from mergexo.feedback_loop import (
 )
 from mergexo.github_gateway import GitHubAuthenticationError, GitHubGateway, GitHubPollingError
 from mergexo.models import (
+    FlakyTestReport,
     GeneratedDesign,
     Issue,
     IssueFlow,
@@ -107,6 +108,8 @@ from mergexo.state import (
     ImplementationCandidateState,
     PendingFeedbackEvent,
     PollCursorUpdate,
+    PrFlakeState,
+    PrFlakeStatus,
     PrePrFollowupState,
     StateStore,
     TrackedPullRequestState,
@@ -215,6 +218,8 @@ class FakeGitHub:
         self.issues = issues
         self.requested_labels: tuple[str, ...] | None = None
         self.created_prs: list[tuple[str, str, str, str]] = []
+        self.created_issues: list[tuple[str, str, tuple[str, ...] | None]] = []
+        self.rerun_requests: list[int] = []
         self.comments: list[tuple[int, str]] = []
         self.review_replies: list[tuple[int, int, str]] = []
         self.review_comments: list[PullRequestReviewComment] = []
@@ -232,6 +237,7 @@ class FakeGitHub:
             merged=False,
         )
         self._next_comment_id = 1000
+        self._next_issue_number = 1000
         self.compare_calls: list[tuple[str, str]] = []
         self.compare_statuses: dict[tuple[str, str], str] = {}
         self.workflow_runs_by_head: dict[tuple[int, str], tuple[WorkflowRunSnapshot, ...]] = {}
@@ -259,6 +265,25 @@ class FakeGitHub:
         pr = PullRequest(number=101, html_url="https://example/pr/101")
         self.pr_lookup_by_head_base[(head, base)] = pr
         return pr
+
+    def create_issue(
+        self,
+        *,
+        title: str,
+        body: str,
+        labels: tuple[str, ...] | None = None,
+    ) -> Issue:
+        self.created_issues.append((title, body, labels))
+        issue_number = self._next_issue_number
+        self._next_issue_number += 1
+        return Issue(
+            number=issue_number,
+            title=title,
+            body=body,
+            html_url=f"https://example/issues/{issue_number}",
+            labels=labels or (),
+            author_login="mergexo[bot]",
+        )
 
     def find_pull_request_by_head(
         self,
@@ -347,6 +372,9 @@ class FakeGitHub:
     ) -> dict[str, str | None]:
         self.failed_log_tail_calls.append((run_id, tail_lines_per_action))
         return dict(self.failed_run_log_tails.get(run_id, {}))
+
+    def rerun_workflow_run_failed_jobs(self, run_id: int) -> None:
+        self.rerun_requests.append(run_id)
 
     def post_review_comment_reply(self, pr_number: int, review_comment_id: int, body: str) -> None:
         self.review_replies.append((pr_number, review_comment_id, body))
@@ -520,6 +548,7 @@ class FakeState:
         self.run_starts: list[tuple[str, str, int, int | None]] = []
         self.run_finishes: list[tuple[str, str, str | None, str | None]] = []
         self._pr_status_by_pr: dict[int, str] = {}
+        self._pr_flake_state_by_pr: dict[int, PrFlakeState] = {}
         self._action_tokens: dict[str, ActionTokenState] = {}
         self._poll_cursors: dict[tuple[str, int], GitHubCommentPollCursorState] = {}
         self._issue_comment_cursors: dict[int, tuple[int, int]] = {}
@@ -1135,6 +1164,142 @@ class FakeState:
         _ = repo_full_name, reason, detail
         self.status_updates.append((pr_number, issue_number, status, last_seen_head_sha, error))
         self._pr_status_by_pr[pr_number] = status
+        if status in {"merged", "closed"}:
+            self._pr_flake_state_by_pr.pop(pr_number, None)
+
+    def upsert_pr_flake_state(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        head_sha: str,
+        run_id: int,
+        initial_run_updated_at: str,
+        status: PrFlakeStatus,
+        flake_issue_number: int,
+        flake_issue_url: str,
+        report_title: str,
+        report_summary: str,
+        report_excerpt: str,
+        full_log_context_markdown: str,
+        rerun_requested_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState:
+        existing = self._pr_flake_state_by_pr.get(pr_number)
+        next_state = PrFlakeState(
+            repo_full_name=repo_full_name or "",
+            pr_number=pr_number,
+            issue_number=issue_number,
+            head_sha=head_sha,
+            run_id=run_id,
+            initial_run_updated_at=initial_run_updated_at,
+            status=status,
+            flake_issue_number=flake_issue_number,
+            flake_issue_url=flake_issue_url,
+            report_title=report_title,
+            report_summary=report_summary,
+            report_excerpt=report_excerpt,
+            full_log_context_markdown=full_log_context_markdown,
+            rerun_requested_at=(
+                existing.rerun_requested_at
+                if existing is not None and rerun_requested_at is None
+                else rerun_requested_at
+            ),
+            created_at="now" if existing is None else existing.created_at,
+            updated_at="now",
+        )
+        self._pr_flake_state_by_pr[pr_number] = next_state
+        return next_state
+
+    def get_pr_flake_state(
+        self, pr_number: int, *, repo_full_name: str | None = None
+    ) -> PrFlakeState | None:
+        _ = repo_full_name
+        return self._pr_flake_state_by_pr.get(pr_number)
+
+    def get_active_pr_flake_state(
+        self, pr_number: int, *, repo_full_name: str | None = None
+    ) -> PrFlakeState | None:
+        _ = repo_full_name
+        state = self._pr_flake_state_by_pr.get(pr_number)
+        if state is None:
+            return None
+        if state.status != "awaiting_rerun_result":
+            return None
+        return state
+
+    def set_pr_flake_state_status(
+        self,
+        *,
+        pr_number: int,
+        status: PrFlakeStatus,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState | None:
+        _ = repo_full_name
+        state = self._pr_flake_state_by_pr.get(pr_number)
+        if state is None:
+            return None
+        updated = PrFlakeState(
+            repo_full_name=state.repo_full_name,
+            pr_number=state.pr_number,
+            issue_number=state.issue_number,
+            head_sha=state.head_sha,
+            run_id=state.run_id,
+            initial_run_updated_at=state.initial_run_updated_at,
+            status=status,
+            flake_issue_number=state.flake_issue_number,
+            flake_issue_url=state.flake_issue_url,
+            report_title=state.report_title,
+            report_summary=state.report_summary,
+            report_excerpt=state.report_excerpt,
+            full_log_context_markdown=state.full_log_context_markdown,
+            rerun_requested_at=state.rerun_requested_at,
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        self._pr_flake_state_by_pr[pr_number] = updated
+        return updated
+
+    def mark_pr_flake_rerun_requested(
+        self,
+        *,
+        pr_number: int,
+        rerun_requested_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> PrFlakeState | None:
+        _ = repo_full_name
+        state = self._pr_flake_state_by_pr.get(pr_number)
+        if state is None:
+            return None
+        updated = PrFlakeState(
+            repo_full_name=state.repo_full_name,
+            pr_number=state.pr_number,
+            issue_number=state.issue_number,
+            head_sha=state.head_sha,
+            run_id=state.run_id,
+            initial_run_updated_at=state.initial_run_updated_at,
+            status=state.status,
+            flake_issue_number=state.flake_issue_number,
+            flake_issue_url=state.flake_issue_url,
+            report_title=state.report_title,
+            report_summary=state.report_summary,
+            report_excerpt=state.report_excerpt,
+            full_log_context_markdown=state.full_log_context_markdown,
+            rerun_requested_at=state.rerun_requested_at or rerun_requested_at or "now",
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        self._pr_flake_state_by_pr[pr_number] = updated
+        return updated
+
+    def clear_pr_flake_state(
+        self,
+        *,
+        pr_number: int,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        return self._pr_flake_state_by_pr.pop(pr_number, None) is not None
 
     def get_issue_comment_cursor(
         self, issue_number: int, *, repo_full_name: str | None = None
@@ -7526,6 +7691,799 @@ def test_feedback_turn_actions_context_handles_missing_failed_jobs(tmp_path: Pat
         "No failed actions were returned by the jobs API for this run."
         in turn.issue_comments[0].body
     )
+
+
+def test_feedback_turn_flake_report_files_issue_and_requests_rerun(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+    )
+    github.workflow_jobs_by_run_id[7002] = (
+        _workflow_job(job_id=8001, name="tests", conclusion="failure"),
+    )
+    github.failed_run_log_tails[7002] = {"tests": "AssertionError: expected 1 got 0"}
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-555"),
+        review_replies=(),
+        general_comment=None,
+        commit_message=None,
+        git_ops=(),
+        flaky_test_report=FlakyTestReport(
+            run_id=7002,
+            title="Flaky scheduler integration test",
+            summary="Failure appears unrelated to this PR and reproduces intermittently.",
+            relevant_log_excerpt="AssertionError: expected 1 got 0",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:actions:7002:2026-02-21T02:00:00Z",
+                pr_number=101,
+                issue_number=issue.number,
+                kind="actions",
+                comment_id=7002,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+        ),
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    result = orch._process_feedback_turn(tracked)
+
+    assert result == "completed"
+    assert len(github.created_issues) == 1
+    created_title, created_body, created_labels = github.created_issues[0]
+    assert created_title == "Flaky scheduler integration test"
+    assert created_labels is None
+    assert "Full Captured Actions Context" in created_body
+    assert "AssertionError: expected 1 got 0" in created_body
+
+    assert github.rerun_requests == [7002]
+    assert any("likely unrelated flaky CI failure" in body for _, body in github.comments)
+    assert any("rerun the failed jobs once" in body.lower() for _, body in github.comments)
+
+    flake_state = state.get_pr_flake_state(101, repo_full_name=cfg.repo.full_name)
+    assert flake_state is not None
+    assert flake_state.status == "awaiting_rerun_result"
+    assert flake_state.rerun_requested_at is not None
+    assert flake_state.flake_issue_number == 1000
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+
+
+def test_monitor_pr_actions_resolves_flake_after_green_rerun(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="success",
+            updated_at="2026-02-21T02:30:00Z",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.upsert_pr_flake_state(
+        pr_number=101,
+        issue_number=issue.number,
+        head_sha="head-1",
+        run_id=7002,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flaky scheduler integration test",
+        report_summary="Looks flaky.",
+        report_excerpt="AssertionError",
+        full_log_context_markdown="MergeXO GitHub Actions failure context",
+        rerun_requested_at="2026-02-21T02:05:00Z",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._monitor_pr_actions()
+
+    flake_state = state.get_pr_flake_state(101, repo_full_name=cfg.repo.full_name)
+    assert flake_state is not None
+    assert flake_state.status == "resolved_after_rerun"
+    tracked = state.list_tracked_pull_requests(repo_full_name=cfg.repo.full_name)
+    assert len(tracked) == 1
+    assert tracked[0].pr_number == 101
+
+
+def test_monitor_pr_actions_blocks_after_second_flake_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:30:00Z",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.upsert_pr_flake_state(
+        pr_number=101,
+        issue_number=issue.number,
+        head_sha="head-1",
+        run_id=7002,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flaky scheduler integration test",
+        report_summary="Looks flaky.",
+        report_excerpt="AssertionError",
+        full_log_context_markdown="MergeXO GitHub Actions failure context",
+        rerun_requested_at="2026-02-21T02:05:00Z",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._monitor_pr_actions()
+
+    flake_state = state.get_pr_flake_state(101, repo_full_name=cfg.repo.full_name)
+    assert flake_state is not None
+    assert flake_state.status == "blocked_after_second_failure"
+    blocked = state.list_blocked_pull_requests(repo_full_name=cfg.repo.full_name)
+    assert len(blocked) == 1
+    assert blocked[0].pr_number == 101
+    assert any("PR is now blocked" in body for _, body in github.comments)
+    assert any("https://example/issues/88" in body for _, body in github.comments)
+
+
+def test_feedback_turn_flake_idempotent_after_finalize_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+    )
+    github.workflow_jobs_by_run_id[7002] = (
+        _workflow_job(job_id=8001, name="tests", conclusion="failure"),
+    )
+    github.failed_run_log_tails[7002] = {"tests": "AssertionError: expected 1 got 0"}
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-555"),
+        review_replies=(),
+        general_comment=None,
+        commit_message=None,
+        git_ops=(),
+        flaky_test_report=FlakyTestReport(
+            run_id=7002,
+            title="Flaky scheduler integration test",
+            summary="Failure appears unrelated to this PR and reproduces intermittently.",
+            relevant_log_excerpt="AssertionError: expected 1 got 0",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:actions:7002:2026-02-21T02:00:00Z",
+                pr_number=101,
+                issue_number=issue.number,
+                kind="actions",
+                comment_id=7002,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+        ),
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    original_finalize = state.finalize_feedback_turn
+    calls = {"count": 0}
+
+    def crash_once(**kwargs: object) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("crash before finalize")
+        original_finalize(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(state, "finalize_feedback_turn", crash_once)
+
+    tracked = _tracked_state_from_store(state)
+    with pytest.raises(RuntimeError, match="crash before finalize"):
+        orch._process_feedback_turn(tracked)
+
+    assert len(github.created_issues) == 1
+    assert len(github.rerun_requests) == 1
+    first_comment_count = len(github.comments)
+    assert first_comment_count >= 1
+
+    tracked_retry = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked_retry)
+
+    assert len(github.created_issues) == 1
+    assert len(github.rerun_requests) == 1
+    assert len(github.comments) == first_comment_count
+    assert state.list_pending_feedback_events(101, repo_full_name=cfg.repo.full_name) == ()
+
+
+def test_reconcile_pr_flake_state_waiting_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg, state=state, github=FakeGitHub([]), git_manager=git, agent=FakeAgent()
+    )
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=7,
+        branch="agent/design/7",
+        status="awaiting_feedback",
+        last_seen_head_sha=None,
+    )
+    pull_request = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+
+    state.upsert_pr_flake_state(
+        pr_number=101,
+        issue_number=7,
+        head_sha="old-head",
+        run_id=7001,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flake",
+        report_summary="summary",
+        report_excerpt="excerpt",
+        full_log_context_markdown="ctx",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert not orch._reconcile_pr_flake_state(tracked=tracked, pull_request=pull_request, runs=())
+    assert state.get_pr_flake_state(101, repo_full_name=cfg.repo.full_name) is None
+
+    state.upsert_pr_flake_state(
+        pr_number=101,
+        issue_number=7,
+        head_sha="head-1",
+        run_id=7001,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flake",
+        report_summary="summary",
+        report_excerpt="excerpt",
+        full_log_context_markdown="ctx",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert orch._reconcile_pr_flake_state(tracked=tracked, pull_request=pull_request, runs=())
+    assert orch._reconcile_pr_flake_state(
+        tracked=tracked,
+        pull_request=pull_request,
+        runs=(
+            _workflow_run(
+                run_id=7001,
+                status="completed",
+                conclusion="failure",
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+        ),
+    )
+    assert orch._reconcile_pr_flake_state(
+        tracked=tracked,
+        pull_request=pull_request,
+        runs=(
+            _workflow_run(
+                run_id=7001,
+                status="in_progress",
+                conclusion=None,
+                updated_at="2026-02-21T02:05:00Z",
+            ),
+        ),
+    )
+
+
+def test_feedback_turn_clears_active_flake_state_on_head_change(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-new",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.upsert_pr_flake_state(
+        pr_number=101,
+        issue_number=issue.number,
+        head_sha="head-old",
+        run_id=7001,
+        initial_run_updated_at="2026-02-21T02:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=88,
+        flake_issue_url="https://example/issues/88",
+        report_title="Flake",
+        report_summary="summary",
+        report_excerpt="excerpt",
+        full_log_context_markdown="ctx",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    tracked = _tracked_state_from_store(state)
+    result = orch._process_feedback_turn(tracked)
+
+    assert result == "completed"
+    assert state.get_pr_flake_state(101, repo_full_name=cfg.repo.full_name) is None
+
+
+def test_actions_context_and_flake_render_helpers(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    contexts = orch._actions_context_by_run_id(
+        (
+            PullRequestIssueComment(
+                comment_id=1,
+                body="- run_id: 7001",
+                user_login="mergexo-system",
+                html_url="",
+                created_at="now",
+                updated_at="now",
+            ),
+            PullRequestIssueComment(
+                comment_id=2,
+                body="- run_id: nope",
+                user_login="mergexo-system",
+                html_url="",
+                created_at="now",
+                updated_at="now",
+            ),
+            PullRequestIssueComment(
+                comment_id=3,
+                body="no run id here",
+                user_login="mergexo-system",
+                html_url="",
+                created_at="now",
+                updated_at="now",
+            ),
+        )
+    )
+    assert contexts == {7001: "- run_id: 7001"}
+    assert orch._run_id_from_actions_context("- run_id: nope") is None
+    assert orch._run_id_from_actions_context("missing") is None
+
+    title = orch._render_flake_issue_title(
+        report=FlakyTestReport(
+            run_id=7001,
+            title="",
+            summary="",
+            relevant_log_excerpt="x",
+        ),
+        pr_number=101,
+    )
+    assert title == "Flaky CI test on PR #101 (run 7001)"
+    blocked_comment = orch._render_flake_blocked_pr_comment(
+        run_id=7001,
+        run_url="https://example/runs/7001",
+        flake_issue_url="https://example/issues/88",
+        conclusion="failure",
+        reason="rerun request failed",
+    )
+    assert "detail: rerun request failed" in blocked_comment
+
+
+def test_handle_flaky_test_report_reject_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=7,
+        branch="agent/design/7",
+        status="awaiting_feedback",
+        last_seen_head_sha=None,
+    )
+    issue = _issue()
+    pr = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    report = FlakyTestReport(
+        run_id=7001,
+        title="Flake",
+        summary="summary",
+        relevant_log_excerpt="excerpt",
+    )
+
+    assert (
+        orch._handle_flaky_test_report(
+            tracked=tracked,
+            issue=issue,
+            pull_request=pr,
+            turn_key="turn",
+            session=AgentSession(adapter="codex", thread_id="t"),
+            pending_event_keys=("k",),
+            actions_only_turn=True,
+            actionable_actions_by_run_id={7001: PendingFeedbackEvent("k", "actions", 7001, "u")},
+            actions_context_by_run_id={7001: "ctx"},
+            report=report,
+            commit_message="bad",
+        )
+        is None
+    )
+    assert (
+        orch._handle_flaky_test_report(
+            tracked=tracked,
+            issue=issue,
+            pull_request=pr,
+            turn_key="turn",
+            session=AgentSession(adapter="codex", thread_id="t"),
+            pending_event_keys=("k",),
+            actions_only_turn=False,
+            actionable_actions_by_run_id={7001: PendingFeedbackEvent("k", "actions", 7001, "u")},
+            actions_context_by_run_id={7001: "ctx"},
+            report=report,
+            commit_message=None,
+        )
+        is None
+    )
+    assert (
+        orch._handle_flaky_test_report(
+            tracked=tracked,
+            issue=issue,
+            pull_request=pr,
+            turn_key="turn",
+            session=AgentSession(adapter="codex", thread_id="t"),
+            pending_event_keys=("k",),
+            actions_only_turn=True,
+            actionable_actions_by_run_id={},
+            actions_context_by_run_id={7001: "ctx"},
+            report=report,
+            commit_message=None,
+        )
+        is None
+    )
+    assert (
+        orch._handle_flaky_test_report(
+            tracked=tracked,
+            issue=issue,
+            pull_request=pr,
+            turn_key="turn",
+            session=AgentSession(adapter="codex", thread_id="t"),
+            pending_event_keys=("k",),
+            actions_only_turn=True,
+            actionable_actions_by_run_id={7001: PendingFeedbackEvent("k", "actions", 7001, "u")},
+            actions_context_by_run_id={},
+            report=report,
+            commit_message=None,
+        )
+        is None
+    )
+
+
+def test_feedback_turn_flake_rerun_request_failure_blocks(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, pr_actions_feedback_policy="first_fail")
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+    )
+    github.workflow_jobs_by_run_id[7002] = (
+        _workflow_job(job_id=8001, name="tests", conclusion="failure"),
+    )
+    github.failed_run_log_tails[7002] = {"tests": "AssertionError"}
+
+    def fail_rerun(run_id: int) -> None:
+        _ = run_id
+        raise RuntimeError("forbidden")
+
+    github.rerun_workflow_run_failed_jobs = fail_rerun  # type: ignore[method-assign]
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-555"),
+        review_replies=(),
+        general_comment=None,
+        commit_message=None,
+        git_ops=(),
+        flaky_test_report=FlakyTestReport(
+            run_id=7002,
+            title="Flaky scheduler integration test",
+            summary="Failure appears unrelated to this PR and reproduces intermittently.",
+            relevant_log_excerpt="AssertionError",
+        ),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="101:actions:7002:2026-02-21T02:00:00Z",
+                pr_number=101,
+                issue_number=issue.number,
+                kind="actions",
+                comment_id=7002,
+                updated_at="2026-02-21T02:00:00Z",
+            ),
+        ),
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = _tracked_state_from_store(state)
+    result = orch._process_feedback_turn(tracked)
+
+    assert result == "blocked"
+    flake_state = state.get_pr_flake_state(101, repo_full_name=cfg.repo.full_name)
+    assert flake_state is not None
+    assert flake_state.status == "blocked_after_second_failure"
+    blocked = state.list_blocked_pull_requests(repo_full_name=cfg.repo.full_name)
+    assert len(blocked) == 1
+    assert any("detail: Rerun request failed" in body for _, body in github.comments)
+
+
+def test_handle_flaky_test_report_replaces_mismatched_existing_state(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    github = FakeGitHub([_issue()])
+    github.workflow_runs_by_head[(101, "head-1")] = (
+        _workflow_run(
+            run_id=7002,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=7,
+        branch="agent/design/7",
+        status="awaiting_feedback",
+        last_seen_head_sha=None,
+    )
+    issue = _issue()
+    pr = PullRequestSnapshot(
+        number=101,
+        title="PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    state.upsert_pr_flake_state(
+        pr_number=101,
+        issue_number=7,
+        head_sha="head-old",
+        run_id=7001,
+        initial_run_updated_at="2026-02-21T01:00:00Z",
+        status="awaiting_rerun_result",
+        flake_issue_number=77,
+        flake_issue_url="https://example/issues/77",
+        report_title="old",
+        report_summary="old",
+        report_excerpt="old",
+        full_log_context_markdown="old",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    result = orch._handle_flaky_test_report(
+        tracked=tracked,
+        issue=issue,
+        pull_request=pr,
+        turn_key="turn",
+        session=AgentSession(adapter="codex", thread_id="t"),
+        pending_event_keys=("k",),
+        actions_only_turn=True,
+        actionable_actions_by_run_id={
+            7002: PendingFeedbackEvent("k", "actions", 7002, "2026-02-21T02:00:00Z")
+        },
+        actions_context_by_run_id={7002: "MergeXO GitHub Actions failure context:\n- run_id: 7002"},
+        report=FlakyTestReport(
+            run_id=7002,
+            title="new flake",
+            summary="new summary",
+            relevant_log_excerpt="new excerpt",
+        ),
+        commit_message=None,
+    )
+    assert result == "completed"
+    flake_state = state.get_pr_flake_state(101, repo_full_name=cfg.repo.full_name)
+    assert flake_state is not None
+    assert flake_state.run_id == 7002
+    assert len(github.created_issues) == 1
 
 
 def test_feedback_turn_blocks_legacy_tracked_pr_when_issue_author_unauthorized(

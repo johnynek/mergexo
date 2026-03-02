@@ -26,6 +26,8 @@ from mergexo.feedback_loop import (
     FeedbackEventRecord,
     ParsedOperatorCommand,
     append_action_token,
+    compute_flake_blocked_token,
+    compute_flake_detected_token,
     compute_general_comment_token,
     compute_history_rewrite_token,
     compute_operator_command_token,
@@ -49,6 +51,7 @@ from mergexo.github_gateway import (
     GitHubPollingError,
 )
 from mergexo.models import (
+    FlakyTestReport,
     GeneratedDesign,
     Issue,
     IssueFlow,
@@ -966,6 +969,10 @@ class Phase1Orchestrator:
         for tracked in tracked_prs:
             pr = self._github.get_pull_request(tracked.pr_number)
             if pr.merged:
+                self._state.clear_pr_flake_state(
+                    pr_number=tracked.pr_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
@@ -982,6 +989,10 @@ class Phase1Orchestrator:
                 )
                 continue
             if pr.state.lower() != "open":
+                self._state.clear_pr_flake_state(
+                    pr_number=tracked.pr_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
@@ -1272,9 +1283,15 @@ class Phase1Orchestrator:
                 continue
             pr = self._github.get_pull_request(tracked.pr_number)
             if pr.merged or pr.state.lower() != "open":
+                self._state.clear_pr_flake_state(
+                    pr_number=tracked.pr_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 continue
 
             runs = self._github.list_workflow_runs_for_head(tracked.pr_number, pr.head_sha)
+            if self._reconcile_pr_flake_state(tracked=tracked, pull_request=pr, runs=runs):
+                continue
             failed_runs = tuple(
                 run
                 for run in runs
@@ -1319,6 +1336,116 @@ class Phase1Orchestrator:
                 failed_run_count=len(failed_runs),
                 active_run_count=len(active_runs),
             )
+
+    def _reconcile_pr_flake_state(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        pull_request: PullRequestSnapshot,
+        runs: tuple[WorkflowRunSnapshot, ...],
+    ) -> bool:
+        flake_state = self._state.get_active_pr_flake_state(
+            tracked.pr_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if flake_state is None:
+            return False
+
+        if pull_request.head_sha != flake_state.head_sha:
+            self._state.clear_pr_flake_state(
+                pr_number=tracked.pr_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
+
+        run = next(
+            (candidate for candidate in runs if candidate.run_id == flake_state.run_id), None
+        )
+        if run is None:
+            return True
+        if run.updated_at == flake_state.initial_run_updated_at:
+            return True
+        if run.status != "completed":
+            return True
+
+        if run.conclusion in _ACTIONS_GREEN_CONCLUSIONS:
+            self._state.set_pr_flake_state_status(
+                pr_number=tracked.pr_number,
+                status="resolved_after_rerun",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            log_event(
+                LOGGER,
+                "flake_rerun_resolved_green",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=run.run_id,
+                flake_issue_number=flake_state.flake_issue_number,
+            )
+            return False
+
+        block_token = compute_flake_blocked_token(
+            pr_number=tracked.pr_number,
+            run_id=run.run_id,
+            flake_issue_number=flake_state.flake_issue_number,
+        )
+        block_comment = self._render_flake_blocked_pr_comment(
+            run_id=run.run_id,
+            run_url=run.html_url,
+            flake_issue_url=flake_state.flake_issue_url,
+            conclusion=run.conclusion,
+        )
+        posted = self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=tracked.pr_number,
+            token=block_token,
+            body=block_comment,
+            source="flake_second_failure_block",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if posted:
+            log_event(
+                LOGGER,
+                "flake_pr_comment_posted",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=run.run_id,
+                flake_issue_number=flake_state.flake_issue_number,
+                comment_kind="second_failure_block",
+            )
+
+        error = (
+            "workflow rerun failed again after flaky classification; "
+            f"run_id={run.run_id} conclusion={run.conclusion or '<none>'}"
+        )
+        self._state.mark_pr_status(
+            pr_number=tracked.pr_number,
+            issue_number=tracked.issue_number,
+            status="blocked",
+            last_seen_head_sha=pull_request.head_sha,
+            error=error,
+            reason="flake_second_failure",
+            detail=flake_state.flake_issue_url,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        self._state.set_pr_flake_state_status(
+            pr_number=tracked.pr_number,
+            status="blocked_after_second_failure",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        self._state.mark_pending_feedback_events_processed_for_pr(
+            pr_number=tracked.pr_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        log_event(
+            LOGGER,
+            "flake_rerun_failed_blocked",
+            issue_number=tracked.issue_number,
+            pr_number=tracked.pr_number,
+            run_id=run.run_id,
+            flake_issue_number=flake_state.flake_issue_number,
+        )
+        return True
 
     def _actions_feedback_event_for_run(
         self,
@@ -4518,6 +4645,16 @@ class Phase1Orchestrator:
                 )
                 return "blocked"
 
+            active_flake_state = self._state.get_active_pr_flake_state(
+                tracked.pr_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if active_flake_state is not None and active_flake_state.head_sha != pr.head_sha:
+                self._state.clear_pr_flake_state(
+                    pr_number=tracked.pr_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+
             if tracked.last_seen_head_sha and tracked.last_seen_head_sha != pr.head_sha:
                 transition_status = self._classify_remote_history_transition(
                     older_sha=tracked.last_seen_head_sha,
@@ -4771,6 +4908,16 @@ class Phase1Orchestrator:
                 issue_comments=turn_issue_comments,
                 changed_files=changed_files,
             )
+            actions_only_turn = (
+                bool(actionable_actions_events)
+                and not pending_review_events
+                and not pending_review_summary_events
+                and not pending_issue_events
+            )
+            actionable_actions_by_run_id = {
+                event.comment_id: event for event in actionable_actions_events
+            }
+            actions_context_by_run_id = self._actions_context_by_run_id(actions_synthetic_comments)
             turn_start_head = pr.head_sha
 
             feedback_outcome = self._run_feedback_agent_with_git_ops(
@@ -4785,6 +4932,22 @@ class Phase1Orchestrator:
                     tracked=tracked, fallback="blocked"
                 )
             result, pr = feedback_outcome
+
+            flaky_outcome = self._handle_flaky_test_report(
+                tracked=tracked,
+                issue=issue,
+                pull_request=pr,
+                turn_key=turn_key,
+                session=result.session,
+                pending_event_keys=pending_event_keys,
+                actions_only_turn=actions_only_turn,
+                actionable_actions_by_run_id=actionable_actions_by_run_id,
+                actions_context_by_run_id=actions_context_by_run_id,
+                report=result.flaky_test_report,
+                commit_message=result.commit_message,
+            )
+            if flaky_outcome is not None:
+                return flaky_outcome
 
             local_head_sha = self._git.current_head_sha(lease.path)
             if not self._git.is_ancestor(lease.path, turn_start_head, local_head_sha):
@@ -4814,6 +4977,10 @@ class Phase1Orchestrator:
 
             refreshed_pr = self._github.get_pull_request(tracked.pr_number)
             if refreshed_pr.merged:
+                self._state.clear_pr_flake_state(
+                    pr_number=tracked.pr_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
@@ -4830,6 +4997,10 @@ class Phase1Orchestrator:
                 )
                 return "merged"
             if refreshed_pr.state.lower() != "open":
+                self._state.clear_pr_flake_state(
+                    pr_number=tracked.pr_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 self._state.mark_pr_status(
                     pr_number=tracked.pr_number,
                     issue_number=tracked.issue_number,
@@ -5017,8 +5188,11 @@ class Phase1Orchestrator:
         tail_lines = self._config.runtime.pr_actions_log_tail_lines
         synthetic_comments: list[PullRequestIssueComment] = []
         failed_action_count = 0
-        for index, run in enumerate(sorted(runs, key=lambda candidate: candidate.run_id), start=1):
-            jobs = self._github.list_workflow_jobs(run.run_id)
+        for index, workflow_run in enumerate(
+            sorted(runs, key=lambda candidate: candidate.run_id),
+            start=1,
+        ):
+            jobs = self._github.list_workflow_jobs(workflow_run.run_id)
             failed_jobs = tuple(
                 job
                 for job in jobs
@@ -5026,22 +5200,22 @@ class Phase1Orchestrator:
             )
             failed_action_count += len(failed_jobs)
             log_tails_by_action = self._github.get_failed_run_log_tails(
-                run.run_id,
+                workflow_run.run_id,
                 tail_lines_per_action=tail_lines,
             )
             synthetic_comments.append(
                 PullRequestIssueComment(
                     comment_id=-(9200 + index),
                     body=self._render_actions_failure_context_comment(
-                        run=run,
+                        run=workflow_run,
                         failed_jobs=failed_jobs,
                         log_tails_by_action=log_tails_by_action,
                         tail_lines=tail_lines,
                     ),
                     user_login="mergexo-system",
-                    html_url=run.html_url,
-                    created_at=run.updated_at or "now",
-                    updated_at=run.updated_at or "now",
+                    html_url=workflow_run.html_url,
+                    created_at=workflow_run.updated_at or "now",
+                    updated_at=workflow_run.updated_at or "now",
                 )
             )
 
@@ -5087,6 +5261,381 @@ class Phase1Orchestrator:
                 continue
             for tail_line in log_tail.splitlines() or ("<empty>",):
                 lines.append(f"  {tail_line}")
+        return "\n".join(lines)
+
+    def _actions_context_by_run_id(
+        self, comments: tuple[PullRequestIssueComment, ...]
+    ) -> dict[int, str]:
+        by_run_id: dict[int, str] = {}
+        for comment in comments:
+            run_id = self._run_id_from_actions_context(comment.body)
+            if run_id is None:
+                continue
+            by_run_id[run_id] = comment.body
+        return by_run_id
+
+    @staticmethod
+    def _run_id_from_actions_context(body: str) -> int | None:
+        for line in body.splitlines():
+            text = line.strip()
+            if not text.startswith("- run_id:"):
+                continue
+            raw = text.split(":", 1)[1].strip()
+            if raw.isdigit():
+                return int(raw)
+            return None
+        return None
+
+    def _handle_flaky_test_report(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        issue: Issue,
+        pull_request: PullRequestSnapshot,
+        turn_key: str,
+        session: AgentSession,
+        pending_event_keys: tuple[str, ...],
+        actions_only_turn: bool,
+        actionable_actions_by_run_id: dict[int, PendingFeedbackEvent],
+        actions_context_by_run_id: dict[int, str],
+        report: FlakyTestReport | None,
+        commit_message: str | None,
+    ) -> str | None:
+        if report is None:
+            return None
+
+        log_event(
+            LOGGER,
+            "flake_report_detected",
+            issue_number=tracked.issue_number,
+            pr_number=tracked.pr_number,
+            run_id=report.run_id,
+        )
+        if commit_message is not None:
+            log_event(
+                LOGGER,
+                "flake_report_rejected_invalid_context",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=report.run_id,
+                reason="commit_message_present",
+            )
+            return None
+        if not actions_only_turn:
+            log_event(
+                LOGGER,
+                "flake_report_rejected_invalid_context",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=report.run_id,
+                reason="events_not_actions_only",
+            )
+            return None
+
+        actionable_event = actionable_actions_by_run_id.get(report.run_id)
+        if actionable_event is None:
+            log_event(
+                LOGGER,
+                "flake_report_rejected_invalid_context",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=report.run_id,
+                reason="run_not_actionable",
+            )
+            return None
+
+        full_context_markdown = actions_context_by_run_id.get(report.run_id)
+        if full_context_markdown is None:
+            log_event(
+                LOGGER,
+                "flake_report_rejected_invalid_context",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=report.run_id,
+                reason="missing_actions_context",
+            )
+            return None
+
+        runs = self._github.list_workflow_runs_for_head(tracked.pr_number, pull_request.head_sha)
+        run_by_id = {run.run_id: run for run in runs}
+        run = run_by_id.get(report.run_id)
+        run_url = (
+            run.html_url
+            if run is not None
+            else f"https://github.com/{self._state_repo_full_name()}/actions/runs/{report.run_id}"
+        )
+        run_updated_at = run.updated_at if run is not None else actionable_event.updated_at
+
+        existing_flake_state = self._state.get_pr_flake_state(
+            tracked.pr_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if existing_flake_state is not None and (
+            existing_flake_state.status != "awaiting_rerun_result"
+            or existing_flake_state.run_id != report.run_id
+            or existing_flake_state.head_sha != pull_request.head_sha
+        ):
+            self._state.clear_pr_flake_state(
+                pr_number=tracked.pr_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            existing_flake_state = None
+
+        flake_state = existing_flake_state
+        if flake_state is None:
+            flake_issue = self._github.create_issue(
+                title=self._render_flake_issue_title(
+                    report=report,
+                    pr_number=tracked.pr_number,
+                ),
+                body=self._render_flake_issue_body(
+                    issue=issue,
+                    pull_request=pull_request,
+                    report=report,
+                    run_id=report.run_id,
+                    run_url=run_url,
+                    full_log_context_markdown=full_context_markdown,
+                ),
+                labels=None,
+            )
+            flake_state = self._state.upsert_pr_flake_state(
+                pr_number=tracked.pr_number,
+                issue_number=tracked.issue_number,
+                head_sha=pull_request.head_sha,
+                run_id=report.run_id,
+                initial_run_updated_at=run_updated_at,
+                status="awaiting_rerun_result",
+                flake_issue_number=flake_issue.number,
+                flake_issue_url=flake_issue.html_url,
+                report_title=report.title,
+                report_summary=report.summary,
+                report_excerpt=report.relevant_log_excerpt,
+                full_log_context_markdown=full_context_markdown,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            log_event(
+                LOGGER,
+                "flake_issue_created",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=report.run_id,
+                flake_issue_number=flake_state.flake_issue_number,
+                flake_issue_url=flake_state.flake_issue_url,
+            )
+
+        detect_token = compute_flake_detected_token(
+            pr_number=tracked.pr_number,
+            run_id=report.run_id,
+            flake_issue_number=flake_state.flake_issue_number,
+        )
+        detected_posted = self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=tracked.pr_number,
+            token=detect_token,
+            body=self._render_flake_detected_pr_comment(
+                run_id=report.run_id,
+                run_url=run_url,
+                flake_issue_url=flake_state.flake_issue_url,
+            ),
+            source="flake_detected",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if detected_posted:
+            log_event(
+                LOGGER,
+                "flake_pr_comment_posted",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=report.run_id,
+                flake_issue_number=flake_state.flake_issue_number,
+                comment_kind="first_detection",
+            )
+
+        if flake_state.rerun_requested_at is None:
+            try:
+                self._github.rerun_workflow_run_failed_jobs(report.run_id)
+            except Exception as exc:  # noqa: BLE001
+                self._state.set_pr_flake_state_status(
+                    pr_number=tracked.pr_number,
+                    status="blocked_after_second_failure",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                block_token = compute_flake_blocked_token(
+                    pr_number=tracked.pr_number,
+                    run_id=report.run_id,
+                    flake_issue_number=flake_state.flake_issue_number,
+                )
+                block_posted = self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=tracked.pr_number,
+                    token=block_token,
+                    body=self._render_flake_blocked_pr_comment(
+                        run_id=report.run_id,
+                        run_url=run_url,
+                        flake_issue_url=flake_state.flake_issue_url,
+                        conclusion=run.conclusion if run is not None else None,
+                        reason=(f"Rerun request failed: {_summarize_git_error(str(exc))}"),
+                    ),
+                    source="flake_rerun_request_failed",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if block_posted:
+                    log_event(
+                        LOGGER,
+                        "flake_pr_comment_posted",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        run_id=report.run_id,
+                        flake_issue_number=flake_state.flake_issue_number,
+                        comment_kind="second_failure_block",
+                    )
+                self._state.mark_feedback_events_processed(
+                    event_keys=pending_event_keys,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                error = (
+                    "failed to request rerun for flaky workflow run "
+                    f"{report.run_id}: {_summarize_git_error(str(exc))}"
+                )
+                self._state.mark_pr_status(
+                    pr_number=tracked.pr_number,
+                    issue_number=tracked.issue_number,
+                    status="blocked",
+                    last_seen_head_sha=pull_request.head_sha,
+                    error=error,
+                    reason="flake_rerun_request_failed",
+                    detail=flake_state.flake_issue_url,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "flake_rerun_failed_blocked",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    run_id=report.run_id,
+                    flake_issue_number=flake_state.flake_issue_number,
+                    rerun_request_failed=True,
+                    error_type=type(exc).__name__,
+                )
+                return "blocked"
+            updated_flake_state = self._state.mark_pr_flake_rerun_requested(
+                pr_number=tracked.pr_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if updated_flake_state is not None:
+                flake_state = updated_flake_state
+            log_event(
+                LOGGER,
+                "flake_rerun_requested",
+                issue_number=tracked.issue_number,
+                pr_number=tracked.pr_number,
+                run_id=report.run_id,
+                flake_issue_number=flake_state.flake_issue_number,
+            )
+
+        self._state.finalize_feedback_turn(
+            pr_number=tracked.pr_number,
+            issue_number=tracked.issue_number,
+            processed_event_keys=pending_event_keys,
+            session=session,
+            head_sha=pull_request.head_sha,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        log_event(
+            LOGGER,
+            "feedback_turn_completed",
+            issue_number=tracked.issue_number,
+            pr_number=tracked.pr_number,
+            turn_key=turn_key,
+            processed_event_count=len(pending_event_keys),
+        )
+        return "completed"
+
+    def _render_flake_issue_title(
+        self,
+        *,
+        report: FlakyTestReport,
+        pr_number: int,
+    ) -> str:
+        candidates = (
+            report.title.strip(),
+            report.summary.strip().splitlines()[0] if report.summary.strip() else "",
+        )
+        for candidate in candidates:
+            if candidate:
+                return candidate[:120]
+        return f"Flaky CI test on PR #{pr_number} (run {report.run_id})"
+
+    def _render_flake_issue_body(
+        self,
+        *,
+        issue: Issue,
+        pull_request: PullRequestSnapshot,
+        report: FlakyTestReport,
+        run_id: int,
+        run_url: str,
+        full_log_context_markdown: str,
+    ) -> str:
+        pr_url = _pull_request_url(
+            repo_full_name=self._state_repo_full_name(),
+            pr_number=pull_request.number,
+        )
+        lines = [
+            "MergeXO flagged this GitHub Actions failure as a likely unrelated flaky test.",
+            "",
+            "## Context",
+            f"- Source issue: #{issue.number} ({issue.html_url})",
+            f"- Pull request: #{pull_request.number} ({pr_url})",
+            f"- Workflow run: {run_id} ({run_url})",
+            f"- Head SHA: `{pull_request.head_sha}`",
+            "",
+            "## Why This Looks Flaky",
+            report.summary.strip(),
+            "",
+            "## Relevant Log Excerpt",
+            "```text",
+            report.relevant_log_excerpt.strip(),
+            "```",
+            "",
+            "## Full Captured Actions Context",
+            "```text",
+            full_log_context_markdown.strip(),
+            "```",
+        ]
+        return "\n".join(lines)
+
+    def _render_flake_detected_pr_comment(
+        self,
+        *,
+        run_id: int,
+        run_url: str,
+        flake_issue_url: str,
+    ) -> str:
+        return (
+            "MergeXO detected a likely unrelated flaky CI failure.\n"
+            f"- workflow run: `{run_id}` ({run_url})\n"
+            f"- flaky-test issue: {flake_issue_url}\n"
+            "- MergeXO will rerun the failed jobs once automatically."
+        )
+
+    def _render_flake_blocked_pr_comment(
+        self,
+        *,
+        run_id: int,
+        run_url: str,
+        flake_issue_url: str,
+        conclusion: str | None,
+        reason: str | None = None,
+    ) -> str:
+        lines = [
+            "MergeXO reran the flaky workflow once, but the failure persisted.",
+            f"- workflow run: `{run_id}` ({run_url})",
+            f"- rerun conclusion: `{conclusion or '<none>'}`",
+            f"- flaky-test issue: {flake_issue_url}",
+            "- This PR is now blocked pending human follow-up on the flaky test issue.",
+        ]
+        if reason:
+            lines.append(f"- detail: {reason}")
         return "\n".join(lines)
 
     def _append_required_tests_feedback_reminder(

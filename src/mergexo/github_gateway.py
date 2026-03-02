@@ -176,6 +176,54 @@ class GitHubGateway:
         )
         return PullRequest(number=number, html_url=html_url)
 
+    def create_issue(
+        self,
+        *,
+        title: str,
+        body: str,
+        labels: tuple[str, ...] | None = None,
+    ) -> Issue:
+        path = f"/repos/{self.owner}/{self.name}/issues"
+        payload_obj: dict[str, object] = {"title": title, "body": body}
+        if labels is not None:
+            payload_obj["labels"] = list(labels)
+        payload = self._api_json(
+            "POST",
+            path,
+            payload=payload_obj,
+        )
+        issue_obj = _as_object_dict(payload)
+        if issue_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for issue")
+        user_obj = _as_object_dict(issue_obj.get("user"))
+        labels_obj = issue_obj.get("labels")
+        label_names: list[str] = []
+        if isinstance(labels_obj, list):
+            for entry in labels_obj:
+                entry_obj = _as_object_dict(entry)
+                if entry_obj is None:
+                    continue
+                name = entry_obj.get("name")
+                if isinstance(name, str):
+                    label_names.append(name)
+        created = Issue(
+            number=_as_int(issue_obj.get("number"), field="number"),
+            title=_as_string(issue_obj.get("title")),
+            body=_as_string(issue_obj.get("body")),
+            html_url=_as_string(issue_obj.get("html_url")),
+            labels=tuple(label_names),
+            author_login=_as_login(user_obj.get("login") if user_obj else None),
+        )
+        log_event(
+            LOGGER,
+            "github_issue_created",
+            repo_full_name=f"{self.owner}/{self.name}",
+            issue_number=created.number,
+            issue_url=created.html_url,
+            label_count=len(created.labels),
+        )
+        return created
+
     def find_pull_request_by_head(
         self,
         *,
@@ -454,6 +502,16 @@ class GitHubGateway:
                 log_tails[action_name] = None
 
         return log_tails
+
+    def rerun_workflow_run_failed_jobs(self, run_id: int) -> None:
+        path = f"/repos/{self.owner}/{self.name}/actions/runs/{run_id}/rerun-failed-jobs"
+        self._api_no_response("POST", path)
+        log_event(
+            LOGGER,
+            "github_actions_rerun_requested",
+            repo_full_name=f"{self.owner}/{self.name}",
+            run_id=run_id,
+        )
 
     def list_pull_request_files(self, pr_number: int) -> tuple[str, ...]:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}/files?per_page=100"
@@ -812,6 +870,47 @@ class GitHubGateway:
                     raise wrapped from exc
                 self._sleep_before_retry(attempt=attempt, method=method_upper, path=path)
         raise RuntimeError("Unreachable GitHub API JSON retry state")
+
+    def _api_no_response(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        method_upper = method.upper()
+        cmd = ["gh", "api", "--method", method_upper, path]
+        stdin_payload: str | None = None
+        if payload is not None:
+            cmd.extend(["--input", "-"])
+            stdin_payload = json.dumps(payload)
+        for attempt in range(1, _GH_API_MAX_ATTEMPTS + 1):
+            raw = ""
+            try:
+                raw = run(cmd, input_text=stdin_payload)
+                return
+            except Exception as exc:
+                wrapped = self._classify_github_failure(
+                    method=method_upper,
+                    path=path,
+                    exc=exc,
+                    raw=raw,
+                    probe_auth=attempt >= _GH_API_MAX_ATTEMPTS,
+                )
+                log_event(
+                    LOGGER,
+                    "github_api_call_failed",
+                    method=method_upper,
+                    path=path,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    raw_preview=_preview_for_log(raw),
+                    attempt=attempt,
+                    max_attempts=_GH_API_MAX_ATTEMPTS,
+                    retrying=attempt < _GH_API_MAX_ATTEMPTS,
+                )
+                if attempt >= _GH_API_MAX_ATTEMPTS:
+                    raise wrapped from exc
+                self._sleep_before_retry(attempt=attempt, method=method_upper, path=path)
 
     def _classify_github_failure(
         self,

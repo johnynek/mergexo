@@ -285,6 +285,13 @@ Behavior:
    - stale events (run now green, run no longer on current head, or run updated) are auto-resolved
    - actionable events inject CI context into agent turn, including failed action names and `last N log lines` tails
 6. If no PR review/issue comments exist, CI context alone can trigger a feedback remediation turn.
+7. If the feedback agent classifies an actionable Actions failure as an unrelated flaky test, MergeXO:
+   - opens a repo issue (no labels) with agent rationale, relevant log excerpt, and full captured CI context
+   - posts a tokenized PR comment linking that flaky-test issue
+   - reruns failed jobs once for that run
+8. While waiting for the rerun result, MergeXO suppresses additional Actions feedback turns for that same flaky incident.
+9. If the rerun finishes green, MergeXO marks the flaky incident resolved and resumes normal monitoring.
+10. If the rerun fails again (or rerun request fails), MergeXO marks the PR `blocked` and posts a tokenized blocking PR comment linking the same flaky-test issue.
 
 Notes:
 

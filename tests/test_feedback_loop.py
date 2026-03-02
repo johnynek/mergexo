@@ -3,6 +3,8 @@ from __future__ import annotations
 from mergexo.feedback_loop import (
     ParsedOperatorCommand,
     append_action_token,
+    compute_flake_blocked_token,
+    compute_flake_detected_token,
     compute_general_comment_token,
     compute_history_rewrite_token,
     compute_operator_command_token,
@@ -60,6 +62,21 @@ def test_action_token_helpers() -> None:
     # Empty body should still emit a valid marker.
     marker_only = append_action_token(body="   ", token=general_token)
     assert marker_only == f"<!-- mergexo-action:{general_token} -->"
+
+
+def test_flake_comment_tokens_are_stable() -> None:
+    detected_a = compute_flake_detected_token(pr_number=12, run_id=44, flake_issue_number=90)
+    detected_b = compute_flake_detected_token(pr_number=12, run_id=44, flake_issue_number=90)
+    detected_c = compute_flake_detected_token(pr_number=12, run_id=45, flake_issue_number=90)
+    assert detected_a == detected_b
+    assert detected_a != detected_c
+
+    blocked_a = compute_flake_blocked_token(pr_number=12, run_id=44, flake_issue_number=90)
+    blocked_b = compute_flake_blocked_token(pr_number=12, run_id=44, flake_issue_number=90)
+    blocked_c = compute_flake_blocked_token(pr_number=12, run_id=44, flake_issue_number=91)
+    assert blocked_a == blocked_b
+    assert blocked_a != blocked_c
+    assert blocked_a != detected_a
 
 
 def test_history_rewrite_token_is_stable_and_specific() -> None:
