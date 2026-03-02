@@ -110,7 +110,7 @@ Contract rules:
 
 1. Agent sets `flaky_test_report` only when CI context is present and classification is “unrelated flaky test”.
 2. When `flaky_test_report` is set, `commit_message` must be null.
-3. The report must include log evidence copied from provided CI context.
+3. The report must include log evidence copied from provided CI context and concrete reproduction details (test target, command, and assumptions) sufficient for a human to reproduce locally.
 4. If uncertain, the agent should not set the field.
 
 Implementation impact:
