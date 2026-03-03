@@ -1106,7 +1106,7 @@ class Phase1Orchestrator:
                     incremental_scan = self._scan_incremental_issue_comments(
                         issue_number=followup.issue_number,
                         surface=_SURFACE_ISSUE_PRE_PR_FOLLOWUPS,
-                        bootstrap_mode="seed_latest",
+                        bootstrap_mode="process_all",
                     )
                     source_comments = [
                         cast(PullRequestIssueComment, comment) for comment in incremental_scan.new
