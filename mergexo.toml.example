@@ -25,6 +25,18 @@ restart_supported_modes = ["git_checkout"]
 # git_checkout_root = "/Users/oscar/code/mergexo"
 # Required for pypi mode.
 # service_python = "/usr/bin/python3"
+# Enable continuous deploy checks in `mergexo service` when no work is in flight.
+continuous_deploy_enabled = false
+# Seconds between idle remote-head checks (minimum 10 seconds).
+continuous_deploy_check_interval_seconds = 300
+# Branch tracked for continuous deploy checks and rollback fetches.
+continuous_deploy_branch = "main"
+# Local health endpoint bind address (GET /healthz).
+continuous_deploy_healthcheck_host = "127.0.0.1"
+# Health endpoint port. Set to 0 to disable.
+continuous_deploy_healthcheck_port = 8765
+# Maximum startup boots allowed while awaiting health before rollback.
+continuous_deploy_max_boot_failures = 2
 # Observability dashboard refresh cadence (seconds).
 observability_refresh_seconds = 2
 # Default dashboard metrics window.

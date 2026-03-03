@@ -325,6 +325,47 @@ Behavior notes:
 - `git_checkout` restart mode runs `git pull --ff-only` and `uv sync` before re-exec
 - `pypi` mode is available only when configured (`restart_supported_modes` + `service_python`)
 
+### Continuous Deploy Mode (`service`)
+
+Enable with:
+
+- `runtime.continuous_deploy_enabled = true`
+- `runtime.restart_supported_modes` includes `git_checkout`
+- `runtime.git_checkout_root` points at the running MergeXO checkout (or run from that checkout)
+
+Behavior:
+
+1. Only in `mergexo service` continuous mode (`--once` does not auto-deploy).
+2. At each `continuous_deploy_check_interval_seconds`, MergeXO checks `origin/<continuous_deploy_branch>`.
+3. Auto-deploy is skipped unless all are true:
+   - no pending/running restart operation
+   - no GitHub auth shutdown pending
+   - no in-flight worker futures
+4. On eligible fast-forward movement, MergeXO reuses the existing restart drain/update/re-exec path.
+5. Startup health is confirmed after one full repo poll cycle with no auth-shutdown state.
+6. If the new revision repeatedly fails startup health (`continuous_deploy_max_boot_failures`), MergeXO:
+   - rolls back to `previous_sha`
+   - opens an unlabeled GitHub issue with failed `target_sha` + captured failure detail
+   - quarantines `target_sha` so it is not retried until branch head changes
+
+Notes:
+
+- continuous deploy currently supports `git_checkout` mode only
+- run service under an external supervisor (for example systemd/launchd) so crash-loop rollback can trigger
+
+### Local Health Endpoint
+
+`mergexo service` can expose a localhost endpoint:
+
+- host: `runtime.continuous_deploy_healthcheck_host` (default `127.0.0.1`)
+- port: `runtime.continuous_deploy_healthcheck_port` (default `8765`, set `0` to disable)
+- path: `GET /healthz`
+
+Responses:
+
+- `200` with `{ "status": "healthy", "active_sha": "...", "uptime_seconds": ... }` after startup is healthy
+- `503` with `{ "status": "unhealthy", "reason": "starting|auth_shutdown_pending|rollback_in_progress|fatal_error", ... }` otherwise
+
 Unblock user story (`head_sha` override):
 
 1. PR `#101` is blocked because MergeXO detected a non-fast-forward head change.
@@ -385,6 +426,12 @@ Do not mix both shapes in one file.
 | `restart_supported_modes` | no | `["git_checkout"]` | list of `git_checkout` and/or `pypi` |
 | `git_checkout_root` | no | unset | optional for `git_checkout` restarts; defaults to current working directory when omitted |
 | `service_python` | no | unset | required for `pypi` restart mode |
+| `continuous_deploy_enabled` | no | `false` | enables idle auto-deploy checks in `mergexo service` |
+| `continuous_deploy_check_interval_seconds` | no | `300` | must be `>= 10` |
+| `continuous_deploy_branch` | no | `"main"` | remote branch checked for auto-deploy candidates |
+| `continuous_deploy_healthcheck_host` | no | `"127.0.0.1"` | localhost health endpoint bind host |
+| `continuous_deploy_healthcheck_port` | no | `8765` | `0` disables endpoint; otherwise `1..65535` |
+| `continuous_deploy_max_boot_failures` | no | `2` | must be `>= 1`; rollback triggers when boot attempts exceed this |
 | `observability_refresh_seconds` | no | `2` | must be `>= 1` |
 | `observability_default_window` | no | `"24h"` | one of `1h`, `24h`, `7d`, `30d` |
 | `observability_row_limit` | no | `200` | positive int or `null` |

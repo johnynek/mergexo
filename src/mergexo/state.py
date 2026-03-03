@@ -13,6 +13,8 @@ from typing import Literal, cast
 from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
 from mergexo.models import (
+    ContinuousDeployState,
+    ContinuousDeployStatus,
     OperatorCommandName,
     OperatorCommandRecord,
     OperatorCommandStatus,
@@ -540,6 +542,34 @@ class StateStore:
                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS continuous_deploy_state (
+                    row_id INTEGER PRIMARY KEY CHECK (row_id = 1),
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    previous_sha TEXT NULL,
+                    target_sha TEXT NULL,
+                    active_sha TEXT NULL,
+                    blocked_target_sha TEXT NULL,
+                    boot_attempt_count INTEGER NOT NULL DEFAULT 0,
+                    requested_at TEXT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    healthy_at TEXT NULL,
+                    last_error TEXT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO continuous_deploy_state(
+                    row_id,
+                    status,
+                    boot_attempt_count
+                )
+                VALUES(1, 'idle', 0)
+                ON CONFLICT(row_id) DO NOTHING
                 """
             )
             conn.execute(
@@ -3844,6 +3874,178 @@ class StateStore:
             return None
         return _parse_runtime_operation_row(row)
 
+    def get_continuous_deploy_state(self) -> ContinuousDeployState:
+        with self._lock, self._connect() as conn:
+            row = self._select_continuous_deploy_state_row(conn=conn)
+        return _parse_continuous_deploy_state_row(row)
+
+    def start_continuous_deploy_attempt(
+        self, *, previous_sha: str, target_sha: str
+    ) -> ContinuousDeployState:
+        previous_sha_normalized = previous_sha.strip()
+        target_sha_normalized = target_sha.strip()
+        if not previous_sha_normalized:
+            raise ValueError("previous_sha must be non-empty")
+        if not target_sha_normalized:
+            raise ValueError("target_sha must be non-empty")
+
+        with self._lock, self._connect() as conn:
+            current = _parse_continuous_deploy_state_row(
+                self._select_continuous_deploy_state_row(conn=conn)
+            )
+            blocked_target_sha = (
+                current.blocked_target_sha
+                if current.blocked_target_sha == target_sha_normalized
+                else None
+            )
+            conn.execute(
+                """
+                UPDATE continuous_deploy_state
+                SET
+                    status = 'awaiting_health',
+                    previous_sha = ?,
+                    target_sha = ?,
+                    active_sha = ?,
+                    blocked_target_sha = ?,
+                    boot_attempt_count = 0,
+                    requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    healthy_at = NULL,
+                    last_error = NULL
+                WHERE row_id = 1
+                """,
+                (
+                    previous_sha_normalized,
+                    target_sha_normalized,
+                    previous_sha_normalized,
+                    blocked_target_sha,
+                ),
+            )
+            updated = self._select_continuous_deploy_state_row(conn=conn)
+        return _parse_continuous_deploy_state_row(updated)
+
+    def increment_continuous_deploy_boot_attempt(self) -> ContinuousDeployState:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE continuous_deploy_state
+                SET
+                    boot_attempt_count = CASE
+                        WHEN status = 'awaiting_health' THEN boot_attempt_count + 1
+                        ELSE boot_attempt_count
+                    END,
+                    updated_at = CASE
+                        WHEN status = 'awaiting_health'
+                            THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        ELSE updated_at
+                    END
+                WHERE row_id = 1
+                """
+            )
+            updated = self._select_continuous_deploy_state_row(conn=conn)
+        return _parse_continuous_deploy_state_row(updated)
+
+    def mark_continuous_deploy_healthy(self, *, active_sha: str | None) -> ContinuousDeployState:
+        active_sha_normalized = active_sha.strip() if isinstance(active_sha, str) else ""
+        persisted_active_sha = active_sha_normalized or None
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE continuous_deploy_state
+                SET
+                    status = 'healthy',
+                    active_sha = COALESCE(?, active_sha),
+                    healthy_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    last_error = NULL
+                WHERE row_id = 1
+                """,
+                (persisted_active_sha,),
+            )
+            updated = self._select_continuous_deploy_state_row(conn=conn)
+        return _parse_continuous_deploy_state_row(updated)
+
+    def mark_continuous_deploy_rolled_back(self, *, error: str | None) -> ContinuousDeployState:
+        detail = (error or "").strip() or "continuous deploy rollback completed"
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE continuous_deploy_state
+                SET
+                    status = 'rolled_back',
+                    active_sha = COALESCE(previous_sha, active_sha),
+                    blocked_target_sha = target_sha,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    healthy_at = NULL,
+                    last_error = ?
+                WHERE row_id = 1
+                """,
+                (detail,),
+            )
+            updated = self._select_continuous_deploy_state_row(conn=conn)
+        return _parse_continuous_deploy_state_row(updated)
+
+    def mark_continuous_deploy_failed(self, *, error: str) -> ContinuousDeployState:
+        detail = error.strip()
+        if not detail:
+            raise ValueError("error must be non-empty")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE continuous_deploy_state
+                SET
+                    status = 'failed',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    last_error = ?
+                WHERE row_id = 1
+                """,
+                (detail,),
+            )
+            updated = self._select_continuous_deploy_state_row(conn=conn)
+        return _parse_continuous_deploy_state_row(updated)
+
+    def set_continuous_deploy_last_error(self, *, detail: str) -> ContinuousDeployState:
+        normalized_detail = detail.strip()
+        if not normalized_detail:
+            raise ValueError("detail must be non-empty")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE continuous_deploy_state
+                SET
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    last_error = ?
+                WHERE row_id = 1
+                """,
+                (normalized_detail,),
+            )
+            updated = self._select_continuous_deploy_state_row(conn=conn)
+        return _parse_continuous_deploy_state_row(updated)
+
+    def _select_continuous_deploy_state_row(
+        self, *, conn: sqlite3.Connection
+    ) -> tuple[object, ...]:
+        row = conn.execute(
+            """
+            SELECT
+                status,
+                previous_sha,
+                target_sha,
+                active_sha,
+                blocked_target_sha,
+                boot_attempt_count,
+                requested_at,
+                updated_at,
+                healthy_at,
+                last_error
+            FROM continuous_deploy_state
+            WHERE row_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("continuous_deploy_state row missing")
+        return row
+
     def list_tracked_pull_requests(
         self, *, repo_full_name: str | None = None
     ) -> tuple[TrackedPullRequestState, ...]:
@@ -4866,6 +5068,56 @@ def _parse_runtime_operation_row(row: tuple[object, ...]) -> RuntimeOperationRec
     )
 
 
+def _parse_continuous_deploy_state_row(row: tuple[object, ...]) -> ContinuousDeployState:
+    if len(row) != 10:
+        raise RuntimeError("Invalid continuous_deploy_state row width")
+
+    (
+        status,
+        previous_sha,
+        target_sha,
+        active_sha,
+        blocked_target_sha,
+        boot_attempt_count,
+        requested_at,
+        updated_at,
+        healthy_at,
+        last_error,
+    ) = row
+
+    if previous_sha is not None and not isinstance(previous_sha, str):
+        raise RuntimeError("Invalid previous_sha value stored in continuous_deploy_state")
+    if target_sha is not None and not isinstance(target_sha, str):
+        raise RuntimeError("Invalid target_sha value stored in continuous_deploy_state")
+    if active_sha is not None and not isinstance(active_sha, str):
+        raise RuntimeError("Invalid active_sha value stored in continuous_deploy_state")
+    if blocked_target_sha is not None and not isinstance(blocked_target_sha, str):
+        raise RuntimeError("Invalid blocked_target_sha value stored in continuous_deploy_state")
+    if not isinstance(boot_attempt_count, int):
+        raise RuntimeError("Invalid boot_attempt_count value stored in continuous_deploy_state")
+    if requested_at is not None and not isinstance(requested_at, str):
+        raise RuntimeError("Invalid requested_at value stored in continuous_deploy_state")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in continuous_deploy_state")
+    if healthy_at is not None and not isinstance(healthy_at, str):
+        raise RuntimeError("Invalid healthy_at value stored in continuous_deploy_state")
+    if last_error is not None and not isinstance(last_error, str):
+        raise RuntimeError("Invalid last_error value stored in continuous_deploy_state")
+
+    return ContinuousDeployState(
+        status=_parse_continuous_deploy_status(status),
+        previous_sha=previous_sha,
+        target_sha=target_sha,
+        active_sha=active_sha,
+        blocked_target_sha=blocked_target_sha,
+        boot_attempt_count=boot_attempt_count,
+        requested_at=requested_at,
+        updated_at=updated_at,
+        healthy_at=healthy_at,
+        last_error=last_error,
+    )
+
+
 def _parse_operator_command_name(value: object) -> OperatorCommandName:
     if not isinstance(value, str):
         raise RuntimeError("Invalid command value stored in operator_commands")
@@ -4973,6 +5225,14 @@ def _parse_runtime_operation_status(value: object) -> RuntimeOperationStatus:
     if value not in {"pending", "running", "failed", "completed"}:
         raise RuntimeError(f"Unknown status value stored in runtime_operations: {value}")
     return cast(RuntimeOperationStatus, value)
+
+
+def _parse_continuous_deploy_status(value: object) -> ContinuousDeployStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in continuous_deploy_state")
+    if value not in {"idle", "awaiting_health", "healthy", "rolled_back", "failed"}:
+        raise RuntimeError(f"Unknown status value stored in continuous_deploy_state: {value}")
+    return cast(ContinuousDeployStatus, value)
 
 
 def _parse_restart_mode(value: object) -> RestartMode:

@@ -4,8 +4,12 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import socket
 from threading import Event
+import time
 from typing import cast
+from urllib import error as urlerror
+from urllib import request
 
 import pytest
 
@@ -14,9 +18,15 @@ from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import append_action_token, compute_operator_command_token
 from mergexo.github_gateway import GitHubGateway
 from mergexo.git_ops import GitRepoManager
-from mergexo.models import PullRequestIssueComment, RestartMode
-from mergexo.orchestrator import RestartRequested
-from mergexo.service_runner import ServiceRunner, ServiceSignal, run_service
+from mergexo.models import Issue, PullRequestIssueComment, RestartMode
+from mergexo.orchestrator import Phase1Orchestrator, RestartRequested
+from mergexo.service_runner import (
+    _ContinuousDeployCandidate,
+    _ServiceHealthTracker,
+    ServiceRunner,
+    ServiceSignal,
+    run_service,
+)
 from mergexo.state import StateStore
 
 
@@ -27,6 +37,12 @@ def _app_config(
     restart_default_mode: RestartMode = "git_checkout",
     service_python: str | None = None,
     restart_drain_timeout_seconds: int = 60,
+    continuous_deploy_enabled: bool = False,
+    continuous_deploy_check_interval_seconds: int = 300,
+    continuous_deploy_branch: str = "main",
+    continuous_deploy_healthcheck_host: str = "127.0.0.1",
+    continuous_deploy_healthcheck_port: int = 0,
+    continuous_deploy_max_boot_failures: int = 2,
 ) -> AppConfig:
     return AppConfig(
         runtime=RuntimeConfig(
@@ -39,6 +55,12 @@ def _app_config(
             restart_supported_modes=restart_supported_modes,
             git_checkout_root=tmp_path,
             service_python=service_python,
+            continuous_deploy_enabled=continuous_deploy_enabled,
+            continuous_deploy_check_interval_seconds=continuous_deploy_check_interval_seconds,
+            continuous_deploy_branch=continuous_deploy_branch,
+            continuous_deploy_healthcheck_host=continuous_deploy_healthcheck_host,
+            continuous_deploy_healthcheck_port=continuous_deploy_healthcheck_port,
+            continuous_deploy_max_boot_failures=continuous_deploy_max_boot_failures,
         ),
         repos=(
             RepoConfig(
@@ -87,12 +109,16 @@ def _multi_repo_config(tmp_path: Path) -> AppConfig:
 class FakeGitHub:
     threads: dict[int, list[PullRequestIssueComment]]
     posted: list[tuple[int, str]]
+    created_issues: list[Issue]
     next_comment_id: int = 1000
+    next_issue_number: int = 2000
 
     def __init__(self) -> None:
         self.threads = {}
         self.posted = []
+        self.created_issues = []
         self.next_comment_id = 1000
+        self.next_issue_number = 2000
 
     def list_issue_comments(
         self, issue_number: int, *, since: str | None = None
@@ -113,6 +139,25 @@ class FakeGitHub:
                 updated_at="now",
             )
         )
+
+    def create_issue(
+        self,
+        *,
+        title: str,
+        body: str,
+        labels: tuple[str, ...] | None = None,
+    ) -> Issue:
+        issue = Issue(
+            number=self.next_issue_number,
+            title=title,
+            body=body,
+            html_url=f"https://example/issues/{self.next_issue_number}",
+            labels=labels or (),
+            author_login="mergexo[bot]",
+        )
+        self.next_issue_number += 1
+        self.created_issues.append(issue)
+        return issue
 
 
 def _seed_restart_command(state: StateStore, *, command_key: str) -> None:
@@ -140,6 +185,15 @@ def _seed_restart_command(state: StateStore, *, command_key: str) -> None:
         mode="git_checkout",
         request_repo_full_name="johnynek/mergexo",
     )
+
+
+def _free_local_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
 
 
 def test_service_runner_returns_when_orchestrator_exits(
@@ -1217,9 +1271,15 @@ def test_service_runner_restart_success_updates_and_reexecs(
     with pytest.raises(ExecCalled):
         runner.run(once=False)
 
-    assert commands[0][0][:5] == ["git", "-C", str(tmp_path), "pull", "--ff-only"]
-    assert commands[1][0] == ["uv", "sync"]
-    assert commands[1][1] == tmp_path
+    pull_commands = [
+        argv
+        for argv, _ in commands
+        if argv[:5] == ["git", "-C", str(tmp_path), "pull", "--ff-only"]
+    ]
+    assert pull_commands
+    sync_commands = [(argv, cwd) for argv, cwd in commands if argv == ["uv", "sync"]]
+    assert sync_commands
+    assert sync_commands[0][1] == tmp_path
 
     op = state.get_runtime_operation("restart")
     assert op is not None
@@ -1254,7 +1314,11 @@ def test_service_runner_update_modes_and_reexec_validation(
     )
 
     runner._run_update(mode="pypi")
-    assert called == [["uv", "pip", "install", "--python", "py3", "--upgrade", "mergexo"]]
+    runner._run_update(mode="git_checkout", git_branch="release")
+    assert called[0] == ["uv", "pip", "install", "--python", "py3", "--upgrade", "mergexo"]
+    assert called[1][:5] == ["git", "-C", str(tmp_path), "pull", "--ff-only"]
+    assert called[1][-2:] == ["origin", "release"]
+    assert called[2] == ["uv", "sync"]
 
     cfg_missing_python = _app_config(
         tmp_path,
@@ -1294,6 +1358,747 @@ def test_service_runner_update_modes_and_reexec_validation(
     )
     with pytest.raises(RuntimeError, match="startup argv"):
         runner_empty_argv._reexec()
+
+
+def test_service_runner_continuous_deploy_schedules_restart_when_idle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(
+        tmp_path,
+        continuous_deploy_enabled=True,
+        continuous_deploy_check_interval_seconds=10,
+    )
+    state = StateStore(tmp_path / "state.db")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    class IdleOrchestrator:
+        def pending_work_count(self) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        ServiceRunner,
+        "_detect_continuous_deploy_candidate",
+        lambda self, blocked_target_sha: _ContinuousDeployCandidate(
+            from_sha="aaa111", to_sha="bbb222"
+        ),
+    )
+
+    next_deadline = runner._maybe_schedule_continuous_deploy(
+        enabled=True,
+        orchestrators=cast(
+            tuple[Phase1Orchestrator, ...],
+            (cast(Phase1Orchestrator, IdleOrchestrator()),),
+        ),
+        auth_shutdown_detail=None,
+        next_check_deadline_monotonic=0.0,
+    )
+    operation = state.get_runtime_operation("restart")
+    assert operation is not None
+    assert operation.requested_by == "continuous_deploy"
+    assert operation.request_command_key.startswith("continuous:")
+    deploy_state = state.get_continuous_deploy_state()
+    assert deploy_state.status == "awaiting_health"
+    assert deploy_state.previous_sha == "aaa111"
+    assert deploy_state.target_sha == "bbb222"
+    assert next_deadline > 0.0
+
+
+def test_service_runner_continuous_deploy_does_not_schedule_when_pending_work_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    class BusyOrchestrator:
+        def pending_work_count(self) -> int:
+            return 1
+
+    monkeypatch.setattr(
+        ServiceRunner,
+        "_detect_continuous_deploy_candidate",
+        lambda self, blocked_target_sha: (_ for _ in ()).throw(
+            AssertionError("candidate detection should not run while work is pending")
+        ),
+    )
+    assert (
+        runner._maybe_schedule_continuous_deploy(
+            enabled=True,
+            orchestrators=cast(
+                tuple[Phase1Orchestrator, ...],
+                (cast(Phase1Orchestrator, BusyOrchestrator()),),
+            ),
+            auth_shutdown_detail=None,
+            next_check_deadline_monotonic=0.0,
+        )
+        == 0.0
+    )
+    assert state.get_runtime_operation("restart") is None
+
+
+def test_service_runner_detect_continuous_deploy_candidate_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    def fake_run_factory(local_sha: str, remote_sha: str, merge_base_sha: str):  # type: ignore[no-untyped-def]
+        def fake_run(argv: list[str], *, cwd=None, input_text=None, check=True) -> str:  # type: ignore[no-untyped-def]
+            _ = cwd, input_text, check
+            if "fetch" in argv:
+                return ""
+            if argv[-2:] == ["rev-parse", "HEAD"]:
+                return f"{local_sha}\n"
+            if len(argv) >= 2 and argv[-2] == "rev-parse" and argv[-1].startswith("origin/"):
+                return f"{remote_sha}\n"
+            if "merge-base" in argv:
+                return f"{merge_base_sha}\n"
+            raise AssertionError(f"unexpected command: {argv}")
+
+        return fake_run
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run_factory("a", "b", "a"))
+    assert runner._detect_continuous_deploy_candidate(blocked_target_sha="b") is None
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run_factory("a", "c", "d"))
+    assert runner._detect_continuous_deploy_candidate(blocked_target_sha=None) is None
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run_factory("a", "d", "a"))
+    candidate = runner._detect_continuous_deploy_candidate(blocked_target_sha=None)
+    assert candidate == _ContinuousDeployCandidate(from_sha="a", to_sha="d")
+
+
+def test_service_runner_detect_continuous_deploy_candidate_validates_revisions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    runner = ServiceRunner(
+        config=cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    def fake_run_empty_head(argv: list[str], *, cwd=None, input_text=None, check=True) -> str:  # type: ignore[no-untyped-def]
+        _ = cwd, input_text, check
+        if "fetch" in argv:
+            return ""
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            return "\n"
+        if len(argv) >= 2 and argv[-2] == "rev-parse" and argv[-1].startswith("origin/"):
+            return "abc\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run_empty_head)
+    with pytest.raises(RuntimeError, match="HEAD returned empty revision"):
+        runner._detect_continuous_deploy_candidate(blocked_target_sha=None)
+
+    def fake_run_empty_remote(argv: list[str], *, cwd=None, input_text=None, check=True) -> str:  # type: ignore[no-untyped-def]
+        _ = cwd, input_text, check
+        if "fetch" in argv:
+            return ""
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            return "abc\n"
+        if len(argv) >= 2 and argv[-2] == "rev-parse" and argv[-1].startswith("origin/"):
+            return "\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run_empty_remote)
+    with pytest.raises(RuntimeError, match="returned empty revision"):
+        runner._detect_continuous_deploy_candidate(blocked_target_sha=None)
+
+    def fake_run_same_revisions(argv: list[str], *, cwd=None, input_text=None, check=True) -> str:  # type: ignore[no-untyped-def]
+        _ = cwd, input_text, check
+        if "fetch" in argv:
+            return ""
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            return "abc\n"
+        if len(argv) >= 2 and argv[-2] == "rev-parse" and argv[-1].startswith("origin/"):
+            return "abc\n"
+        return ""
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run_same_revisions)
+    assert runner._detect_continuous_deploy_candidate(blocked_target_sha=None) is None
+
+
+def test_service_runner_maybe_schedule_continuous_deploy_guard_paths_and_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(
+        tmp_path,
+        continuous_deploy_enabled=True,
+        continuous_deploy_check_interval_seconds=10,
+    )
+    state = StateStore(tmp_path / "state.db")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+
+    class IdleOrchestrator:
+        def pending_work_count(self) -> int:
+            return 0
+
+    idle_orchestrators = cast(
+        tuple[Phase1Orchestrator, ...],
+        (cast(Phase1Orchestrator, IdleOrchestrator()),),
+    )
+
+    future_deadline = time.monotonic() + 60.0
+    assert (
+        runner._maybe_schedule_continuous_deploy(
+            enabled=True,
+            orchestrators=idle_orchestrators,
+            auth_shutdown_detail=None,
+            next_check_deadline_monotonic=future_deadline,
+        )
+        == future_deadline
+    )
+    assert (
+        runner._maybe_schedule_continuous_deploy(
+            enabled=True,
+            orchestrators=idle_orchestrators,
+            auth_shutdown_detail="auth pending",
+            next_check_deadline_monotonic=0.0,
+        )
+        == 0.0
+    )
+
+    _seed_restart_command(state, command_key="77:cd:2026-03-03T00:00:00Z")
+    assert (
+        runner._maybe_schedule_continuous_deploy(
+            enabled=True,
+            orchestrators=idle_orchestrators,
+            auth_shutdown_detail=None,
+            next_check_deadline_monotonic=0.0,
+        )
+        == 0.0
+    )
+    state.set_runtime_operation_status(op_name="restart", status="completed", detail="done")
+
+    state.start_continuous_deploy_attempt(previous_sha="a", target_sha="b")
+    awaiting_deadline = runner._maybe_schedule_continuous_deploy(
+        enabled=True,
+        orchestrators=idle_orchestrators,
+        auth_shutdown_detail=None,
+        next_check_deadline_monotonic=0.0,
+    )
+    assert awaiting_deadline > 0.0
+    state.mark_continuous_deploy_healthy(active_sha="b")
+
+    monkeypatch.setattr(
+        ServiceRunner,
+        "_detect_continuous_deploy_candidate",
+        lambda self, blocked_target_sha: None,
+    )
+    none_deadline = runner._maybe_schedule_continuous_deploy(
+        enabled=True,
+        orchestrators=idle_orchestrators,
+        auth_shutdown_detail=None,
+        next_check_deadline_monotonic=0.0,
+    )
+    assert none_deadline > 0.0
+
+    monkeypatch.setattr(
+        state,
+        "get_continuous_deploy_state",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    errored_deadline = runner._maybe_schedule_continuous_deploy(
+        enabled=True,
+        orchestrators=idle_orchestrators,
+        auth_shutdown_detail=None,
+        next_check_deadline_monotonic=0.0,
+    )
+    assert errored_deadline > 0.0
+
+
+def test_service_runner_current_checkout_sha_handles_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = ServiceRunner(
+        config=_app_config(tmp_path),
+        state=StateStore(tmp_path / "state.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    monkeypatch.setattr("mergexo.service_runner.run", lambda argv, **kwargs: "abc123\n")
+    assert runner._current_checkout_sha() == "abc123"
+    monkeypatch.setattr(
+        "mergexo.service_runner.run",
+        lambda argv, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert runner._current_checkout_sha() is None
+
+
+def test_service_runner_request_continuous_deploy_restart_respects_single_flight(
+    tmp_path: Path,
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    _seed_restart_command(state, command_key="77:pending:2026-03-03T00:00:00Z")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    runner._request_continuous_deploy_restart(
+        candidate=_ContinuousDeployCandidate(from_sha="a", to_sha="b")
+    )
+    deploy_state = state.get_continuous_deploy_state()
+    assert deploy_state.status == "idle"
+
+
+def test_service_runner_reconcile_continuous_deploy_startup_noop_states(
+    tmp_path: Path,
+) -> None:
+    disabled_runner = ServiceRunner(
+        config=_app_config(tmp_path, continuous_deploy_enabled=False),
+        state=StateStore(tmp_path / "state-disabled.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    assert (
+        disabled_runner._reconcile_continuous_deploy_startup(health_tracker=_ServiceHealthTracker())
+        is False
+    )
+
+    enabled_runner = ServiceRunner(
+        config=_app_config(tmp_path, continuous_deploy_enabled=True),
+        state=StateStore(tmp_path / "state-enabled.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    assert (
+        enabled_runner._reconcile_continuous_deploy_startup(health_tracker=_ServiceHealthTracker())
+        is False
+    )
+
+
+def test_service_runner_run_returns_when_startup_reconcile_requests_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = ServiceRunner(
+        config=_app_config(tmp_path),
+        state=StateStore(tmp_path / "state.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    monkeypatch.setattr(
+        ServiceRunner, "_reconcile_continuous_deploy_startup", lambda self, health_tracker: True
+    )
+    runner.run(once=True)
+
+
+def test_service_runner_record_boot_error_handles_empty_detail_and_internal_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    state.start_continuous_deploy_attempt(previous_sha="a", target_sha="b")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    runner._record_continuous_deploy_boot_error(detail="   ")
+    assert state.get_continuous_deploy_state().last_error is None
+
+    monkeypatch.setattr(
+        state,
+        "get_continuous_deploy_state",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    runner._record_continuous_deploy_boot_error(detail="Traceback: boom")
+
+
+def test_service_runner_mark_continuous_deploy_healthy_handles_missing_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = ServiceRunner(
+        config=_app_config(tmp_path),
+        state=StateStore(tmp_path / "state.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    monkeypatch.setattr(
+        runner.state,
+        "get_continuous_deploy_state",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert runner._mark_continuous_deploy_healthy_if_ready() is None
+
+
+def test_service_runner_marks_continuous_deploy_healthy_after_poll_cycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    state.start_continuous_deploy_attempt(previous_sha="aaa111", target_sha="bbb222")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    monkeypatch.setattr(ServiceRunner, "_current_checkout_sha", lambda self: "bbb222")
+    health_tracker = _ServiceHealthTracker()
+    runner._process_completed_poll_cycle(
+        health_tracker=health_tracker,
+        auth_shutdown_detail=None,
+    )
+    deploy_state = state.get_continuous_deploy_state()
+    assert deploy_state.status == "healthy"
+    status_code, payload = health_tracker.response_payload()
+    assert status_code == 200
+    assert payload["active_sha"] == "bbb222"
+
+    blocked_tracker = _ServiceHealthTracker()
+    runner._process_completed_poll_cycle(
+        health_tracker=blocked_tracker,
+        auth_shutdown_detail="gh auth pending",
+    )
+    blocked_status_code, blocked_payload = blocked_tracker.response_payload()
+    assert blocked_status_code == 503
+    assert blocked_payload["reason"] == "starting"
+
+
+def test_service_runner_reconcile_continuous_deploy_startup_rolls_back_after_repeated_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(
+        tmp_path,
+        continuous_deploy_enabled=True,
+        continuous_deploy_max_boot_failures=1,
+    )
+    state = StateStore(tmp_path / "state.db")
+    state.start_continuous_deploy_attempt(previous_sha="aaa111", target_sha="bbb222")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    rollback_calls: list[int] = []
+
+    def fake_rollback(
+        self,
+        *,
+        attempt,
+        error_detail: str,
+        health_tracker,
+    ) -> bool:  # type: ignore[no-untyped-def]
+        _ = error_detail, health_tracker
+        rollback_calls.append(attempt.boot_attempt_count)
+        return True
+
+    monkeypatch.setattr(ServiceRunner, "_perform_continuous_deploy_rollback", fake_rollback)
+    health_tracker = _ServiceHealthTracker()
+    assert runner._reconcile_continuous_deploy_startup(health_tracker=health_tracker) is False
+    assert rollback_calls == []
+    assert runner._reconcile_continuous_deploy_startup(health_tracker=health_tracker) is True
+    assert rollback_calls == [2]
+
+
+def test_service_runner_continuous_deploy_rollback_reports_issue_and_quarantines_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    state.start_continuous_deploy_attempt(previous_sha="aaa111", target_sha="bbb222")
+    state.set_continuous_deploy_last_error(detail="Traceback: startup failed")
+    github = FakeGitHub()
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    commands: list[tuple[list[str], Path | None]] = []
+
+    def fake_run(argv: list[str], *, cwd: Path | None = None, input_text=None, check=True) -> str:  # type: ignore[no-untyped-def]
+        _ = input_text, check
+        commands.append((argv, cwd))
+        return ""
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run)
+    monkeypatch.setattr(ServiceRunner, "_reexec", lambda self: None)
+    attempt = state.get_continuous_deploy_state()
+    assert (
+        runner._perform_continuous_deploy_rollback(
+            attempt=attempt,
+            error_detail="health checks failed",
+            health_tracker=_ServiceHealthTracker(),
+        )
+        is True
+    )
+
+    deploy_state = state.get_continuous_deploy_state()
+    assert deploy_state.status == "rolled_back"
+    assert deploy_state.blocked_target_sha == "bbb222"
+    assert deploy_state.last_error is not None
+    assert "health checks failed" in deploy_state.last_error
+    assert commands[0][0][:4] == ["git", "-C", str(tmp_path), "fetch"]
+    assert commands[1][0][:5] == ["git", "-C", str(tmp_path), "checkout", "-B"]
+    assert commands[2][0] == ["uv", "sync"]
+    assert commands[2][1] == tmp_path
+    assert len(github.created_issues) == 1
+    assert github.created_issues[0].labels == ()
+    assert "target_sha: bbb222" in github.created_issues[0].body
+    assert "Traceback: startup failed" in github.created_issues[0].body
+
+
+def test_service_runner_continuous_deploy_rollback_continues_when_issue_creation_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    state.start_continuous_deploy_attempt(previous_sha="aaa111", target_sha="bbb222")
+
+    class FailingIssueGitHub(FakeGitHub):
+        def create_issue(
+            self, *, title: str, body: str, labels: tuple[str, ...] | None = None
+        ) -> Issue:
+            _ = title, body, labels
+            raise RuntimeError("missing issue scope")
+
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FailingIssueGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    monkeypatch.setattr("mergexo.service_runner.run", lambda argv, **kwargs: "")
+    monkeypatch.setattr(ServiceRunner, "_reexec", lambda self: None)
+    attempt = state.get_continuous_deploy_state()
+    assert (
+        runner._perform_continuous_deploy_rollback(
+            attempt=attempt,
+            error_detail="health checks failed",
+            health_tracker=_ServiceHealthTracker(),
+        )
+        is True
+    )
+    deploy_state = state.get_continuous_deploy_state()
+    assert deploy_state.status == "rolled_back"
+    assert deploy_state.last_error is not None
+    assert "rollback_issue_error" in deploy_state.last_error
+    assert "missing issue scope" in deploy_state.last_error
+
+
+def test_service_runner_continuous_deploy_rollback_failures_mark_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    with pytest.raises(RuntimeError, match="missing previous_sha"):
+        runner._perform_continuous_deploy_rollback(
+            attempt=state.get_continuous_deploy_state(),
+            error_detail="health checks failed",
+            health_tracker=_ServiceHealthTracker(),
+        )
+    assert state.get_continuous_deploy_state().status == "failed"
+
+    state.start_continuous_deploy_attempt(previous_sha="aaa111", target_sha="bbb222")
+
+    def fake_run(argv: list[str], *, cwd: Path | None = None, input_text=None, check=True) -> str:  # type: ignore[no-untyped-def]
+        _ = cwd, input_text, check
+        if "checkout" in argv:
+            raise RuntimeError("checkout failed")
+        return ""
+
+    monkeypatch.setattr("mergexo.service_runner.run", fake_run)
+    with pytest.raises(RuntimeError, match="rollback failed while restoring"):
+        runner._perform_continuous_deploy_rollback(
+            attempt=state.get_continuous_deploy_state(),
+            error_detail="health checks failed",
+            health_tracker=_ServiceHealthTracker(),
+        )
+    assert state.get_continuous_deploy_state().status == "failed"
+
+
+def test_service_runner_continuous_deploy_boot_error_recording(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_enabled=True)
+    state = StateStore(tmp_path / "state.db")
+    state.start_continuous_deploy_attempt(previous_sha="aaa111", target_sha="bbb222")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    runner._record_continuous_deploy_boot_error(detail="Traceback: boom")
+    assert "Traceback: boom" in (state.get_continuous_deploy_state().last_error or "")
+
+    state.mark_continuous_deploy_healthy(active_sha="bbb222")
+    runner._record_continuous_deploy_boot_error(detail="Traceback: ignored")
+    assert state.get_continuous_deploy_state().last_error is None
+
+
+def test_service_runner_health_endpoint_reports_expected_states(tmp_path: Path) -> None:
+    port = _free_local_port()
+    cfg = _app_config(
+        tmp_path,
+        continuous_deploy_healthcheck_port=port,
+    )
+    state = StateStore(tmp_path / "state.db")
+    runner = ServiceRunner(
+        config=cfg,
+        state=state,
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    tracker = _ServiceHealthTracker()
+    server = runner._start_health_server(health_tracker=tracker)
+    assert server is not None
+    try:
+        with pytest.raises(urlerror.HTTPError) as missing_error:
+            request.urlopen(f"http://127.0.0.1:{port}/missing")
+        assert missing_error.value.code == 404
+
+        with pytest.raises(urlerror.HTTPError) as starting_error:
+            request.urlopen(f"http://127.0.0.1:{port}/healthz")
+        assert starting_error.value.code == 503
+        assert '"reason": "starting"' in starting_error.value.read().decode("utf-8")
+
+        tracker.set_poll_cycle_completed()
+        tracker.set_active_sha("abc123")
+        healthy = request.urlopen(f"http://127.0.0.1:{port}/healthz")
+        assert healthy.status == 200
+        assert '"status": "healthy"' in healthy.read().decode("utf-8")
+
+        tracker.set_auth_shutdown_pending(True)
+        with pytest.raises(urlerror.HTTPError) as auth_error:
+            request.urlopen(f"http://127.0.0.1:{port}/healthz")
+        assert auth_error.value.code == 503
+        assert '"reason": "auth_shutdown_pending"' in auth_error.value.read().decode("utf-8")
+
+        tracker.set_rollback_in_progress(True)
+        with pytest.raises(urlerror.HTTPError) as rollback_error:
+            request.urlopen(f"http://127.0.0.1:{port}/healthz")
+        assert rollback_error.value.code == 503
+        assert '"reason": "rollback_in_progress"' in rollback_error.value.read().decode("utf-8")
+
+        tracker.set_fatal_error("boom")
+        with pytest.raises(urlerror.HTTPError) as fatal_error:
+            request.urlopen(f"http://127.0.0.1:{port}/healthz")
+        assert fatal_error.value.code == 503
+        assert '"reason": "fatal_error"' in fatal_error.value.read().decode("utf-8")
+    finally:
+        runner._stop_health_server(server)
+
+
+def test_service_runner_health_endpoint_can_be_disabled(tmp_path: Path) -> None:
+    cfg = _app_config(tmp_path, continuous_deploy_healthcheck_port=0)
+    runner = ServiceRunner(
+        config=cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    assert runner._start_health_server(health_tracker=_ServiceHealthTracker()) is None
+    runner._stop_health_server(None)
+
+
+def test_service_runner_handle_restart_uses_continuous_branch_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _app_config(
+        tmp_path,
+        continuous_deploy_enabled=True,
+        continuous_deploy_branch="release",
+    )
+    runner = ServiceRunner(
+        config=cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=cast(GitHubGateway, FakeGitHub()),
+        git_manager=cast(GitRepoManager, object()),
+        agent=cast(AgentAdapter, object()),
+        startup_argv=("mergexo", "service"),
+    )
+    branches: list[str | None] = []
+
+    def fake_run_update(self, *, mode: RestartMode, git_branch: str | None = None) -> None:
+        _ = mode
+        branches.append(git_branch)
+
+    monkeypatch.setattr(ServiceRunner, "_run_update", fake_run_update)
+    monkeypatch.setattr(ServiceRunner, "_reexec", lambda self: None)
+    assert (
+        runner._handle_restart_requested(
+            requested=RestartRequested(
+                mode="git_checkout", command_key="continuous:deadbeef:2026-03-03T00:00:00Z"
+            )
+        )
+        is True
+    )
+    assert branches == ["release"]
 
 
 def test_service_runner_post_operator_result_is_idempotent(tmp_path: Path) -> None:
@@ -1390,7 +2195,7 @@ def test_handle_restart_requested_returns_true_when_reexec_succeeds(
         agent=cast(AgentAdapter, object()),
         startup_argv=("mergexo", "service"),
     )
-    monkeypatch.setattr(ServiceRunner, "_run_update", lambda self, mode: None)
+    monkeypatch.setattr(ServiceRunner, "_run_update", lambda self, mode, git_branch=None: None)
     monkeypatch.setattr(ServiceRunner, "_reexec", lambda self: None)
     assert (
         runner._handle_restart_requested(
