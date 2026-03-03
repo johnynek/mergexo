@@ -65,15 +65,10 @@ class GitRepoManager:
                 slot=slot,
                 checkout_path=str(checkout_path),
             )
-            run(
-                [
-                    "git",
-                    "clone",
-                    "--reference-if-able",
-                    str(self.layout.mirror_path),
-                    remote_url,
-                    str(checkout_path),
-                ]
+            self._clone_checkout_with_reference_fallback(
+                checkout_path=checkout_path,
+                remote_url=remote_url,
+                slot=slot,
             )
         else:
             log_event(
@@ -439,6 +434,37 @@ class GitRepoManager:
             check=False,
         )
         return bool(output.strip())
+
+    def _clone_checkout_with_reference_fallback(
+        self,
+        *,
+        checkout_path: Path,
+        remote_url: str,
+        slot: int,
+    ) -> None:
+        reference_clone_cmd = [
+            "git",
+            "clone",
+            "--reference-if-able",
+            str(self.layout.mirror_path),
+            remote_url,
+            str(checkout_path),
+        ]
+        try:
+            run(reference_clone_cmd)
+            return
+        except CommandError as exc:
+            log_event(
+                LOGGER,
+                "git_checkout_clone_reference_failed",
+                slot=slot,
+                checkout_path=str(checkout_path),
+                error_type=type(exc).__name__,
+            )
+            # Clean up partial checkout state before retrying a plain clone.
+            if checkout_path.exists():
+                shutil.rmtree(checkout_path)
+        run(["git", "clone", remote_url, str(checkout_path)])
 
     def _ensure_mirror(self) -> None:
         remote_url = self.repo.effective_remote_url
