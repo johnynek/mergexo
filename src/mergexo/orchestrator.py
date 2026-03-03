@@ -129,6 +129,9 @@ _DEFAULT_RUN_META_JSON = json.dumps(
     },
     sort_keys=True,
 )
+_FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS = 4
+_FEEDBACK_TRANSIENT_GIT_INITIAL_DELAY_SECONDS = 5
+_FEEDBACK_TRANSIENT_GIT_MAX_DELAY_SECONDS = 60
 
 PrePrFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
 
@@ -217,6 +220,10 @@ class RestartRequested(RuntimeError):
             f"Restart requested in mode={self.mode} via command_key={self.command_key} "
             f"(repo={self.repo_full_name})"
         )
+
+
+class FeedbackTransientGitError(RuntimeError):
+    """Transient git/GitHub transport issue persisted across bounded retries."""
 
 
 class SlotPool:
@@ -3931,7 +3938,36 @@ class Phase1Orchestrator:
 
     def _process_feedback_turn_worker(self, tracked: TrackedPullRequestState) -> str:
         with logging_repo_context(self._repo.full_name):
-            return self._process_feedback_turn(tracked)
+            last_transient_error: str | None = None
+            for attempt in range(1, _FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS + 1):
+                try:
+                    return self._process_feedback_turn(tracked)
+                except CommandError as exc:
+                    detail = str(exc)
+                    if not _is_transient_feedback_git_command_error(detail):
+                        raise
+                    last_transient_error = detail
+                    if attempt >= _FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS:
+                        break
+                    delay_seconds = _feedback_transient_git_retry_delay_seconds(attempt)
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_retry",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="transient_git_transport_error",
+                        attempt=attempt,
+                        max_attempts=_FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS,
+                        next_delay_seconds=delay_seconds,
+                        error_summary=_summarize_git_error(detail),
+                    )
+                    time.sleep(delay_seconds)
+            summary = _summarize_git_error(last_transient_error or "")
+            raise FeedbackTransientGitError(
+                "Unable to reach GitHub during feedback operations after "
+                f"{_FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS} attempts. "
+                f"Last error: {summary}"
+            )
 
     def _active_run_id_for_issue(self, issue_number: int) -> str | None:
         for _ in range(20):
@@ -6943,6 +6979,8 @@ def _failure_class_for_exception(exc: Exception) -> AgentRunFailureClass:
     normalized = str(exc).strip().lower()
     if "non-fast-forward" in normalized or "history transition" in normalized:
         return "history_rewrite"
+    if isinstance(exc, FeedbackTransientGitError):
+        return "github_error"
     if isinstance(exc, GitHubPollingError):
         return "github_error"
     if (
@@ -7114,6 +7152,45 @@ def _render_git_op_result_comment(*, outcomes: list[_GitOpOutcome], round_number
         "Continue by editing files directly. If more repository git actions are needed, request them in git_ops."
     )
     return "\n".join(lines)
+
+
+def _feedback_transient_git_retry_delay_seconds(attempt: int) -> int:
+    if attempt < 1:
+        raise ValueError("attempt must be >= 1")
+    delay = _FEEDBACK_TRANSIENT_GIT_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1))
+    return min(delay, _FEEDBACK_TRANSIENT_GIT_MAX_DELAY_SECONDS)
+
+
+def _is_transient_git_remote_error(detail: str) -> bool:
+    normalized = detail.strip().lower()
+    if not normalized:
+        return False
+    transient_markers = (
+        "no healthy upstream",
+        "internal error performing authentication",
+        "could not read from remote repository",
+        "upstream connect error",
+        "remote connection failure",
+        "connection refused",
+        "connection timed out",
+        "network is unreachable",
+        "temporary failure in name resolution",
+        "transport failure reason",
+        "connection reset by peer",
+        "kex_exchange_identification",
+        "ssh_exchange_identification",
+    )
+    return any(marker in normalized for marker in transient_markers)
+
+
+def _is_transient_feedback_git_command_error(raw_error: str) -> bool:
+    normalized = raw_error.strip().lower()
+    if not normalized:
+        return False
+    # Guardrail: only treat git command failures as transport retries.
+    if "cmd: git " not in normalized and "\ncmd: git " not in normalized:
+        return False
+    return _is_transient_git_remote_error(normalized)
 
 
 def _summarize_git_error(raw_error: str) -> str:
