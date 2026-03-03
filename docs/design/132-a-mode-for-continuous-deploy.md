@@ -172,8 +172,13 @@ Rollback is `git_checkout` only in v1:
 1. `git -C <git_checkout_root> fetch origin <branch> --prune --tags`.
 2. `git -C <git_checkout_root> checkout -B <branch> <previous_sha>`.
 3. `uv sync`.
-4. Mark state `rolled_back`, set `blocked_target_sha=target_sha`, set error/detail.
-5. Re-exec service.
+4. Attempt to open a GitHub issue (no labels) describing the rollback event, including:
+   - failed target revision SHA (`target_sha`)
+   - previous healthy revision SHA (`previous_sha`)
+   - stack trace and/or failure details captured from the failed boot attempt
+5. If issue creation fails (for example due to missing issue-write permission), continue rollback, emit a structured warning event, and persist the issue-creation failure detail in deploy state.
+6. Mark state `rolled_back`, set `blocked_target_sha=target_sha`, set error/detail.
+7. Re-exec service.
 
 If rollback itself fails, mark state `failed`, emit fatal log event, and require operator intervention.
 
@@ -213,8 +218,9 @@ Validation rules:
 8. Add startup reconciliation path that processes pending deploy attempts and triggers rollback on repeated failed boots.
 9. Add localhost health endpoint lifecycle in `src/mergexo/service_runner.py`.
 10. Add rollback execution path and quarantine semantics for bad target revisions.
-11. Update `mergexo.toml.example` and README operational docs.
-12. Add tests for config parsing, state transitions, idle gating, deploy scheduling, healthy completion, rollback, and quarantine behavior.
+11. Add best-effort rollback issue reporting via `GitHubGateway.create_issue(labels=None)` with failure-tolerant handling.
+12. Update `mergexo.toml.example` and README operational docs.
+13. Add tests for config parsing, state transitions, idle gating, deploy scheduling, healthy completion, rollback, rollback issue reporting, and quarantine behavior.
 
 ## Testing plan
 
@@ -230,6 +236,8 @@ Validation rules:
    - does not schedule when remote equals blocked target.
    - marks deploy healthy after successful poll cycle.
    - rolls back after repeated failed boots.
+   - opens an unlabeled rollback issue that includes `target_sha` and captured stack trace details.
+   - continues rollback when rollback issue creation fails (for example unauthorized issue write).
    - exposes `/healthz` with expected healthy/unhealthy statuses.
 4. regression checks
    - manual `/mergexo restart` behavior unchanged.
@@ -246,7 +254,9 @@ Validation rules:
 7. After rollback, the failed target revision is quarantined and not retried until branch head changes.
 8. `/healthz` reports unhealthy during startup/rollback and healthy after successful startup.
 9. Manual `/mergexo restart` remains functional and single-flight with continuous deploy.
-10. README and example config document enablement, requirements, and rollback semantics.
+10. Rollback opens an unlabeled GitHub issue containing failed `target_sha` plus captured stack trace/failure details.
+11. Rollback still completes when rollback issue creation fails, with warnings/logging and persisted diagnostics.
+12. README and example config document enablement, requirements, and rollback semantics.
 
 ## Risks and mitigations
 
