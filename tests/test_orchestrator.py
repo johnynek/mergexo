@@ -3775,6 +3775,51 @@ def test_enqueue_new_work_passes_existing_issue_comments_on_first_invocation(
     assert cursor.pre_pr_last_consumed_comment_id == 6
 
 
+def test_enqueue_new_work_does_not_advance_cursor_when_issue_already_processed(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, worker_count=1, enable_issue_comment_routing=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(7, labels=("agent:bugfix",))
+    github = FakeGitHub([issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=11,
+            body="Please open the PR now",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-11",
+            created_at="2026-02-23T00:00:00Z",
+            updated_at="2026-02-23T00:00:00Z",
+        )
+    ]
+    state = StateStore(tmp_path / "state.db")
+    state.mark_awaiting_issue_followup(
+        issue_number=7,
+        flow="bugfix",
+        branch="agent/bugfix/7-add-worker-scheduler",
+        context_json="{}",
+        waiting_reason="new_issue_comments_pending",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.advance_pre_pr_last_consumed_comment_id(
+        issue_number=7,
+        comment_id=10,
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    class NoopPool:
+        def submit(self, *args: object, **kwargs: object) -> Future[WorkResult]:
+            _ = args, kwargs
+            raise AssertionError("submit should not be called when claim is lost")
+
+    orch._enqueue_new_work(NoopPool())
+
+    cursor = state.get_issue_comment_cursor(7, repo_full_name=cfg.repo.full_name)
+    assert cursor.pre_pr_last_consumed_comment_id == 10
+
+
 def test_enqueue_new_work_skips_unauthorized_issue_authors(tmp_path: Path) -> None:
     cfg = _config(tmp_path, worker_count=2, allowed_users=("reviewer",))
     git = FakeGitManager(tmp_path / "checkouts")

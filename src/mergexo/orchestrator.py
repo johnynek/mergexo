@@ -814,10 +814,6 @@ class Phase1Orchestrator:
                     flow=flow,
                     branch=branch,
                 )
-                consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
-                    issue.number,
-                    comments=source_issue_comments,
-                )
                 run_id = self._state.claim_new_issue_run_start(
                     issue_number=issue.number,
                     flow=flow,
@@ -833,6 +829,10 @@ class Phase1Orchestrator:
                         reason="already_processed",
                     )
                     continue
+                consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
+                    issue.number,
+                    comments=source_issue_comments,
+                )
                 self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_issue_worker,
@@ -914,9 +914,6 @@ class Phase1Orchestrator:
                     candidate=candidate,
                     branch=branch,
                 )
-                consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
-                    candidate.issue_number
-                )
                 run_id = self._state.claim_implementation_issue_run_start(
                     issue_number=candidate.issue_number,
                     branch=branch,
@@ -931,6 +928,9 @@ class Phase1Orchestrator:
                         reason="already_processed",
                     )
                     continue
+                consumed_comment_id_max = self._capture_run_start_comment_id_if_enabled(
+                    candidate.issue_number
+                )
                 self._initialize_run_meta_cache(run_id)
                 fut = pool.submit(
                     self._process_implementation_candidate_worker,
