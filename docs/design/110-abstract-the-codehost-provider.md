@@ -1,46 +1,5 @@
 ---
 issue: 110
-priority: 3
-touch_paths:
-  - src/mergexo/codehost.py
-  - src/mergexo/codehost_factory.py
-  - src/mergexo/github_gateway.py
-  - src/mergexo/gitlab_gateway.py
-  - src/mergexo/bitbucket_gateway.py
-  - src/mergexo/config.py
-  - src/mergexo/models.py
-  - src/mergexo/cli.py
-  - src/mergexo/service_runner.py
-  - src/mergexo/orchestrator.py
-  - src/mergexo/git_ops.py
-  - src/mergexo/observability_tui.py
-  - src/mergexo/observability.py
-  - README.md
-  - mergexo.toml.example
-  - tests/test_github_gateway.py
-  - tests/test_gitlab_gateway.py
-  - tests/test_bitbucket_gateway.py
-  - tests/test_codehost_factory.py
-  - tests/test_config.py
-  - tests/test_cli.py
-  - tests/test_service_runner.py
-  - tests/test_orchestrator.py
-  - tests/test_observability_tui.py
-depends_on: []
-estimated_size: M
-generated_at: 2026-02-26T05:34:03Z
----
-
-# Design doc for issue #110: abstract the codehost provider
-
-_Issue: #110 (https://github.com/johnynek/mergexo/issues/110)_
-
-## Summary
-
-Introduce a `CodehostGateway` abstraction with GitHub, GitLab, and Bitbucket adapters so MergeXO can support multiple code hosts without rewriting orchestrator/state management.
-
----
-issue: 110
 priority: 2
 touch_paths:
   - docs/design/110-abstract-the-codehost-provider.md
@@ -55,6 +14,7 @@ touch_paths:
   - src/mergexo/service_runner.py
   - src/mergexo/orchestrator.py
   - src/mergexo/git_ops.py
+  - tests/test_git_ops.py
   - src/mergexo/observability_tui.py
   - src/mergexo/observability.py
   - README.md
@@ -217,7 +177,16 @@ Optional cleanup follow-up: rename table/API symbols to `codehost_*` after provi
 3. Existing business logic (enqueue, feedback loop, restart/operator commands) stays unchanged.
 4. `git_ops.py` default remote URL generation becomes provider-aware.
 
-### 8. Intake trigger strategy across hosts
+### 8. Checkout bootstrap and recovery hardening
+
+Provider abstraction increases remote URL and host variability, so checkout bootstrap must remain robust across hosts and stale local paths:
+
+1. Keep `GitRepoManager.ensure_checkout` idempotent when slot paths already exist.
+2. When clone/setup fails for a slot, quarantine the slot and run the existing recovery path (`recover_quarantined_slot`) before retrying assignment.
+3. Keep these recovery semantics provider-agnostic (same behavior for GitHub/GitLab/Bitbucket remotes).
+4. Emit structured events with provider and host context so operators can distinguish auth failures from local checkout corruption.
+
+### 9. Intake trigger strategy across hosts
 
 Label parity differs by host, so intake is resolved in order:
 
@@ -226,13 +195,13 @@ Label parity differs by host, so intake is resolved in order:
 
 This preserves current GitHub/GitLab behavior while giving Bitbucket a deterministic intake path without changing state semantics.
 
-### 9. CI monitoring behavior by capability
+### 10. CI monitoring behavior by capability
 
 1. Keep current GitHub Actions monitor as-is for GitHub repos.
 2. For providers without configured CI support in v1, enforce a no-op policy (`never`) and emit a structured warning event.
 3. Follow-up issues can add GitLab Pipelines and Bitbucket Pipelines adapters behind the same capability flag.
 
-### 10. Observability URL generation
+### 11. Observability URL generation
 
 Replace hardcoded `github.com` URL builders in `src/mergexo/observability_tui.py` with provider-aware URL formatting:
 
@@ -252,10 +221,11 @@ Legacy GitHub repo keys continue to render exactly as today.
 6. Update config parser and sample config for provider and auth fields.
 7. Update orchestrator/service runner typing and exception handling to generic codehost types.
 8. Update git remote defaults/path layout logic for provider hostnames.
-9. Implement provider-aware URL builders in observability TUI.
-10. Update README with per-provider setup and known capability differences.
-11. Add provider contract tests and per-provider adapter tests.
-12. Add integration tests for mixed-provider polling in one process.
+9. Add explicit checkout-bootstrap failure handling assertions (slot quarantine + recovery) to provider rollout tests.
+10. Implement provider-aware URL builders in observability TUI.
+11. Update README with per-provider setup and known capability differences.
+12. Add provider contract tests and per-provider adapter tests.
+13. Add integration tests for mixed-provider polling in one process.
 
 ## Testing plan
 
@@ -280,6 +250,9 @@ Legacy GitHub repo keys continue to render exactly as today.
 - `tests/test_config.py` provider config defaults and validation.
 - `tests/test_observability_tui.py` host-specific URLs.
 
+6. Checkout resilience tests:
+- `tests/test_git_ops.py` verifies stale/non-empty slot paths and clone failures recover via slot quarantine path without requiring manual cleanup.
+
 ## Acceptance criteria
 
 1. Existing GitHub configuration (without new fields) continues to work unchanged.
@@ -294,6 +267,7 @@ Legacy GitHub repo keys continue to render exactly as today.
 10. Observability links open correct host/provider URLs for issue/PR/branch/commit.
 11. Polling/auth failures are surfaced via provider-neutral exceptions and existing retry behavior.
 12. CI monitoring remains functional on GitHub and degrades safely on unsupported providers.
+13. A checkout clone/bootstrap failure on one worker slot is recoverable through automated slot quarantine/recovery, and does not require manual directory cleanup to continue processing PR feedback.
 
 ## Risks and mitigations
 
@@ -315,13 +289,17 @@ Mitigation: phase rollout with GitHub adapter parity first and contract/regressi
 6. Risk: naming debt (`github_*`) causes confusion.
 Mitigation: keep names as compatibility layer now; schedule rename once providers are stable.
 
+7. Risk: host-specific clone/auth differences increase checkout bootstrap failures during canary rollout.
+Mitigation: provider-aware remote validation at startup plus automated slot quarantine/recovery on clone/setup errors.
+
 ## Rollout notes
 
 1. Phase 1: land abstraction + factory + GitHub parity only.
 2. Phase 2: enable GitLab behind explicit `codehost = "gitlab"` config and run one-repo canary.
 3. Phase 3: enable Bitbucket with marker-based intake canary.
 4. Phase 4: run mixed-host canary and verify scheduler fairness, auth failures, and observability links.
-5. Keep non-GitHub provider support opt-in until adapter test coverage and canary metrics are stable.
+5. During canary, force one synthetic checkout-clone failure and verify slot recovery succeeds without human cleanup.
+6. Keep non-GitHub provider support opt-in until adapter test coverage and canary metrics are stable.
 
 ## Open questions
 
