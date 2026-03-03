@@ -16,9 +16,11 @@ def _write(path: Path, content: str) -> Path:
 
 
 def test_load_config_legacy_single_repo_normalizes_and_applies_defaults(tmp_path: Path) -> None:
+    checkout_root = tmp_path / "checkout"
+    (checkout_root / ".git").mkdir(parents=True)
     cfg_path = _write(
         tmp_path / "mergexo.toml",
-        """
+        f"""
 [runtime]
 base_dir = "~/tmp/mergexo"
 worker_count = 2
@@ -33,12 +35,18 @@ pr_actions_log_tail_lines = 250
 restart_drain_timeout_seconds = 120
 restart_default_mode = "git_checkout"
 restart_supported_modes = ["git_checkout", "pypi"]
-git_checkout_root = "~/code/mergexo"
+git_checkout_root = "{checkout_root}"
 service_python = "/usr/bin/python3"
 observability_refresh_seconds = 3
 observability_default_window = "7d"
 observability_row_limit = 150
 observability_history_retention_days = 120
+continuous_deploy_enabled = true
+continuous_deploy_check_interval_seconds = 120
+continuous_deploy_branch = "release"
+continuous_deploy_healthcheck_host = "127.0.0.1"
+continuous_deploy_healthcheck_port = 9000
+continuous_deploy_max_boot_failures = 3
 
 [repo]
 owner = "johnynek"
@@ -84,12 +92,18 @@ extra_args = ["--repo-mode"]
     assert loaded.runtime.restart_default_mode == "git_checkout"
     assert loaded.runtime.restart_supported_modes == ("git_checkout", "pypi")
     assert loaded.runtime.git_checkout_root is not None
-    assert loaded.runtime.git_checkout_root.as_posix().endswith("/code/mergexo")
+    assert loaded.runtime.git_checkout_root == checkout_root
     assert loaded.runtime.service_python == "/usr/bin/python3"
     assert loaded.runtime.observability_refresh_seconds == 3
     assert loaded.runtime.observability_default_window == "7d"
     assert loaded.runtime.observability_row_limit == 150
     assert loaded.runtime.observability_history_retention_days == 120
+    assert loaded.runtime.continuous_deploy_enabled is True
+    assert loaded.runtime.continuous_deploy_check_interval_seconds == 120
+    assert loaded.runtime.continuous_deploy_branch == "release"
+    assert loaded.runtime.continuous_deploy_healthcheck_host == "127.0.0.1"
+    assert loaded.runtime.continuous_deploy_healthcheck_port == 9000
+    assert loaded.runtime.continuous_deploy_max_boot_failures == 3
     assert loaded.repo.repo_id == "repo"
     assert loaded.repo.full_name == "johnynek/repo"
     assert loaded.repo.default_branch == "main"
@@ -153,6 +167,12 @@ coding_guidelines_path = "docs/python_style.md"
     assert loaded.runtime.observability_default_window == "24h"
     assert loaded.runtime.observability_row_limit == 200
     assert loaded.runtime.observability_history_retention_days == 90
+    assert loaded.runtime.continuous_deploy_enabled is False
+    assert loaded.runtime.continuous_deploy_check_interval_seconds == 300
+    assert loaded.runtime.continuous_deploy_branch == "main"
+    assert loaded.runtime.continuous_deploy_healthcheck_host == "127.0.0.1"
+    assert loaded.runtime.continuous_deploy_healthcheck_port == 8765
+    assert loaded.runtime.continuous_deploy_max_boot_failures == 2
 
     by_id = {repo.repo_id: repo for repo in loaded.repos}
     assert by_id["mergexo"].name == "mergexo"
@@ -696,6 +716,66 @@ coding_guidelines_path = "docs/python_style.md"
 base_dir = "/tmp/x"
 worker_count = 1
 poll_interval_seconds = 5
+continuous_deploy_check_interval_seconds = 9
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "continuous_deploy_check_interval_seconds",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+continuous_deploy_healthcheck_port = -1
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "continuous_deploy_healthcheck_port",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+continuous_deploy_healthcheck_port = 70000
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "continuous_deploy_healthcheck_port",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+continuous_deploy_max_boot_failures = 0
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+            "continuous_deploy_max_boot_failures",
+        ),
+        (
+            """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
 restart_default_mode = "pypi"
 restart_supported_modes = ["git_checkout"]
 
@@ -745,6 +825,57 @@ repo = { n = 1 }
 def test_load_config_runtime_and_shape_errors(tmp_path: Path, content: str, expected: str) -> None:
     cfg_path = _write(tmp_path / "bad.toml", content)
     with pytest.raises(ConfigError, match=re.escape(expected)):
+        config.load_config(cfg_path)
+
+
+def test_load_config_rejects_continuous_deploy_without_git_checkout_mode(
+    tmp_path: Path,
+) -> None:
+    checkout_root = tmp_path / "checkout"
+    (checkout_root / ".git").mkdir(parents=True)
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        f"""
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+restart_default_mode = "pypi"
+restart_supported_modes = ["pypi"]
+continuous_deploy_enabled = true
+git_checkout_root = "{checkout_root}"
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match="restart_supported_modes"):
+        config.load_config(cfg_path)
+
+
+def test_load_config_rejects_continuous_deploy_without_git_checkout_root(
+    tmp_path: Path,
+) -> None:
+    checkout_root = tmp_path / "missing-checkout"
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        f"""
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+continuous_deploy_enabled = true
+git_checkout_root = "{checkout_root}"
+
+[repo]
+owner = "o"
+name = "n"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match="git_checkout_root"):
         config.load_config(cfg_path)
 
 

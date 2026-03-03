@@ -17,6 +17,8 @@ from mergexo.state import (
     _parse_action_token_status,
     _parse_github_comment_surface,
     _parse_github_call_outbox_row,
+    _parse_continuous_deploy_state_row,
+    _parse_continuous_deploy_status,
     _parse_operator_command_name,
     _parse_operator_command_row,
     _parse_pr_flake_state_row,
@@ -2683,6 +2685,89 @@ def test_operator_commands_and_runtime_operations(tmp_path: Path) -> None:
     assert refreshed.requested_by == "dana"
 
 
+def test_continuous_deploy_state_transitions(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+
+    initial = store.get_continuous_deploy_state()
+    assert initial.status == "idle"
+    assert initial.previous_sha is None
+    assert initial.target_sha is None
+    assert initial.active_sha is None
+    assert initial.blocked_target_sha is None
+    assert initial.boot_attempt_count == 0
+    assert initial.updated_at
+
+    started = store.start_continuous_deploy_attempt(previous_sha="aaa111", target_sha="bbb222")
+    assert started.status == "awaiting_health"
+    assert started.previous_sha == "aaa111"
+    assert started.target_sha == "bbb222"
+    assert started.active_sha == "aaa111"
+    assert started.boot_attempt_count == 0
+    assert started.requested_at is not None
+
+    incremented = store.increment_continuous_deploy_boot_attempt()
+    assert incremented.boot_attempt_count == 1
+
+    with pytest.raises(ValueError, match="detail must be non-empty"):
+        store.set_continuous_deploy_last_error(detail="   ")
+    errored = store.set_continuous_deploy_last_error(detail="Traceback: boom")
+    assert errored.last_error == "Traceback: boom"
+
+    healthy = store.mark_continuous_deploy_healthy(active_sha="bbb222")
+    assert healthy.status == "healthy"
+    assert healthy.active_sha == "bbb222"
+    assert healthy.healthy_at is not None
+    assert healthy.last_error is None
+
+    unchanged = store.increment_continuous_deploy_boot_attempt()
+    assert unchanged.boot_attempt_count == healthy.boot_attempt_count
+
+    next_attempt = store.start_continuous_deploy_attempt(previous_sha="bbb222", target_sha="ccc333")
+    assert next_attempt.status == "awaiting_health"
+    assert next_attempt.boot_attempt_count == 0
+    assert next_attempt.blocked_target_sha is None
+
+    rolled_back = store.mark_continuous_deploy_rolled_back(error="rollback applied")
+    assert rolled_back.status == "rolled_back"
+    assert rolled_back.active_sha == "bbb222"
+    assert rolled_back.blocked_target_sha == "ccc333"
+    assert rolled_back.last_error == "rollback applied"
+
+    preserved_block = store.start_continuous_deploy_attempt(
+        previous_sha="bbb222", target_sha="ccc333"
+    )
+    assert preserved_block.blocked_target_sha == "ccc333"
+
+    cleared_block = store.start_continuous_deploy_attempt(
+        previous_sha="ccc333", target_sha="ddd444"
+    )
+    assert cleared_block.blocked_target_sha is None
+
+    with pytest.raises(ValueError, match="error must be non-empty"):
+        store.mark_continuous_deploy_failed(error="   ")
+    failed = store.mark_continuous_deploy_failed(error="rollback supervisor failure")
+    assert failed.status == "failed"
+    assert failed.last_error == "rollback supervisor failure"
+
+    with pytest.raises(ValueError, match="previous_sha must be non-empty"):
+        store.start_continuous_deploy_attempt(previous_sha=" ", target_sha="x")
+    with pytest.raises(ValueError, match="target_sha must be non-empty"):
+        store.start_continuous_deploy_attempt(previous_sha="x", target_sha=" ")
+
+
+def test_continuous_deploy_state_row_missing_raises(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM continuous_deploy_state WHERE row_id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="continuous_deploy_state row missing"):
+        store.get_continuous_deploy_state()
+
+
 def test_operator_and_runtime_row_validation(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
@@ -2931,6 +3016,93 @@ def test_parse_runtime_operation_row_validations() -> None:
         )
 
 
+def test_parse_continuous_deploy_state_row_validations() -> None:
+    valid = (
+        "awaiting_health",
+        "a",
+        "b",
+        "a",
+        None,
+        1,
+        "t0",
+        "t1",
+        None,
+        "boom",
+    )
+
+    with pytest.raises(RuntimeError, match="row width"):
+        _parse_continuous_deploy_state_row(())
+    with pytest.raises(RuntimeError, match="previous_sha"):
+        _parse_continuous_deploy_state_row(
+            (valid[0], 1, *valid[2:])  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="target_sha"):
+        _parse_continuous_deploy_state_row(
+            (valid[0], valid[1], 1, *valid[3:])  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="active_sha"):
+        _parse_continuous_deploy_state_row(
+            (valid[0], valid[1], valid[2], 1, *valid[4:])  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="blocked_target_sha"):
+        _parse_continuous_deploy_state_row(
+            (valid[0], valid[1], valid[2], valid[3], 1, *valid[5:])  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="boot_attempt_count"):
+        _parse_continuous_deploy_state_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], "1", *valid[6:])  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="requested_at"):
+        _parse_continuous_deploy_state_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], 1, *valid[7:])  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="updated_at"):
+        _parse_continuous_deploy_state_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                1,
+                valid[8],
+                valid[9],
+            )  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="healthy_at"):
+        _parse_continuous_deploy_state_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                1,
+                valid[9],
+            )  # type: ignore[arg-type]
+        )
+    with pytest.raises(RuntimeError, match="last_error"):
+        _parse_continuous_deploy_state_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                valid[8],
+                1,
+            )  # type: ignore[arg-type]
+        )
+
+
 def test_parse_enum_helpers_validate_types_and_values() -> None:
     with pytest.raises(RuntimeError, match="Invalid command value"):
         _parse_operator_command_name(1)
@@ -2946,6 +3118,10 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
         _parse_runtime_operation_status(1)
     with pytest.raises(RuntimeError, match="Unknown status value"):
         _parse_runtime_operation_status("other")
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        _parse_continuous_deploy_status(1)
+    with pytest.raises(RuntimeError, match="Unknown status value"):
+        _parse_continuous_deploy_status("other")
 
     with pytest.raises(RuntimeError, match="Invalid mode value"):
         _parse_restart_mode(1)

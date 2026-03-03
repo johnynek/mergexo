@@ -30,6 +30,12 @@ class RuntimeConfig:
     observability_default_window: str = "24h"
     observability_row_limit: int | None = 200
     observability_history_retention_days: int = 90
+    continuous_deploy_enabled: bool = False
+    continuous_deploy_check_interval_seconds: int = 300
+    continuous_deploy_branch: str = "main"
+    continuous_deploy_healthcheck_host: str = "127.0.0.1"
+    continuous_deploy_healthcheck_port: int = 8765
+    continuous_deploy_max_boot_failures: int = 2
 
 
 @dataclass(frozen=True)
@@ -178,6 +184,24 @@ def load_config(path: Path) -> AppConfig:
         observability_history_retention_days=_int_with_default(
             runtime_data, "observability_history_retention_days", 90
         ),
+        continuous_deploy_enabled=_bool_with_default(
+            runtime_data, "continuous_deploy_enabled", False
+        ),
+        continuous_deploy_check_interval_seconds=_int_with_default(
+            runtime_data, "continuous_deploy_check_interval_seconds", 300
+        ),
+        continuous_deploy_branch=_str_with_default(
+            runtime_data, "continuous_deploy_branch", "main"
+        ),
+        continuous_deploy_healthcheck_host=_str_with_default(
+            runtime_data, "continuous_deploy_healthcheck_host", "127.0.0.1"
+        ),
+        continuous_deploy_healthcheck_port=_int_with_default(
+            runtime_data, "continuous_deploy_healthcheck_port", 8765
+        ),
+        continuous_deploy_max_boot_failures=_int_with_default(
+            runtime_data, "continuous_deploy_max_boot_failures", 2
+        ),
     )
 
     if runtime.worker_count < 1:
@@ -201,10 +225,33 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("runtime.observability_refresh_seconds must be >= 1")
     if runtime.observability_history_retention_days < 1:
         raise ConfigError("runtime.observability_history_retention_days must be >= 1")
+    if runtime.continuous_deploy_check_interval_seconds < 10:
+        raise ConfigError("runtime.continuous_deploy_check_interval_seconds must be >= 10")
+    if (
+        runtime.continuous_deploy_healthcheck_port < 0
+        or runtime.continuous_deploy_healthcheck_port > 65535
+    ):
+        raise ConfigError(
+            "runtime.continuous_deploy_healthcheck_port must be 0 or between 1 and 65535"
+        )
+    if runtime.continuous_deploy_max_boot_failures < 1:
+        raise ConfigError("runtime.continuous_deploy_max_boot_failures must be >= 1")
     if runtime.restart_default_mode not in runtime.restart_supported_modes:
         raise ConfigError(
             "runtime.restart_default_mode must be included in runtime.restart_supported_modes"
         )
+    if runtime.continuous_deploy_enabled:
+        if "git_checkout" not in runtime.restart_supported_modes:
+            raise ConfigError(
+                "runtime.continuous_deploy_enabled requires runtime.restart_supported_modes "
+                "to include git_checkout"
+            )
+        checkout_root = runtime.git_checkout_root or Path.cwd()
+        if not checkout_root.exists() or not (checkout_root / ".git").exists():
+            raise ConfigError(
+                "runtime.continuous_deploy_enabled requires runtime.git_checkout_root "
+                "(or cwd) to be a git checkout"
+            )
 
     repos = _load_repo_configs(repo_data=repo_data, auth_data=auth_data)
 

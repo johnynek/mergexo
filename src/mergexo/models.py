@@ -11,6 +11,7 @@ OperatorReplyStatus = Literal["applied", "rejected", "failed", "help"]
 RestartMode = Literal["git_checkout", "pypi"]
 RuntimeOperationStatus = Literal["pending", "running", "failed", "completed"]
 PrActionsFeedbackPolicy = Literal["never", "first_fail", "all_complete"]
+ContinuousDeployStatus = Literal["idle", "awaiting_health", "healthy", "rolled_back", "failed"]
 
 
 @dataclass(frozen=True)
@@ -138,3 +139,17 @@ class RuntimeOperationRecord:
     created_at: str
     updated_at: str
     request_repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class ContinuousDeployState:
+    status: ContinuousDeployStatus
+    previous_sha: str | None
+    target_sha: str | None
+    active_sha: str | None
+    blocked_target_sha: str | None
+    boot_attempt_count: int
+    requested_at: str | None
+    updated_at: str
+    healthy_at: str | None
+    last_error: str | None
