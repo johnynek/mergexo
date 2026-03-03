@@ -11,7 +11,11 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    ReleaseSnapshot,
+    RepositoryTagSnapshot,
     RuntimeOperationRecord,
+    TriggeredTaskExecutionResult,
+    TriggeredTaskRequest,
     WorkflowJobSnapshot,
     WorkflowRunSnapshot,
     WorkResult,
@@ -22,6 +26,7 @@ from mergexo.prompts import (
     build_feedback_prompt,
     build_implementation_prompt,
     build_small_job_prompt,
+    build_triggered_task_review_prompt,
 )
 
 
@@ -108,6 +113,26 @@ def test_model_dataclasses_and_version() -> None:
         summary="Intermittent timeout in shard 2.",
         relevant_log_excerpt="TimeoutError: queue did not drain",
     )
+    tag = RepositoryTagSnapshot(name="v1.2.3", commit_sha="abc123")
+    latest_release = ReleaseSnapshot(
+        tag_name="v1.2.2",
+        name="v1.2.2",
+        html_url="https://example/releases/v1.2.2",
+        published_at="2026-03-01T00:00:00Z",
+    )
+    task_request = TriggeredTaskRequest(
+        task_kind="release",
+        resource_key="v1.2.3",
+        requested_tag="v1.2.3",
+        source_text="release v1.2.3",
+    )
+    task_execution = TriggeredTaskExecutionResult(
+        success=True,
+        detail="done",
+        stdout_tail="ok",
+        stderr_tail=None,
+        observed_tag_sha="abc123",
+    )
 
     assert __version__ == "0.1.0"
     assert issue.labels == ("x",)
@@ -122,6 +147,10 @@ def test_model_dataclasses_and_version() -> None:
     assert workflow_run.run_id == 11
     assert workflow_job.job_id == 21
     assert flaky_report.run_id == 777
+    assert tag.name == "v1.2.3"
+    assert latest_release.tag_name == "v1.2.2"
+    assert task_request.task_kind == "release"
+    assert task_execution.observed_tag_sha == "abc123"
 
 
 def test_build_design_prompt_contains_required_contract() -> None:
@@ -328,3 +357,29 @@ def test_build_implementation_prompt_without_guidelines_path_uses_fallback() -> 
     assert "target 100% test coverage" in prompt
     assert "Re-run formatting and tests expected by this repo" in prompt
     assert "docs/python_style.md" not in prompt
+
+
+def test_build_triggered_task_review_prompt_contains_release_rules() -> None:
+    issue = Issue(
+        number=333,
+        title="release v1.2.3",
+        body="release: v1.2.3",
+        html_url="https://example/issue/333",
+        labels=("agent:task",),
+    )
+    prompt = build_triggered_task_review_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        task_kind="release",
+        request_json='{"requested_tag":"v1.2.3"}',
+        snapshot_json='{"default_branch_head_sha":"abc123"}',
+    )
+
+    assert "triggered-task review agent" in prompt
+    assert '"approve" or "reject"' in prompt
+    assert "requested tag already exists remotely" in prompt
+    assert "default-branch CI for target head SHA is missing or non-green" in prompt
+    assert "requested version appears older than or equal to latest release" in prompt
+    assert "Triggered task request JSON" in prompt
+    assert "Triggered task snapshot JSON" in prompt

@@ -5,6 +5,8 @@ poll_interval_seconds = 600
 enable_github_operations = false
 # Enable pre-PR issue comment routing (queued retries before PR creation + post-PR redirects).
 enable_issue_comment_routing = false
+# Enable issue-driven triggered task automation (for example: release requests).
+enable_triggered_tasks = false
 # Compatibility fallback only: when true, repos without explicit policy behave as all_complete.
 enable_pr_actions_monitoring = false
 # Enable incremental GitHub comment polling (bounded by cursors + overlap replay).
@@ -41,12 +43,18 @@ default_branch = "main"
 trigger_label = "agent:design"
 bugfix_label = "agent:bugfix"
 small_job_label = "agent:small-job"
+# Triggered-task label (issue-driven operational tasks like release).
+task_label = "agent:task"
 # Human takeover label; while present MergeXO pauses automation for this source issue/linked PR.
 ignore_label = "agent:ignore"
 # Required path (repo-relative) to coding + testing guidelines agents should follow
 coding_guidelines_path = "docs/python_style.md"
 # Optional repo-relative or absolute path to an executable required before each push.
 required_tests = "scripts/test.sh"
+# Required when runtime.enable_triggered_tasks=true.
+release_task_script = "scripts/release.sh"
+# Optional override; default accepts "release <tag>" and "release: <tag>".
+# release_request_regex = "(?i)^\\s*release\\s*:?\\s*(?P<tag>\\S+)\\s*$"
 # Per-repo GitHub Actions feedback policy: never | first_fail | all_complete.
 # If omitted, runtime.enable_pr_actions_monitoring fallback is used.
 pr_actions_feedback_policy = "all_complete"

@@ -11,6 +11,11 @@ from mergexo.feedback_loop import (
     compute_pre_pr_checkpoint_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
+    compute_task_completed_token,
+    compute_task_execution_started_token,
+    compute_task_failed_token,
+    compute_task_rejected_token,
+    compute_task_snapshot_recorded_token,
     compute_turn_key,
     event_key,
     extract_action_tokens,
@@ -130,6 +135,19 @@ def test_pre_pr_checkpoint_token_is_stable() -> None:
     token_c = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="def456")
     assert token_a == token_b
     assert token_a != token_c
+
+
+def test_triggered_task_tokens_are_stable_and_specific() -> None:
+    task_kwargs = {"issue_number": 44, "task_kind": "release", "resource_key": "v1.2.3"}
+    snapshot_a = compute_task_snapshot_recorded_token(**task_kwargs)
+    snapshot_b = compute_task_snapshot_recorded_token(**task_kwargs)
+    rejected = compute_task_rejected_token(**task_kwargs)
+    started = compute_task_execution_started_token(**task_kwargs)
+    completed = compute_task_completed_token(**task_kwargs)
+    failed = compute_task_failed_token(**task_kwargs)
+
+    assert snapshot_a == snapshot_b
+    assert len({snapshot_a, rejected, started, completed, failed}) == 5
 
 
 def test_parse_operator_command_valid_variants() -> None:

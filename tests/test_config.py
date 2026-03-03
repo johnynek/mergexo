@@ -212,6 +212,48 @@ pr_actions_feedback_policy = "eventually"
         config.load_config(cfg_path)
 
 
+def test_load_config_rejects_invalid_release_request_regex(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad-regex.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+release_request_regex = "(unclosed"
+""".strip(),
+    )
+
+    with pytest.raises(ConfigError, match="release_request_regex contains invalid regex"):
+        config.load_config(cfg_path)
+
+
+def test_load_config_requires_release_script_when_triggered_tasks_enabled(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "triggered-missing-script.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+enable_triggered_tasks = true
+
+[repo]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+""".strip(),
+    )
+
+    with pytest.raises(ConfigError, match="release_task_script is required"):
+        config.load_config(cfg_path)
+
+
 def test_load_config_keeps_runtime_monitoring_flag_for_fallback_when_repo_policy_missing(
     tmp_path: Path,
 ) -> None:

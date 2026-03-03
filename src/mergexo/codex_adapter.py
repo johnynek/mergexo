@@ -16,9 +16,10 @@ from mergexo.agent_adapter import (
     FeedbackTurn,
     GitOpRequest,
     ReviewReply,
+    TriggeredTaskReviewResult,
 )
 from mergexo.config import CodexConfig
-from mergexo.models import FlakyTestReport, GeneratedDesign, Issue
+from mergexo.models import FlakyTestReport, GeneratedDesign, Issue, TriggeredTaskDecision
 from mergexo.observability import log_event
 from mergexo.prompts import (
     build_bugfix_prompt,
@@ -55,6 +56,16 @@ _DIRECT_OUTPUT_SCHEMA: dict[str, object] = {
         "pr_summary": {"type": "string", "minLength": 1},
         "commit_message": {"type": ["string", "null"]},
         "blocked_reason": {"type": ["string", "null"]},
+    },
+}
+
+_TRIGGERED_TASK_REVIEW_OUTPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "reason"],
+    "properties": {
+        "decision": {"type": "string", "enum": ["approve", "reject"]},
+        "reason": {"type": "string", "minLength": 1},
     },
 }
 
@@ -205,6 +216,47 @@ class CodexAdapter(AgentAdapter):
             prompt=prompt,
             cwd=cwd,
         )
+
+    def review_triggered_task(
+        self,
+        *,
+        issue_number: int,
+        task_kind: str,
+        prompt: str,
+        cwd: Path,
+    ) -> TriggeredTaskReviewResult:
+        started_at = time.monotonic()
+        log_event(
+            LOGGER,
+            "codex_invocation_started",
+            mode="triggered-task-review",
+            issue_number=issue_number,
+            task_kind=task_kind,
+        )
+        try:
+            result = self._run_triggered_task_review_turn(prompt=prompt, cwd=cwd)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "codex_invocation_finished",
+                mode="triggered-task-review",
+                issue_number=issue_number,
+                task_kind=task_kind,
+                status="fault",
+                duration_seconds=_elapsed_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log_event(
+            LOGGER,
+            "codex_invocation_finished",
+            mode="triggered-task-review",
+            issue_number=issue_number,
+            task_kind=task_kind,
+            status="success",
+            duration_seconds=_elapsed_seconds(started_at),
+        )
+        return result
 
     def respond_to_feedback(
         self,
@@ -448,6 +500,49 @@ class CodexAdapter(AgentAdapter):
                 session=None,
             ),
             _extract_thread_id(raw_events),
+        )
+
+    def _run_triggered_task_review_turn(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+    ) -> TriggeredTaskReviewResult:
+        if not self._config.enabled:
+            raise RuntimeError("Codex is disabled in config")
+
+        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "schema.json"
+            output_path = tmp_path / "last_message.txt"
+            schema_path.write_text(
+                json.dumps(_TRIGGERED_TASK_REVIEW_OUTPUT_SCHEMA),
+                encoding="utf-8",
+            )
+
+            cmd = [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            self._append_common_options(cmd)
+            _ = run(cmd, cwd=cwd, input_text=prompt)
+            raw = output_path.read_text(encoding="utf-8").strip()
+            payload = _parse_json_payload(raw)
+
+        decision_raw = _require_str(payload, "decision").strip().lower()
+        if decision_raw not in {"approve", "reject"}:
+            raise RuntimeError("Codex response decision must be approve or reject")
+        reason = _require_str(payload, "reason").strip()
+        return TriggeredTaskReviewResult(
+            decision=cast(TriggeredTaskDecision, decision_raw),
+            reason=reason,
         )
 
     def _append_common_options(self, cmd: list[str]) -> None:

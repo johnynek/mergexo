@@ -362,6 +362,299 @@ def test_get_issue_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
         gateway.get_issue(1)
 
 
+def test_get_default_branch_head_sha_parses_and_validates(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"commit": {"sha": "abc123"}},
+    )
+    assert gateway.get_default_branch_head_sha("main") == "abc123"
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"commit": {}},
+    )
+    with pytest.raises(RuntimeError, match="missing branch commit sha"):
+        gateway.get_default_branch_head_sha("main")
+
+
+def test_get_tag_sha_handles_missing_and_annotated_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_404(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
+        _ = self, method, path, payload
+        raise RuntimeError("GitHub API request failed with status 404: missing")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_404)
+    assert gateway.get_tag_sha("v1.2.3") is None
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": {"type": "commit", "sha": "deadbeef"}},
+    )
+    assert gateway.get_tag_sha("v1.2.3") == "deadbeef"
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": {"type": "tag", "sha": "tagobj"}},
+    )
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_resolve_annotated_tag_target_sha",
+        lambda self, tag_object_sha: "resolvedsha",
+    )
+    assert gateway.get_tag_sha("refs/tags/v1.2.3") == "resolvedsha"
+
+
+def test_list_repository_tags_and_latest_release_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        gateway.list_repository_tags(0)
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: [
+            {"name": "v2.0.0", "commit": {"sha": "sha2"}},
+            {"name": "v1.0.0", "commit": {"sha": "sha1"}},
+            {"name": "", "commit": {"sha": "skip"}},
+            "skip",
+        ],
+    )
+    tags = gateway.list_repository_tags(1)
+    assert len(tags) == 1
+    assert tags[0].name == "v2.0.0"
+    assert tags[0].commit_sha == "sha2"
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: [
+            {
+                "tag_name": "v1.0.0",
+                "name": "old",
+                "html_url": "https://example/release/1",
+                "published_at": "2026-02-01T00:00:00Z",
+            },
+            {
+                "tag_name": "v2.0.0",
+                "name": "new",
+                "html_url": "https://example/release/2",
+                "created_at": "2026-03-01T00:00:00Z",
+            },
+        ],
+    )
+    latest = gateway.get_latest_release()
+    assert latest is not None
+    assert latest.tag_name == "v2.0.0"
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: {})
+    with pytest.raises(RuntimeError, match="expected list for releases"):
+        gateway.get_latest_release()
+
+
+def test_list_workflow_runs_for_branch_head_filters_and_validates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        gateway.list_workflow_runs_for_branch_head(default_branch="main", head_sha="abc", limit=0)
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {
+            "workflow_runs": [
+                {
+                    "id": 2,
+                    "name": "ci",
+                    "status": "completed",
+                    "conclusion": "SUCCESS",
+                    "html_url": "https://example/runs/2",
+                    "head_sha": "abc",
+                    "created_at": "c2",
+                    "updated_at": "u2",
+                },
+                {
+                    "id": 1,
+                    "name": "ci",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "html_url": "https://example/runs/1",
+                    "head_sha": "other",
+                    "created_at": "c1",
+                    "updated_at": "u1",
+                },
+            ]
+        },
+    )
+    runs = gateway.list_workflow_runs_for_branch_head(
+        default_branch="main", head_sha="abc", limit=5
+    )
+    assert len(runs) == 1
+    assert runs[0].run_id == 2
+    assert runs[0].conclusion == "success"
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+    with pytest.raises(RuntimeError, match="expected object for workflow runs"):
+        gateway.list_workflow_runs_for_branch_head(default_branch="main", head_sha="abc")
+
+
+def test_resolve_annotated_tag_target_sha_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": {"sha": "targetsha"}},
+    )
+    assert gateway._resolve_annotated_tag_target_sha(tag_object_sha="tagsha") == "targetsha"
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": {}},
+    )
+    assert gateway._resolve_annotated_tag_target_sha(tag_object_sha="tagsha") is None
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: [],
+    )
+    assert gateway._resolve_annotated_tag_target_sha(tag_object_sha="tagsha") is None
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": "bad"},
+    )
+    assert gateway._resolve_annotated_tag_target_sha(tag_object_sha="tagsha") is None
+
+    def raise_runtime(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
+        _ = self, method, path, payload
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", raise_runtime)
+    assert gateway._resolve_annotated_tag_target_sha(tag_object_sha="tagsha") is None
+
+
+def test_release_gateway_methods_reject_invalid_payload_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])
+    with pytest.raises(RuntimeError, match="expected object for branch"):
+        gateway.get_default_branch_head_sha("main")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: {})
+    with pytest.raises(RuntimeError, match="missing branch commit object"):
+        gateway.get_default_branch_head_sha("main")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": {}},
+    )
+    with pytest.raises(RuntimeError, match="missing tag object sha"):
+        gateway.get_tag_sha("v1.2.3")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": {"sha": "   "}},
+    )
+    with pytest.raises(RuntimeError, match="missing tag object sha"):
+        gateway.get_tag_sha("v1.2.3")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: [],
+    )
+    with pytest.raises(RuntimeError, match="expected object for tag ref"):
+        gateway.get_tag_sha("v1.2.3")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": "bad"},
+    )
+    with pytest.raises(RuntimeError, match="missing tag object"):
+        gateway.get_tag_sha("v1.2.3")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"object": {"type": "commit", "sha": "abc"}},
+    )
+    assert gateway.get_tag_sha("v1.2.3") == "abc"
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"bad": "shape"},
+    )
+    with pytest.raises(RuntimeError, match="expected list for tags"):
+        gateway.list_repository_tags(1)
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: [{"name": "v1.0.0"}],
+    )
+    assert gateway.list_repository_tags(5) == ()
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: [
+            "skip",
+            {"name": "missing-tag"},
+        ],
+    )
+    assert gateway.get_latest_release() is None
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"workflow_runs": "bad"},
+    )
+    with pytest.raises(RuntimeError, match="expected workflow_runs list"):
+        gateway.list_workflow_runs_for_branch_head(default_branch="main", head_sha="abc")
+
+    monkeypatch.setattr(
+        GitHubGateway,
+        "_api_json",
+        lambda self, method, path, payload=None: {"workflow_runs": ["skip"]},
+    )
+    assert gateway.list_workflow_runs_for_branch_head(default_branch="main", head_sha="abc") == ()
+
+
+def test_get_tag_sha_re_raises_non_404_runtime_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_error(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
+        _ = self, method, path, payload
+        raise RuntimeError("GitHub API request failed with status 500: boom")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_error)
+    with pytest.raises(RuntimeError, match="status 500"):
+        gateway.get_tag_sha("v1.2.3")
+
+
 def test_create_pull_request_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway = GitHubGateway("o", "r")
     monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])

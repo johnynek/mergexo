@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import subprocess
 import shutil
 
 from mergexo.config import RepoConfig, RuntimeConfig
@@ -31,6 +32,13 @@ def _is_checkout_overwrite_error(detail: str) -> bool:
 class RepoLayout:
     mirror_path: Path
     checkouts_root: Path
+
+
+@dataclass(frozen=True)
+class ScriptRunResult:
+    returncode: int
+    stdout: str
+    stderr: str
 
 
 class GitRepoManager:
@@ -378,6 +386,41 @@ class GitRepoManager:
             # Missing or unrelated commits should be treated as non-ancestor in guard checks.
             return False
         return merge_base == older_sha
+
+    def run_repo_script(
+        self,
+        *,
+        checkout_path: Path,
+        script_path: Path,
+        args: tuple[str, ...],
+    ) -> ScriptRunResult:
+        cmd = [str(script_path), *args]
+        log_event(
+            LOGGER,
+            "git_repo_script_started",
+            checkout_path=str(checkout_path),
+            script_path=str(script_path),
+            arg_count=len(args),
+        )
+        proc = subprocess.run(
+            cmd,
+            cwd=str(checkout_path),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        log_event(
+            LOGGER,
+            "git_repo_script_finished",
+            checkout_path=str(checkout_path),
+            script_path=str(script_path),
+            exit_code=proc.returncode,
+        )
+        return ScriptRunResult(
+            returncode=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+        )
 
     def _checkout_remote_branch(self, checkout_path: Path, branch: str) -> None:
         run(["git", "-C", str(checkout_path), "checkout", "-B", branch, f"origin/{branch}"])

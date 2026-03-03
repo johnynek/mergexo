@@ -205,6 +205,57 @@ Merged design doc markdown ({design_doc_path}):
 """.strip()
 
 
+def build_triggered_task_review_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    task_kind: str,
+    request_json: str,
+    snapshot_json: str,
+) -> str:
+    return f"""
+You are the triggered-task review agent for repository {repo_full_name}.
+
+Task:
+- Review triggered task issue #{issue.number}.
+- Task kind: {task_kind}
+- Default branch: {default_branch}
+- Decide if this task should be approved or rejected based only on the snapshot evidence.
+
+Output requirements:
+- Return JSON only with:
+  - decision: "approve" or "reject"
+  - reason: concise concrete justification tied to snapshot fields
+- If uncertain or evidence is incomplete, reject.
+- For release tasks, reject when:
+  - requested tag already exists remotely
+  - default-branch CI for target head SHA is missing or non-green
+  - requested version appears older than or equal to latest release when comparable
+- Approve only when evidence supports release readiness.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Issue title:
+{issue.title}
+
+Issue URL:
+{issue.html_url}
+
+Issue body:
+{issue.body}
+
+Triggered task request JSON:
+{request_json}
+
+Triggered task snapshot JSON:
+{snapshot_json}
+""".strip()
+
+
 def build_feedback_prompt(*, turn: FeedbackTurn) -> str:
     review_comments = [
         {

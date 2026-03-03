@@ -11,6 +11,7 @@ from mergexo.agent_adapter import (
     FeedbackTurn,
     GitOpRequest,
     ReviewReply,
+    TriggeredTaskReviewResult,
 )
 from mergexo.models import (
     GeneratedDesign,
@@ -126,6 +127,17 @@ class DummyAdapter(AgentAdapter):
             session=AgentSession(adapter="dummy", thread_id="th"),
         )
 
+    def review_triggered_task(
+        self,
+        *,
+        issue_number: int,
+        task_kind: str,
+        prompt: str,
+        cwd: Path,
+    ) -> TriggeredTaskReviewResult:
+        _ = issue_number, task_kind, prompt, cwd
+        return TriggeredTaskReviewResult(decision="approve", reason="snapshot checks passed")
+
 
 def test_agent_adapter_data_model() -> None:
     issue = Issue(number=1, title="t", body="b", html_url="u", labels=("x",))
@@ -207,6 +219,12 @@ def test_agent_adapter_data_model() -> None:
         turn=turn,
         cwd=Path("."),
     )
+    review = adapter.review_triggered_task(
+        issue_number=issue.number,
+        task_kind="release",
+        prompt="review prompt",
+        cwd=Path("."),
+    )
 
     assert start.session is not None
     assert start.session.thread_id == "th"
@@ -215,3 +233,4 @@ def test_agent_adapter_data_model() -> None:
     assert implementation.pr_title == "Implement design"
     assert feedback.review_replies[0].review_comment_id == 1
     assert feedback.git_ops[0].op == "fetch_origin"
+    assert review.decision == "approve"

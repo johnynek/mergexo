@@ -663,3 +663,26 @@ def test_is_ancestor_false_for_non_ancestor_or_missing_commit(
 
     monkeypatch.setattr("mergexo.git_ops.run", fake_run_error)
     assert manager.is_ancestor(checkout, "oldsha", "newsha") is False
+
+
+def test_run_repo_script_executes_and_captures_stdio(tmp_path: Path) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "run.sh"
+    script.write_text(
+        '#!/usr/bin/env bash\necho "stdout:$1"\necho "stderr:$1" 1>&2\nexit 7\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    result = manager.run_repo_script(
+        checkout_path=checkout,
+        script_path=script,
+        args=("v1.2.3",),
+    )
+
+    assert result.returncode == 7
+    assert result.stdout.strip() == "stdout:v1.2.3"
+    assert result.stderr.strip() == "stderr:v1.2.3"

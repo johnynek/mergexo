@@ -5,6 +5,16 @@ from typing import Literal
 
 
 IssueFlow = Literal["design_doc", "bugfix", "small_job"]
+TriggeredTaskKind = Literal["release"]
+TriggeredTaskStatus = Literal[
+    "pending_review",
+    "rejected",
+    "approved",
+    "executing",
+    "completed",
+    "failed",
+]
+TriggeredTaskDecision = Literal["approve", "reject"]
 OperatorCommandName = Literal["unblock", "restart", "help", "invalid"]
 OperatorCommandStatus = Literal["applied", "rejected", "failed"]
 OperatorReplyStatus = Literal["applied", "rejected", "failed", "help"]
@@ -51,6 +61,37 @@ class WorkflowRunSnapshot:
     head_sha: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class RepositoryTagSnapshot:
+    name: str
+    commit_sha: str
+
+
+@dataclass(frozen=True)
+class ReleaseSnapshot:
+    tag_name: str
+    name: str
+    html_url: str
+    published_at: str | None
+
+
+@dataclass(frozen=True)
+class TriggeredTaskRequest:
+    task_kind: TriggeredTaskKind
+    resource_key: str
+    requested_tag: str
+    source_text: str
+
+
+@dataclass(frozen=True)
+class TriggeredTaskExecutionResult:
+    success: bool
+    detail: str
+    stdout_tail: str | None
+    stderr_tail: str | None
+    observed_tag_sha: str | None = None
 
 
 @dataclass(frozen=True)
