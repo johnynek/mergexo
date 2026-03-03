@@ -4855,7 +4855,7 @@ def test_enqueue_pre_pr_followup_work_legacy_mode_records_token_observation(
     assert observed.status == "observed"
 
 
-def test_enqueue_pre_pr_followup_work_incremental_bootstrap_skips_history(
+def test_enqueue_pre_pr_followup_work_incremental_bootstrap_processes_pending_comments(
     tmp_path: Path,
 ) -> None:
     cfg = _config(
@@ -4868,12 +4868,28 @@ def test_enqueue_pre_pr_followup_work_incremental_bootstrap_skips_history(
     github = FakeGitHub([issue])
     github.issue_comments = [
         PullRequestIssueComment(
-            comment_id=6,
-            body="old direction",
+            comment_id=4,
+            body="historical comment",
             user_login="reviewer",
-            html_url="https://example/issues/7#issuecomment-6",
+            html_url="https://example/issues/7#issuecomment-4",
             created_at="2026-02-23T00:00:00Z",
             updated_at="2026-02-23T00:00:00Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=6,
+            body="first follow-up",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-6",
+            created_at="2026-02-23T00:00:01Z",
+            updated_at="2026-02-23T00:00:01Z",
+        ),
+        PullRequestIssueComment(
+            comment_id=7,
+            body="please open the PR",
+            user_login="reviewer",
+            html_url="https://example/issues/7#issuecomment-7",
+            created_at="2026-02-23T00:00:02Z",
+            updated_at="2026-02-23T00:00:02Z",
         ),
     ]
     state = StateStore(tmp_path / "state.db")
@@ -4910,21 +4926,14 @@ def test_enqueue_pre_pr_followup_work_incremental_bootstrap_skips_history(
 
     pool = FakePool()
     orch._enqueue_pre_pr_followup_work(pool)
-    assert pool.submitted == []
-
-    github.issue_comments.append(
-        PullRequestIssueComment(
-            comment_id=7,
-            body="new direction",
-            user_login="reviewer",
-            html_url="https://example/issues/7#issuecomment-7",
-            created_at="2026-02-23T00:00:01Z",
-            updated_at="2026-02-23T00:00:01Z",
-        )
-    )
-    orch._enqueue_pre_pr_followup_work(pool)
     assert len(pool.submitted) == 1
-    assert pool.submitted[0][3] == 7
+    submitted_issue, submitted_flow, submitted_branch, consumed_comment_id = pool.submitted[0]
+    assert submitted_flow == "bugfix"
+    assert submitted_branch == "agent/bugfix/7-add-worker-scheduler"
+    assert consumed_comment_id == 7
+    assert "first follow-up" in submitted_issue.body
+    assert "please open the PR" in submitted_issue.body
+    assert "historical comment" not in submitted_issue.body
 
 
 def test_post_pr_source_issue_comment_redirects_are_idempotent_and_filtered(
