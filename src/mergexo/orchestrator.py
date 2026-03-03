@@ -111,6 +111,18 @@ _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "required pre-push tests did not pass after automated repair attempts",
     "new_issue_comments_pending",
 )
+_TRANSIENT_GIT_REMOTE_ERROR_SIGNATURES: tuple[str, ...] = (
+    "no healthy upstream",
+    "internal error performing authentication",
+    "upstream connect error or disconnect/reset before headers",
+    "remote end hung up unexpectedly",
+    "connection reset by peer",
+    "connection timed out",
+    "operation timed out",
+    "temporary failure in name resolution",
+    "could not resolve host",
+    "network is unreachable",
+)
 _PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(r"(bugfix|small-job|implementation) flow blocked:")
 _COMMENT_CURSOR_EPOCH = "1970-01-01T00:00:00Z"
 _SURFACE_PR_REVIEW_COMMENTS: GitHubCommentSurface = "pr_review_comments"
@@ -3309,6 +3321,30 @@ class Phase1Orchestrator:
                             issue_number=handle.issue_number,
                             pr_number=pr_number,
                             reason="github_polling_error",
+                        )
+                        self._state.finish_agent_run(
+                            run_id=handle.run_id,
+                            terminal_status="failed",
+                            failure_class=_failure_class_for_exception(exc),
+                            error=str(exc),
+                        )
+                        continue
+                    if _is_transient_git_remote_command_error(exc):
+                        self._state.mark_pr_status(
+                            pr_number=pr_number,
+                            issue_number=handle.issue_number,
+                            status="awaiting_feedback",
+                            error=None,
+                            reason="git_remote_retry",
+                            detail=str(exc),
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_retry",
+                            issue_number=handle.issue_number,
+                            pr_number=pr_number,
+                            reason="git_remote_command_error",
                         )
                         self._state.finish_agent_run(
                             run_id=handle.run_id,
@@ -7136,6 +7172,15 @@ def _is_merge_conflict_error(raw_error: str) -> bool:
         "fix conflicts and then commit",
     )
     return any(marker in normalized for marker in conflict_markers)
+
+
+def _is_transient_git_remote_command_error(exc: Exception) -> bool:
+    if not isinstance(exc, CommandError):
+        return False
+    normalized = str(exc).strip().lower()
+    if not normalized or "cmd: git " not in normalized:
+        return False
+    return any(marker in normalized for marker in _TRANSIENT_GIT_REMOTE_ERROR_SIGNATURES)
 
 
 def _operator_args_payload(command: OperatorCommandRecord) -> dict[str, object]:

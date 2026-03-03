@@ -76,6 +76,7 @@ from mergexo.orchestrator import (
     _failure_class_for_exception,
     _is_recoverable_pre_pr_error,
     _is_recoverable_pre_pr_exception,
+    _is_transient_git_remote_command_error,
     _issue_from_json_dict,
     _issue_to_json_dict,
     _issue_branch,
@@ -2496,6 +2497,16 @@ def test_observability_failure_and_terminal_helpers() -> None:
     assert _failure_class_for_exception(GitHubPollingError("x")) == "github_error"
     assert _failure_class_for_exception(RuntimeError("github API failure")) == "github_error"
     assert _failure_class_for_exception(CommandError(["git"], 1, "", "")) == "agent_error"
+    assert not _is_transient_git_remote_command_error(CommandError("Command failed\ncmd: uv run"))
+    assert _is_transient_git_remote_command_error(
+        CommandError(
+            "Command failed\n"
+            "cmd: git fetch origin\n"
+            "exit: 128\n"
+            "stderr:\n"
+            "ERROR: no healthy upstream\n"
+        )
+    )
 
 
 def test_render_design_doc_includes_frontmatter_and_summary() -> None:
@@ -9179,6 +9190,113 @@ def test_reap_finished_keeps_feedback_tracked_on_github_polling_error(tmp_path: 
         )
     ]
     assert state.released_feedback_claims == [(101, "run-poll")]
+
+
+def test_reap_finished_keeps_feedback_tracked_on_transient_git_remote_error(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    transient_failure: Future[str] = Future()
+    transient_failure.set_exception(
+        CommandError(
+            "Command failed\n"
+            "cmd: git clone --reference-if-able /tmp/cache git@github.com:johnynek/mergexo.git "
+            "/tmp/worker-01\n"
+            "exit: 128\n"
+            "stdout:\n\n"
+            "stderr:\n"
+            "Cloning into '/tmp/worker-01'...\n"
+            "ERROR: no healthy upstream\n"
+            "fatal: Could not read from remote repository.\n"
+        )
+    )
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-git-remote", future=transient_failure)
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
+    assert state.run_finishes == [
+        (
+            "run-git-remote",
+            "failed",
+            "github_error",
+            (
+                "Command failed\n"
+                "cmd: git clone --reference-if-able /tmp/cache git@github.com:johnynek/mergexo.git "
+                "/tmp/worker-01\n"
+                "exit: 128\n"
+                "stdout:\n\n"
+                "stderr:\n"
+                "Cloning into '/tmp/worker-01'...\n"
+                "ERROR: no healthy upstream\n"
+                "fatal: Could not read from remote repository.\n"
+            ),
+        )
+    ]
+    assert github.comments == []
+    assert state.released_feedback_claims == [(101, "run-git-remote")]
+
+
+def test_reap_finished_marks_feedback_blocked_on_non_transient_git_command_error(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    non_transient_failure: Future[str] = Future()
+    non_transient_failure.set_exception(
+        CommandError(
+            "Command failed\n"
+            "cmd: git clone --reference-if-able /tmp/cache git@github.com:johnynek/mergexo.git "
+            "/tmp/worker-01\n"
+            "exit: 128\n"
+            "stdout:\n\n"
+            "stderr:\n"
+            "fatal: destination path '/tmp/worker-01' already exists and is not an empty "
+            "directory.\n"
+        )
+    )
+    orch._running_feedback = {
+        101: _FeedbackFuture(
+            issue_number=7,
+            run_id="run-git-non-transient",
+            future=non_transient_failure,
+        )
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [
+        (
+            101,
+            7,
+            "blocked",
+            None,
+            (
+                "Command failed\n"
+                "cmd: git clone --reference-if-able /tmp/cache git@github.com:johnynek/mergexo.git "
+                "/tmp/worker-01\n"
+                "exit: 128\n"
+                "stdout:\n\n"
+                "stderr:\n"
+                "fatal: destination path '/tmp/worker-01' already exists and is not an empty "
+                "directory.\n"
+            ),
+        )
+    ]
+    assert len(github.comments) == 1
+    assert "unexpected error occurred" in github.comments[0][1].lower()
+    assert state.released_feedback_claims == [(101, "run-git-non-transient")]
 
 
 def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:
