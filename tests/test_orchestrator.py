@@ -53,6 +53,7 @@ from mergexo.orchestrator import (
     CheckpointedPrePrBlockedError,
     DirectFlowBlockedError,
     DirectFlowValidationError,
+    FeedbackTransientGitError,
     GlobalWorkLimiter,
     Phase1Orchestrator,
     RestartRequested,
@@ -64,8 +65,11 @@ from mergexo.orchestrator import (
     _design_branch_slug,
     _design_doc_url,
     _default_commit_message,
+    _feedback_transient_git_retry_delay_seconds,
     _flow_label_from_branch,
     _has_regression_test_changes,
+    _is_transient_feedback_git_command_error,
+    _is_transient_git_remote_error,
     _is_mergexo_status_comment,
     _is_merge_conflict_error,
     _normalize_feedback_terminal_status,
@@ -2496,6 +2500,36 @@ def test_observability_failure_and_terminal_helpers() -> None:
     assert _failure_class_for_exception(GitHubPollingError("x")) == "github_error"
     assert _failure_class_for_exception(RuntimeError("github API failure")) == "github_error"
     assert _failure_class_for_exception(CommandError(["git"], 1, "", "")) == "agent_error"
+    assert _failure_class_for_exception(FeedbackTransientGitError("cannot reach github")) == (
+        "github_error"
+    )
+    assert _is_transient_feedback_git_command_error(
+        "Command failed\n"
+        "cmd: git clone foo\n"
+        "exit: 128\n"
+        "stdout:\n\n"
+        "stderr:\nERROR: no healthy upstream\nfatal: Could not read from remote repository.\n"
+    )
+    assert not _is_transient_feedback_git_command_error(
+        "Command failed\n"
+        "cmd: git push origin branch\n"
+        "exit: 1\n"
+        "stdout:\n\n"
+        "stderr:\nAutomatic merge failed; merge conflict in src/app.py\n"
+    )
+    assert not _is_transient_feedback_git_command_error("   \n\t")
+    assert not _is_transient_feedback_git_command_error(
+        "Command failed\n"
+        "cmd: /tmp/custom-wrapper git fetch origin\n"
+        "exit: 128\n"
+        "stdout:\n\n"
+        "stderr:\nERROR: no healthy upstream\n"
+    )
+    assert not _is_transient_git_remote_error("   ")
+    assert _feedback_transient_git_retry_delay_seconds(1) == 5
+    assert _feedback_transient_git_retry_delay_seconds(2) == 10
+    with pytest.raises(ValueError, match="attempt must be >= 1"):
+        _feedback_transient_git_retry_delay_seconds(0)
 
 
 def test_render_design_doc_includes_frontmatter_and_summary() -> None:
@@ -3542,6 +3576,119 @@ def test_active_run_id_helpers_and_prompt_recording(
 
     orch._record_run_prompt("run-issue", "Prompt text")
     assert recorded_meta == [("run-issue", '{"last_prompt": "Prompt text"}')]
+
+
+def test_process_feedback_turn_worker_retries_transient_git_errors_before_succeeding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=7,
+        branch="agent/design/7",
+        status="awaiting_feedback",
+        last_seen_head_sha="head-1",
+    )
+    attempts = 0
+
+    def flaky_feedback_turn(_: TrackedPullRequestState) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: git clone foo\n"
+                "exit: 128\n"
+                "stdout:\n\n"
+                "stderr:\nERROR: no healthy upstream\n"
+                "fatal: Could not read from remote repository.\n"
+            )
+        return "completed"
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(orch, "_process_feedback_turn", flaky_feedback_turn)
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    assert orch._process_feedback_turn_worker(tracked) == "completed"
+    assert attempts == 3
+    assert sleep_calls == [5, 10]
+
+
+def test_process_feedback_turn_worker_raises_concise_error_after_transient_retry_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=7,
+        branch="agent/design/7",
+        status="awaiting_feedback",
+        last_seen_head_sha="head-1",
+    )
+
+    def always_failing_feedback_turn(_: TrackedPullRequestState) -> str:
+        raise CommandError(
+            "Command failed\n"
+            "cmd: git -C /tmp/worker fetch origin --prune --tags\n"
+            "exit: 128\n"
+            "stdout:\n\n"
+            "stderr:\nERROR: no healthy upstream\n"
+            "fatal: Could not read from remote repository.\n"
+        )
+
+    monkeypatch.setattr(orch, "_process_feedback_turn", always_failing_feedback_turn)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    with pytest.raises(
+        FeedbackTransientGitError,
+        match=r"Unable to reach GitHub during feedback operations after 4 attempts",
+    ):
+        orch._process_feedback_turn_worker(tracked)
+
+
+def test_process_feedback_turn_worker_reraises_non_transient_git_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=7,
+        branch="agent/design/7",
+        status="awaiting_feedback",
+        last_seen_head_sha="head-1",
+    )
+
+    def merge_conflict_feedback_turn(_: TrackedPullRequestState) -> str:
+        raise CommandError(
+            "Command failed\n"
+            "cmd: git push origin branch\n"
+            "exit: 1\n"
+            "stdout:\n\n"
+            "stderr:\nAutomatic merge failed; merge conflict in src/app.py\n"
+        )
+
+    monkeypatch.setattr(orch, "_process_feedback_turn", merge_conflict_feedback_turn)
+
+    with pytest.raises(CommandError, match="merge conflict"):
+        orch._process_feedback_turn_worker(tracked)
 
 
 def test_update_run_meta_clears_cache_when_update_fails(
@@ -9181,6 +9328,53 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
     assert len(github.comments) == 1
     assert "unexpected error occurred" in github.comments[0][1].lower()
     assert state.released_feedback_claims == [(101, "run-bad")]
+
+
+def test_reap_finished_blocks_with_concise_transient_git_retry_message(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    transient_failure: Future[str] = Future()
+    transient_failure.set_exception(
+        FeedbackTransientGitError(
+            "Unable to reach GitHub during feedback operations after 4 attempts. "
+            "Last error: ERROR: no healthy upstream"
+        )
+    )
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-transient", future=transient_failure)
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [
+        (
+            101,
+            7,
+            "blocked",
+            None,
+            "Unable to reach GitHub during feedback operations after 4 attempts. "
+            "Last error: ERROR: no healthy upstream",
+        )
+    ]
+    assert state.run_finishes == [
+        (
+            "run-transient",
+            "failed",
+            "github_error",
+            "Unable to reach GitHub during feedback operations after 4 attempts. "
+            "Last error: ERROR: no healthy upstream",
+        )
+    ]
+    assert len(github.comments) == 1
+    assert (
+        "unable to reach github during feedback operations after 4 attempts"
+        in github.comments[0][1].lower()
+    )
+    assert state.released_feedback_claims == [(101, "run-transient")]
 
 
 def test_mark_feedback_blocked_survives_comment_post_failure(tmp_path: Path) -> None:
