@@ -6953,6 +6953,36 @@ def test_commit_push_feedback_returns_none_when_merge_conflict_repair_blocks(
     assert outcome is None
 
 
+def test_commit_push_feedback_pushes_git_op_local_commit_without_commit_message(
+    tmp_path: Path,
+) -> None:
+    orch, git, _github, _state, tracked, turn, _result = _feedback_commit_push_context(tmp_path)
+    result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-1"),
+        review_replies=(),
+        general_comment="Merged main and validated.",
+        commit_message=None,
+        git_ops=(),
+    )
+    git.current_head_sha_value = "head-2"
+    git.is_ancestor_results[("head-1", "head-2")] = True
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is not None
+    pushed_result, _ = outcome
+    assert pushed_result.commit_message is None
+    assert git.commit_calls == []
+    assert len(git.push_calls) == 1
+
+
 def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
