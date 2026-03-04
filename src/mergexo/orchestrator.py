@@ -5808,7 +5808,13 @@ class Phase1Orchestrator:
         repair_round = 0
         push_merge_conflict_round = 0
 
-        while current_result.commit_message:
+        def _has_local_commits_to_push() -> bool:
+            local_head_sha = self._git.current_head_sha(checkout_path)
+            if local_head_sha == turn_start_head:
+                return False
+            return self._git.is_ancestor(checkout_path, turn_start_head, local_head_sha)
+
+        while current_result.commit_message or _has_local_commits_to_push():
             local_head_sha = self._git.current_head_sha(checkout_path)
             if not self._git.is_ancestor(checkout_path, turn_start_head, local_head_sha):
                 self._block_feedback_history_rewrite(
@@ -5828,47 +5834,61 @@ class Phase1Orchestrator:
                 branch=tracked.branch,
                 turn_start_head_sha=turn_start_head,
                 local_head_sha=local_head_sha,
+                has_commit_message=current_result.commit_message is not None,
             )
 
-            try:
-                self._git.commit_all(checkout_path, current_result.commit_message)
-            except RuntimeError as exc:
-                if not _is_no_staged_changes_error(exc):
-                    raise
-                local_head_after_noop = self._git.current_head_sha(checkout_path)
-                if local_head_after_noop != turn_start_head and self._git.is_ancestor(
-                    checkout_path, turn_start_head, local_head_after_noop
-                ):
-                    log_event(
-                        LOGGER,
-                        "feedback_agent_local_commit_detected",
-                        issue_number=tracked.issue_number,
-                        pr_number=tracked.pr_number,
-                        branch=tracked.branch,
-                        turn_start_head_sha=turn_start_head,
-                        local_head_before_sha=local_head_sha,
-                        local_head_after_sha=local_head_after_noop,
-                    )
-                else:
-                    error = (
-                        "agent returned commit_message but no staged changes were found; "
-                        "feedback turn requires repo edits before posting replies"
-                    )
-                    self._mark_feedback_blocked(
-                        pr_number=tracked.pr_number,
-                        issue_number=tracked.issue_number,
-                        reason="commit_message_without_changes",
-                        error=error,
-                        last_seen_head_sha=current_pr.head_sha,
-                        comment_body=(
-                            "MergeXO feedback automation is blocked because the agent "
-                            "returned `commit_message` but no new staged changes or local "
-                            "commits were detected.\n\n"
-                            "Action: request concrete file edits (or explicit `git_ops`), "
-                            "then reset blocked feedback state."
-                        ),
-                    )
-                    return None
+            if current_result.commit_message is not None:
+                try:
+                    self._git.commit_all(checkout_path, current_result.commit_message)
+                except RuntimeError as exc:
+                    if not _is_no_staged_changes_error(exc):
+                        raise
+                    local_head_after_noop = self._git.current_head_sha(checkout_path)
+                    if local_head_after_noop != turn_start_head and self._git.is_ancestor(
+                        checkout_path, turn_start_head, local_head_after_noop
+                    ):
+                        log_event(
+                            LOGGER,
+                            "feedback_agent_local_commit_detected",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            branch=tracked.branch,
+                            turn_start_head_sha=turn_start_head,
+                            local_head_before_sha=local_head_sha,
+                            local_head_after_sha=local_head_after_noop,
+                        )
+                    else:
+                        error = (
+                            "agent returned commit_message but no staged changes were found; "
+                            "feedback turn requires repo edits before posting replies"
+                        )
+                        self._mark_feedback_blocked(
+                            pr_number=tracked.pr_number,
+                            issue_number=tracked.issue_number,
+                            reason="commit_message_without_changes",
+                            error=error,
+                            last_seen_head_sha=current_pr.head_sha,
+                            comment_body=(
+                                "MergeXO feedback automation is blocked because the agent "
+                                "returned `commit_message` but no new staged changes or local "
+                                "commits were detected.\n\n"
+                                "Action: request concrete file edits (or explicit `git_ops`), "
+                                "then reset blocked feedback state."
+                            ),
+                        )
+                        return None
+            else:
+                # A git-op round can advance local HEAD (for example merge origin/main)
+                # without requiring additional file edits from the agent.
+                log_event(
+                    LOGGER,
+                    "feedback_git_op_local_commit_detected",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    branch=tracked.branch,
+                    turn_start_head_sha=turn_start_head,
+                    local_head_sha=local_head_sha,
+                )
 
             required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
             if required_tests_error is not None:
@@ -5920,7 +5940,7 @@ class Phase1Orchestrator:
                     return None
 
                 current_result, current_pr = repair_outcome
-                if current_result.commit_message is None:
+                if current_result.commit_message is None and not _has_local_commits_to_push():
                     detail = (
                         current_result.general_comment.strip()
                         if current_result.general_comment and current_result.general_comment.strip()
@@ -6050,7 +6070,7 @@ class Phase1Orchestrator:
                     return None
 
                 current_result, current_pr = repair_outcome
-                if current_result.commit_message is None:
+                if current_result.commit_message is None and not _has_local_commits_to_push():
                     conflict_detail = (
                         current_result.general_comment.strip()
                         if current_result.general_comment and current_result.general_comment.strip()
