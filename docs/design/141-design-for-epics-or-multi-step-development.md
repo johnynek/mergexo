@@ -37,7 +37,7 @@ _Issue: #141 (https://github.com/johnynek/mergexo/issues/141)_
 
 ## Summary
 
-Add a first-class `roadmap` flow that lets one issue define a bounded DAG (3 to 7 nodes), then opens child issues in dependency order. Node kinds include `roadmap`, `design_doc`, and `small_job`, and dependencies can target either `planned` or `implemented` milestones. The roadmap graph is committed in-repo as canonical JSON, mirrored in sqlite for runtime scheduling, and the parent roadmap issue closes only when all nodes reach terminal implementation outcomes. The design includes revision/abandon handling and an agent escalation path that pauses further fan-out when foundational assumptions fail.
+Add a first-class `roadmap` flow that lets one issue define a bounded DAG (recommended around 3 to 7 nodes, with larger efforts split into roadmap-of-roadmaps), then opens child issues in dependency order. Node kinds include `roadmap`, `design_doc`, and `small_job`, and dependencies can target either `planned` or `implemented` milestones. The roadmap graph is committed in-repo as canonical JSON input, with sqlite as runtime source of truth for scheduling and progress, and the parent roadmap issue closes only when all nodes reach terminal implementation outcomes. The design includes revision/abandon handling, a status-report surface, and an agent escalation path that pauses further fan-out when foundational assumptions fail.
 
 ## Context
 
@@ -45,7 +45,7 @@ MergeXO currently routes issues into `design_doc`, `bugfix`, and `small_job` flo
 
 Issue #141 needs:
 1. A roadmap artifact distinct from a design doc.
-2. A DAG of less than 7 nodes.
+2. A DAG typically around 7 nodes, with larger efforts decomposed through roadmap-of-roadmaps.
 3. Child work opened as issues (not PRs).
 4. Automatic labels to kick off downstream work.
 5. Parent-child linking and dependency-ordered execution.
@@ -65,10 +65,11 @@ Issue #141 needs:
 7. Close roadmap issue only when all roadmap nodes are implemented or explicitly abandoned.
 8. Support revision/abandon transitions without losing lineage.
 9. Allow agent escalations to pause fan-out and request roadmap revision.
+10. Provide a roadmap status query that returns structured state, links, and blocker aging.
 
 ## Non-goals
 
-1. Graphs larger than 7 nodes.
+1. Treating ~7 nodes as a hard limit instead of a decomposition guideline.
 2. Cyclic dependency support.
 3. Cross-repo dependency resolution.
 4. Replacing existing issue/PR feedback loop behavior.
@@ -84,6 +85,7 @@ Add:
 3. `repo.roadmap_docs_dir` default `docs/roadmap`.
 4. `repo.roadmap_revision_label` default `agent:roadmap-revise`.
 5. `repo.roadmap_abandon_label` default `agent:roadmap-abandon`.
+6. `repo.roadmap_recommended_node_count` default `7`.
 
 Flow precedence:
 1. `ignore_label`
@@ -100,7 +102,7 @@ Each roadmap PR must include two files:
 1. Narrative roadmap markdown: `docs/roadmap/<issue>-<slug>.md`.
 2. Canonical machine-readable graph: `docs/roadmap/<issue>-<slug>.graph.json`.
 
-`.graph.json` is source of truth for node relationships and must be human-reviewable in PR. It includes:
+`.graph.json` is required user-authored input for node relationships and must be human-reviewable in PR. It includes:
 1. `roadmap_issue_number`.
 2. `version`.
 3. `nodes` array.
@@ -110,7 +112,12 @@ Each roadmap PR must include two files:
 
 MergeXO parses this file with `roadmap_parser.py` and stores a checksum in sqlite. If sqlite view and repo graph diverge, MergeXO blocks fan-out and posts a deterministic correction comment.
 
-This keeps roadmap relationship state in-repo while sqlite remains runtime state for progress, claims, and idempotency. Active, completed, superseded, and abandoned roadmaps stay auditable by scanning `docs/roadmap/*.graph.json` on default branch and git history.
+This keeps roadmap relationship state visible in-repo while sqlite is the runtime source of truth for scheduling, progress, claims, and idempotency. Active, completed, superseded, and abandoned roadmaps stay auditable by scanning `docs/roadmap/*.graph.json` on default branch and git history.
+
+Sizing policy:
+1. parser accepts DAG sizes above 7 if they are acyclic and structurally valid.
+2. when node count exceeds `repo.roadmap_recommended_node_count`, MergeXO posts a non-blocking decomposition recommendation.
+3. recommendation text points to roadmap-of-roadmaps as the preferred split strategy.
 
 ### 3. Node kinds and milestone semantics
 
@@ -124,8 +131,8 @@ Milestones exposed by each node kind:
 - `planned`: design PR merged.
 - `implemented`: implementation PR merged.
 2. `small_job`
+- `planned`: child small-job issue created and labeled with `repo.small_job_label`.
 - `implemented`: small-job PR merged.
-- `planned` is treated as `implemented` for dependency checks.
 3. `roadmap`
 - `planned`: child roadmap PR merged and graph activated.
 - `implemented`: child roadmap reaches completed status.
@@ -138,6 +145,10 @@ This supports chains like “design A -> design B using A doc -> design C using 
 
 Add new sqlite tables:
 
+Source-of-truth rule:
+1. sqlite `roadmap_state` and `roadmap_nodes` are authoritative for current state.
+2. git/github artifacts are inputs and UI/UX outputs that are reconciled to sqlite.
+
 1. `roadmap_state`
 - key: `(repo_full_name, roadmap_issue_number)`
 - fields: `roadmap_pr_number`, `roadmap_doc_path`, `graph_path`, `graph_checksum`, `status`, `parent_roadmap_issue_number`, `superseding_roadmap_issue_number`, `revision_requested_at`, `last_error`, `updated_at`
@@ -145,7 +156,7 @@ Add new sqlite tables:
 
 2. `roadmap_nodes`
 - key: `(repo_full_name, roadmap_issue_number, node_id)`
-- fields: `kind`, `title`, `body_markdown`, `dependencies_json`, `child_issue_number`, `child_issue_url`, `status`, `planned_at`, `implemented_at`, `updated_at`
+- fields: `kind`, `title`, `body_markdown`, `dependencies_json`, `child_issue_number`, `child_issue_url`, `status`, `planned_at`, `implemented_at`, `status_changed_at`, `last_progress_at`, `blocked_since_at`, `updated_at`
 - status: `pending`, `issued`, `completed`, `blocked`, `abandoned`
 
 3. indexes
@@ -163,6 +174,8 @@ State APIs include:
 8. `mark_roadmap_abandoned(...)`
 9. `mark_roadmap_completed(...)`
 10. `find_roadmap_by_child_issue(...)`
+11. `list_roadmap_status_snapshot(...)`
+12. `list_roadmap_blockers_oldest_first(...)`
 
 ### 5. Orchestrator DAG progression
 
@@ -186,6 +199,13 @@ Add poll steps:
 
 Child issues are created only when ready, so unresolved downstream nodes have no issue yet.
 
+4. `publish_roadmap_status_reports`
+- detect `/roadmap status` command comments on roadmap issues.
+- render structured status snapshot from sqlite with:
+  - node rows (`node_id`, `kind`, `status`, dependency summary, linked child issue, last progress age)
+  - blockers section sorted by `blocked_since_at` oldest first.
+- post idempotent status response comment linked to request comment.
+
 ### 6. Linking and milestone detection
 
 Each child issue includes:
@@ -196,9 +216,10 @@ Each child issue includes:
 Milestone detection:
 1. design node `planned`: child issue has merged design PR state.
 2. design node `implemented`: child issue has merged implementation state (`agent/impl/` merge).
-3. small-job node `implemented`: child issue merged with `agent/small/` branch flow.
-4. roadmap node `planned`: child roadmap activated.
-5. roadmap node `implemented`: child roadmap completed.
+3. small-job node `planned`: child issue exists with `repo.small_job_label`.
+4. small-job node `implemented`: child issue merged with `agent/small/` branch flow.
+5. roadmap node `planned`: child roadmap activated.
+6. roadmap node `implemented`: child roadmap completed.
 
 When all nodes satisfy their terminal implementation milestone, MergeXO posts summary and closes parent roadmap issue.
 
@@ -209,6 +230,12 @@ Revision flow:
 2. no new child issues are created while revision is pending.
 3. a superseding roadmap issue is opened and linked.
 4. on superseding roadmap activation, prior roadmap becomes `superseded`; unresolved prior nodes become `abandoned`.
+
+User story: revision via label
+1. Maintainer adds `repo.roadmap_revision_label` on parent roadmap issue after noticing plan drift.
+2. Orchestrator marks roadmap `revision_requested`, pauses fan-out, and posts a comment listing open nodes and unresolved blockers.
+3. MergeXO opens a superseding roadmap issue with lineage links (`supersedes`/`superseded_by`).
+4. When superseding roadmap is merged and activated, unresolved nodes in old roadmap move to `abandoned` and old roadmap transitions to `superseded`.
 
 Abandon flow:
 1. `repo.roadmap_abandon_label` sets roadmap `abandoned`.
@@ -229,6 +256,12 @@ On escalation:
 3. post tokenized escalation comment on roadmap issue linking source issue/PR.
 4. pause further node fan-out pending revision/abandon action.
 
+User story: revision via escalation
+1. A child node agent emits `kind = roadmap_revision` with flaw details after discovering a foundational assumption failure.
+2. Orchestrator links escalation to parent roadmap, marks `revision_requested`, and freezes new node issuance.
+3. Parent roadmap issue receives a structured escalation comment containing source links, impacted downstream nodes, and currently oldest blockers.
+4. Maintainer chooses follow-up: add revision label to spawn superseding roadmap, or abandon.
+
 ### 9. PR ownership invariant
 
 1. Roadmap PR uses `Refs #<roadmap_issue_number>`.
@@ -242,10 +275,12 @@ Add roadmap metrics/events:
 1. active/revision_requested/superseded/abandoned/completed roadmap counts.
 2. `roadmap_node_issued` and milestone progression events.
 3. drift and validation failures between sqlite graph checksum and in-repo `.graph.json`.
+4. roadmap status report latency and requester count.
+5. blocker age distribution for active roadmaps.
 
 ## Implementation plan
 
-1. Extend config and model types for roadmap flow, labels, and node milestones.
+1. Extend config and model types for roadmap flow, labels, recommended node count, and node milestones.
 2. Add roadmap prompt and adapter output schema for `.graph.json` generation.
 3. Add `roadmap_parser.py` with DAG and milestone-dependency validation.
 4. Add roadmap tables/APIs in `StateStore` with additive migrations.
@@ -255,29 +290,34 @@ Add roadmap metrics/events:
 8. Add milestone detection for design/small-job/roadmap child nodes.
 9. Add parent roadmap close path when all nodes implemented.
 10. Add revision/supersede and abandon transitions.
-11. Add escalation handling in direct and feedback processing.
-12. Add GitHub gateway issue-close helper and tests.
-13. Add observability query support and tests.
-14. Update README and sample config for roadmap authoring and lifecycle.
+11. Add roadmap status request handling (`/roadmap status`) with blocker ordering.
+12. Add escalation handling in direct and feedback processing.
+13. Add GitHub gateway issue-close helper and tests.
+14. Add observability query support and tests.
+15. Update README and sample config for roadmap authoring and lifecycle.
 
 ## Acceptance criteria
 
 1. With `runtime.enable_roadmaps = true`, an issue with `repo.roadmap_label` opens a roadmap PR.
 2. Merged roadmap PR must include valid `*.graph.json`; invalid graphs block fan-out with deterministic guidance.
-3. Graph validation enforces 3 to 7 nodes, unique IDs, no cycles, valid node kinds, and valid dependency milestone requirements.
-4. Default branch always contains human-reviewable roadmap relationship files for active and completed roadmaps (`docs/roadmap/*.graph.json`), while runtime completion state stays in sqlite.
-5. `small_job` is accepted as a roadmap node kind and creates child issues with `repo.small_job_label`.
-6. Child issues are created only when dependency milestones are satisfied; roadmap merge does not require creating all node issues at once.
-7. Dependencies can require `planned` or `implemented`, and scheduler behavior reflects that distinction.
-8. Design-node dependents with `requires=planned` can start after design doc merge without waiting for implementation merge.
-9. Design-node dependents with `requires=implemented` wait for implementation merge.
-10. Roadmap-node dependents can separately depend on child roadmap `planned` or `implemented` milestones.
-11. Child issue bodies include parent roadmap issue and node ID linkage.
-12. Child PR references remain scoped to direct child issues; roadmap issue is not auto-closed by child PR text.
-13. Parent roadmap closes only when all nodes reach terminal implementation outcomes or roadmap is abandoned.
-14. Agent escalation marks roadmap `revision_requested` and pauses further fan-out.
-15. Revision and abandonment transitions preserve lineage and do not duplicate already-issued node issues.
-16. Existing non-roadmap flows remain unchanged when feature flag is off.
+3. Graph validation enforces unique IDs, no cycles, valid node kinds, and valid dependency milestone requirements.
+4. Roadmaps with node counts above `repo.roadmap_recommended_node_count` are accepted but receive non-blocking decomposition guidance.
+5. sqlite `roadmap_state` and `roadmap_nodes` are documented and treated as source of truth; git/github artifacts remain auditable I/O surfaces.
+6. Default branch always contains human-reviewable roadmap relationship files for active and completed roadmaps (`docs/roadmap/*.graph.json`).
+7. `small_job` `planned` milestone is reached when child issue is created with `repo.small_job_label`.
+8. `small_job` `implemented` milestone is reached when its PR merges.
+9. Child issues are created only when dependency milestones are satisfied; roadmap merge does not require creating all node issues at once.
+10. Dependencies can require `planned` or `implemented`, and scheduler behavior reflects that distinction.
+11. Design-node dependents with `requires=planned` can start after design doc merge without waiting for implementation merge.
+12. Design-node dependents with `requires=implemented` wait for implementation merge.
+13. Roadmap-node dependents can separately depend on child roadmap `planned` or `implemented` milestones.
+14. Child issue bodies include parent roadmap issue and node ID linkage.
+15. Child PR references remain scoped to direct child issues; roadmap issue is not auto-closed by child PR text.
+16. Parent roadmap closes only when all nodes reach terminal implementation outcomes or roadmap is abandoned.
+17. On `/roadmap status`, MergeXO posts structured roadmap status with node links and blockers ordered oldest-to-newest by `blocked_since_at`.
+18. Agent escalation marks roadmap `revision_requested` and pauses further fan-out.
+19. Revision and abandonment transitions preserve lineage and do not duplicate already-issued node issues.
+20. Existing non-roadmap flows remain unchanged when feature flag is off.
 
 ## Risks and mitigations
 
