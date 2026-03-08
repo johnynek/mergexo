@@ -15,18 +15,27 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapStartResult,
     ReviewReply,
 )
 from mergexo.config import CodexConfig
-from mergexo.models import FlakyTestReport, GeneratedDesign, Issue
+from mergexo.models import (
+    FlakyTestReport,
+    GeneratedDesign,
+    GeneratedRoadmap,
+    Issue,
+    RoadmapRevisionEscalation,
+)
 from mergexo.observability import log_event
 from mergexo.prompts import (
     build_bugfix_prompt,
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_roadmap_prompt,
     build_small_job_prompt,
 )
+from mergexo.roadmap_parser import parse_roadmap_graph_object
 from mergexo.shell import run
 
 
@@ -55,6 +64,28 @@ _DIRECT_OUTPUT_SCHEMA: dict[str, object] = {
         "pr_summary": {"type": "string", "minLength": 1},
         "commit_message": {"type": ["string", "null"]},
         "blocked_reason": {"type": ["string", "null"]},
+        "escalation": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["kind", "summary", "details"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["roadmap_revision"]},
+                "summary": {"type": "string", "minLength": 1},
+                "details": {"type": "string", "minLength": 1},
+            },
+        },
+    },
+}
+
+_ROADMAP_OUTPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["title", "summary", "roadmap_markdown", "graph_json"],
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "minLength": 1},
+        "roadmap_markdown": {"type": "string", "minLength": 1},
+        "graph_json": {"type": "object"},
     },
 }
 
@@ -150,6 +181,64 @@ class CodexAdapter(AgentAdapter):
             flow_name="bugfix",
             prompt=prompt,
             cwd=cwd,
+        )
+
+    def start_roadmap_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        roadmap_docs_dir: str,
+        recommended_node_count: int,
+        cwd: Path,
+    ) -> RoadmapStartResult:
+        started_at = time.monotonic()
+        log_event(
+            LOGGER,
+            "codex_invocation_started",
+            mode="roadmap",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+        )
+        try:
+            prompt = build_roadmap_prompt(
+                issue=issue,
+                repo_full_name=repo_full_name,
+                default_branch=default_branch,
+                roadmap_docs_dir=roadmap_docs_dir,
+                recommended_node_count=recommended_node_count,
+                coding_guidelines_path=None,
+            )
+            roadmap, thread_id = self._run_roadmap_turn(
+                prompt=prompt,
+                expected_issue_number=issue.number,
+                cwd=cwd,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "codex_invocation_finished",
+                mode="roadmap",
+                repo_full_name=repo_full_name,
+                issue_number=issue.number,
+                status="fault",
+                duration_seconds=_elapsed_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log_event(
+            LOGGER,
+            "codex_invocation_finished",
+            mode="roadmap",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+            status="success",
+            duration_seconds=_elapsed_seconds(started_at),
+        )
+        return RoadmapStartResult(
+            roadmap=roadmap,
+            session=AgentSession(adapter="codex", thread_id=thread_id),
         )
 
     def start_small_job_from_issue(
@@ -253,6 +342,7 @@ class CodexAdapter(AgentAdapter):
             commit_message = _optional_output_text(payload.get("commit_message"))
             git_ops = _parse_git_ops(payload.get("git_ops"))
             flaky_test_report = _parse_flaky_test_report(payload.get("flaky_test_report"))
+            escalation = _parse_roadmap_revision_escalation(payload.get("escalation"))
             if flaky_test_report is not None and commit_message is not None:
                 raise RuntimeError(
                     "Codex response cannot set commit_message when flaky_test_report is present"
@@ -298,6 +388,7 @@ class CodexAdapter(AgentAdapter):
             commit_message=commit_message,
             git_ops=tuple(git_ops),
             flaky_test_report=flaky_test_report,
+            escalation=escalation,
         )
 
     def _run_design_turn(self, *, prompt: str, cwd: Path) -> tuple[GeneratedDesign, str | None]:
@@ -339,6 +430,54 @@ class CodexAdapter(AgentAdapter):
                 summary=summary,
                 design_doc_markdown=design_doc_markdown,
                 touch_paths=tuple(touch_paths),
+            ),
+            _extract_thread_id(raw_events),
+        )
+
+    def _run_roadmap_turn(
+        self, *, prompt: str, expected_issue_number: int, cwd: Path
+    ) -> tuple[GeneratedRoadmap, str | None]:
+        if not self._config.enabled:
+            raise RuntimeError("Codex is disabled in config")
+
+        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "schema.json"
+            output_path = tmp_path / "last_message.txt"
+            schema_path.write_text(json.dumps(_ROADMAP_OUTPUT_SCHEMA), encoding="utf-8")
+
+            cmd = [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            self._append_common_options(cmd)
+            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+            raw = output_path.read_text(encoding="utf-8").strip()
+            payload = _parse_json_payload(raw)
+
+        title = _require_str(payload, "title")
+        summary = _require_str(payload, "summary")
+        roadmap_markdown = _require_str(payload, "roadmap_markdown")
+        graph_obj = payload.get("graph_json")
+        parsed_graph = parse_roadmap_graph_object(
+            graph_obj, expected_issue_number=expected_issue_number
+        )
+        return (
+            GeneratedRoadmap(
+                title=title,
+                summary=summary,
+                roadmap_markdown=roadmap_markdown,
+                roadmap_issue_number=parsed_graph.graph.roadmap_issue_number,
+                version=parsed_graph.graph.version,
+                graph_nodes=parsed_graph.graph.nodes,
+                canonical_graph_json=parsed_graph.canonical_json,
             ),
             _extract_thread_id(raw_events),
         )
@@ -438,6 +577,7 @@ class CodexAdapter(AgentAdapter):
         pr_summary = _require_str(payload, "pr_summary")
         commit_message = _optional_output_text(payload.get("commit_message"))
         blocked_reason = _optional_output_text(payload.get("blocked_reason"))
+        escalation = _parse_roadmap_revision_escalation(payload.get("escalation"))
 
         return (
             DirectStartResult(
@@ -446,6 +586,7 @@ class CodexAdapter(AgentAdapter):
                 commit_message=commit_message,
                 blocked_reason=blocked_reason,
                 session=None,
+                escalation=escalation,
             ),
             _extract_thread_id(raw_events),
         )
@@ -636,6 +777,28 @@ def _parse_flaky_test_report(value: object) -> FlakyTestReport | None:
         title=title.strip(),
         summary=summary.strip(),
         relevant_log_excerpt=relevant_log_excerpt.strip(),
+    )
+
+
+def _parse_roadmap_revision_escalation(value: object) -> RoadmapRevisionEscalation | None:
+    if value is None:
+        return None
+    payload = _as_object_dict(value)
+    if payload is None:
+        raise RuntimeError("escalation must be an object or null")
+    kind = payload.get("kind")
+    summary = payload.get("summary")
+    details = payload.get("details")
+    if kind != "roadmap_revision":
+        raise RuntimeError("escalation.kind must be roadmap_revision")
+    if not isinstance(summary, str) or not summary.strip():
+        raise RuntimeError("escalation.summary must be a non-empty string")
+    if not isinstance(details, str) or not details.strip():
+        raise RuntimeError("escalation.details must be a non-empty string")
+    return RoadmapRevisionEscalation(
+        kind="roadmap_revision",
+        summary=summary.strip(),
+        details=details.strip(),
     )
 
 

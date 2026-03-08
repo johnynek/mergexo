@@ -5,12 +5,16 @@ from mergexo import __version__
 from mergexo.models import (
     FlakyTestReport,
     GeneratedDesign,
+    GeneratedRoadmap,
     Issue,
     OperatorCommandRecord,
     PullRequest,
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    RoadmapDependency,
+    RoadmapNode,
+    RoadmapRevisionEscalation,
     RuntimeOperationRecord,
     WorkflowJobSnapshot,
     WorkflowRunSnapshot,
@@ -21,6 +25,7 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_roadmap_prompt,
     build_small_job_prompt,
 )
 
@@ -60,6 +65,28 @@ def test_model_dataclasses_and_version() -> None:
     )
     gen = GeneratedDesign(
         title="Title", design_doc_markdown="# Doc", touch_paths=("a.py",), summary="sum"
+    )
+    roadmap = GeneratedRoadmap(
+        title="Roadmap",
+        summary="Summary",
+        roadmap_markdown="# Roadmap",
+        roadmap_issue_number=1,
+        version=1,
+        graph_nodes=(
+            RoadmapNode(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Implement",
+                depends_on=(RoadmapDependency(node_id="n0", requires="planned"),),
+            ),
+        ),
+        canonical_graph_json="{}",
+    )
+    escalation = RoadmapRevisionEscalation(
+        kind="roadmap_revision",
+        summary="Assumption failed",
+        details="Need to revise dependency ordering.",
     )
     result = WorkResult(issue_number=1, branch="b", pr_number=2, pr_url="u")
     operator_command = OperatorCommandRecord(
@@ -116,6 +143,8 @@ def test_model_dataclasses_and_version() -> None:
     assert review_comment.path == "src/a.py"
     assert issue_comment.body == "note"
     assert gen.touch_paths == ("a.py",)
+    assert roadmap.graph_nodes[0].depends_on[0].requires == "planned"
+    assert escalation.kind == "roadmap_revision"
     assert result.branch == "b"
     assert operator_command.command == "restart"
     assert runtime_op.mode == "git_checkout"
@@ -206,6 +235,7 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert '"flaky_test_report"' in prompt
     assert '"relevant_log_excerpt"' in prompt
     assert "If flaky_test_report is non-null, commit_message MUST be null." in prompt
+    assert '"escalation"' in prompt
 
 
 def test_build_bugfix_prompt_requires_regression_tests() -> None:
@@ -271,6 +301,33 @@ def test_build_small_job_prompt_is_scoped() -> None:
     assert "docs/python_style.md" in prompt
     assert "blocked_reason" in prompt
     assert "Keep scope tight" in prompt
+
+
+def test_build_roadmap_prompt_requires_graph_contract() -> None:
+    issue = Issue(
+        number=42,
+        title="Multi-step platform migration",
+        body="Need staged rollout across subsystems.",
+        html_url="https://example/issue/42",
+        labels=("agent:roadmap",),
+    )
+
+    prompt = build_roadmap_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        roadmap_docs_dir="docs/roadmap",
+        recommended_node_count=7,
+        coding_guidelines_path="docs/python_style.md",
+    )
+
+    assert "roadmap agent" in prompt
+    assert "graph_json" in prompt
+    assert "docs/roadmap/42-<slug>.graph.json" in prompt
+    assert "design_doc" in prompt
+    assert "small_job" in prompt
+    assert "roadmap" in prompt
+    assert "Recommended node count is around 7" in prompt
 
 
 def test_build_implementation_prompt_links_design_context() -> None:

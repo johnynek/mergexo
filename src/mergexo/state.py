@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 import sqlite3
 import threading
 import uuid
@@ -16,6 +17,8 @@ from mergexo.models import (
     OperatorCommandName,
     OperatorCommandRecord,
     OperatorCommandStatus,
+    RoadmapNodeKind,
+    RoadmapDependencyRequirement,
     RestartMode,
     RuntimeOperationRecord,
     RuntimeOperationStatus,
@@ -31,7 +34,7 @@ _TRANSIENT_RETRY_MAX_ATTEMPTS = 3
 _TRANSIENT_RETRY_INITIAL_DELAY_SECONDS = 30
 _TRANSIENT_RETRY_MAX_DELAY_SECONDS = 300
 _STALE_RUNNING_RETRY_ERROR = "stale_running_issue_without_active_run"
-PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
+PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "roadmap", "implementation"]
 AgentRunKind = Literal["issue_flow", "implementation_flow", "pre_pr_followup", "feedback_turn"]
 AgentRunTerminalStatus = Literal[
     "completed",
@@ -66,6 +69,115 @@ PrFlakeStatus = Literal[
     "resolved_after_rerun",
     "blocked_after_second_failure",
 ]
+RoadmapStatus = Literal["active", "revision_requested", "superseded", "abandoned", "completed"]
+RoadmapNodeStatus = Literal["pending", "issued", "completed", "blocked", "abandoned"]
+
+
+@dataclass(frozen=True)
+class RoadmapDependencyState:
+    node_id: str
+    requires: RoadmapDependencyRequirement
+
+
+@dataclass(frozen=True)
+class RoadmapNodeGraphInput:
+    node_id: str
+    kind: RoadmapNodeKind
+    title: str
+    body_markdown: str
+    dependencies: tuple[RoadmapDependencyState, ...]
+
+
+@dataclass(frozen=True)
+class RoadmapStateRecord:
+    repo_full_name: str
+    roadmap_issue_number: int
+    roadmap_pr_number: int | None
+    roadmap_doc_path: str
+    graph_path: str
+    graph_checksum: str
+    status: RoadmapStatus
+    parent_roadmap_issue_number: int | None
+    superseding_roadmap_issue_number: int | None
+    revision_requested_at: str | None
+    last_error: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class RoadmapNodeRecord:
+    repo_full_name: str
+    roadmap_issue_number: int
+    node_id: str
+    kind: RoadmapNodeKind
+    title: str
+    body_markdown: str
+    dependencies_json: str
+    child_issue_number: int | None
+    child_issue_url: str | None
+    status: RoadmapNodeStatus
+    planned_at: str | None
+    implemented_at: str | None
+    status_changed_at: str | None
+    last_progress_at: str | None
+    blocked_since_at: str | None
+    claim_token: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class RoadmapActivationCandidate:
+    repo_full_name: str
+    roadmap_issue_number: int
+    branch: str
+    roadmap_pr_number: int | None
+    roadmap_pr_url: str | None
+
+
+@dataclass(frozen=True)
+class ReadyRoadmapNodeClaim:
+    repo_full_name: str
+    roadmap_issue_number: int
+    node_id: str
+    kind: RoadmapNodeKind
+    title: str
+    body_markdown: str
+    dependencies_json: str
+    claim_token: str
+
+
+@dataclass(frozen=True)
+class RoadmapChildIssueLookup:
+    repo_full_name: str
+    roadmap_issue_number: int
+    node_id: str
+    roadmap_status: RoadmapStatus
+
+
+@dataclass(frozen=True)
+class RoadmapStatusSnapshotRow:
+    repo_full_name: str
+    roadmap_issue_number: int
+    node_id: str
+    kind: RoadmapNodeKind
+    status: RoadmapNodeStatus
+    dependency_summary: str
+    child_issue_number: int | None
+    child_issue_url: str | None
+    last_progress_at: str | None
+    blocked_since_at: str | None
+
+
+@dataclass(frozen=True)
+class RoadmapBlockerRow:
+    repo_full_name: str
+    roadmap_issue_number: int
+    node_id: str
+    status: RoadmapNodeStatus
+    blocked_since_at: str
+    child_issue_number: int | None
+    child_issue_url: str | None
+    last_progress_at: str | None
 
 
 @dataclass(frozen=True)
@@ -760,6 +872,75 @@ class StateStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_github_call_outbox_run
                 ON github_call_outbox(repo_full_name, run_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS roadmap_state (
+                    repo_full_name TEXT NOT NULL,
+                    roadmap_issue_number INTEGER NOT NULL,
+                    roadmap_pr_number INTEGER NULL,
+                    roadmap_doc_path TEXT NOT NULL,
+                    graph_path TEXT NOT NULL,
+                    graph_checksum TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    parent_roadmap_issue_number INTEGER NULL,
+                    superseding_roadmap_issue_number INTEGER NULL,
+                    revision_requested_at TEXT NULL,
+                    last_error TEXT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, roadmap_issue_number)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_roadmap_state_status
+                ON roadmap_state(repo_full_name, status, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS roadmap_nodes (
+                    repo_full_name TEXT NOT NULL,
+                    roadmap_issue_number INTEGER NOT NULL,
+                    node_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body_markdown TEXT NOT NULL,
+                    dependencies_json TEXT NOT NULL,
+                    child_issue_number INTEGER NULL,
+                    child_issue_url TEXT NULL,
+                    status TEXT NOT NULL,
+                    planned_at TEXT NULL,
+                    implemented_at TEXT NULL,
+                    status_changed_at TEXT NULL,
+                    last_progress_at TEXT NULL,
+                    blocked_since_at TEXT NULL,
+                    claim_token TEXT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, roadmap_issue_number, node_id)
+                )
+                """
+            )
+            roadmap_node_columns = _table_columns(conn, "roadmap_nodes")
+            if "claim_token" not in roadmap_node_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE roadmap_nodes
+                    ADD COLUMN claim_token TEXT NULL
+                    """
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_roadmap_nodes_status
+                ON roadmap_nodes(repo_full_name, roadmap_issue_number, status, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_roadmap_nodes_child_issue
+                ON roadmap_nodes(repo_full_name, child_issue_number)
                 """
             )
 
@@ -4414,6 +4595,981 @@ class StateStore:
                 detail=None,
             )
 
+    def get_issue_run_state(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> tuple[str, str | None] | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT status, branch
+                FROM issue_runs
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            ).fetchone()
+        if row is None:
+            return None
+        status, branch = row
+        if not isinstance(status, str):
+            raise RuntimeError("Invalid status value stored in issue_runs")
+        if branch is not None and not isinstance(branch, str):
+            raise RuntimeError("Invalid branch value stored in issue_runs")
+        return status, branch
+
+    def get_roadmap_state(
+        self, *, roadmap_issue_number: int, repo_full_name: str | None = None
+    ) -> RoadmapStateRecord | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    roadmap_issue_number,
+                    roadmap_pr_number,
+                    roadmap_doc_path,
+                    graph_path,
+                    graph_checksum,
+                    status,
+                    parent_roadmap_issue_number,
+                    superseding_roadmap_issue_number,
+                    revision_requested_at,
+                    last_error,
+                    updated_at
+                FROM roadmap_state
+                WHERE repo_full_name = ? AND roadmap_issue_number = ?
+                """,
+                (repo_key, roadmap_issue_number),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_roadmap_state_row(row, repo_full_name=repo_key)
+
+    def list_roadmap_nodes(
+        self, *, roadmap_issue_number: int, repo_full_name: str | None = None
+    ) -> tuple[RoadmapNodeRecord, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    roadmap_issue_number,
+                    node_id,
+                    kind,
+                    title,
+                    body_markdown,
+                    dependencies_json,
+                    child_issue_number,
+                    child_issue_url,
+                    status,
+                    planned_at,
+                    implemented_at,
+                    status_changed_at,
+                    last_progress_at,
+                    blocked_since_at,
+                    claim_token,
+                    updated_at
+                FROM roadmap_nodes
+                WHERE repo_full_name = ? AND roadmap_issue_number = ?
+                ORDER BY node_id ASC
+                """,
+                (repo_key, roadmap_issue_number),
+            ).fetchall()
+        return tuple(_parse_roadmap_node_row(row, repo_full_name=repo_key) for row in rows)
+
+    def upsert_roadmap_graph(
+        self,
+        *,
+        roadmap_issue_number: int,
+        roadmap_pr_number: int | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_checksum: str,
+        nodes: tuple[RoadmapNodeGraphInput, ...],
+        parent_roadmap_issue_number: int | None = None,
+        repo_full_name: str | None = None,
+    ) -> RoadmapStateRecord:
+        if not nodes:
+            raise ValueError("nodes must be non-empty")
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO roadmap_state(
+                    repo_full_name,
+                    roadmap_issue_number,
+                    roadmap_pr_number,
+                    roadmap_doc_path,
+                    graph_path,
+                    graph_checksum,
+                    status,
+                    parent_roadmap_issue_number,
+                    superseding_roadmap_issue_number,
+                    revision_requested_at,
+                    last_error
+                )
+                VALUES(?, ?, ?, ?, ?, ?, 'active', ?, NULL, NULL, NULL)
+                ON CONFLICT(repo_full_name, roadmap_issue_number) DO UPDATE SET
+                    roadmap_pr_number = COALESCE(excluded.roadmap_pr_number, roadmap_state.roadmap_pr_number),
+                    roadmap_doc_path = excluded.roadmap_doc_path,
+                    graph_path = excluded.graph_path,
+                    graph_checksum = excluded.graph_checksum,
+                    status = CASE
+                        WHEN roadmap_state.status IN ('superseded', 'abandoned', 'completed')
+                        THEN roadmap_state.status
+                        ELSE 'active'
+                    END,
+                    parent_roadmap_issue_number = COALESCE(
+                        excluded.parent_roadmap_issue_number,
+                        roadmap_state.parent_roadmap_issue_number
+                    ),
+                    last_error = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (
+                    repo_key,
+                    roadmap_issue_number,
+                    roadmap_pr_number,
+                    roadmap_doc_path,
+                    graph_path,
+                    graph_checksum,
+                    parent_roadmap_issue_number,
+                ),
+            )
+            existing_node_ids = {
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT node_id
+                    FROM roadmap_nodes
+                    WHERE repo_full_name = ? AND roadmap_issue_number = ?
+                    """,
+                    (repo_key, roadmap_issue_number),
+                ).fetchall()
+            }
+            incoming_node_ids = {node.node_id for node in nodes}
+            stale_node_ids = existing_node_ids - incoming_node_ids
+            if stale_node_ids:
+                placeholders = ",".join("?" for _ in stale_node_ids)
+                conn.execute(
+                    f"""
+                    DELETE FROM roadmap_nodes
+                    WHERE repo_full_name = ?
+                      AND roadmap_issue_number = ?
+                      AND node_id IN ({placeholders})
+                    """,
+                    (repo_key, roadmap_issue_number, *sorted(stale_node_ids)),
+                )
+
+            conn.executemany(
+                """
+                INSERT INTO roadmap_nodes(
+                    repo_full_name,
+                    roadmap_issue_number,
+                    node_id,
+                    kind,
+                    title,
+                    body_markdown,
+                    dependencies_json,
+                    status,
+                    status_changed_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                ON CONFLICT(repo_full_name, roadmap_issue_number, node_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    title = excluded.title,
+                    body_markdown = excluded.body_markdown,
+                    dependencies_json = excluded.dependencies_json,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                [
+                    (
+                        repo_key,
+                        roadmap_issue_number,
+                        node.node_id,
+                        node.kind,
+                        node.title,
+                        node.body_markdown,
+                        json.dumps(
+                            [
+                                {"node_id": dep.node_id, "requires": dep.requires}
+                                for dep in node.dependencies
+                            ],
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    )
+                    for node in nodes
+                ],
+            )
+            row = conn.execute(
+                """
+                SELECT
+                    roadmap_issue_number,
+                    roadmap_pr_number,
+                    roadmap_doc_path,
+                    graph_path,
+                    graph_checksum,
+                    status,
+                    parent_roadmap_issue_number,
+                    superseding_roadmap_issue_number,
+                    revision_requested_at,
+                    last_error,
+                    updated_at
+                FROM roadmap_state
+                WHERE repo_full_name = ? AND roadmap_issue_number = ?
+                """,
+                (repo_key, roadmap_issue_number),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("roadmap_state row disappeared after upsert")
+        return _parse_roadmap_state_row(row, repo_full_name=repo_key)
+
+    def list_roadmap_activation_candidates(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[RoadmapActivationCandidate, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        i.repo_full_name,
+                        i.issue_number,
+                        i.branch,
+                        i.pr_number,
+                        i.pr_url
+                    FROM issue_runs AS i
+                    LEFT JOIN roadmap_state AS r
+                        ON r.repo_full_name = i.repo_full_name
+                       AND r.roadmap_issue_number = i.issue_number
+                    WHERE i.status = 'merged'
+                      AND i.branch LIKE 'agent/roadmap/%'
+                      AND r.roadmap_issue_number IS NULL
+                    ORDER BY i.updated_at ASC, i.repo_full_name ASC, i.issue_number ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        i.repo_full_name,
+                        i.issue_number,
+                        i.branch,
+                        i.pr_number,
+                        i.pr_url
+                    FROM issue_runs AS i
+                    LEFT JOIN roadmap_state AS r
+                        ON r.repo_full_name = i.repo_full_name
+                       AND r.roadmap_issue_number = i.issue_number
+                    WHERE i.repo_full_name = ?
+                      AND i.status = 'merged'
+                      AND i.branch LIKE 'agent/roadmap/%'
+                      AND r.roadmap_issue_number IS NULL
+                    ORDER BY i.updated_at ASC, i.issue_number ASC
+                    """,
+                    (repo_key,),
+                ).fetchall()
+        return tuple(
+            RoadmapActivationCandidate(
+                repo_full_name=str(row_repo_full_name),
+                roadmap_issue_number=int(roadmap_issue_number),
+                branch=str(branch),
+                roadmap_pr_number=int(roadmap_pr_number)
+                if isinstance(roadmap_pr_number, int)
+                else None,
+                roadmap_pr_url=str(roadmap_pr_url) if isinstance(roadmap_pr_url, str) else None,
+            )
+            for (
+                row_repo_full_name,
+                roadmap_issue_number,
+                branch,
+                roadmap_pr_number,
+                roadmap_pr_url,
+            ) in rows
+        )
+
+    def list_active_roadmaps(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[RoadmapStateRecord, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        repo_full_name,
+                        roadmap_issue_number,
+                        roadmap_pr_number,
+                        roadmap_doc_path,
+                        graph_path,
+                        graph_checksum,
+                        status,
+                        parent_roadmap_issue_number,
+                        superseding_roadmap_issue_number,
+                        revision_requested_at,
+                        last_error,
+                        updated_at
+                    FROM roadmap_state
+                    WHERE status IN ('active', 'revision_requested')
+                    ORDER BY updated_at ASC, repo_full_name ASC, roadmap_issue_number ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        roadmap_issue_number,
+                        roadmap_pr_number,
+                        roadmap_doc_path,
+                        graph_path,
+                        graph_checksum,
+                        status,
+                        parent_roadmap_issue_number,
+                        superseding_roadmap_issue_number,
+                        revision_requested_at,
+                        last_error,
+                        updated_at
+                    FROM roadmap_state
+                    WHERE repo_full_name = ?
+                      AND status IN ('active', 'revision_requested')
+                    ORDER BY updated_at ASC, roadmap_issue_number ASC
+                    """,
+                    (repo_key,),
+                ).fetchall()
+        if repo_key is None:
+            return tuple(
+                _parse_roadmap_state_row(
+                    (
+                        roadmap_issue_number,
+                        roadmap_pr_number,
+                        roadmap_doc_path,
+                        graph_path,
+                        graph_checksum,
+                        status,
+                        parent_roadmap_issue_number,
+                        superseding_roadmap_issue_number,
+                        revision_requested_at,
+                        last_error,
+                        updated_at,
+                    ),
+                    repo_full_name=str(row_repo_full_name),
+                )
+                for (
+                    row_repo_full_name,
+                    roadmap_issue_number,
+                    roadmap_pr_number,
+                    roadmap_doc_path,
+                    graph_path,
+                    graph_checksum,
+                    status,
+                    parent_roadmap_issue_number,
+                    superseding_roadmap_issue_number,
+                    revision_requested_at,
+                    last_error,
+                    updated_at,
+                ) in rows
+            )
+        return tuple(_parse_roadmap_state_row(row, repo_full_name=repo_key) for row in rows)
+
+    def claim_ready_roadmap_nodes(
+        self,
+        *,
+        limit: int = 32,
+        repo_full_name: str | None = None,
+    ) -> tuple[ReadyRoadmapNodeClaim, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    n.roadmap_issue_number,
+                    n.node_id,
+                    n.kind,
+                    n.title,
+                    n.body_markdown,
+                    n.dependencies_json,
+                    n.status,
+                    n.planned_at,
+                    n.implemented_at,
+                    n.child_issue_number,
+                    n.claim_token
+                FROM roadmap_nodes AS n
+                INNER JOIN roadmap_state AS r
+                    ON r.repo_full_name = n.repo_full_name
+                   AND r.roadmap_issue_number = n.roadmap_issue_number
+                WHERE n.repo_full_name = ?
+                  AND r.status = 'active'
+                ORDER BY n.roadmap_issue_number ASC, n.node_id ASC
+                """,
+                (repo_key,),
+            ).fetchall()
+
+            nodes_by_roadmap: dict[int, dict[str, tuple[object, ...]]] = {}
+            for row in rows:
+                roadmap_issue_number = int(row[0])
+                node_id = str(row[1])
+                nodes_by_roadmap.setdefault(roadmap_issue_number, {})[node_id] = row
+
+            claims: list[ReadyRoadmapNodeClaim] = []
+            for roadmap_issue_number in sorted(nodes_by_roadmap):
+                if len(claims) >= limit:
+                    break
+                node_rows = nodes_by_roadmap[roadmap_issue_number]
+                for node_id in sorted(node_rows):
+                    if len(claims) >= limit:
+                        break
+                    row = node_rows[node_id]
+                    status = _parse_roadmap_node_status(row[6])
+                    child_issue_number = int(row[9]) if isinstance(row[9], int) else None
+                    claim_token = str(row[10]) if isinstance(row[10], str) else None
+                    if (
+                        status != "pending"
+                        or child_issue_number is not None
+                        or claim_token is not None
+                    ):
+                        continue
+                    dependencies = _parse_roadmap_dependencies_json(str(row[5]))
+                    if not _roadmap_node_dependencies_satisfied(
+                        dependencies=dependencies,
+                        node_rows=node_rows,
+                    ):
+                        continue
+                    claim = uuid.uuid4().hex
+                    cursor = conn.execute(
+                        """
+                        UPDATE roadmap_nodes
+                        SET claim_token = ?,
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE repo_full_name = ?
+                          AND roadmap_issue_number = ?
+                          AND node_id = ?
+                          AND status = 'pending'
+                          AND child_issue_number IS NULL
+                          AND claim_token IS NULL
+                        """,
+                        (claim, repo_key, roadmap_issue_number, node_id),
+                    )
+                    if cursor.rowcount <= 0:
+                        continue
+                    claims.append(
+                        ReadyRoadmapNodeClaim(
+                            repo_full_name=repo_key,
+                            roadmap_issue_number=roadmap_issue_number,
+                            node_id=node_id,
+                            kind=cast(RoadmapNodeKind, str(row[2])),
+                            title=str(row[3]),
+                            body_markdown=str(row[4]),
+                            dependencies_json=str(row[5]),
+                            claim_token=claim,
+                        )
+                    )
+            return tuple(claims)
+
+    def release_roadmap_node_claim(
+        self,
+        *,
+        roadmap_issue_number: int,
+        node_id: str,
+        claim_token: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_nodes
+                SET claim_token = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND node_id = ?
+                  AND claim_token = ?
+                """,
+                (repo_key, roadmap_issue_number, node_id, claim_token),
+            )
+        return cursor.rowcount > 0
+
+    def mark_roadmap_node_issue_created(
+        self,
+        *,
+        roadmap_issue_number: int,
+        node_id: str,
+        claim_token: str,
+        child_issue_number: int,
+        child_issue_url: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_nodes
+                SET
+                    child_issue_number = ?,
+                    child_issue_url = ?,
+                    status = 'issued',
+                    planned_at = CASE
+                        WHEN kind = 'small_job'
+                        THEN COALESCE(planned_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                        ELSE planned_at
+                    END,
+                    status_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    last_progress_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    blocked_since_at = NULL,
+                    claim_token = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND node_id = ?
+                  AND claim_token = ?
+                """,
+                (
+                    child_issue_number,
+                    child_issue_url,
+                    repo_key,
+                    roadmap_issue_number,
+                    node_id,
+                    claim_token,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def record_roadmap_node_milestone(
+        self,
+        *,
+        roadmap_issue_number: int,
+        node_id: str,
+        milestone: RoadmapDependencyRequirement,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            if milestone == "planned":
+                cursor = conn.execute(
+                    """
+                    UPDATE roadmap_nodes
+                    SET
+                        planned_at = COALESCE(planned_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                        status = CASE
+                            WHEN status = 'pending' AND child_issue_number IS NOT NULL
+                            THEN 'issued'
+                            ELSE status
+                        END,
+                        status_changed_at = CASE
+                            WHEN status = 'pending' AND child_issue_number IS NOT NULL
+                            THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                            ELSE status_changed_at
+                        END,
+                        last_progress_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND roadmap_issue_number = ?
+                      AND node_id = ?
+                      AND planned_at IS NULL
+                    """,
+                    (repo_key, roadmap_issue_number, node_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    UPDATE roadmap_nodes
+                    SET
+                        implemented_at = COALESCE(
+                            implemented_at,
+                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        ),
+                        status = 'completed',
+                        status_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        last_progress_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        blocked_since_at = NULL,
+                        claim_token = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND roadmap_issue_number = ?
+                      AND node_id = ?
+                      AND implemented_at IS NULL
+                    """,
+                    (repo_key, roadmap_issue_number, node_id),
+                )
+        return cursor.rowcount > 0
+
+    def mark_roadmap_node_blocked(
+        self,
+        *,
+        roadmap_issue_number: int,
+        node_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_nodes
+                SET
+                    status = CASE
+                        WHEN status IN ('completed', 'abandoned') THEN status
+                        ELSE 'blocked'
+                    END,
+                    blocked_since_at = COALESCE(
+                        blocked_since_at,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    status_changed_at = CASE
+                        WHEN status IN ('completed', 'abandoned', 'blocked')
+                        THEN status_changed_at
+                        ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND node_id = ?
+                """,
+                (repo_key, roadmap_issue_number, node_id),
+            )
+        return cursor.rowcount > 0
+
+    def mark_roadmap_node_unblocked(
+        self,
+        *,
+        roadmap_issue_number: int,
+        node_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_nodes
+                SET
+                    status = 'issued',
+                    blocked_since_at = NULL,
+                    status_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    last_progress_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND node_id = ?
+                  AND status = 'blocked'
+                """,
+                (repo_key, roadmap_issue_number, node_id),
+            )
+        return cursor.rowcount > 0
+
+    def mark_roadmap_revision_requested(
+        self,
+        *,
+        roadmap_issue_number: int,
+        last_error: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_state
+                SET
+                    status = CASE
+                        WHEN status IN ('active', 'revision_requested')
+                        THEN 'revision_requested'
+                        ELSE status
+                    END,
+                    revision_requested_at = COALESCE(
+                        revision_requested_at,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    last_error = COALESCE(?, last_error),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND status IN ('active', 'revision_requested')
+                """,
+                (last_error, repo_key, roadmap_issue_number),
+            )
+        return cursor.rowcount > 0
+
+    def set_roadmap_superseding_issue(
+        self,
+        *,
+        roadmap_issue_number: int,
+        superseding_roadmap_issue_number: int,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_state
+                SET superseding_roadmap_issue_number = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND roadmap_issue_number = ?
+                """,
+                (superseding_roadmap_issue_number, repo_key, roadmap_issue_number),
+            )
+        return cursor.rowcount > 0
+
+    def mark_roadmap_superseded(
+        self,
+        *,
+        roadmap_issue_number: int,
+        superseding_roadmap_issue_number: int,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_state
+                SET
+                    status = 'superseded',
+                    superseding_roadmap_issue_number = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND status IN ('active', 'revision_requested')
+                """,
+                (superseding_roadmap_issue_number, repo_key, roadmap_issue_number),
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    """
+                    UPDATE roadmap_nodes
+                    SET
+                        status = 'abandoned',
+                        status_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        claim_token = NULL
+                    WHERE repo_full_name = ?
+                      AND roadmap_issue_number = ?
+                      AND status IN ('pending', 'issued', 'blocked')
+                    """,
+                    (repo_key, roadmap_issue_number),
+                )
+        return cursor.rowcount > 0
+
+    def mark_roadmap_abandoned(
+        self,
+        *,
+        roadmap_issue_number: int,
+        last_error: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_state
+                SET
+                    status = 'abandoned',
+                    last_error = COALESCE(?, last_error),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND status IN ('active', 'revision_requested')
+                """,
+                (last_error, repo_key, roadmap_issue_number),
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    """
+                    UPDATE roadmap_nodes
+                    SET
+                        status = 'abandoned',
+                        status_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        claim_token = NULL
+                    WHERE repo_full_name = ?
+                      AND roadmap_issue_number = ?
+                      AND status IN ('pending', 'issued', 'blocked')
+                    """,
+                    (repo_key, roadmap_issue_number),
+                )
+        return cursor.rowcount > 0
+
+    def mark_roadmap_completed(
+        self, *, roadmap_issue_number: int, repo_full_name: str | None = None
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_state
+                SET status = 'completed',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND status = 'active'
+                """,
+                (repo_key, roadmap_issue_number),
+            )
+        return cursor.rowcount > 0
+
+    def set_roadmap_last_error(
+        self,
+        *,
+        roadmap_issue_number: int,
+        error: str | None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_state
+                SET last_error = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ? AND roadmap_issue_number = ?
+                """,
+                (error, repo_key, roadmap_issue_number),
+            )
+        return cursor.rowcount > 0
+
+    def find_roadmap_by_child_issue(
+        self, *, child_issue_number: int, repo_full_name: str | None = None
+    ) -> RoadmapChildIssueLookup | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    n.roadmap_issue_number,
+                    n.node_id,
+                    r.status
+                FROM roadmap_nodes AS n
+                INNER JOIN roadmap_state AS r
+                    ON r.repo_full_name = n.repo_full_name
+                   AND r.roadmap_issue_number = n.roadmap_issue_number
+                WHERE n.repo_full_name = ?
+                  AND n.child_issue_number = ?
+                ORDER BY n.roadmap_issue_number DESC, n.node_id ASC
+                LIMIT 1
+                """,
+                (repo_key, child_issue_number),
+            ).fetchone()
+        if row is None:
+            return None
+        roadmap_issue_number, node_id, roadmap_status = row
+        return RoadmapChildIssueLookup(
+            repo_full_name=repo_key,
+            roadmap_issue_number=int(roadmap_issue_number),
+            node_id=str(node_id),
+            roadmap_status=_parse_roadmap_status(roadmap_status),
+        )
+
+    def list_roadmap_status_snapshot(
+        self, *, roadmap_issue_number: int, repo_full_name: str | None = None
+    ) -> tuple[RoadmapStatusSnapshotRow, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    node_id,
+                    kind,
+                    status,
+                    dependencies_json,
+                    child_issue_number,
+                    child_issue_url,
+                    last_progress_at,
+                    blocked_since_at
+                FROM roadmap_nodes
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                ORDER BY node_id ASC
+                """,
+                (repo_key, roadmap_issue_number),
+            ).fetchall()
+        snapshots: list[RoadmapStatusSnapshotRow] = []
+        for row in rows:
+            (
+                node_id,
+                kind,
+                status,
+                dependencies_json,
+                child_issue_number,
+                child_issue_url,
+                last_progress_at,
+                blocked_since_at,
+            ) = row
+            dependencies = _parse_roadmap_dependencies_json(str(dependencies_json))
+            dependency_summary = (
+                ", ".join(f"{dep.node_id}:{dep.requires}" for dep in dependencies)
+                if dependencies
+                else "-"
+            )
+            snapshots.append(
+                RoadmapStatusSnapshotRow(
+                    repo_full_name=repo_key,
+                    roadmap_issue_number=roadmap_issue_number,
+                    node_id=str(node_id),
+                    kind=_parse_roadmap_node_kind(kind),
+                    status=_parse_roadmap_node_status(status),
+                    dependency_summary=dependency_summary,
+                    child_issue_number=int(child_issue_number)
+                    if isinstance(child_issue_number, int)
+                    else None,
+                    child_issue_url=str(child_issue_url)
+                    if isinstance(child_issue_url, str)
+                    else None,
+                    last_progress_at=str(last_progress_at)
+                    if isinstance(last_progress_at, str)
+                    else None,
+                    blocked_since_at=str(blocked_since_at)
+                    if isinstance(blocked_since_at, str)
+                    else None,
+                )
+            )
+        return tuple(snapshots)
+
+    def list_roadmap_blockers_oldest_first(
+        self, *, roadmap_issue_number: int, repo_full_name: str | None = None
+    ) -> tuple[RoadmapBlockerRow, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    node_id,
+                    status,
+                    blocked_since_at,
+                    child_issue_number,
+                    child_issue_url,
+                    last_progress_at
+                FROM roadmap_nodes
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND blocked_since_at IS NOT NULL
+                ORDER BY blocked_since_at ASC, node_id ASC
+                """,
+                (repo_key, roadmap_issue_number),
+            ).fetchall()
+        return tuple(
+            RoadmapBlockerRow(
+                repo_full_name=repo_key,
+                roadmap_issue_number=roadmap_issue_number,
+                node_id=str(node_id),
+                status=_parse_roadmap_node_status(status),
+                blocked_since_at=str(blocked_since_at),
+                child_issue_number=int(child_issue_number)
+                if isinstance(child_issue_number, int)
+                else None,
+                child_issue_url=str(child_issue_url) if isinstance(child_issue_url, str) else None,
+                last_progress_at=str(last_progress_at)
+                if isinstance(last_progress_at, str)
+                else None,
+            )
+            for (
+                node_id,
+                status,
+                blocked_since_at,
+                child_issue_number,
+                child_issue_url,
+                last_progress_at,
+            ) in rows
+        )
+
 
 def _select_pr_feedback_status(
     *, conn: sqlite3.Connection, repo_full_name: str, pr_number: int
@@ -4986,9 +6142,202 @@ def _parse_restart_mode(value: object) -> RestartMode:
 def _parse_pre_pr_followup_flow(value: object) -> PrePrFollowupFlow:
     if not isinstance(value, str):
         raise RuntimeError("Invalid flow value stored in pre_pr_followup_state")
-    if value not in {"design_doc", "bugfix", "small_job", "implementation"}:
+    if value not in {"design_doc", "bugfix", "small_job", "roadmap", "implementation"}:
         raise RuntimeError(f"Unknown flow value stored in pre_pr_followup_state: {value}")
     return cast(PrePrFollowupFlow, value)
+
+
+def _parse_roadmap_status(value: object) -> RoadmapStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in roadmap_state")
+    if value not in {"active", "revision_requested", "superseded", "abandoned", "completed"}:
+        raise RuntimeError(f"Unknown status value stored in roadmap_state: {value}")
+    return cast(RoadmapStatus, value)
+
+
+def _parse_roadmap_node_status(value: object) -> RoadmapNodeStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in roadmap_nodes")
+    if value not in {"pending", "issued", "completed", "blocked", "abandoned"}:
+        raise RuntimeError(f"Unknown status value stored in roadmap_nodes: {value}")
+    return cast(RoadmapNodeStatus, value)
+
+
+def _parse_roadmap_node_kind(value: object) -> RoadmapNodeKind:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid kind value stored in roadmap_nodes")
+    if value not in {"design_doc", "small_job", "roadmap"}:
+        raise RuntimeError(f"Unknown kind value stored in roadmap_nodes: {value}")
+    return cast(RoadmapNodeKind, value)
+
+
+def _parse_roadmap_state_row(row: tuple[object, ...], *, repo_full_name: str) -> RoadmapStateRecord:
+    (
+        roadmap_issue_number,
+        roadmap_pr_number,
+        roadmap_doc_path,
+        graph_path,
+        graph_checksum,
+        status,
+        parent_roadmap_issue_number,
+        superseding_roadmap_issue_number,
+        revision_requested_at,
+        last_error,
+        updated_at,
+    ) = row
+    if not isinstance(roadmap_issue_number, int):
+        raise RuntimeError("Invalid roadmap_issue_number value stored in roadmap_state")
+    if roadmap_pr_number is not None and not isinstance(roadmap_pr_number, int):
+        raise RuntimeError("Invalid roadmap_pr_number value stored in roadmap_state")
+    if not isinstance(roadmap_doc_path, str):
+        raise RuntimeError("Invalid roadmap_doc_path value stored in roadmap_state")
+    if not isinstance(graph_path, str):
+        raise RuntimeError("Invalid graph_path value stored in roadmap_state")
+    if not isinstance(graph_checksum, str):
+        raise RuntimeError("Invalid graph_checksum value stored in roadmap_state")
+    if parent_roadmap_issue_number is not None and not isinstance(parent_roadmap_issue_number, int):
+        raise RuntimeError("Invalid parent_roadmap_issue_number value stored in roadmap_state")
+    if superseding_roadmap_issue_number is not None and not isinstance(
+        superseding_roadmap_issue_number, int
+    ):
+        raise RuntimeError("Invalid superseding_roadmap_issue_number value stored in roadmap_state")
+    if revision_requested_at is not None and not isinstance(revision_requested_at, str):
+        raise RuntimeError("Invalid revision_requested_at value stored in roadmap_state")
+    if last_error is not None and not isinstance(last_error, str):
+        raise RuntimeError("Invalid last_error value stored in roadmap_state")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in roadmap_state")
+    return RoadmapStateRecord(
+        repo_full_name=repo_full_name,
+        roadmap_issue_number=roadmap_issue_number,
+        roadmap_pr_number=roadmap_pr_number,
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        graph_checksum=graph_checksum,
+        status=_parse_roadmap_status(status),
+        parent_roadmap_issue_number=parent_roadmap_issue_number,
+        superseding_roadmap_issue_number=superseding_roadmap_issue_number,
+        revision_requested_at=revision_requested_at,
+        last_error=last_error,
+        updated_at=updated_at,
+    )
+
+
+def _parse_roadmap_node_row(row: tuple[object, ...], *, repo_full_name: str) -> RoadmapNodeRecord:
+    (
+        roadmap_issue_number,
+        node_id,
+        kind,
+        title,
+        body_markdown,
+        dependencies_json,
+        child_issue_number,
+        child_issue_url,
+        status,
+        planned_at,
+        implemented_at,
+        status_changed_at,
+        last_progress_at,
+        blocked_since_at,
+        claim_token,
+        updated_at,
+    ) = row
+    if not isinstance(roadmap_issue_number, int):
+        raise RuntimeError("Invalid roadmap_issue_number value stored in roadmap_nodes")
+    if not isinstance(node_id, str):
+        raise RuntimeError("Invalid node_id value stored in roadmap_nodes")
+    if not isinstance(title, str):
+        raise RuntimeError("Invalid title value stored in roadmap_nodes")
+    if not isinstance(body_markdown, str):
+        raise RuntimeError("Invalid body_markdown value stored in roadmap_nodes")
+    if not isinstance(dependencies_json, str):
+        raise RuntimeError("Invalid dependencies_json value stored in roadmap_nodes")
+    if child_issue_number is not None and not isinstance(child_issue_number, int):
+        raise RuntimeError("Invalid child_issue_number value stored in roadmap_nodes")
+    if child_issue_url is not None and not isinstance(child_issue_url, str):
+        raise RuntimeError("Invalid child_issue_url value stored in roadmap_nodes")
+    if planned_at is not None and not isinstance(planned_at, str):
+        raise RuntimeError("Invalid planned_at value stored in roadmap_nodes")
+    if implemented_at is not None and not isinstance(implemented_at, str):
+        raise RuntimeError("Invalid implemented_at value stored in roadmap_nodes")
+    if status_changed_at is not None and not isinstance(status_changed_at, str):
+        raise RuntimeError("Invalid status_changed_at value stored in roadmap_nodes")
+    if last_progress_at is not None and not isinstance(last_progress_at, str):
+        raise RuntimeError("Invalid last_progress_at value stored in roadmap_nodes")
+    if blocked_since_at is not None and not isinstance(blocked_since_at, str):
+        raise RuntimeError("Invalid blocked_since_at value stored in roadmap_nodes")
+    if claim_token is not None and not isinstance(claim_token, str):
+        raise RuntimeError("Invalid claim_token value stored in roadmap_nodes")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in roadmap_nodes")
+    return RoadmapNodeRecord(
+        repo_full_name=repo_full_name,
+        roadmap_issue_number=roadmap_issue_number,
+        node_id=node_id,
+        kind=_parse_roadmap_node_kind(kind),
+        title=title,
+        body_markdown=body_markdown,
+        dependencies_json=dependencies_json,
+        child_issue_number=child_issue_number,
+        child_issue_url=child_issue_url,
+        status=_parse_roadmap_node_status(status),
+        planned_at=planned_at,
+        implemented_at=implemented_at,
+        status_changed_at=status_changed_at,
+        last_progress_at=last_progress_at,
+        blocked_since_at=blocked_since_at,
+        claim_token=claim_token,
+        updated_at=updated_at,
+    )
+
+
+def _parse_roadmap_dependencies_json(value: str) -> tuple[RoadmapDependencyState, ...]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid dependencies_json value stored in roadmap_nodes") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError("Invalid dependencies_json value stored in roadmap_nodes")
+    parsed: list[RoadmapDependencyState] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise RuntimeError("Invalid dependencies_json value stored in roadmap_nodes")
+        if not all(isinstance(key, str) for key in item.keys()):
+            raise RuntimeError("Invalid dependencies_json value stored in roadmap_nodes")
+        dep_obj = cast(dict[str, object], item)
+        node_id = dep_obj.get("node_id")
+        requires = dep_obj.get("requires", "implemented")
+        if not isinstance(node_id, str) or not node_id:
+            raise RuntimeError("Invalid dependencies_json value stored in roadmap_nodes")
+        if not isinstance(requires, str) or requires not in {"planned", "implemented"}:
+            raise RuntimeError("Invalid dependencies_json value stored in roadmap_nodes")
+        parsed.append(
+            RoadmapDependencyState(
+                node_id=node_id,
+                requires=cast(RoadmapDependencyRequirement, requires),
+            )
+        )
+    return tuple(parsed)
+
+
+def _roadmap_node_dependencies_satisfied(
+    *,
+    dependencies: tuple[RoadmapDependencyState, ...],
+    node_rows: dict[str, tuple[object, ...]],
+) -> bool:
+    for dependency in dependencies:
+        dep_row = node_rows.get(dependency.node_id)
+        if dep_row is None:
+            return False
+        dep_planned_at = dep_row[7] if isinstance(dep_row[7], str) else None
+        dep_implemented_at = dep_row[8] if isinstance(dep_row[8], str) else None
+        if dependency.requires == "planned":
+            if dep_planned_at is None and dep_implemented_at is None:
+                return False
+            continue
+        if dep_implemented_at is None:
+            return False
+    return True
 
 
 def _parse_github_comment_surface(value: object) -> GitHubCommentSurface:

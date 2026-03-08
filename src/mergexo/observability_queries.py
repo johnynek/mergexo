@@ -106,6 +106,25 @@ class MetricsStats:
     per_repo: tuple[RuntimeMetric, ...]
 
 
+@dataclass(frozen=True)
+class RoadmapLifecycleCounts:
+    active: int
+    revision_requested: int
+    superseded: int
+    abandoned: int
+    completed: int
+
+
+@dataclass(frozen=True)
+class RoadmapBlockerAgeRow:
+    repo_full_name: str
+    roadmap_issue_number: int
+    node_id: str
+    blocked_since_at: str
+    age_seconds: float
+    child_issue_number: int | None
+
+
 def load_overview(
     db_path: Path, repo_filter: str | None = None, window: str = "24h"
 ) -> OverviewStats:
@@ -552,6 +571,83 @@ def load_metrics(
 ) -> MetricsStats:
     with _connect(db_path) as conn:
         return _load_metrics(conn=conn, repo_filter=repo_filter, window=window)
+
+
+def load_roadmap_lifecycle_counts(
+    db_path: Path, repo_filter: str | None = None
+) -> RoadmapLifecycleCounts:
+    with _connect(db_path) as conn:
+        repo_clause, repo_params = _repo_filter_sql(repo_filter)
+        row = conn.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN status = 'revision_requested' THEN 1 ELSE 0 END) AS revision_count,
+                SUM(CASE WHEN status = 'superseded' THEN 1 ELSE 0 END) AS superseded_count,
+                SUM(CASE WHEN status = 'abandoned' THEN 1 ELSE 0 END) AS abandoned_count,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_count
+            FROM roadmap_state
+            WHERE 1 = 1
+              {repo_clause}
+            """,
+            repo_params,
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("Expected roadmap lifecycle query to return a row")
+    return RoadmapLifecycleCounts(
+        active=_as_int(row[0], "active_count"),
+        revision_requested=_as_int(row[1], "revision_count"),
+        superseded=_as_int(row[2], "superseded_count"),
+        abandoned=_as_int(row[3], "abandoned_count"),
+        completed=_as_int(row[4], "completed_count"),
+    )
+
+
+def load_roadmap_blocker_ages(
+    db_path: Path,
+    repo_filter: str | None = None,
+    *,
+    limit: int = 50,
+    now: datetime | None = None,
+) -> tuple[RoadmapBlockerAgeRow, ...]:
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    now_value = now if now is not None else datetime.now(timezone.utc)
+    now_iso = now_value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    with _connect(db_path) as conn:
+        repo_clause, repo_params = _repo_filter_sql(repo_filter, prefix="n")
+        rows = conn.execute(
+            f"""
+            SELECT
+                n.repo_full_name,
+                n.roadmap_issue_number,
+                n.node_id,
+                n.blocked_since_at,
+                MAX(0.0, (julianday(?) - julianday(n.blocked_since_at)) * 86400.0) AS age_seconds,
+                n.child_issue_number
+            FROM roadmap_nodes AS n
+            INNER JOIN roadmap_state AS r
+                ON r.repo_full_name = n.repo_full_name
+               AND r.roadmap_issue_number = n.roadmap_issue_number
+            WHERE n.blocked_since_at IS NOT NULL
+              AND r.status IN ('active', 'revision_requested')
+              {repo_clause}
+            ORDER BY n.blocked_since_at ASC, n.repo_full_name ASC, n.roadmap_issue_number ASC
+            LIMIT ?
+            """,
+            (now_iso, *repo_params, limit),
+        ).fetchall()
+    return tuple(
+        RoadmapBlockerAgeRow(
+            repo_full_name=_as_str(row[0], "repo_full_name"),
+            roadmap_issue_number=_as_int(row[1], "roadmap_issue_number"),
+            node_id=_as_str(row[2], "node_id"),
+            blocked_since_at=_as_str(row[3], "blocked_since_at"),
+            age_seconds=_as_float(row[4], "age_seconds"),
+            child_issue_number=_as_optional_int(row[5], "child_issue_number"),
+        )
+        for row in rows
+    )
 
 
 def _load_metrics(

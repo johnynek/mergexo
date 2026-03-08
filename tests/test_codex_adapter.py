@@ -17,6 +17,7 @@ from mergexo.codex_adapter import (
     _optional_output_text,
     _parse_event_line,
     _parse_json_payload,
+    _parse_roadmap_revision_escalation,
     _parse_review_replies,
     _require_str,
     _require_str_list,
@@ -192,6 +193,65 @@ def test_start_design_from_issue_returns_session(
     assert result.design.title == "Design"
     assert result.session is not None
     assert result.session.thread_id == "thread-abc"
+
+
+def test_start_roadmap_from_issue_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert "roadmap agent" in input_text
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "title": "Roadmap",
+                    "summary": "Summary",
+                    "roadmap_markdown": "# Roadmap",
+                    "graph_json": {
+                        "roadmap_issue_number": 1,
+                        "version": 1,
+                        "nodes": [
+                            {
+                                "node_id": "n1",
+                                "kind": "small_job",
+                                "title": "Ship",
+                                "body_markdown": "Do it",
+                                "depends_on": [],
+                            }
+                        ],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-roadmap"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.start_roadmap_from_issue(
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        roadmap_docs_dir="docs/roadmap",
+        recommended_node_count=7,
+        cwd=tmp_path,
+    )
+
+    assert result.roadmap.title == "Roadmap"
+    assert result.roadmap.roadmap_issue_number == 1
+    assert result.roadmap.version == 1
+    assert len(result.roadmap.graph_nodes) == 1
+    assert result.session is not None
+    assert result.session.thread_id == "thread-roadmap"
 
 
 def test_start_bugfix_from_issue_happy_path(
@@ -473,6 +533,21 @@ def test_start_bugfix_from_issue_rejects_disabled(tmp_path: Path) -> None:
         )
 
 
+def test_start_roadmap_from_issue_rejects_disabled(tmp_path: Path) -> None:
+    adapter = CodexAdapter(
+        CodexConfig(enabled=False, model=None, sandbox=None, profile=None, extra_args=())
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        adapter.start_roadmap_from_issue(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            roadmap_docs_dir="docs/roadmap",
+            recommended_node_count=7,
+            cwd=tmp_path,
+        )
+
+
 def test_parse_json_payload_variants_and_errors() -> None:
     fenced = '```json\n{"title":"x"}\n```'
     assert _parse_json_payload(fenced) == {"title": "x"}
@@ -634,6 +709,46 @@ def test_parse_flaky_test_report_validation() -> None:
                 "title": "x",
                 "summary": "y",
                 "relevant_log_excerpt": " ",
+            }
+        )
+
+
+def test_parse_roadmap_revision_escalation_validation() -> None:
+    assert _parse_roadmap_revision_escalation(None) is None
+    escalation = _parse_roadmap_revision_escalation(
+        {
+            "kind": "roadmap_revision",
+            "summary": "Assumption failed",
+            "details": "Need to revise the plan.",
+        }
+    )
+    assert escalation is not None
+    assert escalation.kind == "roadmap_revision"
+
+    with pytest.raises(RuntimeError, match="object or null"):
+        _parse_roadmap_revision_escalation("bad")
+    with pytest.raises(RuntimeError, match="kind must be roadmap_revision"):
+        _parse_roadmap_revision_escalation(
+            {
+                "kind": "unknown",
+                "summary": "x",
+                "details": "y",
+            }
+        )
+    with pytest.raises(RuntimeError, match="summary must be a non-empty string"):
+        _parse_roadmap_revision_escalation(
+            {
+                "kind": "roadmap_revision",
+                "summary": " ",
+                "details": "y",
+            }
+        )
+    with pytest.raises(RuntimeError, match="details must be a non-empty string"):
+        _parse_roadmap_revision_escalation(
+            {
+                "kind": "roadmap_revision",
+                "summary": "x",
+                "details": " ",
             }
         )
 

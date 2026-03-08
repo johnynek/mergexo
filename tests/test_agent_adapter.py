@@ -10,14 +10,17 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapStartResult,
     ReviewReply,
 )
 from mergexo.models import (
     GeneratedDesign,
+    GeneratedRoadmap,
     Issue,
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    RoadmapNode,
 )
 
 
@@ -56,6 +59,47 @@ class DummyAdapter(AgentAdapter):
             general_comment="done",
             commit_message="commit",
             git_ops=(GitOpRequest(op="fetch_origin"),),
+        )
+
+    def start_roadmap_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        roadmap_docs_dir: str,
+        recommended_node_count: int,
+        cwd: Path,
+    ) -> RoadmapStartResult:
+        _ = (
+            issue,
+            repo_full_name,
+            default_branch,
+            roadmap_docs_dir,
+            recommended_node_count,
+            cwd,
+        )
+        return RoadmapStartResult(
+            roadmap=GeneratedRoadmap(
+                title="Roadmap",
+                summary="Summary",
+                roadmap_markdown="# Roadmap",
+                roadmap_issue_number=1,
+                version=1,
+                graph_nodes=(
+                    RoadmapNode(
+                        node_id="n1",
+                        kind="small_job",
+                        title="Ship",
+                        body_markdown="Do it",
+                    ),
+                ),
+                canonical_graph_json=(
+                    '{"nodes":[{"body_markdown":"Do it","depends_on":[],"kind":"small_job",'
+                    '"node_id":"n1","title":"Ship"}],"roadmap_issue_number":1,"version":1}'
+                ),
+            ),
+            session=AgentSession(adapter="dummy", thread_id="th"),
         )
 
     def start_bugfix_from_issue(
@@ -177,6 +221,14 @@ def test_agent_adapter_data_model() -> None:
         default_branch="main",
         cwd=Path("."),
     )
+    roadmap = adapter.start_roadmap_from_issue(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        roadmap_docs_dir="docs/roadmap",
+        recommended_node_count=7,
+        cwd=Path("."),
+    )
     bugfix = adapter.start_bugfix_from_issue(
         issue=issue,
         repo_full_name="johnynek/mergexo",
@@ -210,6 +262,7 @@ def test_agent_adapter_data_model() -> None:
 
     assert start.session is not None
     assert start.session.thread_id == "th"
+    assert roadmap.roadmap.title == "Roadmap"
     assert bugfix.pr_title == "Fix bug"
     assert small_job.pr_title == "Small job"
     assert implementation.pr_title == "Implement design"

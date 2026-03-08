@@ -9,6 +9,8 @@ enable_issue_comment_routing = false
 enable_pr_actions_monitoring = false
 # Enable incremental GitHub comment polling (bounded by cursors + overlap replay).
 enable_incremental_comment_fetch = false
+# Enable roadmap intake, activation, and DAG child-issue scheduling.
+enable_roadmaps = false
 # Seconds of replay overlap applied to the persisted cursor timestamp.
 comment_fetch_overlap_seconds = 5
 # Safe backfill window when a cursor is invalid/future (seconds).
@@ -39,10 +41,17 @@ owner = "johnynek"
 # name omitted => "mergexo"
 default_branch = "main"
 trigger_label = "agent:design"
+roadmap_label = "agent:roadmap"
 bugfix_label = "agent:bugfix"
 small_job_label = "agent:small-job"
 # Human takeover label; while present MergeXO pauses automation for this source issue/linked PR.
 ignore_label = "agent:ignore"
+# Roadmap authoring and lifecycle controls.
+roadmap_docs_dir = "docs/roadmap"
+roadmap_revision_label = "agent:roadmap-revise"
+roadmap_abandon_label = "agent:roadmap-abandon"
+# Non-blocking recommendation for splitting large DAGs.
+roadmap_recommended_node_count = 7
 # Required path (repo-relative) to coding + testing guidelines agents should follow
 coding_guidelines_path = "docs/python_style.md"
 # Optional repo-relative or absolute path to an executable required before each push.
