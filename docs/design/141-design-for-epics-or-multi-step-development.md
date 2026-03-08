@@ -102,7 +102,7 @@ Each roadmap PR must include two files:
 1. Narrative roadmap markdown: `docs/roadmap/<issue>-<slug>.md`.
 2. Canonical machine-readable graph: `docs/roadmap/<issue>-<slug>.graph.json`.
 
-`.graph.json` is required user-authored input for node relationships and must be human-reviewable in PR. It includes:
+`.graph.json` is defined in the roadmap-creation PR (and updated in any roadmap-revision PR), and must stay readable/reviewable by humans even though MergeXO can generate it. It includes:
 1. `roadmap_issue_number`.
 2. `version`.
 3. `nodes` array.
@@ -167,7 +167,7 @@ State APIs include:
 1. `upsert_roadmap_graph(...)`
 2. `list_roadmap_activation_candidates(...)`
 3. `list_active_roadmaps(...)`
-4. `list_ready_roadmap_nodes(...)`
+4. `claim_ready_roadmap_nodes(...)`
 5. `mark_roadmap_node_issue_created(...)`
 6. `record_roadmap_node_milestone(...)`
 7. `mark_roadmap_revision_requested(...)`
@@ -205,6 +205,20 @@ Child issues are created only when ready, so unresolved downstream nodes have no
   - node rows (`node_id`, `kind`, `status`, dependency summary, linked child issue, last progress age)
   - blockers section sorted by `blocked_since_at` oldest first.
 - post idempotent status response comment linked to request comment.
+
+### 5.1 Transactional and crash-safety model
+
+Roadmap progression follows the same practical atomicity pattern used in other MergeXO flows:
+1. Claim rows first in sqlite (`claim_ready_roadmap_nodes(...)`) so only one worker owns each node action at a time.
+2. For each outbound GitHub action (create child issue, post status, post revision/escalation summary, close roadmap issue), compute deterministic action token and check for existing token before posting.
+3. After outbound side effect succeeds, finalize all related state in one sqlite transaction (node status, child issue link, milestone timestamps, roadmap status transitions, token observation).
+4. If crash occurs after GitHub write but before sqlite finalize, retry recomputes the same token, detects prior action, and finalizes missing sqlite state without duplicating GitHub side effects.
+5. Status-changing updates use compare-and-set predicates (`WHERE status = <expected>`) to prevent stale workers from applying invalid transitions.
+
+Atomicity boundaries:
+1. Graph activation writes `roadmap_state` plus all `roadmap_nodes` in one transaction.
+2. Node issue creation finalization is atomic per node.
+3. Revision, supersede, and abandon transitions are atomic at roadmap level.
 
 ### 6. Linking and milestone detection
 
@@ -277,6 +291,7 @@ Add roadmap metrics/events:
 3. drift and validation failures between sqlite graph checksum and in-repo `.graph.json`.
 4. roadmap status report latency and requester count.
 5. blocker age distribution for active roadmaps.
+6. crash-recovery reconciliations where token exists remotely before local finalize.
 
 ## Implementation plan
 
@@ -295,6 +310,7 @@ Add roadmap metrics/events:
 13. Add GitHub gateway issue-close helper and tests.
 14. Add observability query support and tests.
 15. Update README and sample config for roadmap authoring and lifecycle.
+16. Add failure-injection tests for crash windows between GitHub side effects and sqlite finalization.
 
 ## Acceptance criteria
 
@@ -318,10 +334,13 @@ Add roadmap metrics/events:
 18. Agent escalation marks roadmap `revision_requested` and pauses further fan-out.
 19. Revision and abandonment transitions preserve lineage and do not duplicate already-issued node issues.
 20. Existing non-roadmap flows remain unchanged when feature flag is off.
+21. Crash after child issue creation but before sqlite finalize does not create duplicate child issues on retry.
+22. Graph activation and roadmap revision/abandon transitions are each finalized atomically in sqlite transactions.
+23. Stale worker retries cannot regress roadmap/node status because updates enforce expected prior state.
 
 ## Risks and mitigations
 
-1. Risk: repo graph file and sqlite mirror drift.
+1. Risk: in-repo graph input drifts from sqlite runtime state.
 Mitigation: store graph checksum, validate on poll, block fan-out on mismatch, and post deterministic repair guidance.
 
 2. Risk: milestone detection errors unlock nodes too early.
@@ -335,6 +354,9 @@ Mitigation: tokenized idempotent roadmap escalation comments and single active r
 
 5. Risk: additional poll work increases GitHub API load.
 Mitigation: only scan active roadmaps and roadmap-linked child issues, with incremental state-driven checks.
+
+6. Risk: crash between GitHub side effects and sqlite updates leaves partial local state.
+Mitigation: deterministic action tokens, read-after-write reconciliation, and one-transaction finalization per transition.
 
 ## Rollout notes
 
