@@ -108,6 +108,35 @@ def compute_pre_pr_checkpoint_token(*, issue_number: int, checkpoint_sha: str) -
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def compute_task_snapshot_recorded_token(
+    *, issue_number: int, task_kind: str, resource_key: str
+) -> str:
+    payload = f"task_snapshot_recorded:{issue_number}:{task_kind}:{resource_key}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_task_rejected_token(*, issue_number: int, task_kind: str, resource_key: str) -> str:
+    payload = f"task_rejected:{issue_number}:{task_kind}:{resource_key}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_task_execution_started_token(
+    *, issue_number: int, task_kind: str, resource_key: str
+) -> str:
+    payload = f"task_execution_started:{issue_number}:{task_kind}:{resource_key}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_task_completed_token(*, issue_number: int, task_kind: str, resource_key: str) -> str:
+    payload = f"task_completed:{issue_number}:{task_kind}:{resource_key}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_task_failed_token(*, issue_number: int, task_kind: str, resource_key: str) -> str:
+    payload = f"task_failed:{issue_number}:{task_kind}:{resource_key}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def append_action_token(*, body: str, token: str) -> str:
     marker = f"<!-- mergexo-action:{token} -->"
     stripped = body.strip()

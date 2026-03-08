@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +23,7 @@ from mergexo.agent_adapter import (
     FeedbackTurn,
     GitOpRequest,
     ReviewReply,
+    TriggeredTaskReviewResult,
 )
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import (
@@ -44,7 +45,11 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    ReleaseSnapshot,
+    RepositoryTagSnapshot,
     RestartMode,
+    TriggeredTaskExecutionResult,
+    TriggeredTaskRequest,
     WorkflowJobSnapshot,
     WorkflowRunSnapshot,
     WorkResult,
@@ -60,6 +65,7 @@ from mergexo.orchestrator import (
     SlotPool,
     _FeedbackFuture,
     _RunningIssueMetadata,
+    _TaskFuture,
     _branch_for_implementation_candidate,
     _branch_for_pre_pr_followup,
     _design_branch_slug,
@@ -93,16 +99,23 @@ from mergexo.orchestrator import (
     _parse_utc_timestamp,
     _render_source_issue_redirect_comment,
     _render_design_doc,
+    _render_triggered_task_failed_comment,
     _render_operator_command_result,
     _render_regex_patterns,
     _recovery_pr_payload_for_issue,
     _resolve_issue_flow,
     _summarize_git_error,
     _slugify,
+    _triggered_task_execution_json,
+    _triggered_task_request_from_json,
+    _triggered_task_request_json,
+    _triggered_task_snapshot_json,
     _trigger_labels,
 )
 from mergexo.observability import configure_logging
 from mergexo.shell import CommandError
+from mergexo.git_ops import ScriptRunResult
+from mergexo.task_handlers import TriggeredTaskSnapshot
 from mergexo.state import (
     ActionTokenScopeKind,
     ActionTokenState,
@@ -110,6 +123,7 @@ from mergexo.state import (
     GitHubCommentSurface,
     GitHubCommentPollCursorState,
     ImplementationCandidateState,
+    IssueTaskState,
     PendingFeedbackEvent,
     PollCursorUpdate,
     PrFlakeState,
@@ -143,12 +157,14 @@ class FakeGitManager:
         self.merge_calls: list[Path] = []
         self.current_head_calls: list[Path] = []
         self.is_ancestor_calls: list[tuple[Path, str, str]] = []
+        self.script_calls: list[tuple[Path, Path, tuple[str, ...]]] = []
         self.restore_feedback_result = True
         self.staged_files: tuple[str, ...] = ("src/a.py", "tests/test_a.py")
         self.current_head_sha_value = "headsha"
         self.checkpoint_head_sha_value = "checkpointsha"
         self.persist_checkpoint_should_fail = False
         self.is_ancestor_results: dict[tuple[str, str], bool] = {}
+        self.script_result = ScriptRunResult(returncode=0, stdout="ok", stderr="")
 
     def ensure_layout(self) -> None:
         self.ensure_layout_called = True
@@ -216,11 +232,22 @@ class FakeGitManager:
         self.is_ancestor_calls.append((checkout_path, older_sha, newer_sha))
         return self.is_ancestor_results.get((older_sha, newer_sha), True)
 
+    def run_repo_script(
+        self,
+        *,
+        checkout_path: Path,
+        script_path: Path,
+        args: tuple[str, ...],
+    ) -> ScriptRunResult:
+        self.script_calls.append((checkout_path, script_path, args))
+        return self.script_result
+
 
 class FakeGitHub:
     def __init__(self, issues: list[Issue]) -> None:
         self.issues = issues
         self.requested_labels: tuple[str, ...] | None = None
+        self.requested_task_label: str | None = None
         self.created_prs: list[tuple[str, str, str, str]] = []
         self.created_issues: list[tuple[str, str, tuple[str, ...] | None]] = []
         self.rerun_requests: list[int] = []
@@ -249,10 +276,21 @@ class FakeGitHub:
         self.failed_run_log_tails: dict[int, dict[str, str | None]] = {}
         self.failed_log_tail_calls: list[tuple[int, int]] = []
         self.pr_lookup_by_head_base: dict[tuple[str, str], PullRequest] = {}
+        self.default_branch_head_sha = "headsha"
+        self.tag_sha_by_name: dict[str, str] = {}
+        self.tags: tuple[RepositoryTagSnapshot, ...] = ()
+        self.latest_release: ReleaseSnapshot | None = None
+        self.workflow_runs_for_branch_head: dict[
+            tuple[str, str], tuple[WorkflowRunSnapshot, ...]
+        ] = {}
 
     def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
         self.requested_labels = labels
         return self.issues
+
+    def list_open_issues_with_label(self, label: str) -> list[Issue]:
+        self.requested_task_label = label
+        return [issue for issue in self.issues if label in issue.labels]
 
     def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
         self.created_prs.append((title, head, base, body))
@@ -406,6 +444,28 @@ class FakeGitHub:
             return "identical"
         return "ahead"
 
+    def get_default_branch_head_sha(self, default_branch: str) -> str:
+        _ = default_branch
+        return self.default_branch_head_sha
+
+    def get_tag_sha(self, tag_name: str) -> str | None:
+        return self.tag_sha_by_name.get(tag_name)
+
+    def list_repository_tags(self, limit: int) -> tuple[RepositoryTagSnapshot, ...]:
+        return self.tags[:limit]
+
+    def get_latest_release(self) -> ReleaseSnapshot | None:
+        return self.latest_release
+
+    def list_workflow_runs_for_branch_head(
+        self,
+        *,
+        default_branch: str,
+        head_sha: str,
+        limit: int = 20,
+    ) -> tuple[WorkflowRunSnapshot, ...]:
+        return self.workflow_runs_for_branch_head.get((default_branch, head_sha), ())[:limit]
+
 
 class FakeAgent:
     def __init__(self, generated: GeneratedDesign | None = None, fail: bool = False) -> None:
@@ -424,6 +484,7 @@ class FakeAgent:
         self.small_job_guidelines_paths: list[str | None] = []
         self.implementation_guidelines_paths: list[str | None] = []
         self.feedback_calls: list[tuple[AgentSession, FeedbackTurn, Path]] = []
+        self.triggered_task_review_calls: list[tuple[int, str, str, Path]] = []
         self.bugfix_result = DirectStartResult(
             pr_title="Fix bug",
             pr_summary="Applies bugfix changes.",
@@ -452,6 +513,10 @@ class FakeAgent:
             general_comment=None,
             commit_message=None,
             git_ops=(),
+        )
+        self.triggered_task_review_result = TriggeredTaskReviewResult(
+            decision="approve",
+            reason="ready",
         )
 
     def start_design_from_issue(
@@ -538,6 +603,89 @@ class FakeAgent:
             raise RuntimeError("codex failed")
         return self.implementation_result
 
+    def review_triggered_task(
+        self,
+        *,
+        issue_number: int,
+        task_kind: str,
+        prompt: str,
+        cwd: Path,
+    ) -> TriggeredTaskReviewResult:
+        self.triggered_task_review_calls.append((issue_number, task_kind, prompt, cwd))
+        return self.triggered_task_review_result
+
+
+class FakeTriggeredTaskHandler:
+    def __init__(self) -> None:
+        self._request: TriggeredTaskRequest | None = TriggeredTaskRequest(
+            task_kind="release",
+            resource_key="v1.2.3",
+            requested_tag="v1.2.3",
+            source_text="release v1.2.3",
+        )
+        self.snapshot = TriggeredTaskSnapshot(
+            schema_version=1,
+            task_kind="release",
+            payload={"default_branch_head_sha": "headsha"},
+        )
+        self.execution_result = TriggeredTaskExecutionResult(
+            success=True,
+            detail="ok",
+            stdout_tail=None,
+            stderr_tail=None,
+            observed_tag_sha="headsha",
+        )
+        self.parse_calls: list[int] = []
+        self.collect_calls: list[int] = []
+        self.review_prompt_calls: list[int] = []
+        self.execute_calls: list[int] = []
+
+    @property
+    def task_kind(self) -> str:
+        return "release"
+
+    def parse_request(self, issue: Issue) -> TriggeredTaskRequest | None:
+        self.parse_calls.append(issue.number)
+        return self._request
+
+    def collect_snapshot(
+        self,
+        *,
+        request: TriggeredTaskRequest,
+        github: object,
+        default_branch: str,
+    ) -> TriggeredTaskSnapshot:
+        _ = request, github, default_branch
+        self.collect_calls.append(1)
+        return self.snapshot
+
+    def build_review_prompt(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        request: TriggeredTaskRequest,
+        snapshot: TriggeredTaskSnapshot,
+    ) -> str:
+        _ = repo_full_name, default_branch, request, snapshot
+        self.review_prompt_calls.append(issue.number)
+        return "task-review-prompt"
+
+    def execute(
+        self,
+        *,
+        request: TriggeredTaskRequest,
+        reviewed_snapshot: TriggeredTaskSnapshot,
+        github: object,
+        git: object,
+        checkout_path: Path,
+        default_branch: str,
+    ) -> TriggeredTaskExecutionResult:
+        _ = request, reviewed_snapshot, github, git, checkout_path, default_branch
+        self.execute_calls.append(1)
+        return self.execution_result
+
 
 class FakeState:
     def __init__(self, *, allowed: set[int] | None = None) -> None:
@@ -566,6 +714,10 @@ class FakeState:
         self.claim_blocked_feedback_pr_numbers: set[int] = set()
         self.released_feedback_claims: list[tuple[int, str]] = []
         self.cleared_feedback_event_pr_numbers: list[int] = []
+        self.claim_blocked_task_issue_numbers: set[int] = set()
+        self.issue_tasks: dict[int, IssueTaskState] = {}
+        self.released_task_claims: list[tuple[int, str]] = []
+        self.reconciled_issue_task_updates: list[tuple[int, str, str | None, str | None]] = []
 
     def _github_call_state(self, row: dict[str, object]) -> GitHubCallOutboxState:
         return GitHubCallOutboxState(
@@ -833,6 +985,271 @@ class FakeState:
         self.run_starts.append(("feedback_turn", run_key, issue_number, pr_number))
         return run_key
 
+    def claim_issue_task_run_start(
+        self,
+        *,
+        issue_number: int,
+        task_kind: str,
+        resource_key: str,
+        request_json: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        _ = meta_json, started_at, repo_full_name
+        if issue_number in self.claim_blocked_task_issue_numbers:
+            return None
+        run_key = run_id or f"task_flow:{issue_number}:{len(self.run_starts) + 1}"
+        existing = self.issue_tasks.get(issue_number)
+        if existing is None:
+            for state in self.issue_tasks.values():
+                if (
+                    state.task_kind == task_kind
+                    and state.resource_key == resource_key
+                    and state.status in {"pending_review", "approved", "executing"}
+                ):
+                    return None
+            self.issue_tasks[issue_number] = IssueTaskState(
+                repo_full_name=repo_full_name or "",
+                issue_number=issue_number,
+                task_kind=task_kind,
+                resource_key=resource_key,
+                status="pending_review",
+                request_json=request_json,
+                snapshot_json=None,
+                review_json=None,
+                execution_json=None,
+                last_error=None,
+                active_run_id=run_key,
+                created_at="now",
+                updated_at="now",
+            )
+        else:
+            if existing.status not in {"pending_review", "approved", "executing"}:
+                return None
+            if existing.active_run_id is not None:
+                return None
+            self.issue_tasks[issue_number] = IssueTaskState(
+                repo_full_name=existing.repo_full_name,
+                issue_number=existing.issue_number,
+                task_kind=existing.task_kind,
+                resource_key=existing.resource_key,
+                status=existing.status,
+                request_json=existing.request_json,
+                snapshot_json=existing.snapshot_json,
+                review_json=existing.review_json,
+                execution_json=existing.execution_json,
+                last_error=existing.last_error,
+                active_run_id=run_key,
+                created_at=existing.created_at,
+                updated_at="now",
+            )
+        self.run_starts.append(("task_flow", run_key, issue_number, None))
+        return run_key
+
+    def get_issue_task_state(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> IssueTaskState | None:
+        _ = repo_full_name
+        return self.issue_tasks.get(issue_number)
+
+    def list_issue_tasks(
+        self,
+        *,
+        statuses: tuple[str, ...],
+        repo_full_name: str | None = None,
+    ) -> tuple[IssueTaskState, ...]:
+        _ = repo_full_name
+        return tuple(
+            sorted(
+                (state for state in self.issue_tasks.values() if state.status in statuses),
+                key=lambda item: item.issue_number,
+            )
+        )
+
+    def set_issue_task_snapshot(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        snapshot_json: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        state = self.issue_tasks.get(issue_number)
+        if state is None or state.active_run_id != run_id:
+            return False
+        self.issue_tasks[issue_number] = IssueTaskState(
+            repo_full_name=state.repo_full_name,
+            issue_number=state.issue_number,
+            task_kind=state.task_kind,
+            resource_key=state.resource_key,
+            status=state.status,
+            request_json=state.request_json,
+            snapshot_json=snapshot_json,
+            review_json=state.review_json,
+            execution_json=state.execution_json,
+            last_error=state.last_error,
+            active_run_id=state.active_run_id,
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        return True
+
+    def set_issue_task_review(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        approved: bool,
+        review_json: str,
+        last_error: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        state = self.issue_tasks.get(issue_number)
+        if state is None or state.active_run_id != run_id:
+            return False
+        next_status = "approved" if approved else "rejected"
+        self.issue_tasks[issue_number] = IssueTaskState(
+            repo_full_name=state.repo_full_name,
+            issue_number=state.issue_number,
+            task_kind=state.task_kind,
+            resource_key=state.resource_key,
+            status=cast(str, next_status),
+            request_json=state.request_json,
+            snapshot_json=state.snapshot_json,
+            review_json=review_json,
+            execution_json=state.execution_json,
+            last_error=last_error,
+            active_run_id=(state.active_run_id if approved else None),
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        return True
+
+    def mark_issue_task_executing(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        state = self.issue_tasks.get(issue_number)
+        if state is None or state.active_run_id != run_id or state.status != "approved":
+            return False
+        self.issue_tasks[issue_number] = IssueTaskState(
+            repo_full_name=state.repo_full_name,
+            issue_number=state.issue_number,
+            task_kind=state.task_kind,
+            resource_key=state.resource_key,
+            status="executing",
+            request_json=state.request_json,
+            snapshot_json=state.snapshot_json,
+            review_json=state.review_json,
+            execution_json=state.execution_json,
+            last_error=state.last_error,
+            active_run_id=state.active_run_id,
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        return True
+
+    def finalize_issue_task(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        status: str,
+        execution_json: str | None,
+        last_error: str | None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        state = self.issue_tasks.get(issue_number)
+        if state is None or state.active_run_id != run_id:
+            return False
+        self.issue_tasks[issue_number] = IssueTaskState(
+            repo_full_name=state.repo_full_name,
+            issue_number=state.issue_number,
+            task_kind=state.task_kind,
+            resource_key=state.resource_key,
+            status=cast(str, status),
+            request_json=state.request_json,
+            snapshot_json=state.snapshot_json,
+            review_json=state.review_json,
+            execution_json=execution_json,
+            last_error=last_error,
+            active_run_id=None,
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        return True
+
+    def reconcile_interrupted_issue_task(
+        self,
+        *,
+        issue_number: int,
+        status: str,
+        execution_json: str | None,
+        last_error: str | None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        state = self.issue_tasks.get(issue_number)
+        if state is None or state.status != "executing" or state.active_run_id is not None:
+            return False
+        self.issue_tasks[issue_number] = IssueTaskState(
+            repo_full_name=state.repo_full_name,
+            issue_number=state.issue_number,
+            task_kind=state.task_kind,
+            resource_key=state.resource_key,
+            status=cast(str, status),
+            request_json=state.request_json,
+            snapshot_json=state.snapshot_json,
+            review_json=state.review_json,
+            execution_json=execution_json,
+            last_error=last_error,
+            active_run_id=None,
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        self.reconciled_issue_task_updates.append(
+            (issue_number, status, execution_json, last_error)
+        )
+        return True
+
+    def release_issue_task_claim(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        state = self.issue_tasks.get(issue_number)
+        if state is None or state.active_run_id != run_id:
+            return False
+        self.issue_tasks[issue_number] = IssueTaskState(
+            repo_full_name=state.repo_full_name,
+            issue_number=state.issue_number,
+            task_kind=state.task_kind,
+            resource_key=state.resource_key,
+            status=state.status,
+            request_json=state.request_json,
+            snapshot_json=state.snapshot_json,
+            review_json=state.review_json,
+            execution_json=state.execution_json,
+            last_error=state.last_error,
+            active_run_id=None,
+            created_at=state.created_at,
+            updated_at="now",
+        )
+        self.released_task_claims.append((issue_number, run_id))
+        return True
+
     def release_feedback_turn_claim(
         self,
         *,
@@ -1073,6 +1490,10 @@ class FakeState:
     ) -> bool:
         _ = finished_at
         self.run_finishes.append((run_id, terminal_status, failure_class, error))
+        return True
+
+    def update_agent_run_meta(self, *, run_id: str, meta_json: str) -> bool:
+        _ = run_id, meta_json
         return True
 
     def get_runtime_operation(self, op_name: str):  # type: ignore[no-untyped-def]
@@ -1536,6 +1957,7 @@ def _config(
     worker_count: int = 1,
     enable_github_operations: bool = False,
     enable_issue_comment_routing: bool = False,
+    enable_triggered_tasks: bool = False,
     enable_pr_actions_monitoring: bool = False,
     pr_actions_feedback_policy: PrActionsFeedbackPolicy | None = None,
     enable_incremental_comment_fetch: bool = False,
@@ -1564,6 +1986,7 @@ def _config(
             poll_interval_seconds=1,
             enable_github_operations=enable_github_operations,
             enable_issue_comment_routing=enable_issue_comment_routing,
+            enable_triggered_tasks=enable_triggered_tasks,
             enable_pr_actions_monitoring=enable_pr_actions_monitoring,
             enable_incremental_comment_fetch=enable_incremental_comment_fetch,
             comment_fetch_overlap_seconds=comment_fetch_overlap_seconds,
@@ -1582,11 +2005,13 @@ def _config(
                 trigger_label="agent:design",
                 bugfix_label="agent:bugfix",
                 small_job_label="agent:small-job",
+                task_label="agent:task",
                 coding_guidelines_path="docs/python_style.md",
                 design_docs_dir="docs/design",
                 allowed_users=frozenset(login.lower() for login in allowed_users),
                 local_clone_source=None,
                 remote_url=None,
+                release_task_script="scripts/release.sh",
                 required_tests=required_tests,
                 test_file_regex=compiled_test_file_regex,
                 pr_actions_feedback_policy=pr_actions_feedback_policy,
@@ -12360,3 +12785,704 @@ def test_operator_helper_functions_cover_fallbacks(monkeypatch: pytest.MonkeyPat
         source_comment_url="https://x",
     )
     assert "Source command: https://x" in rendered
+
+
+def _task_issue(
+    *,
+    number: int = 7,
+    title: str = "release v1.2.3",
+    author_login: str = "issue-author",
+) -> Issue:
+    return Issue(
+        number=number,
+        title=title,
+        body="",
+        html_url=f"https://example/issues/{number}",
+        labels=("agent:task",),
+        author_login=author_login,
+    )
+
+
+def test_resolve_issue_flow_skips_task_label() -> None:
+    issue = Issue(
+        number=99,
+        title="release v1.2.3",
+        body="",
+        html_url="https://example/issues/99",
+        labels=("agent:task", "agent:bugfix"),
+        author_login="issue-author",
+    )
+    assert (
+        _resolve_issue_flow(
+            issue=issue,
+            design_label="agent:design",
+            bugfix_label="agent:bugfix",
+            small_job_label="agent:small-job",
+            task_label="agent:task",
+            ignore_label="agent:ignore",
+        )
+        is None
+    )
+
+
+def test_triggered_task_helper_json_and_render_functions(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = TriggeredTaskRequest(
+        task_kind="release",
+        resource_key="v1.2.3",
+        requested_tag="v1.2.3",
+        source_text="release v1.2.3",
+    )
+    raw = _triggered_task_request_json(request)
+    parsed = _triggered_task_request_from_json(raw)
+    assert parsed == request
+    assert _triggered_task_request_from_json("{") is None
+    assert _triggered_task_request_from_json("[]") is None
+    assert _triggered_task_request_from_json('{"task_kind":"docs"}') is None
+    assert (
+        _triggered_task_request_from_json(
+            '{"task_kind":"release","resource_key":"","requested_tag":"x","source_text":"x"}'
+        )
+        is None
+    )
+    assert (
+        _triggered_task_request_from_json(
+            '{"task_kind":"release","resource_key":"x","requested_tag":"","source_text":"x"}'
+        )
+        is None
+    )
+    assert (
+        _triggered_task_request_from_json(
+            '{"task_kind":"release","resource_key":"x","requested_tag":"x","source_text":""}'
+        )
+        is None
+    )
+    original_json_loads = json.loads
+    monkeypatch.setattr("mergexo.orchestrator.json.loads", lambda _: {1: "x"})
+    assert _triggered_task_request_from_json(raw) is None
+    monkeypatch.setattr("mergexo.orchestrator.json.loads", original_json_loads)
+
+    snapshot = TriggeredTaskSnapshot(schema_version=1, task_kind="release", payload={"x": 1})
+    assert json.loads(_triggered_task_snapshot_json(snapshot))["payload"] == {"x": 1}
+
+    execution = TriggeredTaskExecutionResult(
+        success=True,
+        detail="ok",
+        stdout_tail="out",
+        stderr_tail="err",
+        observed_tag_sha="abc",
+    )
+    encoded_execution = json.loads(_triggered_task_execution_json(execution))
+    assert encoded_execution["success"] is True
+    assert encoded_execution["detail"] == "ok"
+    encoded_fallback = json.loads(_triggered_task_execution_json(object()))
+    assert encoded_fallback["success"] is False
+    assert encoded_fallback["detail"] == ""
+
+    rendered = _render_triggered_task_failed_comment(
+        task_kind="release",
+        requested_tag="v1.2.3",
+        detail="failed",
+        stdout_tail="a",
+        stderr_tail="b",
+    )
+    assert "stdout tail" in rendered
+    assert "stderr tail" in rendered
+
+
+def test_active_task_run_id_for_issue_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    github = FakeGitHub([])
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    monkeypatch.setattr("mergexo.orchestrator.time.sleep", lambda _: None)
+    assert orch._active_task_run_id_for_issue(7) is None
+
+    fut: Future[str] = Future()
+    orch._running_tasks[7] = _TaskFuture(
+        issue_number=7,
+        run_id="task-run-7",
+        task_kind="release",
+        resource_key="v1.2.3",
+        future=fut,
+    )
+    assert orch._active_task_run_id_for_issue(7) == "task-run-7"
+
+
+def test_select_triggered_task_handler_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    github = FakeGitHub([])
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    none_handler = FakeTriggeredTaskHandler()
+    none_handler._request = None
+    match_handler = FakeTriggeredTaskHandler()
+    orch._task_handlers = (none_handler, match_handler)
+    selected = orch._select_triggered_task_handler(_task_issue())
+    assert selected is not None
+    assert selected[0] is match_handler
+
+    orch._task_handlers = (none_handler,)
+    assert orch._select_triggered_task_handler(_task_issue()) is None
+
+
+def test_enqueue_triggered_tasks_paths_and_claiming(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    issues = [
+        _task_issue(number=1, title="not a task", author_login="issue-author"),
+        _task_issue(number=2, title="release v1.2.3", author_login="outsider"),
+        _task_issue(number=3, title="release v1.2.3", author_login="issue-author"),
+        _task_issue(number=4, title="release v2.0.0", author_login="issue-author"),
+    ]
+    state = FakeState()
+    state.claim_blocked_task_issue_numbers.add(3)
+    github = FakeGitHub(issues)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._process_triggered_task_worker = lambda issue, handler, request: "completed"  # type: ignore[method-assign]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        orch._enqueue_triggered_tasks(pool)
+
+    assert github.requested_task_label == "agent:task"
+    assert any(issue_number == 1 for issue_number, _body in github.comments)
+    assert any(issue_number == 2 for issue_number, _body in github.comments)
+    assert any(
+        run_kind == "task_flow" and issue_number == 4
+        for run_kind, _run_id, issue_number, _pr in state.run_starts
+    )
+    assert 4 in orch._running_tasks
+
+
+def test_enqueue_triggered_tasks_capacity_and_already_running_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    github = FakeGitHub([_task_issue(number=7)])
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    # Force capacity-full return path.
+    orch._work_limiter.try_acquire = lambda: False  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        orch._enqueue_triggered_tasks(pool)
+
+    # Force already-running path that reserves then releases a slot in finally.
+    orch._work_limiter.try_acquire = lambda: True  # type: ignore[method-assign]
+    pending: Future[str] = Future()
+    orch._running_tasks[7] = _TaskFuture(
+        issue_number=7,
+        run_id="task-run-7",
+        task_kind="release",
+        resource_key="v1.2.3",
+        future=pending,
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        orch._enqueue_triggered_tasks(pool)
+
+
+def test_poll_and_setup_include_triggered_task_steps(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    github = FakeGitHub([])
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    steps: list[str] = []
+
+    def fake_run_poll_step(step_name: str, fn):  # type: ignore[no-untyped-def]
+        _ = fn
+        steps.append(step_name)
+        return True
+
+    orch._run_poll_step = lambda *, step_name, fn: fake_run_poll_step(step_name, fn)  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        orch.poll_once(pool)
+    assert "reconcile_interrupted_executing_tasks" in steps
+    assert "enqueue_triggered_tasks" in steps
+
+
+def test_reconcile_interrupted_executing_tasks_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    github = FakeGitHub([])
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    state.issue_tasks[1] = IssueTaskState(
+        repo_full_name="",
+        issue_number=1,
+        task_kind="release",
+        resource_key="v1",
+        status="executing",
+        request_json="{bad",
+        snapshot_json=None,
+        review_json=None,
+        execution_json=None,
+        last_error=None,
+        active_run_id=None,
+        created_at="now",
+        updated_at="now",
+    )
+    state.issue_tasks[2] = IssueTaskState(
+        repo_full_name="",
+        issue_number=2,
+        task_kind="docs",
+        resource_key="x",
+        status="executing",
+        request_json=_triggered_task_request_json(
+            TriggeredTaskRequest(
+                task_kind="release",
+                resource_key="v2",
+                requested_tag="v2",
+                source_text="release v2",
+            )
+        ),
+        snapshot_json=None,
+        review_json=None,
+        execution_json=None,
+        last_error=None,
+        active_run_id=None,
+        created_at="now",
+        updated_at="now",
+    )
+    state.issue_tasks[3] = IssueTaskState(
+        repo_full_name="",
+        issue_number=3,
+        task_kind="release",
+        resource_key="v3",
+        status="executing",
+        request_json=_triggered_task_request_json(
+            TriggeredTaskRequest(
+                task_kind="release",
+                resource_key="v3",
+                requested_tag="v3",
+                source_text="release v3",
+            )
+        ),
+        snapshot_json=None,
+        review_json=None,
+        execution_json=None,
+        last_error=None,
+        active_run_id=None,
+        created_at="now",
+        updated_at="now",
+    )
+    state.issue_tasks[4] = IssueTaskState(
+        repo_full_name="",
+        issue_number=4,
+        task_kind="release",
+        resource_key="v4",
+        status="executing",
+        request_json=_triggered_task_request_json(
+            TriggeredTaskRequest(
+                task_kind="release",
+                resource_key="v4",
+                requested_tag="v4",
+                source_text="release v4",
+            )
+        ),
+        snapshot_json=None,
+        review_json=None,
+        execution_json=None,
+        last_error=None,
+        active_run_id=None,
+        created_at="now",
+        updated_at="now",
+    )
+    state.issue_tasks[5] = IssueTaskState(
+        repo_full_name="",
+        issue_number=5,
+        task_kind="release",
+        resource_key="v5",
+        status="executing",
+        request_json=_triggered_task_request_json(
+            TriggeredTaskRequest(
+                task_kind="release",
+                resource_key="v5",
+                requested_tag="v5",
+                source_text="release v5",
+            )
+        ),
+        snapshot_json=None,
+        review_json=None,
+        execution_json=None,
+        last_error=None,
+        active_run_id="still-running",
+        created_at="now",
+        updated_at="now",
+    )
+    github.tag_sha_by_name["v3"] = "abc123"
+
+    orch._reconcile_interrupted_executing_tasks()
+
+    by_issue = {issue: status for issue, status, _json, _err in state.reconciled_issue_task_updates}
+    assert by_issue[1] == "failed"
+    assert by_issue[2] == "failed"
+    assert by_issue[3] == "completed"
+    assert by_issue[4] == "failed"
+    assert 5 not in by_issue
+
+
+def test_process_triggered_task_worker_and_lifecycle_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    issue = _task_issue(number=10)
+    github = FakeGitHub([issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    agent = FakeAgent()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    # Wrapper path
+    orch._process_triggered_task = lambda **kwargs: "completed"  # type: ignore[method-assign]
+    handler = FakeTriggeredTaskHandler()
+    request = TriggeredTaskRequest(
+        task_kind="release",
+        resource_key="v1.2.3",
+        requested_tag="v1.2.3",
+        source_text="release v1.2.3",
+    )
+    assert orch._process_triggered_task_worker(issue, handler, request) == "completed"
+
+    # Restore real method for full path coverage.
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    run_id = state.claim_issue_task_run_start(
+        issue_number=issue.number,
+        task_kind="release",
+        resource_key="v1.2.3",
+        request_json=_triggered_task_request_json(request),
+        run_id="task-run-10",
+    )
+    assert run_id == "task-run-10"
+    pending: Future[str] = Future()
+    orch._running_tasks[issue.number] = _TaskFuture(
+        issue_number=issue.number,
+        run_id="task-run-10",
+        task_kind="release",
+        resource_key="v1.2.3",
+        future=pending,
+    )
+    assert (
+        orch._process_triggered_task(issue=issue, handler=handler, request=request) == "completed"
+    )
+    task_state = state.get_issue_task_state(issue.number)
+    assert task_state is not None
+    assert task_state.status == "completed"
+    assert handler.collect_calls
+    assert handler.execute_calls
+
+    agent.triggered_task_review_result = TriggeredTaskReviewResult(
+        decision="reject",
+        reason="not ready",
+    )
+    run_id_2 = state.claim_issue_task_run_start(
+        issue_number=11,
+        task_kind="release",
+        resource_key="v1.2.4",
+        request_json=_triggered_task_request_json(
+            TriggeredTaskRequest(
+                task_kind="release",
+                resource_key="v1.2.4",
+                requested_tag="v1.2.4",
+                source_text="release v1.2.4",
+            )
+        ),
+        run_id="task-run-11",
+    )
+    assert run_id_2 == "task-run-11"
+    orch._running_tasks[11] = _TaskFuture(
+        issue_number=11,
+        run_id="task-run-11",
+        task_kind="release",
+        resource_key="v1.2.4",
+        future=Future(),
+    )
+    rejected = orch._process_triggered_task(
+        issue=_task_issue(number=11, title="release v1.2.4"),
+        handler=handler,
+        request=TriggeredTaskRequest(
+            task_kind="release",
+            resource_key="v1.2.4",
+            requested_tag="v1.2.4",
+            source_text="release v1.2.4",
+        ),
+    )
+    assert rejected == "rejected"
+
+    agent.triggered_task_review_result = TriggeredTaskReviewResult(
+        decision="approve",
+        reason="ok",
+    )
+    handler.execution_result = TriggeredTaskExecutionResult(
+        success=False,
+        detail="script failed",
+        stdout_tail="out",
+        stderr_tail="err",
+        observed_tag_sha=None,
+    )
+    run_id_3 = state.claim_issue_task_run_start(
+        issue_number=12,
+        task_kind="release",
+        resource_key="v1.2.5",
+        request_json=_triggered_task_request_json(
+            TriggeredTaskRequest(
+                task_kind="release",
+                resource_key="v1.2.5",
+                requested_tag="v1.2.5",
+                source_text="release v1.2.5",
+            )
+        ),
+        run_id="task-run-12",
+    )
+    assert run_id_3 == "task-run-12"
+    orch._running_tasks[12] = _TaskFuture(
+        issue_number=12,
+        run_id="task-run-12",
+        task_kind="release",
+        resource_key="v1.2.5",
+        future=Future(),
+    )
+    failed = orch._process_triggered_task(
+        issue=_task_issue(number=12, title="release v1.2.5"),
+        handler=handler,
+        request=TriggeredTaskRequest(
+            task_kind="release",
+            resource_key="v1.2.5",
+            requested_tag="v1.2.5",
+            source_text="release v1.2.5",
+        ),
+    )
+    assert failed == "failed"
+
+    with pytest.raises(RuntimeError, match="missing active triggered-task run"):
+        orch._process_triggered_task(
+            issue=_task_issue(number=99),
+            handler=handler,
+            request=request,
+        )
+
+
+def test_reap_finished_handles_task_success_and_failure_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    github = FakeGitHub([])
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    for issue_number, worker_status in ((1, "completed"), (2, "rejected"), (3, "failed")):
+        state.claim_issue_task_run_start(
+            issue_number=issue_number,
+            task_kind="release",
+            resource_key=f"v{issue_number}",
+            request_json="{}",
+            run_id=f"run-{issue_number}",
+        )
+        fut: Future[str] = Future()
+        fut.set_result(worker_status)
+        orch._running_tasks[issue_number] = _TaskFuture(
+            issue_number=issue_number,
+            run_id=f"run-{issue_number}",
+            task_kind="release",
+            resource_key=f"v{issue_number}",
+            future=fut,
+        )
+
+    error_future: Future[str] = Future()
+    error_future.set_exception(RuntimeError("boom"))
+    state.claim_issue_task_run_start(
+        issue_number=4,
+        task_kind="release",
+        resource_key="v4",
+        request_json="{}",
+        run_id="run-4",
+    )
+    orch._running_tasks[4] = _TaskFuture(
+        issue_number=4,
+        run_id="run-4",
+        task_kind="release",
+        resource_key="v4",
+        future=error_future,
+    )
+
+    orch._reap_finished()
+
+    assert ("run-1", "completed", None, None) in state.run_finishes
+    assert ("run-2", "blocked", "policy_block", None) in state.run_finishes
+    assert ("run-3", "failed", None, None) in state.run_finishes
+    assert any(
+        run_id == "run-4" and status == "failed"
+        for run_id, status, _cls, _err in state.run_finishes
+    )
+    assert any(issue_number == 4 for issue_number, _body in github.comments)
+    assert state.released_task_claims
+
+
+def test_enqueue_triggered_tasks_skips_takeover_issues(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    issue = Issue(
+        number=20,
+        title="release v1.2.3",
+        body="",
+        html_url="https://example/issues/20",
+        labels=("agent:task", "agent:ignore"),
+        author_login="issue-author",
+    )
+    state = FakeState()
+    state.set_issue_takeover_active(issue_number=20, ignore_active=True)
+    github = FakeGitHub([issue])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        orch._enqueue_triggered_tasks(pool)
+    assert 20 not in orch._running_tasks
+
+
+def test_enqueue_triggered_tasks_already_running_branch(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True, worker_count=2)
+    state = FakeState()
+    issue = _task_issue(number=21)
+    github = FakeGitHub([issue])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    pending: Future[str] = Future()
+    orch._running_tasks[21] = _TaskFuture(
+        issue_number=21,
+        run_id="run-21",
+        task_kind="release",
+        resource_key="v1.2.3",
+        future=pending,
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        orch._enqueue_triggered_tasks(pool)
+    assert orch._running_tasks[21].run_id == "run-21"
+
+
+def test_poll_once_marks_triggered_task_step_failure_as_poll_error(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    called = {"enqueue_triggered_tasks": False}
+
+    def fake_run_poll_step(*, step_name: str, fn):  # type: ignore[no-untyped-def]
+        _ = fn
+        if step_name == "enqueue_triggered_tasks":
+            called["enqueue_triggered_tasks"] = True
+            return False
+        return True
+
+    orch._run_poll_step = fake_run_poll_step  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        orch.poll_once(pool)
+    assert called["enqueue_triggered_tasks"] is True
+
+
+def _prepare_triggered_task_process_orch(
+    tmp_path: Path,
+    *,
+    issue_number: int,
+    execution_success: bool = True,
+) -> tuple[
+    Phase1Orchestrator,
+    FakeState,
+    Issue,
+    FakeTriggeredTaskHandler,
+    TriggeredTaskRequest,
+]:
+    cfg = _config(tmp_path, enable_triggered_tasks=True)
+    state = FakeState()
+    issue = _task_issue(number=issue_number, title=f"release v1.2.{issue_number}")
+    github = FakeGitHub([issue])
+    agent = FakeAgent()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=agent,
+    )
+    request = TriggeredTaskRequest(
+        task_kind="release",
+        resource_key=f"v1.2.{issue_number}",
+        requested_tag=f"v1.2.{issue_number}",
+        source_text=f"release v1.2.{issue_number}",
+    )
+    run_id = state.claim_issue_task_run_start(
+        issue_number=issue_number,
+        task_kind="release",
+        resource_key=request.resource_key,
+        request_json=_triggered_task_request_json(request),
+        run_id=f"task-run-{issue_number}",
+    )
+    assert run_id == f"task-run-{issue_number}"
+    orch._running_tasks[issue_number] = _TaskFuture(
+        issue_number=issue_number,
+        run_id=run_id,
+        task_kind="release",
+        resource_key=request.resource_key,
+        future=Future(),
+    )
+    handler = FakeTriggeredTaskHandler()
+    handler._request = request
+    handler.execution_result = TriggeredTaskExecutionResult(
+        success=execution_success,
+        detail="ok" if execution_success else "failed",
+        stdout_tail=None,
+        stderr_tail=None,
+        observed_tag_sha="abc" if execution_success else None,
+    )
+    return orch, state, issue, handler, request
+
+
+def test_process_triggered_task_raises_when_review_persist_fails(tmp_path: Path) -> None:
+    orch, state, issue, handler, request = _prepare_triggered_task_process_orch(
+        tmp_path, issue_number=30
+    )
+    state.set_issue_task_review = lambda **kwargs: False  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="failed to persist triggered-task review"):
+        orch._process_triggered_task(issue=issue, handler=handler, request=request)
+
+
+def test_process_triggered_task_raises_when_executing_transition_fails(tmp_path: Path) -> None:
+    orch, state, issue, handler, request = _prepare_triggered_task_process_orch(
+        tmp_path, issue_number=31
+    )
+    state.mark_issue_task_executing = lambda **kwargs: False  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="failed to transition triggered task to executing"):
+        orch._process_triggered_task(issue=issue, handler=handler, request=request)
+
+
+def test_process_triggered_task_raises_when_completion_persist_fails(tmp_path: Path) -> None:
+    orch, state, issue, handler, request = _prepare_triggered_task_process_orch(
+        tmp_path, issue_number=32, execution_success=True
+    )
+    state.finalize_issue_task = lambda **kwargs: False  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="failed to persist triggered-task completion"):
+        orch._process_triggered_task(issue=issue, handler=handler, request=request)
+
+
+def test_process_triggered_task_raises_when_failure_persist_fails(tmp_path: Path) -> None:
+    orch, state, issue, handler, request = _prepare_triggered_task_process_orch(
+        tmp_path, issue_number=33, execution_success=False
+    )
+    state.finalize_issue_task = lambda **kwargs: False  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="failed to persist triggered-task failure"):
+        orch._process_triggered_task(issue=issue, handler=handler, request=request)

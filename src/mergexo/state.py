@@ -19,6 +19,7 @@ from mergexo.models import (
     RestartMode,
     RuntimeOperationRecord,
     RuntimeOperationStatus,
+    TriggeredTaskStatus,
 )
 
 
@@ -32,7 +33,13 @@ _TRANSIENT_RETRY_INITIAL_DELAY_SECONDS = 30
 _TRANSIENT_RETRY_MAX_DELAY_SECONDS = 300
 _STALE_RUNNING_RETRY_ERROR = "stale_running_issue_without_active_run"
 PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
-AgentRunKind = Literal["issue_flow", "implementation_flow", "pre_pr_followup", "feedback_turn"]
+AgentRunKind = Literal[
+    "issue_flow",
+    "implementation_flow",
+    "pre_pr_followup",
+    "feedback_turn",
+    "task_flow",
+]
 AgentRunTerminalStatus = Literal[
     "completed",
     "failed",
@@ -245,6 +252,23 @@ class PrFlakeState:
     report_excerpt: str
     full_log_context_markdown: str
     rerun_requested_at: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class IssueTaskState:
+    repo_full_name: str
+    issue_number: int
+    task_kind: str
+    resource_key: str
+    status: TriggeredTaskStatus
+    request_json: str
+    snapshot_json: str | None
+    review_json: str | None
+    execution_json: str | None
+    last_error: str | None
+    active_run_id: str | None
     created_at: str
     updated_at: str
 
@@ -485,6 +509,118 @@ class StateStore:
                     ADD COLUMN takeover_issue_floor_comment_id INTEGER NOT NULL DEFAULT 0
                     """
                 )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS issue_task_state (
+                    repo_full_name TEXT NOT NULL,
+                    issue_number INTEGER NOT NULL,
+                    task_kind TEXT NOT NULL,
+                    resource_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    snapshot_json TEXT NULL,
+                    review_json TEXT NULL,
+                    execution_json TEXT NULL,
+                    last_error TEXT NULL,
+                    active_run_id TEXT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (repo_full_name, issue_number)
+                )
+                """
+            )
+            task_columns = _table_columns(conn, "issue_task_state")
+            if "repo_full_name" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN repo_full_name TEXT NOT NULL DEFAULT '__single_repo__'
+                    """
+                )
+            if "task_kind" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN task_kind TEXT NOT NULL DEFAULT ''
+                    """
+                )
+            if "resource_key" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN resource_key TEXT NOT NULL DEFAULT ''
+                    """
+                )
+            if "status" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN status TEXT NOT NULL DEFAULT 'failed'
+                    """
+                )
+            if "request_json" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'
+                    """
+                )
+            if "snapshot_json" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN snapshot_json TEXT NULL
+                    """
+                )
+            if "review_json" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN review_json TEXT NULL
+                    """
+                )
+            if "execution_json" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN execution_json TEXT NULL
+                    """
+                )
+            if "last_error" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN last_error TEXT NULL
+                    """
+                )
+            if "active_run_id" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN active_run_id TEXT NULL
+                    """
+                )
+            if "created_at" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    """
+                )
+            if "updated_at" not in task_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_task_state
+                    ADD COLUMN updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    """
+                )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_task_state_active_resource
+                ON issue_task_state(repo_full_name, task_kind, resource_key)
+                WHERE status IN ('pending_review', 'approved', 'executing')
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pr_flake_state (
@@ -1120,6 +1256,305 @@ class StateStore:
             )
         return cursor.rowcount > 0
 
+    def claim_issue_task_run_start(
+        self,
+        *,
+        issue_number: int,
+        task_kind: str,
+        resource_key: str,
+        request_json: str,
+        meta_json: str = "{}",
+        run_id: str | None = None,
+        started_at: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> str | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        run_key = run_id if run_id is not None else uuid.uuid4().hex
+        with self._lock, self._connect() as conn:
+            claimed = conn.execute(
+                """
+                UPDATE issue_task_state
+                SET
+                    active_run_id = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND status IN ('pending_review', 'approved', 'executing')
+                  AND active_run_id IS NULL
+                """,
+                (run_key, repo_key, issue_number),
+            )
+            if claimed.rowcount <= 0:
+                try:
+                    claimed = conn.execute(
+                        """
+                        INSERT INTO issue_task_state(
+                            repo_full_name,
+                            issue_number,
+                            task_kind,
+                            resource_key,
+                            status,
+                            request_json,
+                            active_run_id
+                        )
+                        VALUES(?, ?, ?, ?, 'pending_review', ?, ?)
+                        ON CONFLICT(repo_full_name, issue_number) DO NOTHING
+                        """,
+                        (repo_key, issue_number, task_kind, resource_key, request_json, run_key),
+                    )
+                except sqlite3.IntegrityError:
+                    return None
+                if claimed.rowcount <= 0:
+                    return None
+            self._insert_agent_run_start(
+                conn=conn,
+                run_id=run_key,
+                repo_full_name=repo_key,
+                run_kind="task_flow",
+                issue_number=issue_number,
+                pr_number=None,
+                flow=task_kind,
+                branch=None,
+                started_at=started_at,
+                meta_json=meta_json,
+            )
+        return run_key
+
+    def get_issue_task_state(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> IssueTaskState | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    repo_full_name,
+                    issue_number,
+                    task_kind,
+                    resource_key,
+                    status,
+                    request_json,
+                    snapshot_json,
+                    review_json,
+                    execution_json,
+                    last_error,
+                    active_run_id,
+                    created_at,
+                    updated_at
+                FROM issue_task_state
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_issue_task_state_row(row)
+
+    def list_issue_tasks(
+        self,
+        *,
+        statuses: tuple[TriggeredTaskStatus, ...],
+        repo_full_name: str | None = None,
+    ) -> tuple[IssueTaskState, ...]:
+        if not statuses:
+            return ()
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    repo_full_name,
+                    issue_number,
+                    task_kind,
+                    resource_key,
+                    status,
+                    request_json,
+                    snapshot_json,
+                    review_json,
+                    execution_json,
+                    last_error,
+                    active_run_id,
+                    created_at,
+                    updated_at
+                FROM issue_task_state
+                WHERE repo_full_name = ?
+                  AND status IN ({placeholders})
+                ORDER BY updated_at ASC, issue_number ASC
+                """,
+                (repo_key, *statuses),
+            ).fetchall()
+        return tuple(_parse_issue_task_state_row(row) for row in rows)
+
+    def set_issue_task_snapshot(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        snapshot_json: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE issue_task_state
+                SET
+                    snapshot_json = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND active_run_id = ?
+                """,
+                (snapshot_json, repo_key, issue_number, run_id),
+            )
+        return cursor.rowcount > 0
+
+    def set_issue_task_review(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        approved: bool,
+        review_json: str,
+        last_error: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        next_status: TriggeredTaskStatus = "approved" if approved else "rejected"
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE issue_task_state
+                SET
+                    status = ?,
+                    review_json = ?,
+                    last_error = ?,
+                    active_run_id = CASE
+                        WHEN ? = 'rejected' THEN NULL
+                        ELSE active_run_id
+                    END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND active_run_id = ?
+                """,
+                (
+                    next_status,
+                    review_json,
+                    last_error,
+                    next_status,
+                    repo_key,
+                    issue_number,
+                    run_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def mark_issue_task_executing(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE issue_task_state
+                SET
+                    status = 'executing',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND status = 'approved'
+                  AND active_run_id = ?
+                """,
+                (repo_key, issue_number, run_id),
+            )
+        return cursor.rowcount > 0
+
+    def finalize_issue_task(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        status: TriggeredTaskStatus,
+        execution_json: str | None,
+        last_error: str | None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE issue_task_state
+                SET
+                    status = ?,
+                    execution_json = ?,
+                    last_error = ?,
+                    active_run_id = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND active_run_id = ?
+                """,
+                (status, execution_json, last_error, repo_key, issue_number, run_id),
+            )
+        return cursor.rowcount > 0
+
+    def reconcile_interrupted_issue_task(
+        self,
+        *,
+        issue_number: int,
+        status: TriggeredTaskStatus,
+        execution_json: str | None,
+        last_error: str | None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE issue_task_state
+                SET
+                    status = ?,
+                    execution_json = ?,
+                    last_error = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND status = 'executing'
+                  AND active_run_id IS NULL
+                """,
+                (status, execution_json, last_error, repo_key, issue_number),
+            )
+        return cursor.rowcount > 0
+
+    def release_issue_task_claim(
+        self,
+        *,
+        issue_number: int,
+        run_id: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE issue_task_state
+                SET
+                    active_run_id = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND issue_number = ?
+                  AND active_run_id = ?
+                """,
+                (repo_key, issue_number, run_id),
+            )
+        return cursor.rowcount > 0
+
     def _insert_agent_run_start(
         self,
         *,
@@ -1339,6 +1774,20 @@ class StateStore:
                         )
                     """
                 )
+                conn.execute(
+                    """
+                    UPDATE issue_task_state
+                    SET active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE active_run_id IS NOT NULL
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.run_id = issue_task_state.active_run_id
+                              AND a.finished_at IS NULL
+                        )
+                    """
+                )
             else:
                 cursor = conn.execute(
                     """
@@ -1386,6 +1835,22 @@ class StateStore:
                             SELECT 1
                             FROM agent_run_history AS a
                             WHERE a.run_id = pr_feedback_state.active_run_id
+                              AND a.finished_at IS NULL
+                        )
+                    """,
+                    (repo_key,),
+                )
+                conn.execute(
+                    """
+                    UPDATE issue_task_state
+                    SET active_run_id = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE repo_full_name = ?
+                      AND active_run_id IS NOT NULL
+                      AND NOT EXISTS(
+                            SELECT 1
+                            FROM agent_run_history AS a
+                            WHERE a.run_id = issue_task_state.active_run_id
                               AND a.finished_at IS NULL
                         )
                     """,
@@ -4959,6 +5424,65 @@ def _parse_github_call_outbox_row(row: object) -> GitHubCallOutboxState:
     )
 
 
+def _parse_issue_task_state_row(row: object) -> IssueTaskState:
+    if not isinstance(row, tuple) or len(row) != 13:
+        raise RuntimeError("Invalid issue_task_state row width")
+    (
+        repo_full_name,
+        issue_number,
+        task_kind,
+        resource_key,
+        status,
+        request_json,
+        snapshot_json,
+        review_json,
+        execution_json,
+        last_error,
+        active_run_id,
+        created_at,
+        updated_at,
+    ) = row
+    if not isinstance(repo_full_name, str):
+        raise RuntimeError("Invalid repo_full_name value stored in issue_task_state")
+    if not isinstance(issue_number, int):
+        raise RuntimeError("Invalid issue_number value stored in issue_task_state")
+    if not isinstance(task_kind, str):
+        raise RuntimeError("Invalid task_kind value stored in issue_task_state")
+    if not isinstance(resource_key, str):
+        raise RuntimeError("Invalid resource_key value stored in issue_task_state")
+    if not isinstance(request_json, str):
+        raise RuntimeError("Invalid request_json value stored in issue_task_state")
+    if snapshot_json is not None and not isinstance(snapshot_json, str):
+        raise RuntimeError("Invalid snapshot_json value stored in issue_task_state")
+    if review_json is not None and not isinstance(review_json, str):
+        raise RuntimeError("Invalid review_json value stored in issue_task_state")
+    if execution_json is not None and not isinstance(execution_json, str):
+        raise RuntimeError("Invalid execution_json value stored in issue_task_state")
+    if last_error is not None and not isinstance(last_error, str):
+        raise RuntimeError("Invalid last_error value stored in issue_task_state")
+    if active_run_id is not None and not isinstance(active_run_id, str):
+        raise RuntimeError("Invalid active_run_id value stored in issue_task_state")
+    if not isinstance(created_at, str):
+        raise RuntimeError("Invalid created_at value stored in issue_task_state")
+    if not isinstance(updated_at, str):
+        raise RuntimeError("Invalid updated_at value stored in issue_task_state")
+    return IssueTaskState(
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        task_kind=task_kind,
+        resource_key=resource_key,
+        status=_parse_triggered_task_status(status),
+        request_json=request_json,
+        snapshot_json=snapshot_json,
+        review_json=review_json,
+        execution_json=execution_json,
+        last_error=last_error,
+        active_run_id=active_run_id,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
 def _parse_operator_command_status(value: object) -> OperatorCommandStatus:
     if not isinstance(value, str):
         raise RuntimeError("Invalid status value stored in operator_commands")
@@ -5032,3 +5556,11 @@ def _parse_action_token_status(value: object) -> ActionTokenStatus:
     if value not in {"planned", "posted", "observed", "failed"}:
         raise RuntimeError(f"Unknown status value stored in action_tokens: {value}")
     return cast(ActionTokenStatus, value)
+
+
+def _parse_triggered_task_status(value: object) -> TriggeredTaskStatus:
+    if not isinstance(value, str):
+        raise RuntimeError("Invalid status value stored in issue_task_state")
+    if value not in {"pending_review", "rejected", "approved", "executing", "completed", "failed"}:
+        raise RuntimeError(f"Unknown status value stored in issue_task_state: {value}")
+    return cast(TriggeredTaskStatus, value)

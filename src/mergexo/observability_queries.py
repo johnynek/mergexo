@@ -568,7 +568,7 @@ def _load_metrics(
             AVG(duration_seconds * duration_seconds) AS mean_runtime_sq
         FROM agent_run_history
         WHERE finished_at IS NOT NULL
-          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup')
+          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup', 'task_flow')
           AND terminal_status IN ('completed', 'failed', 'blocked', 'interrupted')
           AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
           {repo_clause}
@@ -595,7 +595,7 @@ def _load_metrics(
             AVG(duration_seconds * duration_seconds) AS mean_runtime_sq
         FROM agent_run_history
         WHERE finished_at IS NOT NULL
-          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup')
+          AND run_kind IN ('issue_flow', 'implementation_flow', 'pre_pr_followup', 'task_flow')
           AND terminal_status IN ('completed', 'failed', 'blocked', 'interrupted')
           AND finished_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)
           {repo_clause}

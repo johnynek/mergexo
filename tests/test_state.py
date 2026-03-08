@@ -9,6 +9,7 @@ from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
 from mergexo.state import (
     ActionTokenObservation,
+    IssueTaskState,
     PollCursorUpdate,
     StateStore,
     _normalize_repo_full_name,
@@ -24,9 +25,11 @@ from mergexo.state import (
     _parse_poll_cursor_row,
     _parse_operator_command_status,
     _parse_pre_pr_followup_flow,
+    _parse_issue_task_state_row,
     _parse_restart_mode,
     _parse_runtime_operation_row,
     _parse_runtime_operation_status,
+    _parse_triggered_task_status,
     _table_columns,
     _transient_retry_delay_seconds,
 )
@@ -79,6 +82,60 @@ def _get_pr_feedback_active_run_id(db_path: Path, pr_number: int) -> str | None:
         active_run_id = row[0]
         assert active_run_id is None or isinstance(active_run_id, str)
         return active_run_id
+    finally:
+        conn.close()
+
+
+def _get_issue_task_row(
+    db_path: Path, issue_number: int
+) -> tuple[str, str, str, str, str | None, str | None, str | None, str | None]:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                task_kind,
+                resource_key,
+                status,
+                request_json,
+                snapshot_json,
+                review_json,
+                execution_json,
+                active_run_id
+            FROM issue_task_state
+            WHERE issue_number = ?
+            """,
+            (issue_number,),
+        ).fetchone()
+        assert row is not None
+        (
+            task_kind,
+            resource_key,
+            status,
+            request_json,
+            snapshot_json,
+            review_json,
+            execution_json,
+            active_run_id,
+        ) = row
+        assert isinstance(task_kind, str)
+        assert isinstance(resource_key, str)
+        assert isinstance(status, str)
+        assert isinstance(request_json, str)
+        assert snapshot_json is None or isinstance(snapshot_json, str)
+        assert review_json is None or isinstance(review_json, str)
+        assert execution_json is None or isinstance(execution_json, str)
+        assert active_run_id is None or isinstance(active_run_id, str)
+        return (
+            task_kind,
+            resource_key,
+            status,
+            request_json,
+            snapshot_json,
+            review_json,
+            execution_json,
+            active_run_id,
+        )
     finally:
         conn.close()
 
@@ -3260,3 +3317,251 @@ def test_parse_github_call_outbox_row_rejects_invalid_field_types(
     row[index] = bad_value
     with pytest.raises(RuntimeError, match=message):
         _parse_github_call_outbox_row(tuple(row))
+
+
+def test_state_store_issue_task_schema_backfills_legacy_columns(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE issue_task_state (
+                issue_number INTEGER PRIMARY KEY
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = StateStore(db_path)
+    _ = store
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = set(_table_columns(conn, "issue_task_state"))
+        assert "repo_full_name" in columns
+        assert "task_kind" in columns
+        assert "resource_key" in columns
+        assert "status" in columns
+        assert "request_json" in columns
+        assert "snapshot_json" in columns
+        assert "review_json" in columns
+        assert "execution_json" in columns
+        assert "last_error" in columns
+        assert "active_run_id" in columns
+        assert "created_at" in columns
+        assert "updated_at" in columns
+    finally:
+        conn.close()
+
+
+def test_state_store_issue_task_lifecycle_and_claim_release(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    assert store.get_issue_task_state(9999) is None
+    assert store.list_issue_tasks(statuses=()) == ()
+
+    run_id = store.claim_issue_task_run_start(
+        issue_number=10,
+        task_kind="release",
+        resource_key="v1.2.3",
+        request_json='{"requested_tag":"v1.2.3"}',
+        run_id="task-run-10",
+    )
+    assert run_id == "task-run-10"
+    state = store.get_issue_task_state(10)
+    assert state is not None
+    assert state.status == "pending_review"
+    assert state.active_run_id == "task-run-10"
+    assert _get_issue_task_row(tmp_path / "state.db", 10)[0:4] == (
+        "release",
+        "v1.2.3",
+        "pending_review",
+        '{"requested_tag":"v1.2.3"}',
+    )
+
+    # Active resource uniqueness should block same task_kind/resource_key while active.
+    assert (
+        store.claim_issue_task_run_start(
+            issue_number=11,
+            task_kind="release",
+            resource_key="v1.2.3",
+            request_json="{}",
+            run_id="task-run-11",
+        )
+        is None
+    )
+    assert (
+        store.claim_issue_task_run_start(
+            issue_number=12,
+            task_kind="release",
+            resource_key="v1.2.4",
+            request_json="{}",
+            run_id="task-run-12",
+        )
+        == "task-run-12"
+    )
+
+    assert store.set_issue_task_snapshot(
+        issue_number=10,
+        run_id="task-run-10",
+        snapshot_json='{"head":"abc"}',
+    )
+    assert not store.set_issue_task_snapshot(
+        issue_number=10,
+        run_id="wrong",
+        snapshot_json='{"head":"abc"}',
+    )
+    assert store.set_issue_task_review(
+        issue_number=10,
+        run_id="task-run-10",
+        approved=True,
+        review_json='{"decision":"approve"}',
+    )
+    approved_state = store.get_issue_task_state(10)
+    assert approved_state is not None
+    assert approved_state.status == "approved"
+    assert approved_state.active_run_id == "task-run-10"
+
+    assert store.mark_issue_task_executing(issue_number=10, run_id="task-run-10")
+    assert not store.mark_issue_task_executing(issue_number=10, run_id="task-run-10")
+    assert store.finalize_issue_task(
+        issue_number=10,
+        run_id="task-run-10",
+        status="completed",
+        execution_json='{"success":true}',
+        last_error=None,
+    )
+    completed = store.get_issue_task_state(10)
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.active_run_id is None
+    # Existing terminal row should not be re-claimable through insert fallback.
+    assert (
+        store.claim_issue_task_run_start(
+            issue_number=10,
+            task_kind="release",
+            resource_key="v1.2.3",
+            request_json="{}",
+            run_id="task-run-10-retry",
+        )
+        is None
+    )
+
+    assert store.set_issue_task_review(
+        issue_number=12,
+        run_id="task-run-12",
+        approved=False,
+        review_json='{"decision":"reject"}',
+        last_error="blocked",
+    )
+    rejected_state = store.get_issue_task_state(12)
+    assert rejected_state is not None
+    assert rejected_state.status == "rejected"
+    assert rejected_state.active_run_id is None
+    assert not store.release_issue_task_claim(issue_number=12, run_id="task-run-12")
+
+
+def test_state_store_issue_task_reconcile_and_list_filters(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    assert store.claim_issue_task_run_start(
+        issue_number=20,
+        task_kind="release",
+        resource_key="v9.0.0",
+        request_json="{}",
+        run_id="task-run-20",
+    )
+    assert store.set_issue_task_review(
+        issue_number=20,
+        run_id="task-run-20",
+        approved=True,
+        review_json='{"decision":"approve"}',
+    )
+    assert store.mark_issue_task_executing(issue_number=20, run_id="task-run-20")
+    assert store.release_issue_task_claim(issue_number=20, run_id="task-run-20")
+
+    assert store.reconcile_interrupted_issue_task(
+        issue_number=20,
+        status="failed",
+        execution_json='{"detail":"interrupted"}',
+        last_error="interrupted",
+    )
+    listed = store.list_issue_tasks(statuses=("failed",))
+    assert [row.issue_number for row in listed] == [20]
+    assert listed[0].execution_json == '{"detail":"interrupted"}'
+    assert listed[0].last_error == "interrupted"
+    assert not store.reconcile_interrupted_issue_task(
+        issue_number=20,
+        status="failed",
+        execution_json=None,
+        last_error=None,
+    )
+
+
+def test_parse_issue_task_row_and_status_parsers() -> None:
+    valid_row = (
+        "o/r",
+        7,
+        "release",
+        "v1.2.3",
+        "pending_review",
+        '{"requested_tag":"v1.2.3"}',
+        None,
+        None,
+        None,
+        None,
+        "run-7",
+        "2026-03-03T00:00:00.000Z",
+        "2026-03-03T00:00:00.000Z",
+    )
+    parsed = _parse_issue_task_state_row(valid_row)
+    assert isinstance(parsed, IssueTaskState)
+    assert parsed.status == "pending_review"
+    assert _parse_triggered_task_status("approved") == "approved"
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        _parse_triggered_task_status(7)
+    with pytest.raises(RuntimeError, match="Unknown status value"):
+        _parse_triggered_task_status("invalid")
+
+    with pytest.raises(RuntimeError, match="row width"):
+        _parse_issue_task_state_row(("only",))
+    with pytest.raises(RuntimeError, match="task_kind"):
+        _parse_issue_task_state_row((valid_row[0], valid_row[1], 1, *valid_row[3:]))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("index", "bad_value", "message"),
+    [
+        (0, 1, "repo_full_name"),
+        (1, "x", "issue_number"),
+        (3, 1, "resource_key"),
+        (5, 1, "request_json"),
+        (6, 1, "snapshot_json"),
+        (7, 1, "review_json"),
+        (8, 1, "execution_json"),
+        (9, 1, "last_error"),
+        (10, 1, "active_run_id"),
+        (11, 1, "created_at"),
+        (12, 1, "updated_at"),
+    ],
+)
+def test_parse_issue_task_row_rejects_invalid_field_types(
+    index: int, bad_value: object, message: str
+) -> None:
+    row: list[object] = [
+        "o/r",
+        7,
+        "release",
+        "v1.2.3",
+        "approved",
+        '{"requested_tag":"v1.2.3"}',
+        None,
+        None,
+        None,
+        None,
+        "run-7",
+        "2026-03-03T00:00:00.000Z",
+        "2026-03-03T00:00:00.000Z",
+    ]
+    row[index] = bad_value
+    with pytest.raises(RuntimeError, match=message):
+        _parse_issue_task_state_row(tuple(row))

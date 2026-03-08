@@ -339,6 +339,71 @@ def test_start_implementation_from_design_happy_path(
     assert result.session.thread_id == "thread-impl"
 
 
+def test_review_triggered_task_happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert "triggered-task review agent" in input_text
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "decision": "approve",
+                    "reason": "CI is green and tag does not exist",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    adapter = CodexAdapter(_enabled_config())
+    review = adapter.review_triggered_task(
+        issue_number=12,
+        task_kind="release",
+        prompt="You are the triggered-task review agent",
+        cwd=tmp_path,
+    )
+
+    assert review.decision == "approve"
+    assert review.reason == "CI is green and tag does not exist"
+
+
+def test_review_triggered_task_rejects_invalid_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, input_text, check
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps({"decision": "maybe", "reason": "unclear"}),
+            encoding="utf-8",
+        )
+        return ""
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(RuntimeError, match="approve or reject"):
+        adapter.review_triggered_task(
+            issue_number=12,
+            task_kind="release",
+            prompt="review prompt",
+            cwd=tmp_path,
+        )
+
+
 def test_respond_to_feedback_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -469,6 +534,19 @@ def test_start_bugfix_from_issue_rejects_disabled(tmp_path: Path) -> None:
             repo_full_name="johnynek/mergexo",
             default_branch="main",
             coding_guidelines_path="docs/python_style.md",
+            cwd=tmp_path,
+        )
+
+
+def test_review_triggered_task_rejects_disabled(tmp_path: Path) -> None:
+    adapter = CodexAdapter(
+        CodexConfig(enabled=False, model=None, sandbox=None, profile=None, extra_args=())
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        adapter.review_triggered_task(
+            issue_number=1,
+            task_kind="release",
+            prompt="review",
             cwd=tmp_path,
         )
 

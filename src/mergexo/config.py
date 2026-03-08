@@ -16,6 +16,7 @@ class RuntimeConfig:
     poll_interval_seconds: int
     enable_github_operations: bool = False
     enable_issue_comment_routing: bool = False
+    enable_triggered_tasks: bool = False
     enable_pr_actions_monitoring: bool = False
     enable_incremental_comment_fetch: bool = False
     comment_fetch_overlap_seconds: int = 5
@@ -46,6 +47,9 @@ class RepoConfig:
     allowed_users: frozenset[str]
     local_clone_source: str | None
     remote_url: str | None
+    task_label: str = "agent:task"
+    release_task_script: str | None = None
+    release_request_regex: str | None = None
     required_tests: str | None = None
     test_file_regex: tuple[re.Pattern[str], ...] | None = None
     pr_actions_feedback_policy: PrActionsFeedbackPolicy | None = None
@@ -142,6 +146,7 @@ def load_config(path: Path) -> AppConfig:
         enable_issue_comment_routing=_bool_with_default(
             runtime_data, "enable_issue_comment_routing", False
         ),
+        enable_triggered_tasks=_bool_with_default(runtime_data, "enable_triggered_tasks", False),
         enable_pr_actions_monitoring=_bool_with_default(
             runtime_data, "enable_pr_actions_monitoring", False
         ),
@@ -207,6 +212,21 @@ def load_config(path: Path) -> AppConfig:
         )
 
     repos = _load_repo_configs(repo_data=repo_data, auth_data=auth_data)
+    for repo in repos:
+        release_request_regex = repo.release_request_regex
+        if release_request_regex is not None:
+            try:
+                re.compile(release_request_regex)
+            except re.error as exc:
+                raise ConfigError(
+                    "repo.release_request_regex contains invalid regex "
+                    f"{release_request_regex!r}: {exc}"
+                ) from exc
+        if runtime.enable_triggered_tasks and not repo.release_task_script:
+            raise ConfigError(
+                "repo.release_task_script is required when runtime.enable_triggered_tasks=true "
+                f"(repo={repo.repo_id})"
+            )
 
     codex = _parse_codex_config(codex_data=codex_data)
     codex_overrides = _load_codex_overrides(codex_data=codex_data, repos=repos, defaults=codex)
@@ -296,11 +316,14 @@ def _parse_repo_config(
         trigger_label=_str_with_default(repo_data, "trigger_label", "agent:design"),
         bugfix_label=_str_with_default(repo_data, "bugfix_label", "agent:bugfix"),
         small_job_label=_str_with_default(repo_data, "small_job_label", "agent:small-job"),
+        task_label=_str_with_default(repo_data, "task_label", "agent:task"),
         coding_guidelines_path=_require_str(repo_data, "coding_guidelines_path"),
         design_docs_dir=_str_with_default(repo_data, "design_docs_dir", "docs/design"),
         allowed_users=allowed_users,
         local_clone_source=_optional_str(repo_data, "local_clone_source"),
         remote_url=_optional_str(repo_data, "remote_url"),
+        release_task_script=_optional_str(repo_data, "release_task_script"),
+        release_request_regex=_optional_str(repo_data, "release_request_regex"),
         required_tests=_optional_str(repo_data, "required_tests"),
         test_file_regex=_optional_regex_list(repo_data, "test_file_regex"),
         pr_actions_feedback_policy=_optional_pr_actions_feedback_policy(

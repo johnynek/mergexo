@@ -12,6 +12,7 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    TriggeredTaskDecision,
 )
 
 
@@ -68,6 +69,12 @@ class FeedbackTurn:
     review_comments: tuple[PullRequestReviewComment, ...]
     issue_comments: tuple[PullRequestIssueComment, ...]
     changed_files: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TriggeredTaskReviewResult:
+    decision: TriggeredTaskDecision
+    reason: str
 
 
 class AgentAdapter(ABC):
@@ -132,3 +139,14 @@ class AgentAdapter(ABC):
         cwd: Path,
     ) -> FeedbackResult:
         """Produce reply actions for a review feedback turn within the same PR session."""
+
+    @abstractmethod
+    def review_triggered_task(
+        self,
+        *,
+        issue_number: int,
+        task_kind: str,
+        prompt: str,
+        cwd: Path,
+    ) -> TriggeredTaskReviewResult:
+        """Review a triggered task request and return an approve/reject decision."""

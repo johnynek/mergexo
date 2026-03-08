@@ -34,6 +34,11 @@ from mergexo.feedback_loop import (
     compute_pre_pr_checkpoint_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
+    compute_task_completed_token,
+    compute_task_execution_started_token,
+    compute_task_failed_token,
+    compute_task_rejected_token,
+    compute_task_snapshot_recorded_token,
     compute_turn_key,
     event_key,
     extract_action_tokens,
@@ -67,6 +72,7 @@ from mergexo.models import (
     WorkflowJobSnapshot,
     WorkflowRunSnapshot,
     WorkResult,
+    TriggeredTaskRequest,
 )
 from mergexo.observability import log_event, logging_repo_context
 from mergexo.prompts import (
@@ -91,6 +97,7 @@ from mergexo.state import (
     StateStore,
     TrackedPullRequestState,
 )
+from mergexo.task_handlers import ReleaseTaskHandler, TriggeredTaskHandler, TriggeredTaskSnapshot
 
 
 LOGGER = logging.getLogger("mergexo.orchestrator")
@@ -146,6 +153,15 @@ class _SlotLease:
 class _FeedbackFuture:
     issue_number: int
     run_id: str
+    future: Future[str]
+
+
+@dataclass(frozen=True)
+class _TaskFuture:
+    issue_number: int
+    run_id: str
+    task_kind: str
+    resource_key: str
     future: Future[str]
 
 
@@ -322,6 +338,7 @@ class Phase1Orchestrator:
         self._running: dict[int, Future[WorkResult]] = {}
         self._running_issue_metadata: dict[int, _RunningIssueMetadata] = {}
         self._running_feedback: dict[int, _FeedbackFuture] = {}
+        self._running_tasks: dict[int, _TaskFuture] = {}
         self._run_meta_cache: dict[str, dict[str, object]] = {}
         self._running_lock = threading.Lock()
         self._poll_setup_done = False
@@ -337,6 +354,9 @@ class Phase1Orchestrator:
         self._poll_issue_cache: dict[int, Issue] = {}
         self._poll_takeover_synced_issue_numbers: set[int] = set()
         self._poll_takeover_active_issue_numbers: set[int] = set()
+        self._task_handlers: tuple[TriggeredTaskHandler, ...] = (
+            ReleaseTaskHandler(repo=self._repo),
+        )
 
     def run(self, *, once: bool) -> None:
         with logging_repo_context(self._repo.full_name):
@@ -420,6 +440,12 @@ class Phase1Orchestrator:
                     fn=self._repair_failed_no_staged_change_runs,
                 ):
                     poll_had_github_errors = True
+                if self._config.runtime.enable_triggered_tasks:
+                    if not self._run_poll_step(
+                        step_name="enqueue_triggered_tasks",
+                        fn=lambda: self._enqueue_triggered_tasks(pool),
+                    ):
+                        poll_had_github_errors = True
                 if not self._run_poll_step(
                     step_name="enqueue_new_work",
                     fn=lambda: self._enqueue_new_work(pool),
@@ -462,6 +488,7 @@ class Phase1Orchestrator:
                 "poll_completed",
                 running_issue_count=len(self._running),
                 running_feedback_count=len(self._running_feedback),
+                running_task_count=len(self._running_tasks),
                 draining_for_restart=not enqueue_allowed,
                 draining_for_github_auth=self._github_auth_shutdown_pending,
                 poll_had_github_errors=poll_had_github_errors,
@@ -470,11 +497,11 @@ class Phase1Orchestrator:
 
     def pending_work_count(self) -> int:
         with self._running_lock:
-            return len(self._running) + len(self._running_feedback)
+            return len(self._running) + len(self._running_feedback) + len(self._running_tasks)
 
     def queue_counts(self) -> tuple[int, int]:
         with self._running_lock:
-            return len(self._running), len(self._running_feedback)
+            return len(self._running) + len(self._running_tasks), len(self._running_feedback)
 
     def in_flight_work_count(self) -> int:
         return self._work_limiter.in_flight()
@@ -529,6 +556,11 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
                 reconciled_count=reconciled_issue_runs_count,
             )
+        if self._config.runtime.enable_triggered_tasks:
+            self._run_poll_step(
+                step_name="reconcile_interrupted_executing_tasks",
+                fn=self._reconcile_interrupted_executing_tasks,
+            )
         self._state.prune_observability_history(
             retention_days=self._config.runtime.observability_history_retention_days,
             repo_full_name=self._state_repo_full_name(),
@@ -543,6 +575,69 @@ class Phase1Orchestrator:
     def _is_restart_pending(self) -> bool:
         operation = self._state.get_runtime_operation(_RESTART_OPERATION_NAME)
         return operation is not None and operation.status in _RESTART_PENDING_STATUSES
+
+    def _reconcile_interrupted_executing_tasks(self) -> None:
+        tasks = self._state.list_issue_tasks(
+            statuses=("executing",),
+            repo_full_name=self._state_repo_full_name(),
+        )
+        for task in tasks:
+            if task.active_run_id is not None:
+                continue
+            request = _triggered_task_request_from_json(task.request_json)
+            if request is None:
+                self._state.reconcile_interrupted_issue_task(
+                    issue_number=task.issue_number,
+                    status="failed",
+                    execution_json=None,
+                    last_error="interrupted_during_execution_invalid_request",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                continue
+            if task.task_kind != "release":
+                self._state.reconcile_interrupted_issue_task(
+                    issue_number=task.issue_number,
+                    status="failed",
+                    execution_json=None,
+                    last_error=f"interrupted_during_execution_unsupported_task_kind:{task.task_kind}",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                continue
+            observed_tag_sha = self._github.get_tag_sha(request.requested_tag)
+            if observed_tag_sha is not None:
+                self._state.reconcile_interrupted_issue_task(
+                    issue_number=task.issue_number,
+                    status="completed",
+                    execution_json=json.dumps(
+                        {
+                            "success": True,
+                            "detail": ("reconciled after restart: requested tag exists remotely"),
+                            "stdout_tail": None,
+                            "stderr_tail": None,
+                            "observed_tag_sha": observed_tag_sha,
+                        },
+                        sort_keys=True,
+                    ),
+                    last_error=None,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            else:
+                self._state.reconcile_interrupted_issue_task(
+                    issue_number=task.issue_number,
+                    status="failed",
+                    execution_json=json.dumps(
+                        {
+                            "success": False,
+                            "detail": "interrupted_during_execution",
+                            "stdout_tail": None,
+                            "stderr_tail": None,
+                            "observed_tag_sha": None,
+                        },
+                        sort_keys=True,
+                    ),
+                    last_error="interrupted_during_execution",
+                    repo_full_name=self._state_repo_full_name(),
+                )
 
     def _effective_pr_actions_feedback_policy(self) -> PrActionsFeedbackPolicy:
         if self._repo.pr_actions_feedback_policy is not None:
@@ -746,6 +841,160 @@ class Phase1Orchestrator:
             pending_feedback_events_cleared=cleared_event_count,
         )
 
+    def _enqueue_triggered_tasks(self, pool: ThreadPoolExecutor) -> None:
+        issues = self._github.list_open_issues_with_label(self._repo.task_label)
+        log_event(
+            LOGGER,
+            "triggered_tasks_fetched",
+            issue_count=len(issues),
+            task_label=self._repo.task_label,
+        )
+        for issue in issues:
+            if self._is_takeover_active(issue_number=issue.number, issue=issue):
+                log_event(
+                    LOGGER,
+                    "triggered_task_skipped",
+                    issue_number=issue.number,
+                    reason="ignore_label_active",
+                    ignore_label=self._repo.ignore_label,
+                )
+                continue
+            selected = self._select_triggered_task_handler(issue)
+            if selected is None:
+                token = compute_task_failed_token(
+                    issue_number=issue.number,
+                    task_kind="invalid",
+                    resource_key="invalid-request",
+                )
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=issue.number,
+                    token=token,
+                    body=(
+                        "MergeXO could not parse the requested task from this issue.\n\n"
+                        "Expected syntax:\n"
+                        "- `release <tag>`\n"
+                        "- `release: <tag>`"
+                    ),
+                    source="task_parse_failed",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "triggered_task_skipped",
+                    issue_number=issue.number,
+                    reason="unparseable_task_request",
+                )
+                continue
+            handler, request = selected
+            if not self._is_issue_author_allowed(
+                issue_number=issue.number,
+                author_login=issue.author_login,
+                reason="unauthorized_issue_author",
+            ):
+                token = compute_task_rejected_token(
+                    issue_number=issue.number,
+                    task_kind=request.task_kind,
+                    resource_key=request.resource_key,
+                )
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=issue.number,
+                    token=token,
+                    body=(
+                        "MergeXO rejected this task request because the issue author is not "
+                        "allowed by `repo.allowed_users`.\n\n"
+                        f"- author: `{issue.author_login}`"
+                    ),
+                    source="task_authorization_rejected",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                log_event(
+                    LOGGER,
+                    "triggered_task_skipped",
+                    issue_number=issue.number,
+                    task_kind=request.task_kind,
+                    resource_key=request.resource_key,
+                    reason="unauthorized_issue_author",
+                )
+                continue
+
+            capacity_reserved = False
+            try:
+                with self._running_lock:
+                    if not self._has_capacity_locked() or not self._work_limiter.try_acquire():
+                        log_event(
+                            LOGGER,
+                            "triggered_task_skipped",
+                            issue_number=issue.number,
+                            task_kind=request.task_kind,
+                            resource_key=request.resource_key,
+                            reason="worker_capacity_full",
+                        )
+                        return
+                    capacity_reserved = True
+                    if issue.number in self._running_tasks:
+                        log_event(
+                            LOGGER,
+                            "triggered_task_skipped",
+                            issue_number=issue.number,
+                            task_kind=request.task_kind,
+                            resource_key=request.resource_key,
+                            reason="already_running",
+                        )
+                        continue
+
+                run_id = self._state.claim_issue_task_run_start(
+                    issue_number=issue.number,
+                    task_kind=request.task_kind,
+                    resource_key=request.resource_key,
+                    request_json=_triggered_task_request_json(request),
+                    meta_json=_DEFAULT_RUN_META_JSON,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if run_id is None:
+                    log_event(
+                        LOGGER,
+                        "triggered_task_skipped",
+                        issue_number=issue.number,
+                        task_kind=request.task_kind,
+                        resource_key=request.resource_key,
+                        reason="already_claimed_or_resource_locked",
+                    )
+                    continue
+                self._initialize_run_meta_cache(run_id)
+                fut = pool.submit(self._process_triggered_task_worker, issue, handler, request)
+                fut.add_done_callback(lambda _: self._work_limiter.release())
+                capacity_reserved = False
+                with self._running_lock:
+                    self._running_tasks[issue.number] = _TaskFuture(
+                        issue_number=issue.number,
+                        run_id=run_id,
+                        task_kind=request.task_kind,
+                        resource_key=request.resource_key,
+                        future=fut,
+                    )
+                log_event(
+                    LOGGER,
+                    "triggered_task_enqueued",
+                    issue_number=issue.number,
+                    task_kind=request.task_kind,
+                    resource_key=request.resource_key,
+                    task_label=self._repo.task_label,
+                )
+            finally:
+                if capacity_reserved:
+                    self._work_limiter.release()
+
+    def _select_triggered_task_handler(
+        self, issue: Issue
+    ) -> tuple[TriggeredTaskHandler, TriggeredTaskRequest] | None:
+        for handler in self._task_handlers:
+            request = handler.parse_request(issue)
+            if request is not None:
+                return handler, request
+        return None
+
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
         labels = _trigger_labels(self._repo)
         issues = self._github.list_open_issues_with_any_labels(labels)
@@ -778,6 +1027,9 @@ class Phase1Orchestrator:
                 design_label=self._repo.trigger_label,
                 bugfix_label=self._repo.bugfix_label,
                 small_job_label=self._repo.small_job_label,
+                task_label=(
+                    self._repo.task_label if self._config.runtime.enable_triggered_tasks else None
+                ),
                 ignore_label=self._repo.ignore_label,
             )
             if flow is None:
@@ -1606,6 +1858,9 @@ class Phase1Orchestrator:
                 design_label=self._repo.trigger_label,
                 bugfix_label=self._repo.bugfix_label,
                 small_job_label=self._repo.small_job_label,
+                task_label=(
+                    self._repo.task_label if self._config.runtime.enable_triggered_tasks else None
+                ),
                 ignore_label=self._repo.ignore_label,
             )
             if flow is None:
@@ -1950,14 +2205,14 @@ class Phase1Orchestrator:
         return replayed_count
 
     def _has_capacity_locked(self) -> bool:
-        local_active = len(self._running) + len(self._running_feedback)
+        local_active = len(self._running) + len(self._running_feedback) + len(self._running_tasks)
         if local_active >= self._config.runtime.worker_count:
             return False
         return self._work_limiter.in_flight() < self._work_limiter.capacity()
 
     def _active_worker_count(self) -> int:
         with self._running_lock:
-            return len(self._running) + len(self._running_feedback)
+            return len(self._running) + len(self._running_feedback) + len(self._running_tasks)
 
     def _scan_operator_commands(self) -> None:
         issue_numbers = self._operator_issue_numbers_to_scan()
@@ -3147,6 +3402,7 @@ class Phase1Orchestrator:
     def _reap_finished(self) -> None:
         finished_issue_numbers: list[int] = []
         finished_pr_numbers: list[int] = []
+        finished_task_issue_numbers: list[int] = []
         with self._running_lock:
             for issue_number, fut in self._running.items():
                 if fut.done():
@@ -3155,6 +3411,10 @@ class Phase1Orchestrator:
             for pr_number, handle in self._running_feedback.items():
                 if handle.future.done():
                     finished_pr_numbers.append(pr_number)
+
+            for issue_number, handle in self._running_tasks.items():
+                if handle.future.done():
+                    finished_task_issue_numbers.append(issue_number)
 
             for issue_number in finished_issue_numbers:
                 fut = self._running.pop(issue_number)
@@ -3354,6 +3614,81 @@ class Phase1Orchestrator:
                     )
                     self._run_meta_cache.pop(handle.run_id, None)
 
+            for issue_number in finished_task_issue_numbers:
+                handle = self._running_tasks.pop(issue_number)
+                try:
+                    worker_status = handle.future.result()
+                    run_terminal_status: Literal[
+                        "completed",
+                        "failed",
+                        "blocked",
+                        "merged",
+                        "closed",
+                        "interrupted",
+                    ]
+                    failure_class: AgentRunFailureClass | None = None
+                    if worker_status == "completed":
+                        run_terminal_status = "completed"
+                    elif worker_status == "rejected":
+                        run_terminal_status = "blocked"
+                        failure_class = "policy_block"
+                    else:
+                        run_terminal_status = "failed"
+                    self._state.finish_agent_run(
+                        run_id=handle.run_id,
+                        terminal_status=run_terminal_status,
+                        failure_class=failure_class,
+                    )
+                    log_event(
+                        LOGGER,
+                        "triggered_task_completed",
+                        issue_number=handle.issue_number,
+                        task_kind=handle.task_kind,
+                        resource_key=handle.resource_key,
+                        status=worker_status,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                    self._state.finalize_issue_task(
+                        issue_number=handle.issue_number,
+                        run_id=handle.run_id,
+                        status="failed",
+                        execution_json=None,
+                        last_error=error,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    failed_token = compute_task_failed_token(
+                        issue_number=handle.issue_number,
+                        task_kind=handle.task_kind,
+                        resource_key=handle.resource_key,
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=handle.issue_number,
+                        token=failed_token,
+                        body=(
+                            "MergeXO triggered task execution failed due to an unexpected error.\n\n"
+                            f"- task: `{handle.task_kind}`\n"
+                            f"- resource: `{handle.resource_key}`\n"
+                            f"- error: `{_summarize_git_error(error)}`"
+                        ),
+                        source="task_failed_exception",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    self._state.finish_agent_run(
+                        run_id=handle.run_id,
+                        terminal_status="failed",
+                        failure_class=_failure_class_for_exception(exc),
+                        error=error,
+                    )
+                finally:
+                    self._state.release_issue_task_claim(
+                        issue_number=handle.issue_number,
+                        run_id=handle.run_id,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    self._run_meta_cache.pop(handle.run_id, None)
+
     def _cleanup_and_release_slot(self, lease: _SlotLease) -> None:
         quarantine_reason: str | None = None
         try:
@@ -3374,9 +3709,212 @@ class Phase1Orchestrator:
         while True:
             self._reap_finished()
             with self._running_lock:
-                if not self._running and not self._running_feedback:
+                if not self._running and not self._running_feedback and not self._running_tasks:
                     return
             time.sleep(1.0)
+
+    def _process_triggered_task_worker(
+        self,
+        issue: Issue,
+        handler: TriggeredTaskHandler,
+        request: TriggeredTaskRequest,
+    ) -> str:
+        with logging_repo_context(self._repo.full_name):
+            return self._process_triggered_task(issue=issue, handler=handler, request=request)
+
+    def _process_triggered_task(
+        self,
+        *,
+        issue: Issue,
+        handler: TriggeredTaskHandler,
+        request: TriggeredTaskRequest,
+    ) -> str:
+        run_id = self._active_task_run_id_for_issue(issue.number)
+        if run_id is None:
+            raise RuntimeError(f"missing active triggered-task run for issue #{issue.number}")
+
+        lease = self._slot_pool.acquire()
+        try:
+            self._git.prepare_checkout(lease.path)
+            snapshot = handler.collect_snapshot(
+                request=request,
+                github=self._github,
+                default_branch=self._repo.default_branch,
+            )
+            snapshot_json = _triggered_task_snapshot_json(snapshot)
+            self._state.set_issue_task_snapshot(
+                issue_number=issue.number,
+                run_id=run_id,
+                snapshot_json=snapshot_json,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            snapshot_token = compute_task_snapshot_recorded_token(
+                issue_number=issue.number,
+                task_kind=request.task_kind,
+                resource_key=request.resource_key,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=issue.number,
+                token=snapshot_token,
+                body=(
+                    "MergeXO recorded a release snapshot and is requesting agent review.\n\n"
+                    f"- task: `{request.task_kind}`\n"
+                    f"- requested tag: `{request.requested_tag}`"
+                ),
+                source="task_snapshot_recorded",
+                repo_full_name=self._state_repo_full_name(),
+            )
+
+            prompt = handler.build_review_prompt(
+                issue=issue,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                request=request,
+                snapshot=snapshot,
+            )
+            self._record_run_prompt(run_id, prompt)
+            review = self._agent.review_triggered_task(
+                issue_number=issue.number,
+                task_kind=request.task_kind,
+                prompt=prompt,
+                cwd=lease.path,
+            )
+            review_json = json.dumps(
+                {"decision": review.decision, "reason": review.reason},
+                sort_keys=True,
+            )
+            if not self._state.set_issue_task_review(
+                issue_number=issue.number,
+                run_id=run_id,
+                approved=review.decision == "approve",
+                review_json=review_json,
+                last_error=(None if review.decision == "approve" else review.reason),
+                repo_full_name=self._state_repo_full_name(),
+            ):
+                raise RuntimeError(
+                    f"failed to persist triggered-task review for issue #{issue.number}"
+                )
+            if review.decision == "reject":
+                rejected_token = compute_task_rejected_token(
+                    issue_number=issue.number,
+                    task_kind=request.task_kind,
+                    resource_key=request.resource_key,
+                )
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=issue.number,
+                    token=rejected_token,
+                    body=(
+                        "MergeXO rejected this triggered task request.\n\n"
+                        f"- task: `{request.task_kind}`\n"
+                        f"- requested tag: `{request.requested_tag}`\n"
+                        f"- reason: {review.reason}"
+                    ),
+                    source="task_rejected",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                return "rejected"
+
+            if not self._state.mark_issue_task_executing(
+                issue_number=issue.number,
+                run_id=run_id,
+                repo_full_name=self._state_repo_full_name(),
+            ):
+                raise RuntimeError(
+                    f"failed to transition triggered task to executing for issue #{issue.number}"
+                )
+            execution_start_token = compute_task_execution_started_token(
+                issue_number=issue.number,
+                task_kind=request.task_kind,
+                resource_key=request.resource_key,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=issue.number,
+                token=execution_start_token,
+                body=(
+                    "MergeXO approved this task request and started deterministic execution.\n\n"
+                    f"- task: `{request.task_kind}`\n"
+                    f"- requested tag: `{request.requested_tag}`"
+                ),
+                source="task_execution_started",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            execution = handler.execute(
+                request=request,
+                reviewed_snapshot=snapshot,
+                github=self._github,
+                git=self._git,
+                checkout_path=lease.path,
+                default_branch=self._repo.default_branch,
+            )
+            execution_json = _triggered_task_execution_json(execution)
+            if execution.success:
+                if not self._state.finalize_issue_task(
+                    issue_number=issue.number,
+                    run_id=run_id,
+                    status="completed",
+                    execution_json=execution_json,
+                    last_error=None,
+                    repo_full_name=self._state_repo_full_name(),
+                ):
+                    raise RuntimeError(
+                        f"failed to persist triggered-task completion for issue #{issue.number}"
+                    )
+                completed_token = compute_task_completed_token(
+                    issue_number=issue.number,
+                    task_kind=request.task_kind,
+                    resource_key=request.resource_key,
+                )
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=issue.number,
+                    token=completed_token,
+                    body=(
+                        "MergeXO completed this triggered task successfully.\n\n"
+                        f"- task: `{request.task_kind}`\n"
+                        f"- requested tag: `{request.requested_tag}`\n"
+                        f"- observed tag sha: `{execution.observed_tag_sha or '<unknown>'}`"
+                    ),
+                    source="task_completed",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                return "completed"
+
+            if not self._state.finalize_issue_task(
+                issue_number=issue.number,
+                run_id=run_id,
+                status="failed",
+                execution_json=execution_json,
+                last_error=execution.detail,
+                repo_full_name=self._state_repo_full_name(),
+            ):
+                raise RuntimeError(
+                    f"failed to persist triggered-task failure for issue #{issue.number}"
+                )
+            failed_token = compute_task_failed_token(
+                issue_number=issue.number,
+                task_kind=request.task_kind,
+                resource_key=request.resource_key,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=issue.number,
+                token=failed_token,
+                body=_render_triggered_task_failed_comment(
+                    task_kind=request.task_kind,
+                    requested_tag=request.requested_tag,
+                    detail=execution.detail,
+                    stdout_tail=execution.stdout_tail,
+                    stderr_tail=execution.stderr_tail,
+                ),
+                source="task_failed",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return "failed"
+        finally:
+            self._cleanup_and_release_slot(lease)
 
     def _process_issue_worker(
         self,
@@ -3975,6 +4513,15 @@ class Phase1Orchestrator:
                 metadata = self._running_issue_metadata.get(issue_number)
                 if metadata is not None:
                     return metadata.run_id
+            time.sleep(0.01)
+        return None
+
+    def _active_task_run_id_for_issue(self, issue_number: int) -> str | None:
+        for _ in range(20):
+            with self._running_lock:
+                task = self._running_tasks.get(issue_number)
+                if task is not None:
+                    return task.run_id
             time.sleep(0.01)
         return None
 
@@ -6825,6 +7372,98 @@ def _implementation_candidate_from_json_dict(raw: object) -> ImplementationCandi
     )
 
 
+def _triggered_task_request_json(request: TriggeredTaskRequest) -> str:
+    return json.dumps(
+        {
+            "task_kind": request.task_kind,
+            "resource_key": request.resource_key,
+            "requested_tag": request.requested_tag,
+            "source_text": request.source_text,
+        },
+        sort_keys=True,
+    )
+
+
+def _triggered_task_request_from_json(raw_json: str) -> TriggeredTaskRequest | None:
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not all(isinstance(key, str) for key in payload.keys()):
+        return None
+    task_kind = payload.get("task_kind")
+    resource_key = payload.get("resource_key")
+    requested_tag = payload.get("requested_tag")
+    source_text = payload.get("source_text")
+    if task_kind != "release":
+        return None
+    if not isinstance(resource_key, str) or not resource_key.strip():
+        return None
+    if not isinstance(requested_tag, str) or not requested_tag.strip():
+        return None
+    if not isinstance(source_text, str) or not source_text.strip():
+        return None
+    return TriggeredTaskRequest(
+        task_kind="release",
+        resource_key=resource_key,
+        requested_tag=requested_tag,
+        source_text=source_text,
+    )
+
+
+def _triggered_task_snapshot_json(snapshot: TriggeredTaskSnapshot) -> str:
+    return json.dumps(
+        {
+            "schema_version": snapshot.schema_version,
+            "task_kind": snapshot.task_kind,
+            "payload": snapshot.payload,
+        },
+        sort_keys=True,
+    )
+
+
+def _triggered_task_execution_json(execution: object) -> str:
+    success = getattr(execution, "success", None)
+    detail = getattr(execution, "detail", None)
+    stdout_tail = getattr(execution, "stdout_tail", None)
+    stderr_tail = getattr(execution, "stderr_tail", None)
+    observed_tag_sha = getattr(execution, "observed_tag_sha", None)
+    return json.dumps(
+        {
+            "success": success is True,
+            "detail": detail if isinstance(detail, str) else "",
+            "stdout_tail": stdout_tail if isinstance(stdout_tail, str) else None,
+            "stderr_tail": stderr_tail if isinstance(stderr_tail, str) else None,
+            "observed_tag_sha": observed_tag_sha if isinstance(observed_tag_sha, str) else None,
+        },
+        sort_keys=True,
+    )
+
+
+def _render_triggered_task_failed_comment(
+    *,
+    task_kind: str,
+    requested_tag: str,
+    detail: str,
+    stdout_tail: str | None,
+    stderr_tail: str | None,
+) -> str:
+    lines = [
+        "MergeXO triggered task failed.",
+        "",
+        f"- task: `{task_kind}`",
+        f"- requested tag: `{requested_tag}`",
+        f"- detail: {detail}",
+    ]
+    if stdout_tail:
+        lines.extend(["", "stdout tail:", "```", stdout_tail, "```"])
+    if stderr_tail:
+        lines.extend(["", "stderr tail:", "```", stderr_tail, "```"])
+    return "\n".join(lines)
+
+
 def _branch_for_issue_flow(*, flow: IssueFlow, issue: Issue) -> str:
     return _issue_branch(flow=flow, issue_number=issue.number, slug=_slugify(issue.title))
 
@@ -6859,6 +7498,7 @@ def _infer_pre_pr_flow_from_issue_and_error(
     design_label: str,
     bugfix_label: str,
     small_job_label: str,
+    task_label: str | None = None,
     ignore_label: str | None = None,
 ) -> PrePrFlow | None:
     resolved = _resolve_issue_flow(
@@ -6866,6 +7506,7 @@ def _infer_pre_pr_flow_from_issue_and_error(
         design_label=design_label,
         bugfix_label=bugfix_label,
         small_job_label=small_job_label,
+        task_label=task_label,
         ignore_label=ignore_label,
     )
     if resolved is not None:
@@ -7028,10 +7669,13 @@ def _resolve_issue_flow(
     design_label: str,
     bugfix_label: str,
     small_job_label: str,
+    task_label: str | None = None,
     ignore_label: str | None = None,
 ) -> IssueFlow | None:
     issue_labels = set(issue.labels)
     if ignore_label and ignore_label in issue_labels:
+        return None
+    if task_label and task_label in issue_labels:
         return None
     if bugfix_label in issue_labels:
         return "bugfix"

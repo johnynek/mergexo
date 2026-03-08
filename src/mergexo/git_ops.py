@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import logging
+import subprocess
 import shutil
 
 from mergexo.config import RepoConfig, RuntimeConfig
@@ -33,6 +34,13 @@ class RepoLayout:
     checkouts_root: Path
 
 
+@dataclass(frozen=True)
+class ScriptRunResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
 class GitRepoManager:
     def __init__(self, runtime: RuntimeConfig, repo: RepoConfig) -> None:
         self.runtime = runtime
@@ -57,15 +65,10 @@ class GitRepoManager:
                 slot=slot,
                 checkout_path=str(checkout_path),
             )
-            run(
-                [
-                    "git",
-                    "clone",
-                    "--reference-if-able",
-                    str(self.layout.mirror_path),
-                    remote_url,
-                    str(checkout_path),
-                ]
+            self._clone_checkout_with_reference_fallback(
+                checkout_path=checkout_path,
+                remote_url=remote_url,
+                slot=slot,
             )
         else:
             log_event(
@@ -379,6 +382,41 @@ class GitRepoManager:
             return False
         return merge_base == older_sha
 
+    def run_repo_script(
+        self,
+        *,
+        checkout_path: Path,
+        script_path: Path,
+        args: tuple[str, ...],
+    ) -> ScriptRunResult:
+        cmd = [str(script_path), *args]
+        log_event(
+            LOGGER,
+            "git_repo_script_started",
+            checkout_path=str(checkout_path),
+            script_path=str(script_path),
+            arg_count=len(args),
+        )
+        proc = subprocess.run(
+            cmd,
+            cwd=str(checkout_path),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        log_event(
+            LOGGER,
+            "git_repo_script_finished",
+            checkout_path=str(checkout_path),
+            script_path=str(script_path),
+            exit_code=proc.returncode,
+        )
+        return ScriptRunResult(
+            returncode=proc.returncode,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+        )
+
     def _checkout_remote_branch(self, checkout_path: Path, branch: str) -> None:
         run(["git", "-C", str(checkout_path), "checkout", "-B", branch, f"origin/{branch}"])
         run(["git", "-C", str(checkout_path), "reset", "--hard", f"origin/{branch}"])
@@ -396,6 +434,37 @@ class GitRepoManager:
             check=False,
         )
         return bool(output.strip())
+
+    def _clone_checkout_with_reference_fallback(
+        self,
+        *,
+        checkout_path: Path,
+        remote_url: str,
+        slot: int,
+    ) -> None:
+        reference_clone_cmd = [
+            "git",
+            "clone",
+            "--reference-if-able",
+            str(self.layout.mirror_path),
+            remote_url,
+            str(checkout_path),
+        ]
+        try:
+            run(reference_clone_cmd)
+            return
+        except CommandError as exc:
+            log_event(
+                LOGGER,
+                "git_checkout_clone_reference_failed",
+                slot=slot,
+                checkout_path=str(checkout_path),
+                error_type=type(exc).__name__,
+            )
+            # Clean up partial checkout state before retrying a plain clone.
+            if checkout_path.exists():
+                shutil.rmtree(checkout_path)
+        run(["git", "clone", remote_url, str(checkout_path)])
 
     def _ensure_mirror(self) -> None:
         remote_url = self.repo.effective_remote_url

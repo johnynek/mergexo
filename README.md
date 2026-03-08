@@ -9,6 +9,7 @@ MergeXO is a local-first Python orchestrator that watches labeled issues and rou
 - `design_doc`: open a design-doc PR first, then implementation PR work after merge
 - `bugfix`: open a direct bugfix PR
 - `small_job`: open a direct scoped-change PR
+- `task` (triggered tasks): issue-driven operational tasks such as deterministic release script execution
 
 ## Quickstart Session (Start Here)
 
@@ -101,6 +102,7 @@ This is the recommended first run because it gives you both orchestration and vi
 MergeXO reads these repo labels:
 
 - `ignore_label` (human takeover pause)
+- `task_label` (triggered operational tasks)
 - `trigger_label` (default design flow)
 - `bugfix_label` (direct bugfix)
 - `small_job_label` (direct small job)
@@ -108,9 +110,10 @@ MergeXO reads these repo labels:
 If multiple labels are present, precedence is deterministic:
 
 1. `ignore_label`
-2. `bugfix_label`
-3. `small_job_label`
-4. `trigger_label`
+2. `task_label`
+3. `bugfix_label`
+4. `small_job_label`
+5. `trigger_label`
 
 ### Example User Story
 
@@ -138,7 +141,15 @@ Assume one repo with labels:
    - MergeXO creates `agent/small/122-...` and runs scoped direct changes.
    - PR body uses `Fixes #122`.
 
-4. Human takeover flow (`agent:ignore`):
+4. Triggered release task issue:
+   - Issue `#124` has `agent:task` and title/body `release v1.2.3` (or `release: v1.2.3`).
+   - MergeXO records a deterministic release snapshot (default-branch head, tag state, recent tags, latest release, head CI runs).
+   - Agent returns structured `approve`/`reject` with reason.
+   - On approval, MergeXO revalidates invariants and runs only `repo.release_task_script <tag>` with argv (no shell interpolation).
+   - MergeXO verifies the tag exists remotely and posts success/failure status comments.
+   - On rejection, MergeXO posts the reason and does not run the script.
+
+5. Human takeover flow (`agent:ignore`):
    - Issue `#123` starts in bugfix flow and already has an open PR `#205`.
    - Maintainer adds label `agent:ignore` on issue `#123`.
    - MergeXO pauses enqueue/feedback/redirect automation for that issue + linked PR while takeover is active.
@@ -147,6 +158,21 @@ Assume one repo with labels:
    - Maintainer leaves a fresh PR or source-issue comment after label removal; MergeXO resumes from that post-takeover boundary without replaying takeover-period comments.
 
 For both direct flows, MergeXO asks the agent to follow `coding_guidelines_path` and runs `required_tests` before each push when configured.
+
+### Triggered Task Requirements
+
+Triggered tasks are feature-flagged:
+
+- set `runtime.enable_triggered_tasks = true`
+- set `repo.task_label` (default `agent:task`)
+- set `repo.release_task_script` (required when triggered tasks are enabled)
+
+Release request syntax is strict by default:
+
+- `release <tag>`
+- `release: <tag>`
+
+You can override parsing with `repo.release_request_regex`, but the resulting tag must still pass MergeXO's safe tag validation.
 
 ## Workflow Details
 
@@ -375,6 +401,7 @@ Do not mix both shapes in one file.
 | `poll_interval_seconds` | yes | none | must be `>= 5` |
 | `enable_github_operations` | no | `false` | enables `/mergexo ...` command processing |
 | `enable_issue_comment_routing` | no | `false` | enables pre-PR follow-up + post-PR source redirects |
+| `enable_triggered_tasks` | no | `false` | enables issue-driven triggered-task automation (release flow) |
 | `enable_pr_actions_monitoring` | no | `false` | compatibility fallback: when true, repos without explicit policy behave as `all_complete` |
 | `enable_incremental_comment_fetch` | no | `false` | enables incremental GitHub comment polling with persisted cursors |
 | `comment_fetch_overlap_seconds` | no | `5` | overlap replay window used with `since` queries; must be `>= 0` |
@@ -400,6 +427,7 @@ Do not mix both shapes in one file.
 | `trigger_label` | no | `"agent:design"` | design flow trigger |
 | `bugfix_label` | no | `"agent:bugfix"` | bugfix flow trigger |
 | `small_job_label` | no | `"agent:small-job"` | small-job flow trigger |
+| `task_label` | no | `"agent:task"` | triggered-task flow label; preempts PR-producing flows |
 | `ignore_label` | no | `"agent:ignore"` | human takeover label; preempts all automation while present |
 | `coding_guidelines_path` | yes | none | repo-relative path for coding/testing guidance |
 | `design_docs_dir` | no | `"docs/design"` | design doc output directory |
@@ -407,6 +435,8 @@ Do not mix both shapes in one file.
 | `local_clone_source` | no | unset | local repo/.git used to seed mirror |
 | `remote_url` | no | `git@github.com:<owner>/<name>.git` | explicit remote override |
 | `required_tests` | no | unset | repo-relative or absolute executable path |
+| `release_task_script` | no\* | unset | deterministic release script path; required when `runtime.enable_triggered_tasks=true` |
+| `release_request_regex` | no | default `release <tag>` / `release: <tag>` matcher | optional release request parser override |
 | `test_file_regex` | no | unset | bugfix-only regression-test staged-file gate; string or list |
 | `pr_actions_feedback_policy` | no | unset | one of `never`, `first_fail`, `all_complete`; when omitted runtime fallback applies (`true -> all_complete`, `false -> never`) |
 | `operations_issue_number` | no | unset | optional global ops issue |
@@ -503,4 +533,5 @@ usage: mergexo feedback blocked reset [-h] (--pr PR | --all) [--yes] [--dry-run]
 
 - `bugfix` and `small_job` PR bodies include `Fixes #<issue_number>`.
 - `design_doc` PR bodies include `Refs #<issue_number>`.
-- If multiple flow labels are present, precedence is `ignore` > `bugfix` > `small_job` > `design_doc`.
+- `task` issues do not open PRs; they run the configured deterministic task handler flow.
+- If multiple flow labels are present, precedence is `ignore` > `task` > `bugfix` > `small_job` > `design_doc`.

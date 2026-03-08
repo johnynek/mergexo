@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from typing import Literal, cast
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from mergexo.models import (
     Issue,
@@ -14,6 +14,8 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    ReleaseSnapshot,
+    RepositoryTagSnapshot,
     WorkflowJobSnapshot,
     WorkflowRunSnapshot,
 )
@@ -314,6 +316,176 @@ class GitHubGateway:
             labels=tuple(label_names),
             author_login=_as_login(user_obj.get("login") if user_obj else None),
         )
+
+    def get_default_branch_head_sha(self, default_branch: str) -> str:
+        path = f"/repos/{self.owner}/{self.name}/branches/{default_branch}"
+        payload = self._api_json("GET", path)
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for branch")
+        commit_obj = _as_object_dict(payload_obj.get("commit"))
+        if commit_obj is None:
+            raise RuntimeError("Unexpected GitHub response: missing branch commit object")
+        head_sha = _as_string(commit_obj.get("sha")).strip()
+        if not head_sha:
+            raise RuntimeError("Unexpected GitHub response: missing branch commit sha")
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="default_branch_head",
+            branch=default_branch,
+            head_sha=head_sha,
+        )
+        return head_sha
+
+    def get_tag_sha(self, tag_name: str) -> str | None:
+        encoded_tag = quote(tag_name, safe="")
+        path = f"/repos/{self.owner}/{self.name}/git/ref/tags/{encoded_tag}"
+        try:
+            payload = self._api_json("GET", path)
+        except RuntimeError as exc:
+            if "status 404" in str(exc):
+                return None
+            raise
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for tag ref")
+        object_obj = _as_object_dict(payload_obj.get("object"))
+        if object_obj is None:
+            raise RuntimeError("Unexpected GitHub response: missing tag object")
+        object_sha = _as_string(object_obj.get("sha")).strip()
+        if not object_sha:
+            raise RuntimeError("Unexpected GitHub response: missing tag object sha")
+        object_type = _as_string(object_obj.get("type")).strip().lower()
+        if object_type == "tag":
+            resolved = self._resolve_annotated_tag_target_sha(tag_object_sha=object_sha)
+            if resolved is not None:
+                object_sha = resolved
+        return object_sha
+
+    def list_repository_tags(self, limit: int) -> tuple[RepositoryTagSnapshot, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        query = urlencode({"per_page": str(min(limit, 100))})
+        path = f"/repos/{self.owner}/{self.name}/tags?{query}"
+        payload = self._api_json("GET", path)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected list for tags")
+
+        tags: list[RepositoryTagSnapshot] = []
+        for item in payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            commit_obj = _as_object_dict(item_obj.get("commit"))
+            if commit_obj is None:
+                continue
+            name = _as_string(item_obj.get("name")).strip()
+            commit_sha = _as_string(commit_obj.get("sha")).strip()
+            if not name or not commit_sha:
+                continue
+            tags.append(RepositoryTagSnapshot(name=name, commit_sha=commit_sha))
+        out = tuple(tags[:limit])
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="repository_tags",
+            count=len(out),
+            limit=limit,
+        )
+        return out
+
+    def get_latest_release(self) -> ReleaseSnapshot | None:
+        path = f"/repos/{self.owner}/{self.name}/releases?per_page=20"
+        payload = self._api_json("GET", path)
+        if not isinstance(payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected list for releases")
+
+        latest: ReleaseSnapshot | None = None
+        latest_sort_key = ""
+        for item in payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            tag_name = _as_string(item_obj.get("tag_name")).strip()
+            if not tag_name:
+                continue
+            release = ReleaseSnapshot(
+                tag_name=tag_name,
+                name=_as_string(item_obj.get("name")).strip(),
+                html_url=_as_string(item_obj.get("html_url")).strip(),
+                published_at=_as_optional_str(item_obj.get("published_at")),
+            )
+            sort_key = release.published_at or _as_string(item_obj.get("created_at")).strip()
+            if sort_key >= latest_sort_key:
+                latest = release
+                latest_sort_key = sort_key
+
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="latest_release",
+            found=latest is not None,
+            tag_name=latest.tag_name if latest is not None else "",
+        )
+        return latest
+
+    def list_workflow_runs_for_branch_head(
+        self,
+        *,
+        default_branch: str,
+        head_sha: str,
+        limit: int = 20,
+    ) -> tuple[WorkflowRunSnapshot, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        query = urlencode(
+            {
+                "event": "push",
+                "branch": default_branch,
+                "head_sha": head_sha,
+                "per_page": str(min(limit, 100)),
+            }
+        )
+        path = f"/repos/{self.owner}/{self.name}/actions/runs?{query}"
+        payload = self._api_json("GET", path)
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            raise RuntimeError("Unexpected GitHub response: expected object for workflow runs")
+        runs_payload = payload_obj.get("workflow_runs")
+        if not isinstance(runs_payload, list):
+            raise RuntimeError("Unexpected GitHub response: expected workflow_runs list")
+
+        runs: list[WorkflowRunSnapshot] = []
+        for item in runs_payload:
+            item_obj = _as_object_dict(item)
+            if item_obj is None:
+                continue
+            if _as_string(item_obj.get("head_sha")).strip() != head_sha:
+                continue
+            runs.append(
+                WorkflowRunSnapshot(
+                    run_id=_as_int(item_obj.get("id"), field="id"),
+                    name=_as_string(item_obj.get("name")),
+                    status=_as_string(item_obj.get("status")).strip().lower(),
+                    conclusion=_normalize_optional_lower_str(item_obj.get("conclusion")),
+                    html_url=_as_string(item_obj.get("html_url")),
+                    head_sha=_as_string(item_obj.get("head_sha")),
+                    created_at=_as_string(item_obj.get("created_at")),
+                    updated_at=_as_string(item_obj.get("updated_at")),
+                )
+            )
+        out = tuple(sorted(runs, key=lambda run: run.run_id, reverse=True)[:limit])
+        log_event(
+            LOGGER,
+            "github_read",
+            endpoint="workflow_runs_for_branch_head",
+            branch=default_branch,
+            head_sha=head_sha,
+            count=len(out),
+            limit=limit,
+        )
+        return out
 
     def get_pull_request(self, pr_number: int) -> PullRequestSnapshot:
         path = f"/repos/{self.owner}/{self.name}/pulls/{pr_number}"
@@ -739,6 +911,21 @@ class GitHubGateway:
             pr_number=pr_number,
             review_comment_id=review_comment_id,
         )
+
+    def _resolve_annotated_tag_target_sha(self, *, tag_object_sha: str) -> str | None:
+        path = f"/repos/{self.owner}/{self.name}/git/tags/{tag_object_sha}"
+        try:
+            payload = self._api_json("GET", path)
+        except RuntimeError:
+            return None
+        payload_obj = _as_object_dict(payload)
+        if payload_obj is None:
+            return None
+        object_obj = _as_object_dict(payload_obj.get("object"))
+        if object_obj is None:
+            return None
+        target_sha = _as_string(object_obj.get("sha")).strip()
+        return target_sha or None
 
     def _api_text(self, method: str, path: str) -> str:
         method_upper = method.upper()
