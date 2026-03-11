@@ -1192,23 +1192,25 @@ class Phase1Orchestrator:
                     repo_full_name=self._state_repo_full_name(),
                 )
                 if nodes and all(node.status in {"completed", "abandoned"} for node in nodes):
-                    if self._state.mark_roadmap_completed(
+                    token = compute_roadmap_status_token(
+                        roadmap_issue_number=refreshed.roadmap_issue_number,
+                        request_comment_id=0,
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=refreshed.roadmap_issue_number,
+                        token=token,
+                        body="MergeXO roadmap completed: all roadmap nodes reached terminal outcomes.",
+                        source="roadmap_completed",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    self._github.close_issue(refreshed.roadmap_issue_number)
+                    # Persist completion only after side effects so retries can recover from
+                    # crashes between commenting/closing and state finalization.
+                    self._state.mark_roadmap_completed(
                         roadmap_issue_number=refreshed.roadmap_issue_number,
                         repo_full_name=self._state_repo_full_name(),
-                    ):
-                        token = compute_roadmap_status_token(
-                            roadmap_issue_number=refreshed.roadmap_issue_number,
-                            request_comment_id=0,
-                        )
-                        self._ensure_tokenized_issue_comment(
-                            github=self._github,
-                            issue_number=refreshed.roadmap_issue_number,
-                            token=token,
-                            body="MergeXO roadmap completed: all roadmap nodes reached terminal outcomes.",
-                            source="roadmap_completed",
-                            repo_full_name=self._state_repo_full_name(),
-                        )
-                        self._github.close_issue(refreshed.roadmap_issue_number)
+                    )
             claims = self._state.claim_ready_roadmap_nodes(
                 repo_full_name=self._state_repo_full_name()
             )

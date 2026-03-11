@@ -6458,6 +6458,33 @@ def test_poll_once_runs_roadmap_steps_when_enabled(
     assert "publish_roadmap_status_reports" in steps
 
 
+def test_poll_once_skips_roadmap_steps_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=False)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    steps: list[str] = []
+
+    def fake_run_poll_step(*, step_name: str, fn) -> bool:  # type: ignore[no-untyped-def]
+        _ = fn
+        steps.append(step_name)
+        return True
+
+    monkeypatch.setattr(orch, "_run_poll_step", fake_run_poll_step)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+
+    assert "activate_merged_roadmaps" not in steps
+    assert "advance_roadmap_nodes" not in steps
+    assert "publish_roadmap_status_reports" not in steps
+
+
 def test_poll_once_marks_github_error_when_roadmap_steps_fail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -12797,6 +12824,93 @@ def test_activate_and_advance_roadmap_nodes_creates_children_in_dependency_order
     completed = state.get_roadmap_state(roadmap_issue_number=50, repo_full_name=repo)
     assert completed is not None
     assert completed.status == "completed"
+
+
+def test_advance_roadmap_nodes_completion_finalizes_after_issue_close(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    graph_payload = {
+        "roadmap_issue_number": 51,
+        "version": 1,
+        "nodes": [
+            {
+                "node_id": "n1",
+                "kind": "small_job",
+                "title": "Ship",
+                "body_markdown": "Do it",
+                "depends_on": [],
+            }
+        ],
+    }
+    parsed = parse_roadmap_graph_json(json.dumps(graph_payload), expected_issue_number=51)
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=51,
+        roadmap_pr_number=510,
+        roadmap_doc_path="docs/roadmap/51-complete.md",
+        graph_path="docs/roadmap/51-complete.graph.json",
+        graph_checksum=parsed.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=51,
+        node_id="n1",
+        claim_token=claim.claim_token,
+        child_issue_number=5101,
+        child_issue_url="https://example/issues/5101",
+        repo_full_name=repo,
+    )
+    state.record_roadmap_node_milestone(
+        roadmap_issue_number=51,
+        node_id="n1",
+        milestone="implemented",
+        repo_full_name=repo,
+    )
+
+    git = FakeGitManager(tmp_path / "checkouts")
+    checkout = git.ensure_checkout(0)
+    docs_dir = checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "51-complete.graph.json").write_text(parsed.canonical_json, encoding="utf-8")
+
+    class FailingCloseGitHub(FakeGitHub):
+        def close_issue(self, issue_number: int) -> None:
+            _ = issue_number
+            raise RuntimeError("close failed")
+
+    failing_github = FailingCloseGitHub([_issue(51, "Complete", labels=(cfg.repo.roadmap_label,))])
+    failing_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=failing_github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    with pytest.raises(RuntimeError, match="close failed"):
+        failing_orch._advance_roadmap_nodes()
+
+    after_failure = state.get_roadmap_state(roadmap_issue_number=51, repo_full_name=repo)
+    assert after_failure is not None
+    assert after_failure.status == "active"
+
+    github = FakeGitHub([_issue(51, "Complete", labels=(cfg.repo.roadmap_label,))])
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._advance_roadmap_nodes()
+
+    finalized = state.get_roadmap_state(roadmap_issue_number=51, repo_full_name=repo)
+    assert finalized is not None
+    assert finalized.status == "completed"
+    assert 51 in github.closed_issue_numbers
 
 
 def test_publish_roadmap_status_reports_and_abandon_flow(tmp_path: Path) -> None:
