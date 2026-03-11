@@ -27,7 +27,7 @@ from mergexo.prompts import (
     build_implementation_prompt,
     build_small_job_prompt,
 )
-from mergexo.shell import run
+from mergexo.shell import CommandError, run
 
 
 _DESIGN_OUTPUT_SCHEMA: dict[str, object] = {
@@ -55,6 +55,52 @@ _DIRECT_OUTPUT_SCHEMA: dict[str, object] = {
         "pr_summary": {"type": "string", "minLength": 1},
         "commit_message": {"type": ["string", "null"]},
         "blocked_reason": {"type": ["string", "null"]},
+    },
+}
+
+_FEEDBACK_OUTPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "review_replies": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["review_comment_id", "body"],
+                "properties": {
+                    "review_comment_id": {"type": "integer"},
+                    "body": {"type": "string", "minLength": 1},
+                },
+            },
+        },
+        "general_comment": {"type": ["string", "null"]},
+        "commit_message": {"type": ["string", "null"]},
+        "git_ops": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["op"],
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": ["fetch_origin", "merge_origin_default_branch"],
+                    }
+                },
+            },
+        },
+        "flaky_test_report": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["run_id", "title", "summary", "relevant_log_excerpt"],
+            "properties": {
+                "run_id": {"type": "integer", "minimum": 1},
+                "title": {"type": "string", "minLength": 1},
+                "summary": {"type": "string", "minLength": 1},
+                "relevant_log_excerpt": {"type": "string", "minLength": 1},
+            },
+        },
     },
 }
 
@@ -234,19 +280,27 @@ class CodexAdapter(AgentAdapter):
         )
         try:
             prompt = build_feedback_prompt(turn=turn)
-            cmd = [
-                "codex",
-                "exec",
-                "resume",
-                "--json",
-                "--skip-git-repo-check",
-            ]
-            self._append_resume_options(cmd)
-            cmd.extend([session.thread_id, "-"])
-
-            raw_events = run(cmd, cwd=cwd, input_text=prompt)
-            message = _extract_final_agent_message(raw_events)
-            payload = _parse_json_payload(message)
+            try:
+                payload, resumed_thread_id = self._run_feedback_turn_resume(
+                    session=session,
+                    prompt=prompt,
+                    cwd=cwd,
+                )
+            except CommandError as exc:
+                if not _is_context_window_exhaustion_error(exc):
+                    raise
+                log_event(
+                    LOGGER,
+                    "feedback_agent_call_restart_fresh_thread",
+                    issue_number=turn.issue.number,
+                    pr_number=turn.pull_request.number,
+                    thread_id=session.thread_id,
+                )
+                payload, resumed_thread_id = self._run_feedback_turn_fresh(
+                    prompt=prompt,
+                    cwd=cwd,
+                )
+                resumed_thread_id = resumed_thread_id or session.thread_id
 
             replies = _parse_review_replies(payload.get("review_replies"))
             general_comment = _optional_output_text(payload.get("general_comment"))
@@ -257,8 +311,6 @@ class CodexAdapter(AgentAdapter):
                 raise RuntimeError(
                     "Codex response cannot set commit_message when flaky_test_report is present"
                 )
-
-            resumed_thread_id = _extract_thread_id(raw_events) or session.thread_id
         except Exception as exc:  # noqa: BLE001
             log_event(
                 LOGGER,
@@ -299,6 +351,62 @@ class CodexAdapter(AgentAdapter):
             git_ops=tuple(git_ops),
             flaky_test_report=flaky_test_report,
         )
+
+    def _run_feedback_turn_resume(
+        self,
+        *,
+        session: AgentSession,
+        prompt: str,
+        cwd: Path,
+    ) -> tuple[dict[str, object], str | None]:
+        if session.thread_id is None:
+            raise RuntimeError("Cannot resume Codex feedback turn without a thread_id")
+
+        cmd = [
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "--skip-git-repo-check",
+        ]
+        self._append_resume_options(cmd)
+        cmd.extend([session.thread_id, "-"])
+
+        raw_events = run(cmd, cwd=cwd, input_text=prompt)
+        message = _extract_final_agent_message(raw_events)
+        payload = _parse_json_payload(message)
+        return payload, _extract_thread_id(raw_events) or session.thread_id
+
+    def _run_feedback_turn_fresh(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+    ) -> tuple[dict[str, object], str | None]:
+        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "schema.json"
+            output_path = tmp_path / "last_message.txt"
+            schema_path.write_text(json.dumps(_FEEDBACK_OUTPUT_SCHEMA), encoding="utf-8")
+
+            cmd = [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            self._append_common_options(cmd)
+
+            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+            raw = output_path.read_text(encoding="utf-8").strip()
+            payload = _parse_json_payload(raw)
+
+        return payload, _extract_thread_id(raw_events)
 
     def _run_design_turn(self, *, prompt: str, cwd: Path) -> tuple[GeneratedDesign, str | None]:
         if not self._config.enabled:
@@ -666,6 +774,15 @@ def _filter_resume_extra_args(extra_args: tuple[str, ...]) -> list[str]:
         filtered.append(arg)
         idx += 1
     return filtered
+
+
+def _is_context_window_exhaustion_error(exc: Exception) -> bool:
+    if not isinstance(exc, CommandError):
+        return False
+    normalized = str(exc).lower()
+    return "context window" in normalized and (
+        "start a new thread" in normalized or "ran out of room" in normalized
+    )
 
 
 def _direct_invocation_mode(flow_name: str) -> str:
