@@ -144,6 +144,7 @@ class FakeGitManager:
         self.merge_calls: list[Path] = []
         self.current_head_calls: list[Path] = []
         self.is_ancestor_calls: list[tuple[Path, str, str]] = []
+        self.push_results: list[bool] = []
         self.restore_feedback_result = True
         self.staged_files: tuple[str, ...] = ("src/a.py", "tests/test_a.py")
         self.current_head_sha_value = "headsha"
@@ -173,8 +174,11 @@ class FakeGitManager:
         _ = checkout_path
         return self.staged_files
 
-    def push_branch(self, checkout_path: Path, branch: str) -> None:
+    def push_branch(self, checkout_path: Path, branch: str) -> bool:
         self.push_calls.append((checkout_path, branch))
+        if self.push_results:
+            return self.push_results.pop(0)
+        return False
 
     def persist_checkpoint_branch(
         self,
@@ -6982,6 +6986,174 @@ def test_commit_push_feedback_pushes_git_op_local_commit_without_commit_message(
     assert pushed_result.commit_message is None
     assert git.commit_calls == []
     assert len(git.push_calls) == 1
+
+
+def test_commit_push_feedback_replays_agent_after_remote_push_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch, git, github, _state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    git.current_head_sha_value = "head-1"
+    git.push_results = [True]
+    github.changed_files = ("src/a.py",)
+    replay_calls: list[FeedbackTurn] = []
+
+    replay_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-2"),
+        review_replies=(),
+        general_comment="Validated merged remote updates.",
+        commit_message=None,
+        git_ops=(),
+    )
+
+    def fake_run_feedback_agent_with_git_ops(
+        **kwargs: object,
+    ) -> tuple[FeedbackResult, PullRequestSnapshot]:
+        replay_calls.append(cast(FeedbackTurn, kwargs["turn"]))
+        return replay_result, github.pr_snapshot
+
+    monkeypatch.setattr(
+        orch, "_run_feedback_agent_with_git_ops", fake_run_feedback_agent_with_git_ops
+    )
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is not None
+    final_result, _ = outcome
+    assert final_result.general_comment == "Validated merged remote updates."
+    assert len(replay_calls) == 1
+    repair_turn = replay_calls[0]
+    assert (
+        "concurrent remote branch update while pushing feedback"
+        in repair_turn.issue_comments[-1].body
+    )
+    assert "origin/agent/design/7-add-worker-scheduler" in repair_turn.issue_comments[-1].body
+    assert repair_turn.changed_files == ("src/a.py",)
+
+
+def test_commit_push_feedback_blocks_after_repeated_remote_push_races(tmp_path: Path) -> None:
+    orch, git, github, state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    git.current_head_sha_value = "head-1"
+    git.push_results = [True, True, True, True]
+
+    def replay_result_with_followup(
+        **kwargs: object,
+    ) -> tuple[FeedbackResult, PullRequestSnapshot]:
+        _ = kwargs
+        return (
+            FeedbackResult(
+                session=AgentSession(adapter="codex", thread_id="thread-race"),
+                review_replies=(),
+                general_comment="Remote branch changed again; applying follow-up.",
+                commit_message="fix: re-apply after remote branch merge",
+                git_ops=(),
+            ),
+            github.pr_snapshot,
+        )
+
+    orch._run_feedback_agent_with_git_ops = replay_result_with_followup  # type: ignore[method-assign]
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert state.status_updates[-1][2] == "blocked"
+    assert "reconciliation exceeded safety limit" in str(state.status_updates[-1][4]).lower()
+    assert any(
+        "concurrent remote branch updates kept racing" in body.lower()
+        for _, body in github.comments
+    )
+
+
+def test_commit_push_feedback_marks_merged_when_pr_merges_after_remote_push_race(
+    tmp_path: Path,
+) -> None:
+    orch, git, github, state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    git.current_head_sha_value = "head-1"
+    git.push_results = [True]
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-merged",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=True,
+    )
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert state.status_updates == [(101, 7, "merged", "head-merged", None)]
+
+
+def test_commit_push_feedback_marks_closed_when_pr_closes_after_remote_push_race(
+    tmp_path: Path,
+) -> None:
+    orch, git, github, state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    git.current_head_sha_value = "head-1"
+    git.push_results = [True]
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-closed",
+        base_sha="base-1",
+        draft=False,
+        state="closed",
+        merged=False,
+    )
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert state.status_updates == [(101, 7, "closed", "head-closed", None)]
+
+
+def test_commit_push_feedback_returns_none_when_remote_push_race_repair_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch, git, _github, _state, tracked, turn, result = _feedback_commit_push_context(tmp_path)
+    git.current_head_sha_value = "head-1"
+    git.push_results = [True]
+    monkeypatch.setattr(orch, "_run_feedback_agent_with_git_ops", lambda **kwargs: None)
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
 
 
 def test_feedback_turn_processes_once_for_same_comment(tmp_path: Path) -> None:

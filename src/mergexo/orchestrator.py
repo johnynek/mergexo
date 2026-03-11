@@ -98,6 +98,7 @@ _MAX_FEEDBACK_GIT_OP_ROUNDS = 3
 _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
 _MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
 _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS = 3
+_MAX_PUSH_REMOTE_RACE_REPAIR_ROUNDS = 3
 _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT = 12000
 _FEEDBACK_TEXT_MAX_CHARS = 32000
 _GITHUB_ISSUE_BODY_MAX_CHARS = 65536
@@ -5807,6 +5808,45 @@ class Phase1Orchestrator:
             changed_files=self._github.list_pull_request_files(pull_request.number),
         )
 
+    def _feedback_turn_with_remote_push_race(
+        self,
+        *,
+        turn: FeedbackTurn,
+        pull_request: PullRequestSnapshot,
+        branch: str,
+        repair_round: int,
+        turn_start_head: str,
+        local_head_sha: str,
+    ) -> FeedbackTurn:
+        race_comment = PullRequestIssueComment(
+            comment_id=-(9400 + repair_round),
+            body=(
+                "MergeXO detected a concurrent remote branch update while pushing feedback.\n"
+                f"- branch: `{branch}`\n"
+                f"- repair_round: {repair_round}\n"
+                f"- turn_start_head_sha: `{turn_start_head}`\n"
+                f"- local_head_after_auto_merge_sha: `{local_head_sha}`\n"
+                f"- MergeXO auto-merged `origin/{branch}` and pushed the merged branch.\n"
+                "- Re-check your assumptions against the merged branch state.\n"
+                "- If remote edits changed required behavior, update files and return "
+                "`commit_message`.\n"
+                "- If no additional edits are needed, set `commit_message` to null and summarize "
+                "why."
+            ),
+            user_login="mergexo-system",
+            html_url="",
+            created_at="now",
+            updated_at="now",
+        )
+        return FeedbackTurn(
+            turn_key=turn.turn_key,
+            issue=turn.issue,
+            pull_request=pull_request,
+            review_comments=turn.review_comments,
+            issue_comments=turn.issue_comments + (race_comment,),
+            changed_files=self._github.list_pull_request_files(pull_request.number),
+        )
+
     def _commit_push_feedback_with_required_tests(
         self,
         *,
@@ -5822,6 +5862,7 @@ class Phase1Orchestrator:
         current_pr = pull_request
         repair_round = 0
         push_merge_conflict_round = 0
+        push_remote_race_repair_round = 0
 
         def _has_local_commits_to_push() -> bool:
             local_head_sha = self._git.current_head_sha(checkout_path)
@@ -5986,8 +6027,9 @@ class Phase1Orchestrator:
                     return None
                 continue
 
+            push_recovered_remote_race = False
             try:
-                self._git.push_branch(checkout_path, tracked.branch)
+                push_recovered_remote_race = self._git.push_branch(checkout_path, tracked.branch)
             except CommandError as exc:
                 detail = str(exc)
                 if not _is_merge_conflict_error(detail):
@@ -6114,6 +6156,105 @@ class Phase1Orchestrator:
                         reason="push_merge_conflict_reported_impossible",
                     )
                     return None
+                continue
+
+            if push_recovered_remote_race:
+                push_remote_race_repair_round += 1
+                log_event(
+                    LOGGER,
+                    "feedback_push_remote_race_detected",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    branch=tracked.branch,
+                    repair_round=push_remote_race_repair_round,
+                )
+                if push_remote_race_repair_round > _MAX_PUSH_REMOTE_RACE_REPAIR_ROUNDS:
+                    error = (
+                        "remote branch changed during feedback push and automated "
+                        "reconciliation exceeded safety limit; "
+                        f"max={_MAX_PUSH_REMOTE_RACE_REPAIR_ROUNDS}"
+                    )
+                    self._github.post_issue_comment(
+                        issue_number=tracked.pr_number,
+                        body=(
+                            "MergeXO feedback automation is blocked because concurrent remote "
+                            "branch updates kept racing this feedback push.\n"
+                            f"- branch: `{tracked.branch}`\n"
+                            f"- attempts: {_MAX_PUSH_REMOTE_RACE_REPAIR_ROUNDS}\n"
+                            "- MergeXO automatically merged `origin/<branch>` each attempt, but "
+                            "the branch kept changing."
+                        ),
+                    )
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="blocked",
+                        last_seen_head_sha=current_pr.head_sha,
+                        error=error,
+                        reason="push_remote_race_repair_limit_exceeded",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_blocked",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        reason="push_remote_race_repair_limit_exceeded",
+                    )
+                    return None
+
+                current_pr = self._github.get_pull_request(tracked.pr_number)
+                if current_pr.merged:
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="merged",
+                        last_seen_head_sha=current_pr.head_sha,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_completed",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        result="pr_merged",
+                    )
+                    return None
+                if current_pr.state.lower() != "open":
+                    self._state.mark_pr_status(
+                        pr_number=tracked.pr_number,
+                        issue_number=tracked.issue_number,
+                        status="closed",
+                        last_seen_head_sha=current_pr.head_sha,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    log_event(
+                        LOGGER,
+                        "feedback_turn_completed",
+                        issue_number=tracked.issue_number,
+                        pr_number=tracked.pr_number,
+                        result="pr_closed",
+                    )
+                    return None
+
+                current_turn = self._feedback_turn_with_remote_push_race(
+                    turn=current_turn,
+                    pull_request=current_pr,
+                    branch=tracked.branch,
+                    repair_round=push_remote_race_repair_round,
+                    turn_start_head=turn_start_head,
+                    local_head_sha=self._git.current_head_sha(checkout_path),
+                )
+                repair_outcome = self._run_feedback_agent_with_git_ops(
+                    tracked=tracked,
+                    session=current_result.session,
+                    turn=current_turn,
+                    checkout_path=checkout_path,
+                    pull_request=current_pr,
+                )
+                if repair_outcome is None:
+                    return None
+                current_result, current_pr = repair_outcome
                 continue
 
             current_pr = self._github.get_pull_request(tracked.pr_number)

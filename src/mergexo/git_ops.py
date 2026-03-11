@@ -17,7 +17,14 @@ def _is_non_fast_forward_push_error(detail: str) -> bool:
     normalized = detail.strip().lower()
     if not normalized:
         return False
-    return "non-fast-forward" in normalized
+    markers = (
+        "non-fast-forward",
+        "fetch first",
+        "failed to push some refs",
+        "updates were rejected because the remote contains work",
+        "remote contains work that you do not",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _is_checkout_overwrite_error(detail: str) -> bool:
@@ -203,7 +210,7 @@ class GitRepoManager:
         )
         run(["git", "-C", str(checkout_path), "commit", "-m", message])
 
-    def push_branch(self, checkout_path: Path, branch: str) -> None:
+    def push_branch(self, checkout_path: Path, branch: str) -> bool:
         log_event(
             LOGGER,
             "git_push",
@@ -212,7 +219,7 @@ class GitRepoManager:
         )
         try:
             run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
-            return
+            return False
         except CommandError as exc:
             if _is_non_fast_forward_push_error(str(exc)):
                 log_event(
@@ -256,7 +263,7 @@ class GitRepoManager:
                     checkout_path=str(checkout_path),
                     branch=branch,
                 )
-                return
+                return True
             log_event(
                 LOGGER,
                 "git_push_failed",
