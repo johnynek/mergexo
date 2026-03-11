@@ -100,6 +100,7 @@ from mergexo.orchestrator import (
     _summarize_git_error,
     _slugify,
     _trigger_labels,
+    _truncate_feedback_text,
 )
 from mergexo.observability import configure_logging
 from mergexo.shell import CommandError
@@ -8444,6 +8445,56 @@ def test_actions_context_and_flake_render_helpers(tmp_path: Path) -> None:
         reason="rerun request failed",
     )
     assert "detail: rerun request failed" in blocked_comment
+
+    oversized_tail = "x" * 40000
+    actions_context = orch._render_actions_failure_context_comment(
+        run=_workflow_run(
+            run_id=7001,
+            status="completed",
+            conclusion="failure",
+            updated_at="2026-02-21T02:00:00Z",
+        ),
+        failed_jobs=(_workflow_job(job_id=8001, name="tests", conclusion="failure"),),
+        log_tails_by_action={"tests": oversized_tail},
+        tail_lines=500,
+    )
+    assert len(actions_context) <= 32000
+    assert actions_context.endswith("... [truncated by MergeXO]")
+
+    oversized_issue_body = orch._render_flake_issue_body(
+        issue=_issue(),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        report=FlakyTestReport(
+            run_id=7001,
+            title="Flaky scheduler integration test",
+            summary="Likely flaky; failure reproduces intermittently.",
+            relevant_log_excerpt="AssertionError: expected 1 got 0",
+        ),
+        run_id=7001,
+        run_url="https://example/runs/7001",
+        full_log_context_markdown="y" * 50000,
+    )
+    assert len(oversized_issue_body) <= 32000
+    assert oversized_issue_body.endswith("... [truncated by MergeXO]")
+
+
+def test_truncate_feedback_text_guardrails() -> None:
+    with pytest.raises(ValueError, match="soft_limit_chars"):
+        _truncate_feedback_text("text", soft_limit_chars=0, hard_limit_chars=100)
+    with pytest.raises(ValueError, match="hard_limit_chars"):
+        _truncate_feedback_text("text", soft_limit_chars=100, hard_limit_chars=0)
+
+    truncated = _truncate_feedback_text("x" * 10, soft_limit_chars=5, hard_limit_chars=5)
+    assert truncated == "\n... [truncated by MergeXO]"[:5]
 
 
 def test_handle_flaky_test_report_reject_paths(tmp_path: Path) -> None:
