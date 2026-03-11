@@ -249,6 +249,12 @@ def test_close_issue_updates_state_via_patch(monkeypatch: pytest.MonkeyPatch) ->
     assert calls == [("PATCH", "/repos/o/r/issues/7", {"state": "closed"})]
 
 
+def test_close_issue_rejects_non_positive_issue_number() -> None:
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(ValueError, match="issue_number must be >= 1"):
+        gateway.close_issue(0)
+
+
 def test_close_issue_raises_when_patch_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway = GitHubGateway("o", "r")
 

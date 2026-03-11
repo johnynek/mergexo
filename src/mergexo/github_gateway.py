@@ -225,6 +225,8 @@ class GitHubGateway:
         return created
 
     def close_issue(self, issue_number: int) -> None:
+        if issue_number < 1:
+            raise ValueError("issue_number must be >= 1")
         path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}"
         try:
             self._api_json("PATCH", path, payload={"state": "closed"})

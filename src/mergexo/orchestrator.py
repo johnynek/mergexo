@@ -118,6 +118,9 @@ _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
 _MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
 _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS = 3
 _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT = 12000
+_FEEDBACK_TEXT_MAX_CHARS = 32000
+_GITHUB_ISSUE_BODY_MAX_CHARS = 65536
+_GITHUB_ISSUE_TRUNCATION_NOTICE = "\n... [truncated by MergeXO]"
 _ALLOWED_LINEAR_HISTORY_STATUSES: tuple[CompareCommitsStatus, ...] = ("ahead", "identical")
 _ACTIONS_ACTIVE_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 _ACTIONS_GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
@@ -1041,7 +1044,27 @@ class Phase1Orchestrator:
                         repo_full_name=self._state_repo_full_name(),
                     )
                     continue
-                graph_raw = graph_abspath.read_text(encoding="utf-8")
+                try:
+                    graph_raw = graph_abspath.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    token = compute_roadmap_graph_drift_token(
+                        roadmap_issue_number=candidate.roadmap_issue_number,
+                        graph_checksum="unreadable",
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=candidate.roadmap_issue_number,
+                        token=token,
+                        body=(
+                            "MergeXO roadmap activation is blocked: canonical graph file is unreadable.\n"
+                            f"- graph path: `{graph_relpath}`\n"
+                            f"- read error: {exc}\n\n"
+                            "Merge a correction PR that fixes the `.graph.json` file contents/encoding."
+                        ),
+                        source="roadmap_activation_unreadable_graph",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
                 try:
                     parsed = parse_roadmap_graph_json(
                         graph_raw,
@@ -1091,11 +1114,34 @@ class Phase1Orchestrator:
                     repo_full_name=self._state_repo_full_name(),
                 )
                 if parent_roadmap_issue_number is not None:
-                    self._state.mark_roadmap_superseded(
+                    parent_state = self._state.get_roadmap_state(
                         roadmap_issue_number=parent_roadmap_issue_number,
-                        superseding_roadmap_issue_number=candidate.roadmap_issue_number,
                         repo_full_name=self._state_repo_full_name(),
                     )
+                    if parent_state is None:
+                        token = compute_roadmap_graph_drift_token(
+                            roadmap_issue_number=candidate.roadmap_issue_number,
+                            graph_checksum=f"missing_parent:{parent_roadmap_issue_number}",
+                        )
+                        self._ensure_tokenized_issue_comment(
+                            github=self._github,
+                            issue_number=candidate.roadmap_issue_number,
+                            token=token,
+                            body=(
+                                "MergeXO roadmap supersede linkage warning:\n"
+                                f"- `Supersedes` references roadmap #{parent_roadmap_issue_number}, "
+                                "but it was not found in roadmap state.\n"
+                                "- skipping parent supersede transition for this activation."
+                            ),
+                            source="roadmap_activation_missing_parent",
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                    else:
+                        self._state.mark_roadmap_superseded(
+                            roadmap_issue_number=parent_roadmap_issue_number,
+                            superseding_roadmap_issue_number=candidate.roadmap_issue_number,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
                 if len(parsed.graph.nodes) > self._repo.roadmap_recommended_node_count:
                     token = compute_roadmap_graph_drift_token(
                         roadmap_issue_number=candidate.roadmap_issue_number,
@@ -1220,6 +1266,13 @@ class Phase1Orchestrator:
                         )
                         continue
                 else:
+                    log_event(
+                        LOGGER,
+                        "roadmap_child_issue_reused",
+                        roadmap_issue_number=claim.roadmap_issue_number,
+                        node_id=claim.node_id,
+                        child_issue_number=existing.number,
+                    )
                     created = existing
                 marked = self._state.mark_roadmap_node_issue_created(
                     roadmap_issue_number=claim.roadmap_issue_number,
@@ -6079,7 +6132,11 @@ class Phase1Orchestrator:
         ]
         if not failed_jobs:
             lines.append("No failed actions were returned by the jobs API for this run.")
-            return "\n".join(lines)
+            return _truncate_feedback_text(
+                "\n".join(lines),
+                soft_limit_chars=_FEEDBACK_TEXT_MAX_CHARS,
+                hard_limit_chars=_GITHUB_ISSUE_BODY_MAX_CHARS,
+            )
 
         job_name_counts = Counter(_normalized_actions_job_name(job.name) for job in failed_jobs)
         lines.append("Failed actions:")
@@ -6099,7 +6156,11 @@ class Phase1Orchestrator:
                 continue
             for tail_line in log_tail.splitlines() or ("<empty>",):
                 lines.append(f"  {tail_line}")
-        return "\n".join(lines)
+        return _truncate_feedback_text(
+            "\n".join(lines),
+            soft_limit_chars=_FEEDBACK_TEXT_MAX_CHARS,
+            hard_limit_chars=_GITHUB_ISSUE_BODY_MAX_CHARS,
+        )
 
     def _actions_context_by_run_id(
         self, comments: tuple[PullRequestIssueComment, ...]
@@ -6440,7 +6501,11 @@ class Phase1Orchestrator:
             full_log_context_markdown.strip(),
             "```",
         ]
-        return "\n".join(lines)
+        return _truncate_feedback_text(
+            "\n".join(lines),
+            soft_limit_chars=_FEEDBACK_TEXT_MAX_CHARS,
+            hard_limit_chars=_GITHUB_ISSUE_BODY_MAX_CHARS,
+        )
 
     def _render_flake_detected_pr_comment(
         self,
@@ -8132,6 +8197,24 @@ def _summarize_git_error(raw_error: str) -> str:
     if len(normalized) > 240:
         return normalized[:237] + "..."
     return normalized
+
+
+def _truncate_feedback_text(
+    text: str,
+    *,
+    soft_limit_chars: int,
+    hard_limit_chars: int,
+) -> str:
+    if soft_limit_chars < 1:
+        raise ValueError("soft_limit_chars must be >= 1")
+    if hard_limit_chars < 1:
+        raise ValueError("hard_limit_chars must be >= 1")
+    limit = min(soft_limit_chars, hard_limit_chars)
+    if len(text) <= limit:
+        return text
+    if limit <= len(_GITHUB_ISSUE_TRUNCATION_NOTICE):
+        return _GITHUB_ISSUE_TRUNCATION_NOTICE[:limit]
+    return text[: limit - len(_GITHUB_ISSUE_TRUNCATION_NOTICE)] + _GITHUB_ISSUE_TRUNCATION_NOTICE
 
 
 def _is_merge_conflict_error(raw_error: str) -> bool:

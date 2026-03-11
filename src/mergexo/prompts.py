@@ -361,6 +361,8 @@ Rules:
 - Use review_replies to summarize what changed and where.
 - Set flaky_test_report only when the failure is an unrelated flaky CI test and you are confident.
 - flaky_test_report must include run_id/title/summary/relevant_log_excerpt with concrete reproduction details.
+- Keep the total JSON response compact and under 32000 characters.
+- If you have more detail than that, prioritize actionable facts and summarize the rest.
 - If flaky_test_report is non-null, commit_message MUST be null.
 - If uncertain whether it is flaky, leave flaky_test_report as null and continue normal remediation.
 - If you discover a foundational roadmap flaw, set escalation with kind=roadmap_revision.

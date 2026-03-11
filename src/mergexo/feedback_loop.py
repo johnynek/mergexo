@@ -109,6 +109,7 @@ def compute_pre_pr_checkpoint_token(*, issue_number: int, checkpoint_sha: str) -
 
 
 def compute_roadmap_status_token(*, roadmap_issue_number: int, request_comment_id: int) -> str:
+    """Return an idempotency token for /roadmap status response comments."""
     payload = f"roadmap_status:{roadmap_issue_number}:{request_comment_id}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -119,16 +120,19 @@ def compute_roadmap_revision_escalation_token(
     source_issue_number: int,
     summary: str,
 ) -> str:
+    """Return an idempotency token for roadmap revision escalation comments."""
     payload = f"roadmap_revision_escalation:{roadmap_issue_number}:{source_issue_number}:{summary}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def compute_roadmap_graph_drift_token(*, roadmap_issue_number: int, graph_checksum: str) -> str:
+    """Return an idempotency token for roadmap graph drift/mismatch notifications."""
     payload = f"roadmap_graph_drift:{roadmap_issue_number}:{graph_checksum}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def compute_roadmap_node_issue_token(*, roadmap_issue_number: int, node_id: str) -> str:
+    """Return an idempotency token for child issue creation per roadmap node."""
     payload = f"roadmap_node_issue:{roadmap_issue_number}:{node_id}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

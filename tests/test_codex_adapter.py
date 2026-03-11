@@ -12,6 +12,7 @@ from mergexo.codex_adapter import (
     _extract_final_agent_message,
     _extract_thread_id,
     _filter_resume_extra_args,
+    _is_context_window_exhaustion_error,
     _parse_flaky_test_report,
     _parse_git_ops,
     _optional_output_text,
@@ -30,6 +31,7 @@ from mergexo.models import (
     PullRequestSnapshot,
 )
 from mergexo.observability import configure_logging
+from mergexo.shell import CommandError
 
 
 def _enabled_config() -> CodexConfig:
@@ -254,6 +256,44 @@ def test_start_roadmap_from_issue_happy_path(
     assert result.session.thread_id == "thread-roadmap"
 
 
+def test_start_roadmap_from_issue_requires_graph_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, input_text, check
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "title": "Roadmap",
+                    "summary": "Summary",
+                    "roadmap_markdown": "# Roadmap",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-roadmap"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(RuntimeError, match="missing required graph_json"):
+        adapter.start_roadmap_from_issue(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            roadmap_docs_dir="docs/roadmap",
+            recommended_node_count=7,
+            cwd=tmp_path,
+        )
+
+
 def test_start_bugfix_from_issue_happy_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -461,6 +501,103 @@ def test_respond_to_feedback_happy_path(
     )
 
 
+def test_respond_to_feedback_falls_back_to_fresh_thread_on_context_window_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, input_text, check
+        calls.append(cmd)
+        if cmd[:3] == ["codex", "exec", "resume"]:
+            raise CommandError(
+                "Command failed\n"
+                f"cmd: {' '.join(cmd)}\n"
+                "exit: 1\n"
+                'stdout:\n{"type":"error","message":"Codex ran out of room in the model\'s context window. Start a new thread."}\n'
+                "stderr:\n"
+            )
+
+        assert cmd[:4] == ["codex", "exec", "--json", "--skip-git-repo-check"]
+        assert "resume" not in cmd
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "review_replies": [{"review_comment_id": 101, "body": "Retried in new thread"}],
+                    "general_comment": "Updated after thread reset",
+                    "commit_message": "fix: continue after context-window exhaustion",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-fresh"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.respond_to_feedback(
+        session=AgentSession(adapter="codex", thread_id="thread-abc"),
+        turn=_feedback_turn(),
+        cwd=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert calls[0][:3] == ["codex", "exec", "resume"]
+    assert calls[1][:2] == ["codex", "exec"]
+    assert calls[1][2] != "resume"
+    assert result.session.thread_id == "thread-fresh"
+    assert result.review_replies[0].body == "Retried in new thread"
+    assert result.general_comment == "Updated after thread reset"
+    assert result.commit_message == "fix: continue after context-window exhaustion"
+
+
+def test_respond_to_feedback_re_raises_non_context_window_command_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        raise CommandError(
+            "Command failed\n"
+            "cmd: codex exec resume --json --skip-git-repo-check thread-abc -\n"
+            "exit: 1\n"
+            'stdout:\n{"type":"error","message":"transient CLI failure"}\n'
+            "stderr:\n"
+        )
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    adapter = CodexAdapter(_enabled_config())
+
+    with pytest.raises(CommandError, match="transient CLI failure"):
+        adapter.respond_to_feedback(
+            session=AgentSession(adapter="codex", thread_id="thread-abc"),
+            turn=_feedback_turn(),
+            cwd=tmp_path,
+        )
+
+
+def test_run_feedback_turn_resume_requires_thread_id(tmp_path: Path) -> None:
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(RuntimeError, match="thread_id"):
+        adapter._run_feedback_turn_resume(
+            session=AgentSession(adapter="codex", thread_id=None),
+            prompt="prompt",
+            cwd=tmp_path,
+        )
+
+
 def test_respond_to_feedback_requires_thread_id(tmp_path: Path) -> None:
     adapter = CodexAdapter(_enabled_config())
     with pytest.raises(RuntimeError, match="thread_id"):
@@ -640,6 +777,22 @@ def test_filter_resume_extra_args_strips_unsupported_options() -> None:
         "--ephemeral",
     )
     assert _filter_resume_extra_args(extra) == ["--full-auto", "--ephemeral"]
+
+
+def test_is_context_window_exhaustion_error_detection() -> None:
+    assert _is_context_window_exhaustion_error(RuntimeError("not command")) is False
+    assert (
+        _is_context_window_exhaustion_error(
+            CommandError(
+                "Command failed\n"
+                "cmd: codex exec resume --json --skip-git-repo-check thread-abc -\n"
+                "exit: 1\n"
+                'stdout:\n{"type":"error","message":"Codex ran out of room in the model\'s context window. Start a new thread."}\n'
+                "stderr:\n"
+            )
+        )
+        is True
+    )
 
 
 def test_parse_git_ops_validation() -> None:

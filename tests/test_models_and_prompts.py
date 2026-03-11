@@ -234,6 +234,7 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "A non-null commit_message is the ready-to-push signal." in prompt
     assert '"flaky_test_report"' in prompt
     assert '"relevant_log_excerpt"' in prompt
+    assert "under 32000 characters" in prompt
     assert "If flaky_test_report is non-null, commit_message MUST be null." in prompt
     assert '"escalation"' in prompt
 
