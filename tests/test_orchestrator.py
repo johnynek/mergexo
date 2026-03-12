@@ -13612,6 +13612,196 @@ def test_handle_roadmap_control_labels_revision_and_abandon_paths(tmp_path: Path
     assert abandon_github.closed_issue_numbers.count(97) == first_parent_close_count
 
 
+def test_handle_roadmap_control_labels_opens_superseding_issue_after_crash_window(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=990,
+        roadmap_pr_number=9900,
+        roadmap_doc_path="docs/roadmap/990.md",
+        graph_path="docs/roadmap/990.graph.json",
+        graph_checksum="sum990",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_revision_requested(roadmap_issue_number=990, repo_full_name=repo)
+
+    github = FakeGitHub(
+        [_issue(990, "Plan", labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_revision_label))]
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=990, repo_full_name=repo)
+    assert roadmap is not None
+    assert roadmap.superseding_roadmap_issue_number is None
+    orch._handle_roadmap_control_labels(roadmap=roadmap)
+
+    refreshed = state.get_roadmap_state(roadmap_issue_number=990, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.status == "revision_requested"
+    assert refreshed.superseding_roadmap_issue_number is not None
+    assert len(github.created_issues) == 1
+
+
+def test_open_superseding_roadmap_issue_reuses_existing_issue(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=991,
+        roadmap_pr_number=9910,
+        roadmap_doc_path="docs/roadmap/991.md",
+        graph_path="docs/roadmap/991.graph.json",
+        graph_checksum="sum991",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_revision_requested(roadmap_issue_number=991, repo_full_name=repo)
+    parent_issue = _issue(
+        991,
+        "Plan",
+        labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_revision_label),
+    )
+    existing_superseding = Issue(
+        number=9911,
+        title="Existing revision",
+        body="Supersedes roadmap #991",
+        html_url="https://example/issues/9911",
+        labels=(cfg.repo.roadmap_label,),
+        author_login="issue-author",
+    )
+    unrelated_roadmap_issue = Issue(
+        number=9912,
+        title="Unrelated roadmap",
+        body="No supersede lineage",
+        html_url="https://example/issues/9912",
+        labels=(cfg.repo.roadmap_label,),
+        author_login="issue-author",
+    )
+    github = FakeGitHub([parent_issue, unrelated_roadmap_issue, existing_superseding])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=991, repo_full_name=repo)
+    assert roadmap is not None
+    orch._open_superseding_roadmap_issue(roadmap=roadmap, issue=parent_issue)
+
+    refreshed = state.get_roadmap_state(roadmap_issue_number=991, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.superseding_roadmap_issue_number == 9911
+    assert not github.created_issues
+
+
+def test_abandon_roadmap_finalizes_after_issue_close(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=992,
+        roadmap_pr_number=9920,
+        roadmap_doc_path="docs/roadmap/992.md",
+        graph_path="docs/roadmap/992.graph.json",
+        graph_checksum="sum992",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=992,
+        node_id=claim.node_id,
+        claim_token=claim.claim_token,
+        child_issue_number=9921,
+        child_issue_url="https://example/issues/9921",
+        repo_full_name=repo,
+    )
+
+    class FailingCloseGitHub(FakeGitHub):
+        def close_issue(self, issue_number: int) -> None:
+            _ = issue_number
+            raise RuntimeError("close failed")
+
+    failing_github = FailingCloseGitHub(
+        [
+            _issue(992, "Plan", labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_abandon_label)),
+            _issue(9921, "Child", labels=(cfg.repo.small_job_label,)),
+        ]
+    )
+    failing_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=failing_github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert roadmap is not None
+    with pytest.raises(RuntimeError, match="close failed"):
+        failing_orch._abandon_roadmap(roadmap=roadmap, reason="manual abandon")
+
+    after_failure = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert after_failure is not None
+    assert after_failure.status == "active"
+
+    github = FakeGitHub(
+        [
+            _issue(992, "Plan", labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_abandon_label)),
+            _issue(9921, "Child", labels=(cfg.repo.small_job_label,)),
+        ]
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts-ok"),
+        agent=FakeAgent(),
+    )
+    retried = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert retried is not None
+    orch._abandon_roadmap(roadmap=retried, reason="manual abandon")
+
+    finalized = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert finalized is not None
+    assert finalized.status == "abandoned"
+    assert 9921 in github.closed_issue_numbers
+    assert 992 in github.closed_issue_numbers
+
+
 def test_publish_roadmap_status_reports_skips_bot_and_non_command_comments(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_roadmaps=True)
     repo = cfg.repo.full_name

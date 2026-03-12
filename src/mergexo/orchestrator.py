@@ -1498,24 +1498,36 @@ class Phase1Orchestrator:
             self._abandon_roadmap(roadmap=roadmap, reason="abandon label set on roadmap issue")
             return
         if self._repo.roadmap_revision_label in labels:
-            changed = self._state.mark_roadmap_revision_requested(
+            self._state.mark_roadmap_revision_requested(
                 roadmap_issue_number=roadmap.roadmap_issue_number,
                 last_error="roadmap revision label applied",
                 repo_full_name=self._state_repo_full_name(),
             )
-            if changed and roadmap.superseding_roadmap_issue_number is None:
-                self._open_superseding_roadmap_issue(roadmap=roadmap, issue=issue)
+            refreshed = self._state.get_roadmap_state(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if (
+                refreshed is not None
+                and refreshed.status == "revision_requested"
+                and refreshed.superseding_roadmap_issue_number is None
+            ):
+                self._open_superseding_roadmap_issue(roadmap=refreshed, issue=issue)
 
     def _open_superseding_roadmap_issue(self, *, roadmap: RoadmapStateRecord, issue: Issue) -> None:
-        created = self._github.create_issue(
-            title=f"Roadmap revision for #{roadmap.roadmap_issue_number}: {issue.title}",
-            body=(
-                f"Supersedes roadmap #{roadmap.roadmap_issue_number}.\n\n"
-                "Please propose a revised roadmap graph and markdown narrative.\n"
-                "This issue was generated automatically after revision was requested."
-            ),
-            labels=(self._repo.roadmap_label,),
+        created = self._find_existing_superseding_roadmap_issue(
+            roadmap_issue_number=roadmap.roadmap_issue_number
         )
+        if created is None:
+            created = self._github.create_issue(
+                title=f"Roadmap revision for #{roadmap.roadmap_issue_number}: {issue.title}",
+                body=(
+                    f"Supersedes roadmap #{roadmap.roadmap_issue_number}.\n\n"
+                    "Please propose a revised roadmap graph and markdown narrative.\n"
+                    "This issue was generated automatically after revision was requested."
+                ),
+                labels=(self._repo.roadmap_label,),
+            )
         self._state.set_roadmap_superseding_issue(
             roadmap_issue_number=roadmap.roadmap_issue_number,
             superseding_roadmap_issue_number=created.number,
@@ -1537,13 +1549,24 @@ class Phase1Orchestrator:
             repo_full_name=self._state_repo_full_name(),
         )
 
+    def _find_existing_superseding_roadmap_issue(
+        self, *, roadmap_issue_number: int
+    ) -> Issue | None:
+        roadmap_issues = self._github.list_open_issues_with_label(self._repo.roadmap_label)
+        for roadmap_issue in roadmap_issues:
+            if roadmap_issue.number == roadmap_issue_number:
+                continue
+            if _parse_superseding_roadmap_parent(roadmap_issue.body) != roadmap_issue_number:
+                continue
+            return roadmap_issue
+        return None
+
     def _abandon_roadmap(self, *, roadmap: RoadmapStateRecord, reason: str) -> None:
-        changed = self._state.mark_roadmap_abandoned(
+        refreshed = self._state.get_roadmap_state(
             roadmap_issue_number=roadmap.roadmap_issue_number,
-            last_error=reason,
             repo_full_name=self._state_repo_full_name(),
         )
-        if not changed:
+        if refreshed is None or refreshed.status not in {"active", "revision_requested"}:
             return
         nodes = self._state.list_roadmap_nodes(
             roadmap_issue_number=roadmap.roadmap_issue_number,
@@ -1585,6 +1608,13 @@ class Phase1Orchestrator:
             repo_full_name=self._state_repo_full_name(),
         )
         self._github.close_issue(roadmap.roadmap_issue_number)
+        # Persist abandon status only after side effects so retries can recover from
+        # crashes between issue close/comment operations and sqlite finalization.
+        self._state.mark_roadmap_abandoned(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            last_error=reason,
+            repo_full_name=self._state_repo_full_name(),
+        )
 
     def _publish_roadmap_status_reports(self) -> None:
         roadmaps = self._state.list_active_roadmaps(repo_full_name=self._state_repo_full_name())
