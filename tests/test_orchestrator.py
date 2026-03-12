@@ -13825,6 +13825,74 @@ def test_open_superseding_roadmap_issue_reuses_existing_issue(tmp_path: Path) ->
     assert not github.created_issues
 
 
+def test_open_superseding_roadmap_issue_finalizes_after_comment(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=993,
+        roadmap_pr_number=9930,
+        roadmap_doc_path="docs/roadmap/993.md",
+        graph_path="docs/roadmap/993.graph.json",
+        graph_checksum="sum993",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_revision_requested(roadmap_issue_number=993, repo_full_name=repo)
+    parent_issue = _issue(
+        993,
+        "Plan",
+        labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_revision_label),
+    )
+    github = FakeGitHub([parent_issue])
+    failing_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert roadmap is not None
+
+    def fail_comment(**kwargs) -> None:  # type: ignore[no-untyped-def]
+        _ = kwargs
+        raise RuntimeError("comment failed")
+
+    failing_orch._ensure_tokenized_issue_comment = fail_comment  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="comment failed"):
+        failing_orch._open_superseding_roadmap_issue(roadmap=roadmap, issue=parent_issue)
+
+    after_failure = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert after_failure is not None
+    assert after_failure.superseding_roadmap_issue_number is None
+    assert len(github.created_issues) == 1
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts-retry"),
+        agent=FakeAgent(),
+    )
+    retried = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert retried is not None
+    orch._open_superseding_roadmap_issue(roadmap=retried, issue=parent_issue)
+
+    finalized = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert finalized is not None
+    assert finalized.superseding_roadmap_issue_number is not None
+    assert len(github.created_issues) == 1
+
+
 def test_abandon_roadmap_finalizes_after_issue_close(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_roadmaps=True)
     repo = cfg.repo.full_name

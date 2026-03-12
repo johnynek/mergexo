@@ -1501,11 +1501,6 @@ class Phase1Orchestrator:
                 ),
                 labels=(self._repo.roadmap_label,),
             )
-        self._state.set_roadmap_superseding_issue(
-            roadmap_issue_number=roadmap.roadmap_issue_number,
-            superseding_roadmap_issue_number=created.number,
-            repo_full_name=self._state_repo_full_name(),
-        )
         token = compute_roadmap_status_token(
             roadmap_issue_number=roadmap.roadmap_issue_number,
             request_comment_id=created.number,
@@ -1519,6 +1514,13 @@ class Phase1Orchestrator:
                 f"- superseding issue: #{created.number} ({created.html_url})"
             ),
             source="roadmap_superseding_issue_created",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        # Persist linkage only after comment side effect so retries can recover from
+        # crashes/failures between issue creation/comment and sqlite finalization.
+        self._state.set_roadmap_superseding_issue(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            superseding_roadmap_issue_number=created.number,
             repo_full_name=self._state_repo_full_name(),
         )
 
