@@ -17,11 +17,15 @@ def _is_non_fast_forward_push_error(detail: str) -> bool:
     normalized = detail.strip().lower()
     if not normalized:
         return False
+    # Remote-side rejects (for example GitHub 5xx) often include
+    # "failed to push some refs", but should not enter merge-repair flow.
+    if "remote rejected" in normalized:
+        return False
     markers = (
         "non-fast-forward",
         "fetch first",
-        "failed to push some refs",
         "updates were rejected because the remote contains work",
+        "updates were rejected because the tip of your current branch is behind",
         "remote contains work that you do not",
     )
     return any(marker in normalized for marker in markers)

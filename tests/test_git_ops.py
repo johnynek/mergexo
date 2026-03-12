@@ -425,13 +425,52 @@ def test_push_branch_command_error_with_empty_message_does_not_retry(
     assert calls == [["git", "-C", str(checkout), "push", "-u", "origin", "feature"]]
 
 
+def test_push_branch_remote_rejected_error_does_not_attempt_non_fast_forward_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: git push\n"
+                "exit: 1\n"
+                "stdout:\n\n"
+                "stderr:\n"
+                "remote: Internal Server Error\n"
+                "To github.com:example/repo.git\n"
+                " ! [remote rejected] feature -> feature (internal server error)\n"
+                "error: failed to push some refs to 'github.com:example/repo.git'\n"
+            )
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError, match="internal server error"):
+        manager.push_branch(checkout, "feature")
+
+    assert calls == [["git", "-C", str(checkout), "push", "-u", "origin", "feature"]]
+
+
 def test_is_non_fast_forward_push_error_accepts_fetch_first_variants() -> None:
     assert _is_non_fast_forward_push_error("non-fast-forward") is True
     assert _is_non_fast_forward_push_error("(fetch first)") is True
-    assert _is_non_fast_forward_push_error("failed to push some refs") is True
+    assert _is_non_fast_forward_push_error("failed to push some refs") is False
     assert (
         _is_non_fast_forward_push_error("updates were rejected because the remote contains work")
         is True
+    )
+    assert (
+        _is_non_fast_forward_push_error(
+            "! [remote rejected] feature -> feature (internal server error)"
+        )
+        is False
     )
     assert _is_non_fast_forward_push_error("unrelated command failure") is False
 

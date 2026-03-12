@@ -7170,6 +7170,8 @@ def _failure_class_for_exception(exc: Exception) -> AgentRunFailureClass:
     if "github" in normalized:
         return "github_error"
     if isinstance(exc, CommandError):
+        if _is_transient_feedback_git_command_error(str(exc)):
+            return "github_error"
         return "agent_error"
     return "unknown"
 
@@ -7342,6 +7344,7 @@ def _is_transient_git_remote_error(detail: str) -> bool:
     if not normalized:
         return False
     transient_markers = (
+        "internal server error",
         "no healthy upstream",
         "internal error performing authentication",
         "could not read from remote repository",

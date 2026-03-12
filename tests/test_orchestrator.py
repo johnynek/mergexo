@@ -2506,6 +2506,18 @@ def test_observability_failure_and_terminal_helpers() -> None:
     assert _failure_class_for_exception(GitHubPollingError("x")) == "github_error"
     assert _failure_class_for_exception(RuntimeError("github API failure")) == "github_error"
     assert _failure_class_for_exception(CommandError(["git"], 1, "", "")) == "agent_error"
+    assert (
+        _failure_class_for_exception(
+            CommandError(
+                "Command failed\n"
+                "cmd: git push origin branch\n"
+                "exit: 1\n"
+                "stdout:\n\n"
+                "stderr:\nERROR: no healthy upstream\nfatal: Could not read from remote repository.\n"
+            )
+        )
+        == "github_error"
+    )
     assert _failure_class_for_exception(FeedbackTransientGitError("cannot reach github")) == (
         "github_error"
     )
@@ -2532,6 +2544,7 @@ def test_observability_failure_and_terminal_helpers() -> None:
         "stderr:\nERROR: no healthy upstream\n"
     )
     assert not _is_transient_git_remote_error("   ")
+    assert _is_transient_git_remote_error("remote: Internal Server Error")
     assert _feedback_transient_git_retry_delay_seconds(1) == 5
     assert _feedback_transient_git_retry_delay_seconds(2) == 10
     with pytest.raises(ValueError, match="attempt must be >= 1"):
