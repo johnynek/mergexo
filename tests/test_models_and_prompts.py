@@ -141,6 +141,8 @@ def test_build_design_prompt_contains_required_contract() -> None:
     )
 
     assert "You MUST report likely implementation file paths in touch_paths." in prompt
+    assert "`design_doc_markdown` must contain only the body" in prompt
+    assert "Do NOT include YAML frontmatter" in prompt
     assert "Return JSON only." in prompt
     assert "issue #12" in prompt.lower()
     assert "docs/design/12-improve-scheduler.md" in prompt

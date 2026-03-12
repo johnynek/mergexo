@@ -353,7 +353,7 @@ Multi-repo support uses repo-scoped state schema. If upgrading from old single-r
 
 ### Generated Design Doc Contract
 
-Design prompts require `touch_paths` in output; these are recorded in design doc frontmatter.
+Design prompts require `touch_paths` in output; these are recorded in design doc frontmatter. The orchestrator also renders the document frontmatter, H1 title, issue line, and summary. `design_doc_markdown` should therefore contain only the body that starts at the first substantive section.
 
 ## Configuration Reference
 
