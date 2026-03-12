@@ -7476,9 +7476,48 @@ def _design_doc_url(*, repo_full_name: str, default_branch: str, design_doc_path
     return f"https://github.com/{repo_full_name}/blob/{default_branch}/{design_doc_path}"
 
 
+def _strip_leading_frontmatter(markdown: str) -> str:
+    lines = markdown.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return markdown
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            return "\n".join(lines[idx + 1 :]).lstrip()
+    return markdown
+
+
+def _is_markdown_heading(line: str) -> bool:
+    return bool(re.match(r"^#{1,6}\s+", line.strip()))
+
+
+def _normalize_design_doc_body(markdown: str) -> str:
+    original = markdown.strip()
+    body = _strip_leading_frontmatter(original).strip()
+    lines = body.splitlines()
+
+    if lines and lines[0].startswith("# "):
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and re.match(r"^_?Issue:\s*#", lines[0].strip(), flags=re.IGNORECASE):
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].strip().lower() == "## summary":
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not _is_markdown_heading(lines[0]):
+            lines.pop(0)
+
+    normalized = "\n".join(lines).strip()
+    return normalized or original
+
+
 def _render_design_doc(*, issue: Issue, design: GeneratedDesign) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     touch_paths = "\n".join(f"  - {path}" for path in design.touch_paths)
+    body_markdown = _normalize_design_doc_body(design.design_doc_markdown)
     return (
         "---\n"
         f"issue: {issue.number}\n"
@@ -7492,5 +7531,5 @@ def _render_design_doc(*, issue: Issue, design: GeneratedDesign) -> str:
         f"# {design.title}\n\n"
         f"_Issue: #{issue.number} ({issue.html_url})_\n\n"
         f"## Summary\n\n{design.summary}\n\n"
-        f"{design.design_doc_markdown.strip()}\n"
+        f"{body_markdown}\n"
     )

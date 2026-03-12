@@ -91,6 +91,7 @@ from mergexo.orchestrator import (
     _pre_pr_flow_label,
     _pull_request_url,
     _parse_utc_timestamp,
+    _normalize_design_doc_body,
     _render_source_issue_redirect_comment,
     _render_design_doc,
     _render_operator_command_result,
@@ -2553,6 +2554,49 @@ def test_render_design_doc_includes_frontmatter_and_summary() -> None:
     assert "  - src/a.py" in doc
     assert "## Summary" in doc
     assert "## Section" in doc
+
+
+def test_render_design_doc_strips_duplicate_generated_preamble() -> None:
+    issue = _issue()
+    design = GeneratedDesign(
+        title="Design",
+        summary="Summary",
+        touch_paths=("src/a.py",),
+        design_doc_markdown=(
+            "---\n"
+            "issue: 7\n"
+            "priority: 2\n"
+            "touch_paths:\n"
+            "  - src/a.py\n"
+            "---\n\n"
+            "# Design\n\n"
+            "_Issue: #7 (https://example/issues/7)_\n\n"
+            "## Summary\n\n"
+            "Repeated summary.\n\n"
+            "## Context\n\n"
+            "Real content.\n"
+        ),
+    )
+
+    doc = _render_design_doc(issue=issue, design=design)
+
+    assert doc.count("touch_paths:") == 1
+    assert doc.count("# Design") == 1
+    assert doc.count("## Summary") == 1
+    assert "## Context\n\nReal content." in doc
+    assert "Repeated summary." not in doc
+
+
+def test_normalize_design_doc_body_keeps_malformed_frontmatter_literal() -> None:
+    body = _normalize_design_doc_body("---\nissue: 7\npriority: 2")
+
+    assert body == "---\nissue: 7\npriority: 2"
+
+
+def test_normalize_design_doc_body_strips_leading_blank_lines() -> None:
+    body = _normalize_design_doc_body("\n\n## Context\n\nReal content.\n")
+
+    assert body == "## Context\n\nReal content."
 
 
 def test_process_issue_happy_path(tmp_path: Path) -> None:
