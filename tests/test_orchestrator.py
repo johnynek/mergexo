@@ -13157,6 +13157,111 @@ def test_activate_merged_roadmaps_covers_missing_invalid_unreadable_parent_and_r
     assert unknown_parent_child.parent_roadmap_issue_number == 999
 
 
+def test_advance_roadmap_nodes_reconciles_parent_supersede_after_activation_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    git = FakeGitManager(tmp_path / "checkouts")
+
+    parent_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 111,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "p1",
+                        "kind": "small_job",
+                        "title": "Parent node",
+                        "body_markdown": "Parent node",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=111,
+    )
+    child_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 112,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "c1",
+                        "kind": "small_job",
+                        "title": "Child node",
+                        "body_markdown": "Child node",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=112,
+    )
+
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=111,
+        roadmap_pr_number=1110,
+        roadmap_doc_path="docs/roadmap/111-parent.md",
+        graph_path="docs/roadmap/111-parent.graph.json",
+        graph_checksum=parent_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="p1",
+                kind="small_job",
+                title="Parent node",
+                body_markdown="Parent node",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=112,
+        roadmap_pr_number=1120,
+        roadmap_doc_path="docs/roadmap/112-child.md",
+        graph_path="docs/roadmap/112-child.graph.json",
+        graph_checksum=child_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="c1",
+                kind="small_job",
+                title="Child node",
+                body_markdown="Child node",
+                dependencies=(),
+            ),
+        ),
+        parent_roadmap_issue_number=111,
+        repo_full_name=repo,
+    )
+
+    checkout = git.ensure_checkout(0)
+    docs_dir = checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "111-parent.graph.json").write_text(parent_graph.canonical_json, encoding="utf-8")
+    (docs_dir / "112-child.graph.json").write_text(child_graph.canonical_json, encoding="utf-8")
+
+    github = FakeGitHub(
+        [
+            _issue(111, "Parent", labels=(cfg.repo.roadmap_label,)),
+            _issue(112, "Child", labels=(cfg.repo.roadmap_label,)),
+        ]
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    monkeypatch.setattr(orch._state, "claim_ready_roadmap_nodes", lambda **kwargs: ())
+    orch._advance_roadmap_nodes()
+
+    parent = state.get_roadmap_state(roadmap_issue_number=111, repo_full_name=repo)
+    assert parent is not None
+    assert parent.status == "superseded"
+    child = state.get_roadmap_state(roadmap_issue_number=112, repo_full_name=repo)
+    assert child is not None
+    assert child.status == "active"
+
+
 def test_advance_roadmap_nodes_handles_missing_roadmap_state_and_claim_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

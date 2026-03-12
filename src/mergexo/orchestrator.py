@@ -1103,7 +1103,7 @@ class Phase1Orchestrator:
                     for node in parsed.graph.nodes
                 )
                 parent_roadmap_issue_number = _parse_superseding_roadmap_parent(issue.body)
-                self._state.upsert_roadmap_graph(
+                activated = self._state.upsert_roadmap_graph(
                     roadmap_issue_number=candidate.roadmap_issue_number,
                     roadmap_pr_number=candidate.roadmap_pr_number,
                     roadmap_doc_path=roadmap_relpath,
@@ -1113,35 +1113,7 @@ class Phase1Orchestrator:
                     parent_roadmap_issue_number=parent_roadmap_issue_number,
                     repo_full_name=self._state_repo_full_name(),
                 )
-                if parent_roadmap_issue_number is not None:
-                    parent_state = self._state.get_roadmap_state(
-                        roadmap_issue_number=parent_roadmap_issue_number,
-                        repo_full_name=self._state_repo_full_name(),
-                    )
-                    if parent_state is None:
-                        token = compute_roadmap_graph_drift_token(
-                            roadmap_issue_number=candidate.roadmap_issue_number,
-                            graph_checksum=f"missing_parent:{parent_roadmap_issue_number}",
-                        )
-                        self._ensure_tokenized_issue_comment(
-                            github=self._github,
-                            issue_number=candidate.roadmap_issue_number,
-                            token=token,
-                            body=(
-                                "MergeXO roadmap supersede linkage warning:\n"
-                                f"- `Supersedes` references roadmap #{parent_roadmap_issue_number}, "
-                                "but it was not found in roadmap state.\n"
-                                "- skipping parent supersede transition for this activation."
-                            ),
-                            source="roadmap_activation_missing_parent",
-                            repo_full_name=self._state_repo_full_name(),
-                        )
-                    else:
-                        self._state.mark_roadmap_superseded(
-                            roadmap_issue_number=parent_roadmap_issue_number,
-                            superseding_roadmap_issue_number=candidate.roadmap_issue_number,
-                            repo_full_name=self._state_repo_full_name(),
-                        )
+                self._reconcile_roadmap_parent_supersede(roadmap=activated)
                 if len(parsed.graph.nodes) > self._repo.roadmap_recommended_node_count:
                     token = compute_roadmap_graph_drift_token(
                         roadmap_issue_number=candidate.roadmap_issue_number,
@@ -1179,6 +1151,7 @@ class Phase1Orchestrator:
                 )
                 if refreshed is None:
                     continue
+                self._reconcile_roadmap_parent_supersede(roadmap=refreshed)
                 self._sync_roadmap_node_progress(roadmap=refreshed)
                 if refreshed.status != "active":
                     continue
@@ -1613,6 +1586,39 @@ class Phase1Orchestrator:
         self._state.mark_roadmap_abandoned(
             roadmap_issue_number=roadmap.roadmap_issue_number,
             last_error=reason,
+            repo_full_name=self._state_repo_full_name(),
+        )
+
+    def _reconcile_roadmap_parent_supersede(self, *, roadmap: RoadmapStateRecord) -> None:
+        parent_roadmap_issue_number = roadmap.parent_roadmap_issue_number
+        if parent_roadmap_issue_number is None:
+            return
+        parent_state = self._state.get_roadmap_state(
+            roadmap_issue_number=parent_roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if parent_state is None:
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"missing_parent:{parent_roadmap_issue_number}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO roadmap supersede linkage warning:\n"
+                    f"- `Supersedes` references roadmap #{parent_roadmap_issue_number}, "
+                    "but it was not found in roadmap state.\n"
+                    "- skipping parent supersede transition."
+                ),
+                source="roadmap_activation_missing_parent",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return
+        self._state.mark_roadmap_superseded(
+            roadmap_issue_number=parent_roadmap_issue_number,
+            superseding_roadmap_issue_number=roadmap.roadmap_issue_number,
             repo_full_name=self._state_repo_full_name(),
         )
 
