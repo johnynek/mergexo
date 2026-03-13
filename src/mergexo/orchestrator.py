@@ -4296,7 +4296,12 @@ class Phase1Orchestrator:
             raise DirectFlowValidationError(
                 "required pre-push tests failed before pushing design branch"
             )
-        self._git.push_branch(checkout_path, branch)
+        self._push_pre_pr_branch(
+            issue=issue,
+            flow_label="design",
+            checkout_path=checkout_path,
+            branch=branch,
+        )
         self._run_pre_pr_ordering_gate(
             issue_number=issue.number,
             last_consumed_comment_id=pre_pr_last_consumed_comment_id,
@@ -4415,7 +4420,12 @@ class Phase1Orchestrator:
             raise DirectFlowValidationError(
                 "required pre-push tests failed before pushing roadmap branch"
             )
-        self._git.push_branch(checkout_path, branch)
+        self._push_pre_pr_branch(
+            issue=issue,
+            flow_label="roadmap",
+            checkout_path=checkout_path,
+            branch=branch,
+        )
         self._run_pre_pr_ordering_gate(
             issue_number=issue.number,
             last_consumed_comment_id=pre_pr_last_consumed_comment_id,
@@ -4944,6 +4954,40 @@ class Phase1Orchestrator:
             repo_full_name=self._state_repo_full_name(),
         )
 
+    def _push_pre_pr_branch(
+        self,
+        *,
+        issue: Issue,
+        flow_label: str,
+        checkout_path: Path,
+        branch: str,
+    ) -> None:
+        push_recovered_remote_race = self._git.push_branch(checkout_path, branch)
+        if not push_recovered_remote_race:
+            return
+
+        # push_branch() may auto-merge origin/<branch> to recover a non-fast-forward race.
+        # Re-run required tests on that merged state before opening any PR.
+        required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+        if required_tests_error is None:
+            return
+
+        required_tests_command = self._repo.required_tests or "<unset>"
+        error_summary = _summarize_git_error(required_tests_error)
+        self._github.post_issue_comment(
+            issue_number=issue.number,
+            body=(
+                f"MergeXO {flow_label} flow pushed `{branch}` after automatically reconciling "
+                "a remote branch update, but required pre-push tests then failed on the merged "
+                f"branch (`{required_tests_command}`).\n"
+                f"Failure summary: {error_summary}\n"
+                "No PR was opened so this can be fixed before review."
+            ),
+        )
+        raise DirectFlowValidationError(
+            "required pre-push tests failed after push reconciled remote branch updates"
+        )
+
     def _push_branch_with_merge_conflict_repair(
         self,
         *,
@@ -4957,7 +5001,12 @@ class Phase1Orchestrator:
         conflict_repair_round = 0
         while True:
             try:
-                self._git.push_branch(checkout_path, branch)
+                self._push_pre_pr_branch(
+                    issue=issue,
+                    flow_label=flow_label,
+                    checkout_path=checkout_path,
+                    branch=branch,
+                )
                 return
             except CommandError as exc:
                 detail = str(exc)

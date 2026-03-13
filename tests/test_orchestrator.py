@@ -3261,6 +3261,112 @@ def test_process_issue_push_non_conflict_error_propagates(tmp_path: Path) -> Non
     assert github.created_prs == []
 
 
+def test_process_issue_small_job_revalidates_required_tests_after_push_auto_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.push_results = [True]
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=(cfg.repo.small_job_label,))
+    required_test_calls: list[Path] = []
+    required_test_results = iter((None, "post-merge required-tests failure"))
+
+    def fake_run_required_tests(*, checkout_path: Path) -> str | None:
+        required_test_calls.append(checkout_path)
+        return next(required_test_results)
+
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", fake_run_required_tests)
+
+    with pytest.raises(
+        DirectFlowValidationError,
+        match="required pre-push tests failed after push reconciled remote branch updates",
+    ):
+        orch._process_issue(issue, "small_job")
+
+    assert len(required_test_calls) == 2
+    assert len(git.push_calls) == 1
+    assert github.created_prs == []
+    assert any(
+        issue_number == issue.number
+        and "small-job flow pushed" in body
+        and "required pre-push tests then failed on the merged branch" in body
+        for issue_number, body in github.comments
+    )
+
+
+def test_process_issue_small_job_allows_push_auto_merge_when_recheck_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.push_results = [True]
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=(cfg.repo.small_job_label,))
+    required_test_calls: list[Path] = []
+
+    def fake_run_required_tests(*, checkout_path: Path) -> str | None:
+        required_test_calls.append(checkout_path)
+        return None
+
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", fake_run_required_tests)
+
+    result = orch._process_issue(issue, "small_job")
+
+    assert result.pr_number == 101
+    assert len(required_test_calls) == 2
+    assert len(git.push_calls) == 1
+    assert github.created_prs != []
+
+
+def test_process_issue_roadmap_revalidates_required_tests_after_push_auto_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True, required_tests="scripts/test.sh")
+    issue = _issue(120, "Roadmap", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.push_results = [True]
+    state = StateStore(tmp_path / "state.db")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    required_test_calls: list[Path] = []
+    required_test_results = iter((None, "post-merge required-tests failure"))
+
+    def fake_run_required_tests(*, checkout_path: Path) -> str | None:
+        required_test_calls.append(checkout_path)
+        return next(required_test_results)
+
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", fake_run_required_tests)
+
+    with pytest.raises(
+        DirectFlowValidationError,
+        match="required pre-push tests failed after push reconciled remote branch updates",
+    ):
+        orch._process_issue(issue, "roadmap")
+
+    assert len(required_test_calls) == 2
+    assert len(git.push_calls) == 1
+    assert github.created_prs == []
+    assert any(
+        issue_number == issue.number
+        and "roadmap flow pushed" in body
+        and "required pre-push tests then failed on the merged branch" in body
+        for issue_number, body in github.comments
+    )
+
+
 def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
