@@ -17,7 +17,18 @@ def _is_non_fast_forward_push_error(detail: str) -> bool:
     normalized = detail.strip().lower()
     if not normalized:
         return False
-    return "non-fast-forward" in normalized
+    # Remote-side rejects (for example GitHub 5xx) often include
+    # "failed to push some refs", but should not enter merge-repair flow.
+    if "remote rejected" in normalized:
+        return False
+    markers = (
+        "non-fast-forward",
+        "fetch first",
+        "updates were rejected because the remote contains work",
+        "updates were rejected because the tip of your current branch is behind",
+        "remote contains work that you do not",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _is_checkout_overwrite_error(detail: str) -> bool:
@@ -203,7 +214,7 @@ class GitRepoManager:
         )
         run(["git", "-C", str(checkout_path), "commit", "-m", message])
 
-    def push_branch(self, checkout_path: Path, branch: str) -> None:
+    def push_branch(self, checkout_path: Path, branch: str) -> bool:
         log_event(
             LOGGER,
             "git_push",
@@ -212,7 +223,7 @@ class GitRepoManager:
         )
         try:
             run(["git", "-C", str(checkout_path), "push", "-u", "origin", branch])
-            return
+            return False
         except CommandError as exc:
             if _is_non_fast_forward_push_error(str(exc)):
                 log_event(
@@ -256,7 +267,7 @@ class GitRepoManager:
                     checkout_path=str(checkout_path),
                     branch=branch,
                 )
-                return
+                return True
             log_event(
                 LOGGER,
                 "git_push_failed",

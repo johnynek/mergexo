@@ -32,7 +32,7 @@ def build_design_prompt(
 You are the design-doc agent for repository {repo_full_name}.
 
 Task:
-- Create the full content for a design doc that addresses issue #{issue.number}.
+- Create structured content for a design doc that addresses issue #{issue.number}.
 - The resulting PR will add the file at: {design_doc_path}
 - Base branch is: {default_branch}
 
@@ -42,6 +42,10 @@ Output requirements:
 - Include risks and rollout notes.
 - You MUST report likely implementation file paths in touch_paths.
 - Keep touch_paths concrete and repository-relative.
+- `title` and `summary` are rendered separately by the orchestrator.
+- `design_doc_markdown` must contain only the body that comes after the auto-generated header.
+- Do NOT include YAML frontmatter, the H1 title, the issue line, or a `## Summary` section in `design_doc_markdown`.
+- Start `design_doc_markdown` at the first substantive section, for example `## Context`, `## Problem`, `## Goals`, or equivalent.
 
 Response format:
 - Return JSON only.

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from mergexo.config import RepoConfig, RuntimeConfig
-from mergexo.git_ops import GitRepoManager
+from mergexo.git_ops import GitRepoManager, _is_non_fast_forward_push_error
 from mergexo.observability import configure_logging
 from mergexo.shell import CommandError
 
@@ -323,8 +323,46 @@ def test_push_branch_retries_non_fast_forward_once(
 
     monkeypatch.setattr("mergexo.git_ops.run", fake_run)
 
-    manager.push_branch(checkout, "feature")
+    assert manager.push_branch(checkout, "feature") is True
 
+    assert push_attempts == 2
+    assert ["git", "-C", str(checkout), "fetch", "origin", "--prune", "--tags"] in calls
+    assert ["git", "-C", str(checkout), "merge", "--no-edit", "origin/feature"] in calls
+
+
+def test_push_branch_retries_fetch_first_rejection_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+    push_attempts = 0
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        nonlocal push_attempts
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            push_attempts += 1
+            if push_attempts == 1:
+                raise CommandError(
+                    "Command failed\n"
+                    "cmd: git push\n"
+                    "exit: 1\n"
+                    "stdout:\n\n"
+                    "stderr:\n"
+                    "To github.com:example/repo.git\n"
+                    " ! [rejected]        feature -> feature (fetch first)\n"
+                    "error: failed to push some refs to 'github.com:example/repo.git'\n"
+                    "hint: Updates were rejected because the remote contains work that you do not\n"
+                    "hint: have locally.\n"
+                )
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    assert manager.push_branch(checkout, "feature") is True
     assert push_attempts == 2
     assert ["git", "-C", str(checkout), "fetch", "origin", "--prune", "--tags"] in calls
     assert ["git", "-C", str(checkout), "merge", "--no-edit", "origin/feature"] in calls
@@ -385,6 +423,56 @@ def test_push_branch_command_error_with_empty_message_does_not_retry(
         manager.push_branch(checkout, "feature")
 
     assert calls == [["git", "-C", str(checkout), "push", "-u", "origin", "feature"]]
+
+
+def test_push_branch_remote_rejected_error_does_not_attempt_non_fast_forward_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    checkout = tmp_path / "checkout"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[-4:] == ["push", "-u", "origin", "feature"]:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: git push\n"
+                "exit: 1\n"
+                "stdout:\n\n"
+                "stderr:\n"
+                "remote: Internal Server Error\n"
+                "To github.com:example/repo.git\n"
+                " ! [remote rejected] feature -> feature (internal server error)\n"
+                "error: failed to push some refs to 'github.com:example/repo.git'\n"
+            )
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError, match="internal server error"):
+        manager.push_branch(checkout, "feature")
+
+    assert calls == [["git", "-C", str(checkout), "push", "-u", "origin", "feature"]]
+
+
+def test_is_non_fast_forward_push_error_accepts_fetch_first_variants() -> None:
+    assert _is_non_fast_forward_push_error("non-fast-forward") is True
+    assert _is_non_fast_forward_push_error("(fetch first)") is True
+    assert _is_non_fast_forward_push_error("failed to push some refs") is False
+    assert (
+        _is_non_fast_forward_push_error("updates were rejected because the remote contains work")
+        is True
+    )
+    assert (
+        _is_non_fast_forward_push_error(
+            "! [remote rejected] feature -> feature (internal server error)"
+        )
+        is False
+    )
+    assert _is_non_fast_forward_push_error("unrelated command failure") is False
 
 
 def test_push_branch_logs_failed_event_for_non_command_error(
