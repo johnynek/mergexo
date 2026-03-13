@@ -7,11 +7,20 @@ import pytest
 
 from mergexo.agent_adapter import AgentSession
 from mergexo.feedback_loop import FeedbackEventRecord
+import mergexo.state as state_module
 from mergexo.state import (
     ActionTokenObservation,
     PollCursorUpdate,
+    RoadmapDependencyState,
+    RoadmapNodeGraphInput,
     StateStore,
     _normalize_repo_full_name,
+    _parse_roadmap_dependencies_json,
+    _parse_roadmap_node_kind,
+    _parse_roadmap_node_row,
+    _parse_roadmap_node_status,
+    _parse_roadmap_state_row,
+    _parse_roadmap_status,
     _parse_action_token_row,
     _parse_action_token_scope_kind,
     _parse_action_token_status,
@@ -28,6 +37,7 @@ from mergexo.state import (
     _parse_runtime_operation_row,
     _parse_runtime_operation_status,
     _table_columns,
+    _roadmap_node_dependencies_satisfied,
     _transient_retry_delay_seconds,
 )
 
@@ -787,6 +797,46 @@ def test_state_store_migrates_issue_runs_retry_columns(tmp_path: Path) -> None:
     assert "last_failure_class" in columns
     assert "retry_count" in columns
     assert "next_retry_at" in columns
+
+
+def test_state_store_migrates_roadmap_nodes_claim_token_column(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE roadmap_nodes (
+                repo_full_name TEXT NOT NULL,
+                roadmap_issue_number INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body_markdown TEXT NOT NULL,
+                dependencies_json TEXT NOT NULL,
+                child_issue_number INTEGER NULL,
+                child_issue_url TEXT NULL,
+                status TEXT NOT NULL,
+                planned_at TEXT NULL,
+                implemented_at TEXT NULL,
+                status_changed_at TEXT NULL,
+                last_progress_at TEXT NULL,
+                blocked_since_at TEXT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (repo_full_name, roadmap_issue_number, node_id)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _ = StateStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = set(_table_columns(conn, "roadmap_nodes"))
+    finally:
+        conn.close()
+    assert "claim_token" in columns
 
 
 def test_state_store_upsert_github_call_intent_raises_when_insert_not_visible(
@@ -2972,6 +3022,1108 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
         _parse_action_token_status(1)
     with pytest.raises(RuntimeError, match="Unknown status value"):
         _parse_action_token_status("other")
+
+
+def test_state_store_roadmap_lifecycle_and_scheduler_paths(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo"
+
+    store.mark_completed(
+        50,
+        "agent/roadmap/50-plan",
+        500,
+        "https://example/pr/500",
+        repo_full_name=repo,
+    )
+    store.mark_pr_status(
+        pr_number=500,
+        issue_number=50,
+        status="merged",
+        repo_full_name=repo,
+    )
+    activation = store.list_roadmap_activation_candidates(repo_full_name=repo)
+    assert len(activation) == 1
+    assert activation[0].roadmap_issue_number == 50
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=50,
+        roadmap_pr_number=500,
+        roadmap_doc_path="docs/roadmap/50-plan.md",
+        graph_path="docs/roadmap/50-plan.graph.json",
+        graph_checksum="sum",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="design",
+                kind="design_doc",
+                title="Design",
+                body_markdown="Write doc",
+                dependencies=(),
+            ),
+            RoadmapNodeGraphInput(
+                node_id="impl",
+                kind="small_job",
+                title="Implement",
+                body_markdown="Ship code",
+                dependencies=(RoadmapDependencyState(node_id="design", requires="planned"),),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    assert store.list_roadmap_activation_candidates(repo_full_name=repo) == ()
+    active = store.list_active_roadmaps(repo_full_name=repo)
+    assert len(active) == 1
+    assert active[0].status == "active"
+    nodes = store.list_roadmap_nodes(roadmap_issue_number=50, repo_full_name=repo)
+    assert [node.node_id for node in nodes] == ["design", "impl"]
+    assert nodes[0].status == "pending"
+
+    claims = store.claim_ready_roadmap_nodes(repo_full_name=repo)
+    assert len(claims) == 1
+    assert claims[0].node_id == "design"
+    assert (
+        store.mark_roadmap_node_issue_created(
+            roadmap_issue_number=50,
+            node_id="design",
+            claim_token=claims[0].claim_token,
+            child_issue_number=700,
+            child_issue_url="https://example/issues/700",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert (
+        store.record_roadmap_node_milestone(
+            roadmap_issue_number=50,
+            node_id="design",
+            milestone="planned",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    # Second write is idempotent.
+    assert (
+        store.record_roadmap_node_milestone(
+            roadmap_issue_number=50,
+            node_id="design",
+            milestone="planned",
+            repo_full_name=repo,
+        )
+        is False
+    )
+
+    claims = store.claim_ready_roadmap_nodes(repo_full_name=repo)
+    assert len(claims) == 1
+    assert claims[0].node_id == "impl"
+    assert (
+        store.release_roadmap_node_claim(
+            roadmap_issue_number=50,
+            node_id="impl",
+            claim_token=claims[0].claim_token,
+            repo_full_name=repo,
+        )
+        is True
+    )
+    claims = store.claim_ready_roadmap_nodes(repo_full_name=repo)
+    assert len(claims) == 1
+    impl_claim = claims[0]
+    assert (
+        store.mark_roadmap_node_issue_created(
+            roadmap_issue_number=50,
+            node_id="impl",
+            claim_token=impl_claim.claim_token,
+            child_issue_number=701,
+            child_issue_url="https://example/issues/701",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert (
+        store.record_roadmap_node_milestone(
+            roadmap_issue_number=50,
+            node_id="impl",
+            milestone="implemented",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert (
+        store.mark_roadmap_node_blocked(
+            roadmap_issue_number=50,
+            node_id="design",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    blockers = store.list_roadmap_blockers_oldest_first(
+        roadmap_issue_number=50,
+        repo_full_name=repo,
+    )
+    assert len(blockers) == 1
+    assert blockers[0].node_id == "design"
+    assert (
+        store.mark_roadmap_node_unblocked(
+            roadmap_issue_number=50,
+            node_id="design",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert (
+        store.record_roadmap_node_milestone(
+            roadmap_issue_number=50,
+            node_id="design",
+            milestone="implemented",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    snapshot = store.list_roadmap_status_snapshot(
+        roadmap_issue_number=50,
+        repo_full_name=repo,
+    )
+    assert [row.node_id for row in snapshot] == ["design", "impl"]
+    assert snapshot[0].dependency_summary == "-"
+    assert "design:planned" in snapshot[1].dependency_summary
+
+    linked = store.find_roadmap_by_child_issue(child_issue_number=700, repo_full_name=repo)
+    assert linked is not None
+    assert linked.roadmap_issue_number == 50
+    assert linked.node_id == "design"
+
+    assert (
+        store.mark_roadmap_revision_requested(
+            roadmap_issue_number=50,
+            last_error="needs revision",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert (
+        store.set_roadmap_superseding_issue(
+            roadmap_issue_number=50,
+            superseding_roadmap_issue_number=51,
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert (
+        store.mark_roadmap_superseded(
+            roadmap_issue_number=50,
+            superseding_roadmap_issue_number=51,
+            repo_full_name=repo,
+        )
+        is True
+    )
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=60,
+        roadmap_pr_number=600,
+        roadmap_doc_path="docs/roadmap/60.md",
+        graph_path="docs/roadmap/60.graph.json",
+        graph_checksum="sum60",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="Body",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    assert (
+        store.mark_roadmap_abandoned(
+            roadmap_issue_number=60,
+            last_error="manual abandon",
+            repo_full_name=repo,
+        )
+        is True
+    )
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=61,
+        roadmap_pr_number=601,
+        roadmap_doc_path="docs/roadmap/61.md",
+        graph_path="docs/roadmap/61.graph.json",
+        graph_checksum="sum61",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="Body",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    assert (
+        store.mark_roadmap_completed(
+            roadmap_issue_number=61,
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert (
+        store.set_roadmap_last_error(
+            roadmap_issue_number=61,
+            error="done",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    run_state = store.get_issue_run_state(50, repo_full_name=repo)
+    assert run_state is not None
+    assert run_state[0] == "merged"
+
+
+def test_roadmap_state_helper_parsers_validate_shapes() -> None:
+    assert _parse_roadmap_status("active") == "active"
+    assert _parse_roadmap_node_status("pending") == "pending"
+    assert _parse_roadmap_node_kind("small_job") == "small_job"
+    state = _parse_roadmap_state_row(
+        (
+            1,
+            None,
+            "docs/roadmap/1.md",
+            "docs/roadmap/1.graph.json",
+            "sum",
+            "active",
+            None,
+            None,
+            None,
+            None,
+            "t",
+        ),
+        repo_full_name="o/r",
+    )
+    assert state.roadmap_issue_number == 1
+    node = _parse_roadmap_node_row(
+        (
+            1,
+            "n1",
+            "small_job",
+            "T",
+            "B",
+            "[]",
+            None,
+            None,
+            "pending",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "t",
+        ),
+        repo_full_name="o/r",
+    )
+    assert node.node_id == "n1"
+    deps = _parse_roadmap_dependencies_json('[{"node_id":"n1","requires":"planned"}]')
+    assert deps[0].node_id == "n1"
+    assert _roadmap_node_dependencies_satisfied(
+        dependencies=deps,
+        node_rows={"n1": (1, "n1", "small_job", "T", "B", "[]", "issued", "x", None, 11, None)},
+    )
+    assert (
+        _roadmap_node_dependencies_satisfied(
+            dependencies=(RoadmapDependencyState(node_id="missing", requires="planned"),),
+            node_rows={},
+        )
+        is False
+    )
+    assert (
+        _roadmap_node_dependencies_satisfied(
+            dependencies=(RoadmapDependencyState(node_id="n1", requires="implemented"),),
+            node_rows={
+                "n1": (1, "n1", "small_job", "T", "B", "[]", "issued", None, None, 11, None)
+            },
+        )
+        is False
+    )
+
+    with pytest.raises(RuntimeError, match="Unknown status"):
+        _parse_roadmap_status("other")
+    with pytest.raises(RuntimeError, match="Unknown status"):
+        _parse_roadmap_node_status("other")
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        _parse_roadmap_status(1)
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        _parse_roadmap_node_status(1)
+    with pytest.raises(RuntimeError, match="Invalid kind value"):
+        _parse_roadmap_node_kind(1)
+    with pytest.raises(RuntimeError, match="Unknown kind value"):
+        _parse_roadmap_node_kind("x")
+    with pytest.raises(RuntimeError, match="Invalid roadmap_issue_number"):
+        _parse_roadmap_state_row(
+            (
+                "1",  # type: ignore[arg-type]
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid roadmap_pr_number"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                "p",
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid roadmap_doc_path"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                1,
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid graph_path"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                1,
+                "sum",
+                "active",
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid graph_checksum"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                1,
+                "active",
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid parent_roadmap_issue_number"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                "p",
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid superseding_roadmap_issue_number"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                None,
+                "p",
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid revision_requested_at"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                None,
+                None,
+                1,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid last_error"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                None,
+                None,
+                None,
+                1,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid updated_at"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                "active",
+                None,
+                None,
+                None,
+                None,
+                1,
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid node_id"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                1,  # type: ignore[arg-type]
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid roadmap_issue_number"):
+        _parse_roadmap_node_row(
+            (
+                "1",
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid title"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                1,
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid body_markdown"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                1,
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                1,
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid child_issue_number"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                "1",
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid child_issue_url"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                1,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid planned_at"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid implemented_at"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid status_changed_at"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                1,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid last_progress_at"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                1,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid blocked_since_at"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                1,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid claim_token"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid updated_at"):
+        _parse_roadmap_node_row(
+            (
+                1,
+                "n1",
+                "small_job",
+                "T",
+                "B",
+                "[]",
+                None,
+                None,
+                "pending",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+        _parse_roadmap_dependencies_json("not-json")
+    with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+        _parse_roadmap_dependencies_json("{}")
+    with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+        _parse_roadmap_dependencies_json("[1]")
+    with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+        _parse_roadmap_dependencies_json('[{"node_id":"n1","requires":"soon"}]')
+    with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+        _parse_roadmap_dependencies_json('[{"node_id":"","requires":"planned"}]')
+    with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+        _parse_roadmap_dependencies_json('[{"node_id":"n1","requires":1}]')
+    original_loads = state_module.json.loads
+    state_module.json.loads = lambda value: [{1: "x"}]
+    try:
+        with pytest.raises(RuntimeError, match="Invalid dependencies_json"):
+            _parse_roadmap_dependencies_json("[]")
+    finally:
+        state_module.json.loads = original_loads
+
+
+def test_state_store_roadmap_edge_paths_and_global_queries(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo_a = "o/repo-a"
+    repo_b = "o/repo-b"
+
+    assert store.get_roadmap_state(roadmap_issue_number=999, repo_full_name=repo_a) is None
+    assert store.find_roadmap_by_child_issue(child_issue_number=1234, repo_full_name=repo_a) is None
+
+    with pytest.raises(ValueError, match="non-empty"):
+        store.upsert_roadmap_graph(
+            roadmap_issue_number=1,
+            roadmap_pr_number=10,
+            roadmap_doc_path="docs/roadmap/1.md",
+            graph_path="docs/roadmap/1.graph.json",
+            graph_checksum="sum",
+            nodes=(),
+            repo_full_name=repo_a,
+        )
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        store.claim_ready_roadmap_nodes(limit=0, repo_full_name=repo_a)
+
+    store.mark_completed(
+        101,
+        "agent/roadmap/101-plan",
+        1001,
+        "https://example/pr/1001",
+        repo_full_name=repo_a,
+    )
+    store.mark_pr_status(pr_number=1001, issue_number=101, status="merged", repo_full_name=repo_a)
+    store.mark_completed(
+        102,
+        "agent/roadmap/102-plan",
+        1002,
+        "https://example/pr/1002",
+        repo_full_name=repo_b,
+    )
+    store.mark_pr_status(pr_number=1002, issue_number=102, status="merged", repo_full_name=repo_b)
+    candidates = store.list_roadmap_activation_candidates()
+    assert {(item.repo_full_name, item.roadmap_issue_number) for item in candidates} == {
+        (repo_a, 101),
+        (repo_b, 102),
+    }
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=201,
+        roadmap_pr_number=2001,
+        roadmap_doc_path="docs/roadmap/201.md",
+        graph_path="docs/roadmap/201.graph.json",
+        graph_checksum="sum201",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="Body",
+                dependencies=(),
+            ),
+            RoadmapNodeGraphInput(
+                node_id="n2",
+                kind="small_job",
+                title="Two",
+                body_markdown="Body",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo_a,
+    )
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=201,
+        roadmap_pr_number=2001,
+        roadmap_doc_path="docs/roadmap/201.md",
+        graph_path="docs/roadmap/201.graph.json",
+        graph_checksum="sum201b",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="Body",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo_a,
+    )
+    assert [
+        node.node_id
+        for node in store.list_roadmap_nodes(roadmap_issue_number=201, repo_full_name=repo_a)
+    ] == ["n1"]
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=202,
+        roadmap_pr_number=2002,
+        roadmap_doc_path="docs/roadmap/202.md",
+        graph_path="docs/roadmap/202.graph.json",
+        graph_checksum="sum202",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="Body",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo_b,
+    )
+    active = store.list_active_roadmaps()
+    assert {(item.repo_full_name, item.roadmap_issue_number) for item in active} == {
+        (repo_a, 201),
+        (repo_b, 202),
+    }
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute(
+            """
+            CREATE TRIGGER delete_roadmap_state_after_insert
+            AFTER INSERT ON roadmap_state
+            BEGIN
+                DELETE FROM roadmap_state
+                WHERE repo_full_name = NEW.repo_full_name
+                  AND roadmap_issue_number = NEW.roadmap_issue_number;
+            END
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="disappeared after upsert"):
+        store.upsert_roadmap_graph(
+            roadmap_issue_number=203,
+            roadmap_pr_number=2003,
+            roadmap_doc_path="docs/roadmap/203.md",
+            graph_path="docs/roadmap/203.graph.json",
+            graph_checksum="sum203",
+            nodes=(
+                RoadmapNodeGraphInput(
+                    node_id="n1",
+                    kind="small_job",
+                    title="One",
+                    body_markdown="Body",
+                    dependencies=(),
+                ),
+            ),
+            repo_full_name=repo_a,
+        )
+
+
+def test_claim_ready_roadmap_nodes_limit_and_conflict_paths(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo"
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=301,
+        roadmap_pr_number=3001,
+        roadmap_doc_path="docs/roadmap/301.md",
+        graph_path="docs/roadmap/301.graph.json",
+        graph_checksum="sum301",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+            RoadmapNodeGraphInput(
+                node_id="b",
+                kind="small_job",
+                title="B",
+                body_markdown="B",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claims = store.claim_ready_roadmap_nodes(limit=1, repo_full_name=repo)
+    assert len(claims) == 1
+    store.release_roadmap_node_claim(
+        roadmap_issue_number=claims[0].roadmap_issue_number,
+        node_id=claims[0].node_id,
+        claim_token=claims[0].claim_token,
+        repo_full_name=repo,
+    )
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=302,
+        roadmap_pr_number=3002,
+        roadmap_doc_path="docs/roadmap/302.md",
+        graph_path="docs/roadmap/302.graph.json",
+        graph_checksum="sum302",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=303,
+        roadmap_pr_number=3003,
+        roadmap_doc_path="docs/roadmap/303.md",
+        graph_path="docs/roadmap/303.graph.json",
+        graph_checksum="sum303",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    global_limited_claims = store.claim_ready_roadmap_nodes(limit=1, repo_full_name=repo)
+    assert len(global_limited_claims) == 1
+
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute(
+            """
+            UPDATE roadmap_nodes
+            SET claim_token = ?
+            WHERE repo_full_name = ? AND roadmap_issue_number = ? AND node_id = ?
+            """,
+            (sqlite3.Binary(b"\x01"), repo, 303, "a"),
+        )
+        conn.commit()
+    after_conflict = store.claim_ready_roadmap_nodes(repo_full_name=repo)
+    assert all(
+        not (claim.roadmap_issue_number == 303 and claim.node_id == "a") for claim in after_conflict
+    )
+
+
+def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    repo = "o/repo"
+    store.mark_running(1, repo_full_name=repo)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET status = ?
+            WHERE repo_full_name = ? AND issue_number = ?
+            """,
+            (sqlite3.Binary(b"\x01"), repo, 1),
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        store.get_issue_run_state(1, repo_full_name=repo)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET status = 'running', branch = ?
+            WHERE repo_full_name = ? AND issue_number = ?
+            """,
+            (sqlite3.Binary(b"\x02"), repo, 1),
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="Invalid branch value"):
+        store.get_issue_run_state(1, repo_full_name=repo)
 
 
 def test_parse_poll_cursor_row_validations() -> None:

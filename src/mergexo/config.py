@@ -15,6 +15,7 @@ class RuntimeConfig:
     worker_count: int
     poll_interval_seconds: int
     enable_github_operations: bool = False
+    enable_roadmaps: bool = False
     enable_issue_comment_routing: bool = False
     enable_pr_actions_monitoring: bool = False
     enable_incremental_comment_fetch: bool = False
@@ -52,6 +53,11 @@ class RepoConfig:
     operations_issue_number: int | None = None
     operator_logins: tuple[str, ...] = ()
     ignore_label: str = "agent:ignore"
+    roadmap_label: str = "agent:roadmap"
+    roadmap_docs_dir: str = "docs/roadmap"
+    roadmap_revision_label: str = "agent:roadmap-revise"
+    roadmap_abandon_label: str = "agent:roadmap-abandon"
+    roadmap_recommended_node_count: int = 7
 
     @property
     def full_name(self) -> str:
@@ -139,6 +145,7 @@ def load_config(path: Path) -> AppConfig:
         enable_github_operations=_bool_with_default(
             runtime_data, "enable_github_operations", False
         ),
+        enable_roadmaps=_bool_with_default(runtime_data, "enable_roadmaps", False),
         enable_issue_comment_routing=_bool_with_default(
             runtime_data, "enable_issue_comment_routing", False
         ),
@@ -207,6 +214,9 @@ def load_config(path: Path) -> AppConfig:
         )
 
     repos = _load_repo_configs(repo_data=repo_data, auth_data=auth_data)
+    for repo in repos:
+        if repo.roadmap_recommended_node_count < 1:
+            raise ConfigError("repo.roadmap_recommended_node_count must be >= 1")
 
     codex = _parse_codex_config(codex_data=codex_data)
     codex_overrides = _load_codex_overrides(codex_data=codex_data, repos=repos, defaults=codex)
@@ -309,6 +319,17 @@ def _parse_repo_config(
         operations_issue_number=_optional_positive_int(repo_data, "operations_issue_number"),
         operator_logins=_operator_logins_with_default(repo_data, "operator_logins", ()),
         ignore_label=_str_with_default(repo_data, "ignore_label", "agent:ignore"),
+        roadmap_label=_str_with_default(repo_data, "roadmap_label", "agent:roadmap"),
+        roadmap_docs_dir=_str_with_default(repo_data, "roadmap_docs_dir", "docs/roadmap"),
+        roadmap_revision_label=_str_with_default(
+            repo_data, "roadmap_revision_label", "agent:roadmap-revise"
+        ),
+        roadmap_abandon_label=_str_with_default(
+            repo_data, "roadmap_abandon_label", "agent:roadmap-abandon"
+        ),
+        roadmap_recommended_node_count=_int_with_default(
+            repo_data, "roadmap_recommended_node_count", 7
+        ),
     )
 
 

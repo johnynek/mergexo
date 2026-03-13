@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
@@ -22,12 +22,14 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapStartResult,
     ReviewReply,
 )
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import (
     FeedbackEventRecord,
     ParsedOperatorCommand,
+    compute_roadmap_node_issue_token,
     compute_pre_pr_checkpoint_token,
     compute_source_issue_redirect_token,
     parse_operator_command,
@@ -36,6 +38,7 @@ from mergexo.github_gateway import GitHubAuthenticationError, GitHubGateway, Git
 from mergexo.models import (
     FlakyTestReport,
     GeneratedDesign,
+    GeneratedRoadmap,
     Issue,
     IssueFlow,
     OperatorCommandRecord,
@@ -45,6 +48,8 @@ from mergexo.models import (
     PullRequestReviewComment,
     PullRequestSnapshot,
     RestartMode,
+    RoadmapRevisionEscalation,
+    RoadmapNode,
     WorkflowJobSnapshot,
     WorkflowRunSnapshot,
     WorkResult,
@@ -65,6 +70,7 @@ from mergexo.orchestrator import (
     _design_branch_slug,
     _design_doc_url,
     _default_commit_message,
+    _flow_trigger_label,
     _feedback_transient_git_retry_delay_seconds,
     _flow_label_from_branch,
     _has_regression_test_changes,
@@ -95,8 +101,12 @@ from mergexo.orchestrator import (
     _render_source_issue_redirect_comment,
     _render_design_doc,
     _render_operator_command_result,
+    _render_roadmap_child_issue_body,
+    _render_roadmap_status_report,
     _render_regex_patterns,
     _recovery_pr_payload_for_issue,
+    _roadmap_child_label_for_kind,
+    _parse_superseding_roadmap_parent,
     _resolve_issue_flow,
     _summarize_git_error,
     _slugify,
@@ -104,6 +114,7 @@ from mergexo.orchestrator import (
     _truncate_feedback_text,
 )
 from mergexo.observability import configure_logging
+from mergexo.roadmap_parser import parse_roadmap_graph_json
 from mergexo.shell import CommandError
 from mergexo.state import (
     ActionTokenScopeKind,
@@ -117,6 +128,9 @@ from mergexo.state import (
     PrFlakeState,
     PrFlakeStatus,
     PrePrFollowupState,
+    RoadmapBlockerRow,
+    RoadmapNodeGraphInput,
+    RoadmapStatusSnapshotRow,
     StateStore,
     TrackedPullRequestState,
 )
@@ -255,10 +269,14 @@ class FakeGitHub:
         self.failed_run_log_tails: dict[int, dict[str, str | None]] = {}
         self.failed_log_tail_calls: list[tuple[int, int]] = []
         self.pr_lookup_by_head_base: dict[tuple[str, str], PullRequest] = {}
+        self.closed_issue_numbers: list[int] = []
 
     def list_open_issues_with_any_labels(self, labels: tuple[str, ...]) -> list[Issue]:
         self.requested_labels = labels
         return self.issues
+
+    def list_open_issues_with_label(self, label: str) -> list[Issue]:
+        return [issue for issue in self.issues if label in issue.labels]
 
     def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
         self.created_prs.append((title, head, base, body))
@@ -286,7 +304,7 @@ class FakeGitHub:
         self.created_issues.append((title, body, labels))
         issue_number = self._next_issue_number
         self._next_issue_number += 1
-        return Issue(
+        issue = Issue(
             number=issue_number,
             title=title,
             body=body,
@@ -294,6 +312,11 @@ class FakeGitHub:
             labels=labels or (),
             author_login="mergexo[bot]",
         )
+        self.issues.append(issue)
+        return issue
+
+    def close_issue(self, issue_number: int) -> None:
+        self.closed_issue_numbers.append(issue_number)
 
     def find_pull_request_by_head(
         self,
@@ -423,6 +446,7 @@ class FakeAgent:
         )
         self.fail = fail
         self.calls: list[tuple[Issue, Path]] = []
+        self.roadmap_calls: list[tuple[Issue, Path]] = []
         self.bugfix_calls: list[tuple[Issue, Path]] = []
         self.small_job_calls: list[tuple[Issue, Path]] = []
         self.implementation_calls: list[tuple[Issue, Path, str]] = []
@@ -451,6 +475,25 @@ class FakeAgent:
             blocked_reason=None,
             session=AgentSession(adapter="codex", thread_id="thread-123"),
         )
+        self.roadmap_result = GeneratedRoadmap(
+            title="Roadmap Title",
+            summary="Roadmap summary",
+            roadmap_markdown="# Roadmap\n\nBody",
+            roadmap_issue_number=7,
+            version=1,
+            graph_nodes=(
+                RoadmapNode(
+                    node_id="n1",
+                    kind="small_job",
+                    title="Ship",
+                    body_markdown="Do it",
+                ),
+            ),
+            canonical_graph_json=(
+                '{"nodes":[{"body_markdown":"Do it","depends_on":[],"kind":"small_job",'
+                '"node_id":"n1","title":"Ship"}],"roadmap_issue_number":7,"version":1}'
+            ),
+        )
         self.feedback_results: list[FeedbackResult] = []
         self.feedback_result = FeedbackResult(
             session=AgentSession(adapter="codex", thread_id="thread-123"),
@@ -475,6 +518,49 @@ class FakeAgent:
             raise RuntimeError("codex failed")
         return DesignStartResult(
             design=self.generated,
+            session=AgentSession(adapter="codex", thread_id="thread-123"),
+        )
+
+    def start_roadmap_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        roadmap_docs_dir: str,
+        recommended_node_count: int,
+        cwd: Path,
+    ) -> RoadmapStartResult:
+        _ = repo_full_name, default_branch, roadmap_docs_dir, recommended_node_count
+        self.roadmap_calls.append((issue, cwd))
+        if self.fail:
+            raise RuntimeError("codex failed")
+        return RoadmapStartResult(
+            roadmap=GeneratedRoadmap(
+                title=self.roadmap_result.title,
+                summary=self.roadmap_result.summary,
+                roadmap_markdown=self.roadmap_result.roadmap_markdown,
+                roadmap_issue_number=issue.number,
+                version=self.roadmap_result.version,
+                graph_nodes=self.roadmap_result.graph_nodes,
+                canonical_graph_json=json.dumps(
+                    {
+                        "nodes": [
+                            {
+                                "body_markdown": "Do it",
+                                "depends_on": [],
+                                "kind": "small_job",
+                                "node_id": "n1",
+                                "title": "Ship",
+                            }
+                        ],
+                        "roadmap_issue_number": issue.number,
+                        "version": 1,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            ),
             session=AgentSession(adapter="codex", thread_id="thread-123"),
         )
 
@@ -1541,6 +1627,7 @@ def _config(
     *,
     worker_count: int = 1,
     enable_github_operations: bool = False,
+    enable_roadmaps: bool = False,
     enable_issue_comment_routing: bool = False,
     enable_pr_actions_monitoring: bool = False,
     pr_actions_feedback_policy: PrActionsFeedbackPolicy | None = None,
@@ -1569,6 +1656,7 @@ def _config(
             worker_count=worker_count,
             poll_interval_seconds=1,
             enable_github_operations=enable_github_operations,
+            enable_roadmaps=enable_roadmaps,
             enable_issue_comment_routing=enable_issue_comment_routing,
             enable_pr_actions_monitoring=enable_pr_actions_monitoring,
             enable_incremental_comment_fetch=enable_incremental_comment_fetch,
@@ -2418,13 +2506,30 @@ def test_flow_helpers() -> None:
         local_clone_source=None,
         remote_url=None,
     )
-    assert _trigger_labels(cfg) == ("agent:design", "agent:bugfix", "agent:small-job")
+    assert _trigger_labels(cfg) == (
+        "agent:roadmap",
+        "agent:bugfix",
+        "agent:small-job",
+        "agent:design",
+    )
+    assert _trigger_labels(cfg, enable_roadmaps=False) == (
+        "agent:bugfix",
+        "agent:small-job",
+        "agent:design",
+    )
+    assert _trigger_labels(cfg, enable_roadmaps=True) == (
+        "agent:roadmap",
+        "agent:bugfix",
+        "agent:small-job",
+        "agent:design",
+    )
 
     issue = _issue(labels=("agent:design", "agent:bugfix", "agent:small-job"))
     assert (
         _resolve_issue_flow(
             issue=issue,
             design_label=cfg.trigger_label,
+            roadmap_label=cfg.roadmap_label,
             bugfix_label=cfg.bugfix_label,
             small_job_label=cfg.small_job_label,
             ignore_label=cfg.ignore_label,
@@ -2435,13 +2540,26 @@ def test_flow_helpers() -> None:
         _resolve_issue_flow(
             issue=_issue(labels=("agent:bugfix", cfg.ignore_label)),
             design_label=cfg.trigger_label,
+            roadmap_label=cfg.roadmap_label,
             bugfix_label=cfg.bugfix_label,
             small_job_label=cfg.small_job_label,
             ignore_label=cfg.ignore_label,
         )
         is None
     )
+    assert (
+        _resolve_issue_flow(
+            issue=_issue(labels=("agent:roadmap", "agent:bugfix")),
+            design_label=cfg.trigger_label,
+            roadmap_label=cfg.roadmap_label,
+            bugfix_label=cfg.bugfix_label,
+            small_job_label=cfg.small_job_label,
+            ignore_label=cfg.ignore_label,
+        )
+        == "roadmap"
+    )
     assert _issue_branch(flow="design_doc", issue_number=7, slug="x") == "agent/design/7-x"
+    assert _issue_branch(flow="roadmap", issue_number=7, slug="x") == "agent/roadmap/7-x"
     assert _issue_branch(flow="bugfix", issue_number=7, slug="x") == "agent/bugfix/7-x"
     assert _issue_branch(flow="small_job", issue_number=7, slug="x") == "agent/small/7-x"
     assert _default_commit_message(flow="bugfix", issue_number=7) == "fix: resolve issue #7"
@@ -2450,6 +2568,7 @@ def test_flow_helpers() -> None:
         _resolve_issue_flow(
             issue=_issue(labels=("triage",)),
             design_label=cfg.trigger_label,
+            roadmap_label=cfg.roadmap_label,
             bugfix_label=cfg.bugfix_label,
             small_job_label=cfg.small_job_label,
         )
@@ -2481,6 +2600,83 @@ def test_flow_helpers() -> None:
     assert _design_branch_slug("agent/design/7-x") == "7-x"
     assert _design_branch_slug("agent/small/7-x") is None
     assert _design_branch_slug("agent/design/   ") is None
+    assert _parse_superseding_roadmap_parent("Supersedes roadmap #41") == 41
+    assert _parse_superseding_roadmap_parent("no parent") is None
+    assert _roadmap_child_label_for_kind(kind="design_doc", repo=cfg) == cfg.trigger_label
+    assert _roadmap_child_label_for_kind(kind="small_job", repo=cfg) == cfg.small_job_label
+    assert _roadmap_child_label_for_kind(kind="roadmap", repo=cfg) == cfg.roadmap_label
+    with pytest.raises(RuntimeError, match="Unsupported roadmap node kind"):
+        _roadmap_child_label_for_kind(kind="unknown", repo=cfg)
+    child_body = _render_roadmap_child_issue_body(
+        roadmap_issue_number=7,
+        node_id="n1",
+        dependencies_json='[{"node_id":"n0","requires":"planned"}]',
+        body_markdown="Body",
+    )
+    assert "Parent roadmap: #7" in child_body
+    assert "n0 (planned)" in child_body
+    invalid_child_body = _render_roadmap_child_issue_body(
+        roadmap_issue_number=7,
+        node_id="n2",
+        dependencies_json="{",
+        body_markdown="Body",
+    )
+    assert "- none" in invalid_child_body
+    mixed_child_body = _render_roadmap_child_issue_body(
+        roadmap_issue_number=7,
+        node_id="n3",
+        dependencies_json='[1, {"node_id":"n1","requires":"implemented"}]',
+        body_markdown="Body",
+    )
+    assert "n1 (implemented)" in mixed_child_body
+    status_body = _render_roadmap_status_report(
+        roadmap_status="active",
+        rows=(
+            RoadmapStatusSnapshotRow(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="n1",
+                kind="small_job",
+                status="issued",
+                dependency_summary="-",
+                child_issue_number=10,
+                child_issue_url="https://example/issues/10",
+                last_progress_at="2026-03-01T00:00:00.000Z",
+                blocked_since_at=None,
+            ),
+        ),
+        blockers=(
+            RoadmapBlockerRow(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="n2",
+                status="blocked",
+                blocked_since_at="2026-03-01T00:00:00.000Z",
+                child_issue_number=11,
+                child_issue_url="https://example/issues/11",
+                last_progress_at="2026-03-01T00:00:00.000Z",
+            ),
+        ),
+        request_comment_id=123,
+    )
+    assert "request_comment_id: 123" in status_body
+    assert "n1 [small_job]" in status_body
+    assert "n2: blocked_since" in status_body
+    empty_status_body = _render_roadmap_status_report(
+        roadmap_status="active",
+        rows=(),
+        blockers=(),
+        request_comment_id=321,
+    )
+    assert "(no roadmap nodes found)" in empty_status_body
+    assert "Blockers (oldest first):\n- none" in empty_status_body
+    assert _pre_pr_flow_label("roadmap") == "roadmap"
+    assert _flow_trigger_label(flow="roadmap", repo=cfg) == cfg.roadmap_label
+    roadmap_recovery = _recovery_pr_payload_for_issue(
+        issue=_issue(8, "Plan"), branch="agent/roadmap/8-plan"
+    )
+    assert roadmap_recovery[0].startswith("Roadmap for #8:")
+    assert _flow_label_from_branch("agent/roadmap/8-plan") == "roadmap"
     assert (
         _design_doc_url(
             repo_full_name="johnynek/mergexo",
@@ -3063,6 +3259,112 @@ def test_process_issue_push_non_conflict_error_propagates(tmp_path: Path) -> Non
 
     assert len(agent.small_job_calls) == 1
     assert github.created_prs == []
+
+
+def test_process_issue_small_job_revalidates_required_tests_after_push_auto_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.push_results = [True]
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=(cfg.repo.small_job_label,))
+    required_test_calls: list[Path] = []
+    required_test_results = iter((None, "post-merge required-tests failure"))
+
+    def fake_run_required_tests(*, checkout_path: Path) -> str | None:
+        required_test_calls.append(checkout_path)
+        return next(required_test_results)
+
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", fake_run_required_tests)
+
+    with pytest.raises(
+        DirectFlowValidationError,
+        match="required pre-push tests failed after push reconciled remote branch updates",
+    ):
+        orch._process_issue(issue, "small_job")
+
+    assert len(required_test_calls) == 2
+    assert len(git.push_calls) == 1
+    assert github.created_prs == []
+    assert any(
+        issue_number == issue.number
+        and "small-job flow pushed" in body
+        and "required pre-push tests then failed on the merged branch" in body
+        for issue_number, body in github.comments
+    )
+
+
+def test_process_issue_small_job_allows_push_auto_merge_when_recheck_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, required_tests="scripts/required-tests.sh")
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.push_results = [True]
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    issue = _issue(labels=(cfg.repo.small_job_label,))
+    required_test_calls: list[Path] = []
+
+    def fake_run_required_tests(*, checkout_path: Path) -> str | None:
+        required_test_calls.append(checkout_path)
+        return None
+
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", fake_run_required_tests)
+
+    result = orch._process_issue(issue, "small_job")
+
+    assert result.pr_number == 101
+    assert len(required_test_calls) == 2
+    assert len(git.push_calls) == 1
+    assert github.created_prs != []
+
+
+def test_process_issue_roadmap_revalidates_required_tests_after_push_auto_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True, required_tests="scripts/test.sh")
+    issue = _issue(120, "Roadmap", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    git.push_results = [True]
+    state = StateStore(tmp_path / "state.db")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    required_test_calls: list[Path] = []
+    required_test_results = iter((None, "post-merge required-tests failure"))
+
+    def fake_run_required_tests(*, checkout_path: Path) -> str | None:
+        required_test_calls.append(checkout_path)
+        return next(required_test_results)
+
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", fake_run_required_tests)
+
+    with pytest.raises(
+        DirectFlowValidationError,
+        match="required pre-push tests failed after push reconciled remote branch updates",
+    ):
+        orch._process_issue(issue, "roadmap")
+
+    assert len(required_test_calls) == 2
+    assert len(git.push_calls) == 1
+    assert github.created_prs == []
+    assert any(
+        issue_number == issue.number
+        and "roadmap flow pushed" in body
+        and "required pre-push tests then failed on the merged branch" in body
+        for issue_number, body in github.comments
+    )
 
 
 def test_process_implementation_candidate_happy_path(tmp_path: Path) -> None:
@@ -3892,7 +4194,7 @@ def test_enqueue_new_work_paths(tmp_path: Path) -> None:
     orch._enqueue_new_work(pool)
     assert state.running == [1]
     assert pool.submitted == [(1, "design_doc")]
-    assert github.requested_labels == ("agent:design", "agent:bugfix", "agent:small-job")
+    assert github.requested_labels == ("agent:bugfix", "agent:small-job", "agent:design")
 
     # Already-running path: skip existing issue number.
     already_running_future: Future[WorkResult] = Future()
@@ -6018,6 +6320,7 @@ def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
             issue=issue,
             error="small-job flow blocked: waiting",
             design_label="agent:design",
+            roadmap_label="agent:roadmap",
             bugfix_label="agent:bugfix",
             small_job_label="agent:small-job",
         )
@@ -6028,6 +6331,7 @@ def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
             issue=issue,
             error="implementation flow blocked: waiting",
             design_label="agent:design",
+            roadmap_label="agent:roadmap",
             bugfix_label="agent:bugfix",
             small_job_label="agent:small-job",
         )
@@ -6038,6 +6342,7 @@ def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
             issue=issue,
             error="plain failure",
             design_label="agent:design",
+            roadmap_label="agent:roadmap",
             bugfix_label="agent:bugfix",
             small_job_label="agent:small-job",
         )
@@ -6290,6 +6595,86 @@ def test_poll_once_skips_actions_monitor_when_repo_policy_is_never(
 
     orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
     assert order == ["feedback"]
+
+
+def test_poll_once_runs_roadmap_steps_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    steps: list[str] = []
+
+    def fake_run_poll_step(*, step_name: str, fn) -> bool:  # type: ignore[no-untyped-def]
+        _ = fn
+        steps.append(step_name)
+        return True
+
+    monkeypatch.setattr(orch, "_run_poll_step", fake_run_poll_step)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+
+    assert "activate_merged_roadmaps" in steps
+    assert "advance_roadmap_nodes" in steps
+    assert "publish_roadmap_status_reports" in steps
+
+
+def test_poll_once_skips_roadmap_steps_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=False)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    steps: list[str] = []
+
+    def fake_run_poll_step(*, step_name: str, fn) -> bool:  # type: ignore[no-untyped-def]
+        _ = fn
+        steps.append(step_name)
+        return True
+
+    monkeypatch.setattr(orch, "_run_poll_step", fake_run_poll_step)
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
+
+    assert "activate_merged_roadmaps" not in steps
+    assert "advance_roadmap_nodes" not in steps
+    assert "publish_roadmap_status_reports" not in steps
+
+
+def test_poll_once_marks_github_error_when_roadmap_steps_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(orch, "_reap_finished", lambda: None)
+
+    def fake_run_poll_step(*, step_name: str, fn) -> bool:  # type: ignore[no-untyped-def]
+        _ = fn
+        return step_name not in {
+            "activate_merged_roadmaps",
+            "advance_roadmap_nodes",
+            "publish_roadmap_status_reports",
+        }
+
+    monkeypatch.setattr(orch, "_run_poll_step", fake_run_poll_step)
+    orch.poll_once(pool=cast(object, object()), allow_enqueue=True)  # type: ignore[arg-type]
 
 
 def test_effective_pr_actions_feedback_policy_uses_repo_override_then_runtime_fallback(
@@ -12640,3 +13025,1595 @@ def test_operator_helper_functions_cover_fallbacks(monkeypatch: pytest.MonkeyPat
         source_comment_url="https://x",
     )
     assert "Source command: https://x" in rendered
+
+
+def test_process_issue_roadmap_flow_creates_graph_and_pr(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    issue = _issue(7, "Roadmap Plan", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    result = orch._process_issue(issue, "roadmap")
+
+    assert result.branch == "agent/roadmap/7-roadmap-plan"
+    assert len(agent.roadmap_calls) == 1
+    assert len(github.created_prs) == 1
+    pr_title, _head, _base, pr_body = github.created_prs[0]
+    assert pr_title.startswith("Roadmap for #7:")
+    assert "Refs #7" in pr_body
+    graph_path = tmp_path / "checkouts" / "worker-0" / "docs/roadmap/7-roadmap-plan.graph.json"
+    assert graph_path.exists()
+    assert '"roadmap_issue_number": 7' in graph_path.read_text(encoding="utf-8")
+
+
+def test_activate_and_advance_roadmap_nodes_creates_children_in_dependency_order(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    roadmap_issue = _issue(50, "Main Plan", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([roadmap_issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    repo = cfg.repo.full_name
+    store_checkout = git.ensure_checkout(0)
+    docs_dir = store_checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "50-main-plan.md").write_text("# Plan", encoding="utf-8")
+    (docs_dir / "50-main-plan.graph.json").write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 50,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "design_doc",
+                        "title": "Design",
+                        "body_markdown": "Write design",
+                        "depends_on": [],
+                    },
+                    {
+                        "node_id": "n2",
+                        "kind": "small_job",
+                        "title": "Implement",
+                        "body_markdown": "Ship code",
+                        "depends_on": [{"node_id": "n1", "requires": "planned"}],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state.mark_completed(
+        50,
+        "agent/roadmap/50-main-plan",
+        500,
+        "https://example/pr/500",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(pr_number=500, issue_number=50, status="merged", repo_full_name=repo)
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._activate_merged_roadmaps()
+    activated = state.get_roadmap_state(roadmap_issue_number=50, repo_full_name=repo)
+    assert activated is not None
+    assert activated.status == "active"
+
+    orch._advance_roadmap_nodes()
+    assert len(github.created_issues) == 1
+    _title1, _body1, labels1 = github.created_issues[0]
+    assert labels1 == (cfg.repo.trigger_label,)
+    child_design = github.issues[-1]
+    state.mark_completed(
+        child_design.number,
+        f"agent/design/{child_design.number}-design",
+        501,
+        "https://example/pr/501",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(
+        pr_number=501,
+        issue_number=child_design.number,
+        status="merged",
+        repo_full_name=repo,
+    )
+
+    orch._advance_roadmap_nodes()
+    assert len(github.created_issues) == 2
+    _title2, _body2, labels2 = github.created_issues[1]
+    assert labels2 == (cfg.repo.small_job_label,)
+    child_impl = github.issues[-1]
+    state.mark_completed(
+        child_impl.number,
+        f"agent/small/{child_impl.number}-impl",
+        502,
+        "https://example/pr/502",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(
+        pr_number=502,
+        issue_number=child_impl.number,
+        status="merged",
+        repo_full_name=repo,
+    )
+    state.mark_completed(
+        child_design.number,
+        f"agent/impl/{child_design.number}-impl",
+        503,
+        "https://example/pr/503",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(
+        pr_number=503,
+        issue_number=child_design.number,
+        status="merged",
+        repo_full_name=repo,
+    )
+
+    orch._advance_roadmap_nodes()
+    assert 50 in github.closed_issue_numbers
+    completed = state.get_roadmap_state(roadmap_issue_number=50, repo_full_name=repo)
+    assert completed is not None
+    assert completed.status == "completed"
+
+
+def test_advance_roadmap_nodes_completion_finalizes_after_issue_close(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    graph_payload = {
+        "roadmap_issue_number": 51,
+        "version": 1,
+        "nodes": [
+            {
+                "node_id": "n1",
+                "kind": "small_job",
+                "title": "Ship",
+                "body_markdown": "Do it",
+                "depends_on": [],
+            }
+        ],
+    }
+    parsed = parse_roadmap_graph_json(json.dumps(graph_payload), expected_issue_number=51)
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=51,
+        roadmap_pr_number=510,
+        roadmap_doc_path="docs/roadmap/51-complete.md",
+        graph_path="docs/roadmap/51-complete.graph.json",
+        graph_checksum=parsed.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=51,
+        node_id="n1",
+        claim_token=claim.claim_token,
+        child_issue_number=5101,
+        child_issue_url="https://example/issues/5101",
+        repo_full_name=repo,
+    )
+    state.record_roadmap_node_milestone(
+        roadmap_issue_number=51,
+        node_id="n1",
+        milestone="implemented",
+        repo_full_name=repo,
+    )
+
+    git = FakeGitManager(tmp_path / "checkouts")
+    checkout = git.ensure_checkout(0)
+    docs_dir = checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "51-complete.graph.json").write_text(parsed.canonical_json, encoding="utf-8")
+
+    class FailingCloseGitHub(FakeGitHub):
+        def close_issue(self, issue_number: int) -> None:
+            _ = issue_number
+            raise RuntimeError("close failed")
+
+    failing_github = FailingCloseGitHub([_issue(51, "Complete", labels=(cfg.repo.roadmap_label,))])
+    failing_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=failing_github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    with pytest.raises(RuntimeError, match="close failed"):
+        failing_orch._advance_roadmap_nodes()
+
+    after_failure = state.get_roadmap_state(roadmap_issue_number=51, repo_full_name=repo)
+    assert after_failure is not None
+    assert after_failure.status == "active"
+
+    github = FakeGitHub([_issue(51, "Complete", labels=(cfg.repo.roadmap_label,))])
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._advance_roadmap_nodes()
+
+    finalized = state.get_roadmap_state(roadmap_issue_number=51, repo_full_name=repo)
+    assert finalized is not None
+    assert finalized.status == "completed"
+    assert 51 in github.closed_issue_numbers
+
+
+def test_publish_roadmap_status_reports_and_abandon_flow(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    roadmap_issue = _issue(
+        70,
+        "Status Plan",
+        labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_abandon_label),
+    )
+    child_issue = _issue(701, "Child", labels=(cfg.repo.small_job_label,))
+    github = FakeGitHub([roadmap_issue, child_issue])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=9001,
+            body="/roadmap status",
+            user_login="reviewer",
+            html_url="https://example/issues/70#issuecomment-9001",
+            created_at="2026-03-01T00:00:00.000Z",
+            updated_at="2026-03-01T00:00:00.000Z",
+        )
+    ]
+    git = FakeGitManager(tmp_path / "checkouts")
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    repo = cfg.repo.full_name
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=70,
+        roadmap_pr_number=700,
+        roadmap_doc_path="docs/roadmap/70-status-plan.md",
+        graph_path="docs/roadmap/70-status-plan.graph.json",
+        graph_checksum="checksum",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    node_claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=70,
+        node_id="n1",
+        claim_token=node_claim.claim_token,
+        child_issue_number=701,
+        child_issue_url="https://example/issues/701",
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_node_blocked(
+        roadmap_issue_number=70,
+        node_id="n1",
+        repo_full_name=repo,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._publish_roadmap_status_reports()
+    assert any(
+        issue_number == 70 and "roadmap status report" in body.lower()
+        for issue_number, body in github.comments
+    )
+
+    orch._advance_roadmap_nodes()
+    assert 70 in github.closed_issue_numbers
+    assert 701 in github.closed_issue_numbers
+    abandoned = state.get_roadmap_state(roadmap_issue_number=70, repo_full_name=repo)
+    assert abandoned is not None
+    assert abandoned.status == "abandoned"
+
+
+def test_activate_merged_roadmaps_returns_when_no_candidates(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    orch._activate_merged_roadmaps()
+
+
+def test_advance_roadmap_nodes_returns_when_no_active_roadmaps(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    orch._advance_roadmap_nodes()
+
+
+def test_activate_merged_roadmaps_covers_missing_invalid_unreadable_parent_and_recommendation(
+    tmp_path: Path,
+) -> None:
+    cfg0 = _config(tmp_path, enable_roadmaps=True)
+    cfg = AppConfig(
+        runtime=cfg0.runtime,
+        repos=(replace(cfg0.repo, roadmap_recommended_node_count=1),),
+        codex=cfg0.codex,
+    )
+    repo = cfg.repo.full_name
+    issues = [
+        _issue(70, "Parent Plan", labels=(cfg.repo.roadmap_label,)),
+        _issue(80, "Missing Graph", labels=(cfg.repo.roadmap_label,)),
+        _issue(81, "Invalid Graph", labels=(cfg.repo.roadmap_label,)),
+        Issue(
+            number=82,
+            title="Superseding Plan",
+            body="Supersedes roadmap #70",
+            html_url="https://example/issues/82",
+            labels=(cfg.repo.roadmap_label,),
+            author_login="issue-author",
+        ),
+        Issue(
+            number=83,
+            title="Unknown Parent Plan",
+            body="Supersedes roadmap #999",
+            html_url="https://example/issues/83",
+            labels=(cfg.repo.roadmap_label,),
+            author_login="issue-author",
+        ),
+        _issue(84, "Unreadable Graph", labels=(cfg.repo.roadmap_label,)),
+    ]
+    github = FakeGitHub(issues)
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=70,
+        roadmap_pr_number=700,
+        roadmap_doc_path="docs/roadmap/70-parent-plan.md",
+        graph_path="docs/roadmap/70-parent-plan.graph.json",
+        graph_checksum="sum70",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="p1",
+                kind="small_job",
+                title="Parent",
+                body_markdown="Parent",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+
+    for issue_number in (80, 81, 82, 83, 84):
+        state.mark_completed(
+            issue_number,
+            f"agent/roadmap/{issue_number}-plan",
+            1000 + issue_number,
+            f"https://example/pr/{1000 + issue_number}",
+            repo_full_name=repo,
+        )
+        state.mark_pr_status(
+            pr_number=1000 + issue_number,
+            issue_number=issue_number,
+            status="merged",
+            repo_full_name=repo,
+        )
+
+    checkout = git.ensure_checkout(0)
+    docs_dir = checkout / cfg.repo.roadmap_docs_dir
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "81-invalid-graph.graph.json").write_text("{", encoding="utf-8")
+    valid_graph = {
+        "roadmap_issue_number": 82,
+        "version": 1,
+        "nodes": [
+            {
+                "node_id": "a",
+                "kind": "small_job",
+                "title": "A",
+                "body_markdown": "A",
+                "depends_on": [],
+            },
+            {
+                "node_id": "b",
+                "kind": "small_job",
+                "title": "B",
+                "body_markdown": "B",
+                "depends_on": [],
+            },
+        ],
+    }
+    (docs_dir / "82-superseding-plan.graph.json").write_text(
+        json.dumps(valid_graph),
+        encoding="utf-8",
+    )
+    unknown_parent_graph = {
+        "roadmap_issue_number": 83,
+        "version": 1,
+        "nodes": [
+            {
+                "node_id": "x",
+                "kind": "small_job",
+                "title": "X",
+                "body_markdown": "X",
+                "depends_on": [],
+            }
+        ],
+    }
+    (docs_dir / "83-unknown-parent-plan.graph.json").write_text(
+        json.dumps(unknown_parent_graph),
+        encoding="utf-8",
+    )
+    (docs_dir / "84-unreadable-graph.graph.json").write_bytes(b"\xff")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._activate_merged_roadmaps()
+
+    assert any(
+        issue_number == 80 and "missing canonical graph file" in body
+        for issue_number, body in github.comments
+    )
+    assert any(
+        issue_number == 81 and "invalid canonical graph" in body
+        for issue_number, body in github.comments
+    )
+    assert any(
+        issue_number == 82 and "sizing recommendation" in body.lower()
+        for issue_number, body in github.comments
+    )
+    assert any(
+        issue_number == 83 and "supersede linkage warning" in body.lower()
+        for issue_number, body in github.comments
+    )
+    assert any(
+        issue_number == 84 and "canonical graph file is unreadable" in body.lower()
+        for issue_number, body in github.comments
+    )
+    parent = state.get_roadmap_state(roadmap_issue_number=70, repo_full_name=repo)
+    assert parent is not None
+    assert parent.status == "superseded"
+    child = state.get_roadmap_state(roadmap_issue_number=82, repo_full_name=repo)
+    assert child is not None
+    assert child.parent_roadmap_issue_number == 70
+    unknown_parent_child = state.get_roadmap_state(roadmap_issue_number=83, repo_full_name=repo)
+    assert unknown_parent_child is not None
+    assert unknown_parent_child.parent_roadmap_issue_number == 999
+
+
+def test_advance_roadmap_nodes_reconciles_parent_supersede_after_activation_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    git = FakeGitManager(tmp_path / "checkouts")
+
+    parent_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 111,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "p1",
+                        "kind": "small_job",
+                        "title": "Parent node",
+                        "body_markdown": "Parent node",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=111,
+    )
+    child_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 112,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "c1",
+                        "kind": "small_job",
+                        "title": "Child node",
+                        "body_markdown": "Child node",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=112,
+    )
+
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=111,
+        roadmap_pr_number=1110,
+        roadmap_doc_path="docs/roadmap/111-parent.md",
+        graph_path="docs/roadmap/111-parent.graph.json",
+        graph_checksum=parent_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="p1",
+                kind="small_job",
+                title="Parent node",
+                body_markdown="Parent node",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=112,
+        roadmap_pr_number=1120,
+        roadmap_doc_path="docs/roadmap/112-child.md",
+        graph_path="docs/roadmap/112-child.graph.json",
+        graph_checksum=child_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="c1",
+                kind="small_job",
+                title="Child node",
+                body_markdown="Child node",
+                dependencies=(),
+            ),
+        ),
+        parent_roadmap_issue_number=111,
+        repo_full_name=repo,
+    )
+
+    checkout = git.ensure_checkout(0)
+    docs_dir = checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "111-parent.graph.json").write_text(parent_graph.canonical_json, encoding="utf-8")
+    (docs_dir / "112-child.graph.json").write_text(child_graph.canonical_json, encoding="utf-8")
+
+    github = FakeGitHub(
+        [
+            _issue(111, "Parent", labels=(cfg.repo.roadmap_label,)),
+            _issue(112, "Child", labels=(cfg.repo.roadmap_label,)),
+        ]
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    monkeypatch.setattr(orch._state, "claim_ready_roadmap_nodes", lambda **kwargs: ())
+    orch._advance_roadmap_nodes()
+
+    parent = state.get_roadmap_state(roadmap_issue_number=111, repo_full_name=repo)
+    assert parent is not None
+    assert parent.status == "superseded"
+    child = state.get_roadmap_state(roadmap_issue_number=112, repo_full_name=repo)
+    assert child is not None
+    assert child.status == "active"
+
+
+def test_advance_roadmap_nodes_handles_missing_roadmap_state_and_claim_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=90,
+        roadmap_pr_number=900,
+        roadmap_doc_path="docs/roadmap/90.md",
+        graph_path="docs/roadmap/90.graph.json",
+        graph_checksum="sum90",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(90, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(orch._state, "get_roadmap_state", lambda **kwargs: None)
+    orch._advance_roadmap_nodes()
+    node = state.list_roadmap_nodes(roadmap_issue_number=90, repo_full_name=repo)[0]
+    assert node.claim_token is None
+    assert node.child_issue_number is None
+
+
+def test_advance_roadmap_nodes_blocks_on_missing_graph_drift_and_releases_claim(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=91,
+        roadmap_pr_number=901,
+        roadmap_doc_path="docs/roadmap/91.md",
+        graph_path="docs/roadmap/91.graph.json",
+        graph_checksum="sum91",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    github = FakeGitHub([_issue(91, "Plan", labels=(cfg.repo.roadmap_label,))])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    orch._advance_roadmap_nodes()
+    node = state.list_roadmap_nodes(roadmap_issue_number=91, repo_full_name=repo)[0]
+    assert node.claim_token is None
+    assert node.child_issue_number is None
+    assert any(
+        issue_number == 91 and "canonical graph file is missing" in body
+        for issue_number, body in github.comments
+    )
+
+
+def test_advance_roadmap_nodes_handles_issue_creation_exception_and_mark_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    graph_payload = {
+        "roadmap_issue_number": 92,
+        "version": 1,
+        "nodes": [
+            {
+                "node_id": "n1",
+                "kind": "small_job",
+                "title": "Ship",
+                "body_markdown": "Do it",
+                "depends_on": [],
+            }
+        ],
+    }
+    parsed = parse_roadmap_graph_json(json.dumps(graph_payload), expected_issue_number=92)
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=92,
+        roadmap_pr_number=902,
+        roadmap_doc_path="docs/roadmap/92.md",
+        graph_path="docs/roadmap/92.graph.json",
+        graph_checksum=parsed.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    checkout = FakeGitManager(tmp_path / "checkouts")
+    docs_dir = checkout.ensure_checkout(0) / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "92.graph.json").write_text(parsed.canonical_json, encoding="utf-8")
+
+    class FailingCreateIssueGitHub(FakeGitHub):
+        def create_issue(
+            self,
+            title: str,
+            body: str,
+            labels: tuple[str, ...] | None = None,
+        ) -> Issue:
+            _ = title, body, labels
+            raise RuntimeError("boom")
+
+    failing_github = FailingCreateIssueGitHub(
+        [_issue(92, "Plan", labels=(cfg.repo.roadmap_label,))]
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=failing_github,
+        git_manager=checkout,
+        agent=FakeAgent(),
+    )
+    orch._advance_roadmap_nodes()
+    node = state.list_roadmap_nodes(roadmap_issue_number=92, repo_full_name=repo)[0]
+    assert node.claim_token is None
+
+    token = compute_roadmap_node_issue_token(roadmap_issue_number=92, node_id="n1")
+    existing = Issue(
+        number=9201,
+        title="Existing child",
+        body=f"existing\n<!-- mergexo-action:{token} -->",
+        html_url="https://example/issues/9201",
+        labels=(cfg.repo.small_job_label,),
+        author_login="issue-author",
+    )
+    github = FakeGitHub([_issue(92, "Plan", labels=(cfg.repo.roadmap_label,)), existing])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=checkout,
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(orch._state, "mark_roadmap_node_issue_created", lambda **kwargs: False)
+    orch._advance_roadmap_nodes()
+
+
+def test_verify_roadmap_graph_checksum_invalid_and_mismatch_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = FakeGitHub([_issue(93, "Invalid"), _issue(94, "Mismatch")])
+    checkout = git.ensure_checkout(0)
+    docs_dir = checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=93,
+        roadmap_pr_number=903,
+        roadmap_doc_path="docs/roadmap/93.md",
+        graph_path="docs/roadmap/93.graph.json",
+        graph_checksum="sum93",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    (docs_dir / "93.graph.json").write_text("{", encoding="utf-8")
+
+    valid_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 94,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=94,
+    )
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=94,
+        roadmap_pr_number=904,
+        roadmap_doc_path="docs/roadmap/94.md",
+        graph_path="docs/roadmap/94.graph.json",
+        graph_checksum="wrong-sum",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    (docs_dir / "94.graph.json").write_text(valid_graph.canonical_json, encoding="utf-8")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    roadmap_invalid = state.get_roadmap_state(roadmap_issue_number=93, repo_full_name=repo)
+    assert roadmap_invalid is not None
+    assert (
+        orch._verify_roadmap_graph_checksum(roadmap=roadmap_invalid, checkout_path=checkout)
+        is False
+    )
+    roadmap_mismatch = state.get_roadmap_state(roadmap_issue_number=94, repo_full_name=repo)
+    assert roadmap_mismatch is not None
+    assert (
+        orch._verify_roadmap_graph_checksum(roadmap=roadmap_mismatch, checkout_path=checkout)
+        is False
+    )
+    assert any("canonical graph is invalid" in body for _, body in github.comments)
+    assert any("checksums diverged" in body for _, body in github.comments)
+
+
+def test_roadmap_node_milestones_and_sync_blocking_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=95,
+        roadmap_pr_number=905,
+        roadmap_doc_path="docs/roadmap/95.md",
+        graph_path="docs/roadmap/95.graph.json",
+        graph_checksum="sum95",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="design",
+                kind="design_doc",
+                title="Design",
+                body_markdown="Doc",
+                dependencies=(),
+            ),
+            RoadmapNodeGraphInput(
+                node_id="road",
+                kind="roadmap",
+                title="Nested",
+                body_markdown="Nested",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim_design, claim_road = state.claim_ready_roadmap_nodes(repo_full_name=repo)
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=95,
+        node_id=claim_design.node_id,
+        claim_token=claim_design.claim_token,
+        child_issue_number=951,
+        child_issue_url="https://example/issues/951",
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=95,
+        node_id=claim_road.node_id,
+        claim_token=claim_road.claim_token,
+        child_issue_number=952,
+        child_issue_url="https://example/issues/952",
+        repo_full_name=repo,
+    )
+    state.mark_failed(951, "waiting", repo_full_name=repo)
+    state.mark_failed(952, "waiting", repo_full_name=repo)
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(95, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    nodes = state.list_roadmap_nodes(roadmap_issue_number=95, repo_full_name=repo)
+    design_node = next(node for node in nodes if node.node_id == "design")
+    roadmap_node = next(node for node in nodes if node.node_id == "road")
+    assert orch._roadmap_node_milestones(node=roadmap_node) == (False, False, True)
+
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=952,
+        roadmap_pr_number=9520,
+        roadmap_doc_path="docs/roadmap/952.md",
+        graph_path="docs/roadmap/952.graph.json",
+        graph_checksum="sum952",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_revision_requested(roadmap_issue_number=952, repo_full_name=repo)
+    assert orch._roadmap_node_milestones(node=roadmap_node) == (True, False, True)
+    assert orch._roadmap_node_milestones(
+        node=replace(design_node, child_issue_number=None, child_issue_url=None)
+    ) == (False, False, False)
+
+    roadmap = state.get_roadmap_state(roadmap_issue_number=95, repo_full_name=repo)
+    assert roadmap is not None
+    orch._sync_roadmap_node_progress(roadmap=roadmap)
+    updated_design = next(
+        node
+        for node in state.list_roadmap_nodes(roadmap_issue_number=95, repo_full_name=repo)
+        if node.node_id == "design"
+    )
+    assert updated_design.status == "blocked"
+
+
+def test_handle_roadmap_control_labels_revision_and_abandon_paths(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=96,
+        roadmap_pr_number=906,
+        roadmap_doc_path="docs/roadmap/96.md",
+        graph_path="docs/roadmap/96.graph.json",
+        graph_checksum="sum96",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    roadmap_issue = _issue(
+        96,
+        "Plan",
+        labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_revision_label),
+    )
+    completed_child = _issue(9601, "Done child", labels=(cfg.repo.small_job_label,))
+    github = FakeGitHub([roadmap_issue, completed_child])
+    claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=96,
+        node_id=claim.node_id,
+        claim_token=claim.claim_token,
+        child_issue_number=9601,
+        child_issue_url="https://example/issues/9601",
+        repo_full_name=repo,
+    )
+    state.record_roadmap_node_milestone(
+        roadmap_issue_number=96,
+        node_id=claim.node_id,
+        milestone="implemented",
+        repo_full_name=repo,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=96, repo_full_name=repo)
+    assert roadmap is not None
+    orch._handle_roadmap_control_labels(roadmap=roadmap)
+    revised = state.get_roadmap_state(roadmap_issue_number=96, repo_full_name=repo)
+    assert revised is not None
+    assert revised.status == "revision_requested"
+    assert revised.superseding_roadmap_issue_number is not None
+    assert len(github.created_issues) == 1
+
+    abandon_cfg = _config(tmp_path / "abandon", enable_roadmaps=True)
+    abandon_repo = abandon_cfg.repo.full_name
+    abandon_state = StateStore((tmp_path / "abandon") / "state.db")
+    abandon_state.upsert_roadmap_graph(
+        roadmap_issue_number=97,
+        roadmap_pr_number=907,
+        roadmap_doc_path="docs/roadmap/97.md",
+        graph_path="docs/roadmap/97.graph.json",
+        graph_checksum="sum97",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=abandon_repo,
+    )
+    claim = abandon_state.claim_ready_roadmap_nodes(repo_full_name=abandon_repo)[0]
+    abandon_state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=97,
+        node_id=claim.node_id,
+        claim_token=claim.claim_token,
+        child_issue_number=9701,
+        child_issue_url="https://example/issues/9701",
+        repo_full_name=abandon_repo,
+    )
+    abandon_state.record_roadmap_node_milestone(
+        roadmap_issue_number=97,
+        node_id=claim.node_id,
+        milestone="implemented",
+        repo_full_name=abandon_repo,
+    )
+    abandon_github = FakeGitHub([_issue(97, "Plan"), _issue(9701, "Child")])
+    abandon_orch = Phase1Orchestrator(
+        abandon_cfg,
+        state=abandon_state,
+        github=abandon_github,
+        git_manager=FakeGitManager((tmp_path / "abandon") / "checkouts"),
+        agent=FakeAgent(),
+    )
+    abandoned = abandon_state.get_roadmap_state(
+        roadmap_issue_number=97, repo_full_name=abandon_repo
+    )
+    assert abandoned is not None
+    abandon_orch._abandon_roadmap(roadmap=abandoned, reason="manual abandon")
+    assert 9701 not in abandon_github.closed_issue_numbers
+    first_parent_close_count = abandon_github.closed_issue_numbers.count(97)
+    abandon_orch._abandon_roadmap(roadmap=abandoned, reason="noop")
+    assert abandon_github.closed_issue_numbers.count(97) == first_parent_close_count
+
+
+def test_handle_roadmap_control_labels_opens_superseding_issue_after_crash_window(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=990,
+        roadmap_pr_number=9900,
+        roadmap_doc_path="docs/roadmap/990.md",
+        graph_path="docs/roadmap/990.graph.json",
+        graph_checksum="sum990",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_revision_requested(roadmap_issue_number=990, repo_full_name=repo)
+
+    github = FakeGitHub(
+        [_issue(990, "Plan", labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_revision_label))]
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=990, repo_full_name=repo)
+    assert roadmap is not None
+    assert roadmap.superseding_roadmap_issue_number is None
+    orch._handle_roadmap_control_labels(roadmap=roadmap)
+
+    refreshed = state.get_roadmap_state(roadmap_issue_number=990, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.status == "revision_requested"
+    assert refreshed.superseding_roadmap_issue_number is not None
+    assert len(github.created_issues) == 1
+
+
+def test_open_superseding_roadmap_issue_reuses_existing_issue(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=991,
+        roadmap_pr_number=9910,
+        roadmap_doc_path="docs/roadmap/991.md",
+        graph_path="docs/roadmap/991.graph.json",
+        graph_checksum="sum991",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_revision_requested(roadmap_issue_number=991, repo_full_name=repo)
+    parent_issue = _issue(
+        991,
+        "Plan",
+        labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_revision_label),
+    )
+    existing_superseding = Issue(
+        number=9911,
+        title="Existing revision",
+        body="Supersedes roadmap #991",
+        html_url="https://example/issues/9911",
+        labels=(cfg.repo.roadmap_label,),
+        author_login="issue-author",
+    )
+    unrelated_roadmap_issue = Issue(
+        number=9912,
+        title="Unrelated roadmap",
+        body="No supersede lineage",
+        html_url="https://example/issues/9912",
+        labels=(cfg.repo.roadmap_label,),
+        author_login="issue-author",
+    )
+    github = FakeGitHub([parent_issue, unrelated_roadmap_issue, existing_superseding])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=991, repo_full_name=repo)
+    assert roadmap is not None
+    orch._open_superseding_roadmap_issue(roadmap=roadmap, issue=parent_issue)
+
+    refreshed = state.get_roadmap_state(roadmap_issue_number=991, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.superseding_roadmap_issue_number == 9911
+    assert not github.created_issues
+
+
+def test_open_superseding_roadmap_issue_finalizes_after_comment(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=993,
+        roadmap_pr_number=9930,
+        roadmap_doc_path="docs/roadmap/993.md",
+        graph_path="docs/roadmap/993.graph.json",
+        graph_checksum="sum993",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_revision_requested(roadmap_issue_number=993, repo_full_name=repo)
+    parent_issue = _issue(
+        993,
+        "Plan",
+        labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_revision_label),
+    )
+    github = FakeGitHub([parent_issue])
+    failing_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert roadmap is not None
+
+    def fail_comment(**kwargs) -> None:  # type: ignore[no-untyped-def]
+        _ = kwargs
+        raise RuntimeError("comment failed")
+
+    failing_orch._ensure_tokenized_issue_comment = fail_comment  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="comment failed"):
+        failing_orch._open_superseding_roadmap_issue(roadmap=roadmap, issue=parent_issue)
+
+    after_failure = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert after_failure is not None
+    assert after_failure.superseding_roadmap_issue_number is None
+    assert len(github.created_issues) == 1
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts-retry"),
+        agent=FakeAgent(),
+    )
+    retried = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert retried is not None
+    orch._open_superseding_roadmap_issue(roadmap=retried, issue=parent_issue)
+
+    finalized = state.get_roadmap_state(roadmap_issue_number=993, repo_full_name=repo)
+    assert finalized is not None
+    assert finalized.superseding_roadmap_issue_number is not None
+    assert len(github.created_issues) == 1
+
+
+def test_abandon_roadmap_finalizes_after_issue_close(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=992,
+        roadmap_pr_number=9920,
+        roadmap_doc_path="docs/roadmap/992.md",
+        graph_path="docs/roadmap/992.graph.json",
+        graph_checksum="sum992",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=992,
+        node_id=claim.node_id,
+        claim_token=claim.claim_token,
+        child_issue_number=9921,
+        child_issue_url="https://example/issues/9921",
+        repo_full_name=repo,
+    )
+
+    class FailingCloseGitHub(FakeGitHub):
+        def close_issue(self, issue_number: int) -> None:
+            _ = issue_number
+            raise RuntimeError("close failed")
+
+    failing_github = FailingCloseGitHub(
+        [
+            _issue(992, "Plan", labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_abandon_label)),
+            _issue(9921, "Child", labels=(cfg.repo.small_job_label,)),
+        ]
+    )
+    failing_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=failing_github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert roadmap is not None
+    with pytest.raises(RuntimeError, match="close failed"):
+        failing_orch._abandon_roadmap(roadmap=roadmap, reason="manual abandon")
+
+    after_failure = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert after_failure is not None
+    assert after_failure.status == "active"
+
+    github = FakeGitHub(
+        [
+            _issue(992, "Plan", labels=(cfg.repo.roadmap_label, cfg.repo.roadmap_abandon_label)),
+            _issue(9921, "Child", labels=(cfg.repo.small_job_label,)),
+        ]
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts-ok"),
+        agent=FakeAgent(),
+    )
+    retried = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert retried is not None
+    orch._abandon_roadmap(roadmap=retried, reason="manual abandon")
+
+    finalized = state.get_roadmap_state(roadmap_issue_number=992, repo_full_name=repo)
+    assert finalized is not None
+    assert finalized.status == "abandoned"
+    assert 9921 in github.closed_issue_numbers
+    assert 992 in github.closed_issue_numbers
+
+
+def test_publish_roadmap_status_reports_skips_bot_and_non_command_comments(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=98,
+        roadmap_pr_number=908,
+        roadmap_doc_path="docs/roadmap/98.md",
+        graph_path="docs/roadmap/98.graph.json",
+        graph_checksum="sum98",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    github = FakeGitHub([_issue(98, "Plan", labels=(cfg.repo.roadmap_label,))])
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=1,
+            body="/roadmap status",
+            user_login="mergexo[bot]",
+            html_url="https://example/issues/98#1",
+            created_at="t",
+            updated_at="t",
+        ),
+        PullRequestIssueComment(
+            comment_id=2,
+            body="status please",
+            user_login="reviewer",
+            html_url="https://example/issues/98#2",
+            created_at="t",
+            updated_at="t",
+        ),
+    ]
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    orch._publish_roadmap_status_reports()
+    assert not github.comments
+
+    empty = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state-empty.db"),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts-empty"),
+        agent=FakeAgent(),
+    )
+    empty._publish_roadmap_status_reports()
+
+
+def test_handle_roadmap_revision_escalation_and_direct_feedback_call_sites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=99,
+        roadmap_pr_number=909,
+        roadmap_doc_path="docs/roadmap/99.md",
+        graph_path="docs/roadmap/99.graph.json",
+        graph_checksum="sum99",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=99,
+        node_id=claim.node_id,
+        claim_token=claim.claim_token,
+        child_issue_number=991,
+        child_issue_url="https://example/issues/991",
+        repo_full_name=repo,
+    )
+    state.mark_roadmap_node_blocked(
+        roadmap_issue_number=99,
+        node_id=claim.node_id,
+        repo_full_name=repo,
+    )
+    github = FakeGitHub([_issue(99, "Plan"), _issue(991, "Child")])
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    escalation = RoadmapRevisionEscalation(
+        kind="roadmap_revision", summary="bad base", details="details"
+    )
+
+    orch._handle_roadmap_revision_escalation(
+        source_issue=_issue(123, "No link"),
+        escalation=escalation,
+        source_url="https://example/issues/123",
+    )
+    before = len(github.comments)
+    orch._handle_roadmap_revision_escalation(
+        source_issue=_issue(991, "Child"),
+        escalation=escalation,
+        source_url="https://example/issues/991",
+    )
+    assert len(github.comments) == before + 1
+    roadmap = state.get_roadmap_state(roadmap_issue_number=99, repo_full_name=repo)
+    assert roadmap is not None
+    assert roadmap.status == "revision_requested"
+
+    handled: list[str] = []
+    monkeypatch.setattr(
+        orch,
+        "_handle_roadmap_revision_escalation",
+        lambda source_issue, escalation, source_url: handled.append(source_url),
+    )
+    monkeypatch.setattr(orch._git, "commit_all", lambda checkout_path, message: None)
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", lambda *, checkout_path: None)
+    direct_result = DirectStartResult(
+        pr_title="t",
+        pr_summary="s",
+        commit_message="m",
+        blocked_reason=None,
+        session=None,
+        escalation=escalation,
+    )
+    orch._run_direct_turn_with_required_tests_repair(
+        issue=_issue(7, "Direct"),
+        flow_label="bugfix",
+        checkout_path=tmp_path,
+        default_commit_message="fallback",
+        regression_test_file_regex=None,
+        direct_turn=lambda issue: direct_result,
+    )
+    assert any(url.endswith("/7") for url in handled)
+
+    issue = _issue(7, "Feedback")
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment()]
+    github.changed_files = ("docs/design/7-add-worker-scheduler.md",)
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-123"),
+        review_replies=(),
+        general_comment=None,
+        commit_message=None,
+        git_ops=(),
+        escalation=escalation,
+    )
+    state = StateStore(tmp_path / "feedback.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "feedback-checkouts"),
+        agent=agent,
+    )
+    feedback_calls: list[str] = []
+    monkeypatch.setattr(
+        orch,
+        "_handle_roadmap_revision_escalation",
+        lambda source_issue, escalation, source_url: feedback_calls.append(source_url),
+    )
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+    assert any("/pull/101" in url for url in feedback_calls)
+
+
+def test_process_issue_roadmap_validation_and_required_tests_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True, required_tests="scripts/test.sh")
+    issue = _issue(120, "Roadmap", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    failing_agent = FakeAgent(fail=True)
+    failing_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=failing_agent,
+    )
+    with pytest.raises(RuntimeError, match="codex failed"):
+        failing_orch._process_issue(issue, "roadmap")
+
+    mismatch_agent = FakeAgent()
+    mismatch_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=mismatch_agent,
+    )
+    monkeypatch.setattr(
+        mismatch_agent,
+        "start_roadmap_from_issue",
+        lambda **kwargs: RoadmapStartResult(
+            roadmap=GeneratedRoadmap(
+                title="Roadmap",
+                summary="Summary",
+                roadmap_markdown="# Plan",
+                roadmap_issue_number=999,
+                version=1,
+                graph_nodes=(
+                    RoadmapNode(
+                        node_id="n1",
+                        kind="small_job",
+                        title="Ship",
+                        body_markdown="Do it",
+                    ),
+                ),
+                canonical_graph_json=(
+                    '{"nodes":[{"body_markdown":"Do it","depends_on":[],"kind":"small_job",'
+                    '"node_id":"n1","title":"Ship"}],"roadmap_issue_number":999,"version":1}'
+                ),
+            ),
+            session=None,
+        ),
+    )
+    with pytest.raises(DirectFlowValidationError, match="did not match"):
+        mismatch_orch._process_issue(issue, "roadmap")
+
+    required_tests_orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(
+        required_tests_orch,
+        "_run_required_tests_before_push",
+        lambda *, checkout_path: "boom",
+    )
+    with pytest.raises(DirectFlowValidationError, match="required pre-push"):
+        required_tests_orch._process_issue(issue, "roadmap")
+    assert any(
+        "required pre-push test" in body
+        for issue_number, body in github.comments
+        if issue_number == 120
+    )
+
+
+def test_process_issue_roadmap_posts_size_recommendation(tmp_path: Path) -> None:
+    cfg0 = _config(tmp_path, enable_roadmaps=True)
+    cfg = AppConfig(
+        runtime=cfg0.runtime,
+        repos=(replace(cfg0.repo, roadmap_recommended_node_count=1),),
+        codex=cfg0.codex,
+    )
+    issue = _issue(130, "Roadmap", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    agent = FakeAgent()
+    agent.roadmap_result = replace(
+        agent.roadmap_result,
+        graph_nodes=(
+            RoadmapNode(node_id="n1", kind="small_job", title="One", body_markdown="One"),
+            RoadmapNode(node_id="n2", kind="small_job", title="Two", body_markdown="Two"),
+        ),
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=StateStore(tmp_path / "state.db"),
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=agent,
+    )
+    orch._process_issue(issue, "roadmap")
+    assert any(
+        issue_number == 130 and "sizing recommendation" in body.lower()
+        for issue_number, body in github.comments
+    )

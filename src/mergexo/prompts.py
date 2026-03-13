@@ -87,6 +87,10 @@ Output requirements:
 - Implement the fix and any required supporting updates.
 - Return PR metadata with a clear summary of what changed.
 - If you cannot proceed safely, return a blocked_reason.
+- If roadmap assumptions are fundamentally invalid, set escalation with:
+  - kind = "roadmap_revision"
+  - summary
+  - details
 
 Response format:
 - Return JSON only.
@@ -127,6 +131,10 @@ Output requirements:
 - Implement only what is needed for the requested change.
 - Return PR metadata with a concise summary of what changed.
 - If you cannot proceed safely, return a blocked_reason.
+- If roadmap assumptions are fundamentally invalid, set escalation with:
+  - kind = "roadmap_revision"
+  - summary
+  - details
 
 Response format:
 - Return JSON only.
@@ -181,6 +189,10 @@ Output requirements:
 - Keep changes aligned to the design doc scope unless explicitly blocked by missing requirements.
 - Return PR metadata with a clear summary of what changed.
 - If you cannot proceed safely, return a blocked_reason.
+- If roadmap assumptions are fundamentally invalid, set escalation with:
+  - kind = "roadmap_revision"
+  - summary
+  - details
 - Before finalizing your output:
   - Re-read the full diff against {default_branch}.
   - Re-read the design doc and any PR comments provided in context.
@@ -206,6 +218,67 @@ Issue body:
 
 Merged design doc markdown ({design_doc_path}):
 {design_doc_markdown}
+""".strip()
+
+
+def build_roadmap_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    roadmap_docs_dir: str,
+    recommended_node_count: int,
+    coding_guidelines_path: str | None,
+) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    markdown_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.md"
+    graph_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.graph.json"
+    return f"""
+You are the roadmap agent for repository {repo_full_name}.
+
+Task:
+- Implement issue #{issue.number} as a roadmap PR.
+- Base branch is: {default_branch}
+{coding_guidelines_lines}
+- Create both roadmap artifacts:
+  - narrative markdown
+  - canonical machine-readable graph JSON
+
+Output requirements:
+- Keep the graph acyclic with internal `node_id` references only.
+- Allowed node kinds: `design_doc`, `small_job`, `roadmap`.
+- Dependency `requires` must be `planned` or `implemented`.
+- If a dependency omits `requires`, default it to `implemented`.
+- Recommended node count is around {recommended_node_count}; larger DAGs are allowed but should include decomposition notes.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Required output fields:
+- `title`
+- `summary`
+- `roadmap_markdown`
+- `graph_json` as an object with:
+  - `roadmap_issue_number`
+  - `version`
+  - `nodes`
+
+Target file paths:
+- roadmap markdown: {markdown_path}
+- roadmap graph: {graph_path}
+
+Issue title:
+{issue.title}
+
+Issue URL:
+{issue.html_url}
+
+Issue body:
+{issue.body}
 """.strip()
 
 
@@ -266,6 +339,11 @@ Return JSON only with this object shape:
   ],
   "general_comment": "optional summary comment for the PR",
   "commit_message": "optional commit message if code changes are needed",
+  "escalation": {{
+    "kind": "roadmap_revision",
+    "summary": "short escalation summary",
+    "details": "full escalation details with impacted assumptions"
+  }},
   "flaky_test_report": {{
     "run_id": 123456789,
     "title": "meaningful flaky test issue title",
@@ -291,6 +369,7 @@ Rules:
 - If you have more detail than that, prioritize actionable facts and summarize the rest.
 - If flaky_test_report is non-null, commit_message MUST be null.
 - If uncertain whether it is flaky, leave flaky_test_report as null and continue normal remediation.
+- If you discover a foundational roadmap flaw, set escalation with kind=roadmap_revision.
 - Allowed git_ops are exactly: `fetch_origin`, `merge_origin_default_branch`.
 - If you need MergeXO to run one of those git operations (for example because of sandbox git metadata limits), request it via git_ops and set commit_message to null for that response.
 - When git_ops are requested, do not post proposal-only review replies yet; wait for the follow-up turn with operation results and then implement/finalize.

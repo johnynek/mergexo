@@ -6,6 +6,7 @@ The goal is agentic development with normal software rigor: decisions are captur
 
 MergeXO is a local-first Python orchestrator that watches labeled issues and routes each issue into one startup flow:
 
+- `roadmap`: open a roadmap PR with canonical DAG JSON that schedules child issues
 - `design_doc`: open a design-doc PR first, then implementation PR work after merge
 - `bugfix`: open a direct bugfix PR
 - `small_job`: open a direct scoped-change PR
@@ -101,6 +102,7 @@ This is the recommended first run because it gives you both orchestration and vi
 MergeXO reads these repo labels:
 
 - `ignore_label` (human takeover pause)
+- `roadmap_label` (multi-step roadmap flow)
 - `trigger_label` (default design flow)
 - `bugfix_label` (direct bugfix)
 - `small_job_label` (direct small job)
@@ -108,9 +110,10 @@ MergeXO reads these repo labels:
 If multiple labels are present, precedence is deterministic:
 
 1. `ignore_label`
-2. `bugfix_label`
-3. `small_job_label`
-4. `trigger_label`
+2. `roadmap_label`
+3. `bugfix_label`
+4. `small_job_label`
+5. `trigger_label`
 
 ### Example User Story
 
@@ -138,7 +141,13 @@ Assume one repo with labels:
    - MergeXO creates `agent/small/122-...` and runs scoped direct changes.
    - PR body uses `Fixes #122`.
 
-4. Human takeover flow (`agent:ignore`):
+4. Roadmap flow issue (feature-flagged):
+   - Set `runtime.enable_roadmaps = true` and apply `agent:roadmap` to issue `#123`.
+   - MergeXO opens `agent/roadmap/123-...` and creates both `docs/roadmap/123-...md` and `docs/roadmap/123-....graph.json`.
+   - After merge, MergeXO activates the roadmap DAG, opens child issues only when dependency milestones are satisfied, and keeps parent-child links in issue bodies.
+   - Child PRs should reference only their direct child issue; MergeXO closes the parent roadmap issue once all roadmap nodes reach terminal outcomes (or the roadmap is abandoned).
+
+5. Human takeover flow (`agent:ignore`):
    - Issue `#123` starts in bugfix flow and already has an open PR `#205`.
    - Maintainer adds label `agent:ignore` on issue `#123`.
    - MergeXO pauses enqueue/feedback/redirect automation for that issue + linked PR while takeover is active.

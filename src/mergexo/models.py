@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-IssueFlow = Literal["design_doc", "bugfix", "small_job"]
+IssueFlow = Literal["design_doc", "bugfix", "small_job", "roadmap"]
+RoadmapNodeKind = Literal["design_doc", "small_job", "roadmap"]
+RoadmapDependencyRequirement = Literal["planned", "implemented"]
 OperatorCommandName = Literal["unblock", "restart", "help", "invalid"]
 OperatorCommandStatus = Literal["applied", "rejected", "failed"]
 OperatorReplyStatus = Literal["applied", "rejected", "failed", "help"]
@@ -100,6 +102,39 @@ class GeneratedDesign:
     design_doc_markdown: str
     touch_paths: tuple[str, ...]
     summary: str
+
+
+@dataclass(frozen=True)
+class RoadmapDependency:
+    node_id: str
+    requires: RoadmapDependencyRequirement = "implemented"
+
+
+@dataclass(frozen=True)
+class RoadmapNode:
+    node_id: str
+    kind: RoadmapNodeKind
+    title: str
+    body_markdown: str
+    depends_on: tuple[RoadmapDependency, ...] = ()
+
+
+@dataclass(frozen=True)
+class GeneratedRoadmap:
+    title: str
+    summary: str
+    roadmap_markdown: str
+    roadmap_issue_number: int
+    version: int
+    graph_nodes: tuple[RoadmapNode, ...]
+    canonical_graph_json: str
+
+
+@dataclass(frozen=True)
+class RoadmapRevisionEscalation:
+    kind: Literal["roadmap_revision"]
+    summary: str
+    details: str
 
 
 @dataclass(frozen=True)

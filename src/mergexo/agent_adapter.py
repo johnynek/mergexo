@@ -8,10 +8,12 @@ from typing import Literal
 from mergexo.models import (
     FlakyTestReport,
     GeneratedDesign,
+    GeneratedRoadmap,
     Issue,
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    RoadmapRevisionEscalation,
 )
 
 
@@ -28,12 +30,19 @@ class DesignStartResult:
 
 
 @dataclass(frozen=True)
+class RoadmapStartResult:
+    roadmap: GeneratedRoadmap
+    session: AgentSession | None
+
+
+@dataclass(frozen=True)
 class DirectStartResult:
     pr_title: str
     pr_summary: str
     commit_message: str | None
     blocked_reason: str | None
     session: AgentSession | None
+    escalation: RoadmapRevisionEscalation | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,7 @@ class FeedbackResult:
     commit_message: str | None
     git_ops: tuple[GitOpRequest, ...]
     flaky_test_report: FlakyTestReport | None = None
+    escalation: RoadmapRevisionEscalation | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +92,19 @@ class AgentAdapter(ABC):
         cwd: Path,
     ) -> DesignStartResult:
         """Start a PR lifecycle from an issue and produce an initial design artifact."""
+
+    @abstractmethod
+    def start_roadmap_from_issue(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        roadmap_docs_dir: str,
+        recommended_node_count: int,
+        cwd: Path,
+    ) -> RoadmapStartResult:
+        """Start a roadmap PR lifecycle from an issue and produce roadmap artifacts."""
 
     @abstractmethod
     def start_bugfix_from_issue(
