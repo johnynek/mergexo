@@ -7045,6 +7045,41 @@ def test_commit_push_feedback_pushes_git_op_local_commit_without_commit_message(
     assert len(git.push_calls) == 1
 
 
+def test_commit_push_feedback_blocks_for_invalid_review_reply_target(tmp_path: Path) -> None:
+    orch, git, github, state, tracked, turn, _result = _feedback_commit_push_context(tmp_path)
+    result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-1"),
+        review_replies=(ReviewReply(review_comment_id=21, body="Done"),),
+        general_comment=None,
+        commit_message="feat: update",
+        git_ops=(),
+    )
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=tmp_path,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert git.commit_calls == []
+    assert git.push_calls == []
+    assert state.status_updates == [
+        (
+            101,
+            7,
+            "blocked",
+            "head-1",
+            "agent returned review_replies for non-review comment ids: 21",
+        )
+    ]
+    assert len(github.comments) == 1
+    assert "non-review comment ids" in github.comments[0][1].lower()
+
+
 def test_commit_push_feedback_replays_agent_after_remote_push_race(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9121,6 +9156,63 @@ def test_feedback_turn_retry_after_crash_does_not_duplicate_replies(
     assert len(github.review_replies) == first_reply_count
     assert len(github.comments) == first_issue_comment_count
     assert state.list_pending_feedback_events(101) == ()
+
+
+def test_feedback_turn_blocks_before_push_for_invalid_review_reply_target(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue()
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Design PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.issue_comments = [_issue_comment(comment_id=21)]
+
+    agent = FakeAgent()
+    agent.feedback_result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-456"),
+        review_replies=(ReviewReply(review_comment_id=21, body="Done"),),
+        general_comment=None,
+        commit_message="docs: apply feedback",
+        git_ops=(),
+    )
+
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/design/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    result = orch._process_feedback_turn(tracked)
+
+    assert result == "blocked"
+    assert git.commit_calls == []
+    assert git.push_calls == []
+    assert github.review_replies == []
+    assert len(github.comments) == 1
+    assert "non-review comment ids" in github.comments[0][1].lower()
+    assert "general_comment" in github.comments[0][1]
+    assert len(state.list_pending_feedback_events(101)) == 1
+    assert state.list_tracked_pull_requests() == ()
 
 
 def test_feedback_turn_skips_agent_when_branch_head_mismatch_and_retries(

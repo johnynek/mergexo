@@ -285,6 +285,10 @@ Rules:
 - Reply to specific review comments using their exact review_comment_id.
 - Do not invent IDs.
 - Use review_replies to summarize what changed and where.
+- review_replies may only target IDs listed under "Review comments (line-level)".
+- Never put PR issue-thread comment IDs into review_replies.
+- Synthetic MergeXO reminders may appear in issue_comments with negative IDs; never use those in review_replies.
+- Use general_comment for PR issue-thread responses when a thread-level reply is needed.
 - Set flaky_test_report only when the failure is an unrelated flaky CI test and you are confident.
 - flaky_test_report must include run_id/title/summary/relevant_log_excerpt with concrete reproduction details.
 - Keep the total JSON response compact and under 32000 characters.
