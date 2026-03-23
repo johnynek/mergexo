@@ -5913,6 +5913,15 @@ class Phase1Orchestrator:
                         pr_number=tracked.pr_number,
                     ),
                 )
+            if self._block_invalid_feedback_review_reply_targets(
+                tracked=tracked,
+                pull_request=pr,
+                turn=turn,
+                result=result,
+            ):
+                return self._feedback_terminal_status_from_state(
+                    tracked=tracked, fallback="blocked"
+                )
 
             flaky_outcome = self._handle_flaky_test_report(
                 tracked=tracked,
@@ -6812,6 +6821,13 @@ class Phase1Orchestrator:
             return self._git.is_ancestor(checkout_path, turn_start_head, local_head_sha)
 
         while current_result.commit_message or _has_local_commits_to_push():
+            if self._block_invalid_feedback_review_reply_targets(
+                tracked=tracked,
+                pull_request=current_pr,
+                turn=current_turn,
+                result=current_result,
+            ):
+                return None
             local_head_sha = self._git.current_head_sha(checkout_path)
             if not self._git.is_ancestor(checkout_path, turn_start_head, local_head_sha):
                 self._block_feedback_history_rewrite(
@@ -7676,6 +7692,47 @@ class Phase1Orchestrator:
             pr_number=pr_number,
             reason=reason,
         )
+
+    def _block_invalid_feedback_review_reply_targets(
+        self,
+        *,
+        tracked: TrackedPullRequestState,
+        pull_request: PullRequestSnapshot,
+        turn: FeedbackTurn,
+        result: FeedbackResult,
+    ) -> bool:
+        if not result.review_replies:
+            return False
+        valid_review_comment_ids = {comment.comment_id for comment in turn.review_comments}
+        invalid_reply_ids = tuple(
+            sorted(
+                {
+                    reply.review_comment_id
+                    for reply in result.review_replies
+                    if reply.review_comment_id not in valid_review_comment_ids
+                }
+            )
+        )
+        if not invalid_reply_ids:
+            return False
+
+        rendered_ids = ", ".join(str(comment_id) for comment_id in invalid_reply_ids)
+        self._mark_feedback_blocked(
+            pr_number=tracked.pr_number,
+            issue_number=tracked.issue_number,
+            reason="invalid_review_reply_target",
+            error=f"agent returned review_replies for non-review comment ids: {rendered_ids}",
+            last_seen_head_sha=pull_request.head_sha,
+            comment_body=(
+                "MergeXO feedback automation is blocked because the agent attempted to post "
+                "review replies to non-review comment IDs.\n\n"
+                f"- invalid review_comment_id values: `{rendered_ids}`\n"
+                "- Only IDs from `Review comments (line-level)` are valid in "
+                "`review_replies`.\n"
+                "- For PR issue-thread comments, use `general_comment` instead."
+            ),
+        )
+        return True
 
     def _block_feedback_history_rewrite(
         self,
