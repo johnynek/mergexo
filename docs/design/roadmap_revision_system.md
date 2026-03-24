@@ -25,7 +25,8 @@ The current branch already contains the enabling foundation:
 1. Roadmap graphs are versioned and stored non-destructively.
 2. Roadmap revisions are applied to the same roadmap instead of opening a
    superseding roadmap issue for the normal revision path.
-3. Graph transition validation exists and protects basic invariants.
+3. Graph transition validation now enforces version bumps, started-work
+   protections, and retained-node identity stability across revisions.
 4. Roadmap advancement now pauses at an adjustment gate before issuing ready
    nodes.
 5. The adjustment decision can currently return `proceed`,
@@ -72,6 +73,12 @@ full continuous-adjustment system.
   graph changes remain blocked as drift; once the tracked PR is merged and the
   merged graph matches the requested version, the revision is applied and the
   roadmap can resume child issuance in the same `advance_roadmap_nodes` pass.
+- Checkpoint 6 completed: graph transition validation now treats retained
+  `node_id`s as stable work identities. Revisions must preserve title, body,
+  dependencies, and kind for retained nodes, pending work that changes must be
+  retired and replaced under a new `node_id`, and revisions cannot silently
+  retire a pending node only to reintroduce the same work under a different
+  identifier.
 
 ## Current Job
 
@@ -85,9 +92,6 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 - The adjustment lock is only partially realized operationally. We have claim
   APIs and adjustment state, but not the full "worker owns the adjustment until
   the revision PR is resolved" lifecycle with pending PR metadata.
-- Transition validation still enforces the minimal safety rules, not the full
-  lineage policy. In particular, we do not yet strictly enforce semantic
-  `node_id` stability versus replacement across all revision cases.
 - Status and observability are still thin. The current status output shows
   roadmap version and adjustment state, but not pending revision PR details,
   adjustment rationale history, or revision history.
