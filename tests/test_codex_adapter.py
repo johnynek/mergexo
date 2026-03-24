@@ -8,6 +8,7 @@ import pytest
 from mergexo.agent_adapter import AgentSession, FeedbackTurn
 from mergexo.codex_adapter import (
     CodexAdapter,
+    CodexInvocationHooks,
     _as_object_dict,
     _extract_final_agent_message,
     _extract_thread_id,
@@ -30,7 +31,7 @@ from mergexo.models import (
     PullRequestSnapshot,
 )
 from mergexo.observability import configure_logging
-from mergexo.shell import CommandError
+from mergexo.shell import CommandError, RunningCommand
 
 
 def _enabled_config() -> CodexConfig:
@@ -98,6 +99,7 @@ def test_start_design_from_issue_happy_path(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         assert cwd == tmp_path
         assert check is True
@@ -164,6 +166,7 @@ def test_start_design_from_issue_returns_session(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cwd, input_text, check
         idx = cmd.index("--output-last-message")
@@ -196,6 +199,103 @@ def test_start_design_from_issue_returns_session(
     assert result.session.thread_id == "thread-abc"
 
 
+def test_start_design_from_issue_reports_process_start_and_progress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    started: list[RunningCommand] = []
+    progress_ticks: list[str] = []
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        timeout_seconds: float | None = None,
+        idle_timeout_seconds: float | None = None,
+        on_start=None,
+        on_output=None,
+        **_kwargs: object,
+    ) -> str:
+        _ = input_text, check
+        assert cwd == tmp_path
+        assert timeout_seconds == 3600.0
+        assert idle_timeout_seconds == 900
+        if on_start is not None:
+            on_start(
+                RunningCommand(
+                    argv=tuple(cmd),
+                    cwd=cwd,
+                    pid=123,
+                    pgid=456,
+                    timeout_seconds=timeout_seconds,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                )
+            )
+        if on_output is not None:
+            on_output("stdout", '{"type":"thread.started","thread_id":"thread-xyz"}\n')
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "title": "Design",
+                    "summary": "Summary",
+                    "touch_paths": ["src/a.py"],
+                    "design_doc_markdown": "Doc",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-xyz"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    adapter = CodexAdapter(_enabled_config())
+    with adapter.observe_invocations(
+        CodexInvocationHooks(
+            on_start=started.append,
+            on_progress=lambda: progress_ticks.append("tick"),
+        )
+    ):
+        result = adapter.start_design_from_issue(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            design_doc_path="docs/design/1-issue.md",
+            default_branch="main",
+            cwd=tmp_path,
+        )
+
+    assert result.session is not None
+    assert result.session.thread_id == "thread-xyz"
+    assert started == [
+        RunningCommand(
+            argv=(
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                started[0].argv[5],
+                "--output-last-message",
+                started[0].argv[7],
+                "--model",
+                "gpt-5-codex",
+                "--sandbox",
+                "workspace-write",
+                "--profile",
+                "default",
+                "--full-auto",
+                "-",
+            ),
+            cwd=tmp_path,
+            pid=123,
+            pgid=456,
+            timeout_seconds=3600.0,
+            idle_timeout_seconds=900,
+        )
+    ]
+    assert progress_ticks == ["tick"]
+
+
 def test_start_bugfix_from_issue_happy_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -205,6 +305,7 @@ def test_start_bugfix_from_issue_happy_path(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cwd, check
         assert input_text is not None
@@ -251,6 +352,7 @@ def test_start_small_job_from_issue_can_return_blocked_reason(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cwd, check
         assert input_text is not None
@@ -297,6 +399,7 @@ def test_start_implementation_from_design_happy_path(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cwd, check
         assert input_text is not None
@@ -352,6 +455,7 @@ def test_respond_to_feedback_happy_path(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cwd, input_text, check
         assert cmd[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
@@ -414,6 +518,7 @@ def test_respond_to_feedback_falls_back_to_fresh_thread_on_context_window_exhaus
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cwd, input_text, check
         calls.append(cmd)
@@ -469,6 +574,7 @@ def test_respond_to_feedback_re_raises_non_context_window_command_error(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cmd, cwd, input_text, check
         raise CommandError(
@@ -521,6 +627,7 @@ def test_respond_to_feedback_logs_fault_when_final_message_missing(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cmd, cwd, input_text, check
         return '{"type":"thread.started","thread_id":"thread-resumed"}\n'
@@ -762,6 +869,7 @@ def test_respond_to_feedback_rejects_flaky_report_with_commit_message(
         cwd: Path | None = None,
         input_text: str | None = None,
         check: bool = True,
+        **_kwargs: object,
     ) -> str:
         _ = cmd, cwd, input_text, check
         message_payload = json.dumps(

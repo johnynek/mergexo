@@ -1,52 +1,54 @@
 from __future__ import annotations
 
-from pathlib import Path
-import subprocess
+import sys
 
 import pytest
 
-from mergexo.observability import configure_logging
-from mergexo.shell import CommandError, _preview, run
+from mergexo.shell import CommandTimeoutError, RunningCommand, run
 
 
-def test_run_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    called: dict[str, object] = {}
+def test_run_reports_start_and_progress_callbacks(tmp_path: Path) -> None:
+    started: list[RunningCommand] = []
+    output_chunks: list[tuple[str, str]] = []
 
-    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        called["args"] = args
-        called["kwargs"] = kwargs
-        return subprocess.CompletedProcess(args=["echo"], returncode=0, stdout="ok", stderr="")
+    stdout = run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('hello'); print('err', file=sys.stderr)",
+        ],
+        cwd=tmp_path,
+        on_start=started.append,
+        on_output=lambda stream, chunk: output_chunks.append((stream, chunk)),
+    )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    out = run(["echo", "hello"], cwd=tmp_path, input_text="hi")
-
-    assert out == "ok"
-    kwargs = called["kwargs"]
-    assert isinstance(kwargs, dict)
-    assert kwargs["cwd"] == str(tmp_path)
-    assert kwargs["input"] == "hi"
-    assert kwargs["check"] is False
-
-
-def test_run_failure_raises(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        _ = args, kwargs
-        return subprocess.CompletedProcess(args=["bad"], returncode=2, stdout="out", stderr="err")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    configure_logging(verbose=True)
-
-    with pytest.raises(CommandError, match="Command failed"):
-        run(["bad"])
-    stderr = capsys.readouterr().err
-    assert "event=command_failed command=bad exit_code=2" in stderr
-    assert "stderr=err" in stderr
-    assert "stdout=out" in stderr
+    assert stdout == "hello\n"
+    assert len(started) == 1
+    assert started[0].cwd == tmp_path
+    assert started[0].pid > 0
+    assert any(stream == "stdout" and chunk == "hello\n" for stream, chunk in output_chunks)
+    assert any(stream == "stderr" and chunk == "err\n" for stream, chunk in output_chunks)
 
 
-def test_preview_handles_empty_and_truncation() -> None:
-    assert _preview("") == "<empty>"
-    assert _preview("x" * 10, limit=4) == "xxxx..."
+def test_run_raises_timeout_and_preserves_partial_output(tmp_path: Path) -> None:
+    with pytest.raises(CommandTimeoutError, match="timeout_kind: wall_clock") as exc_info:
+        run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys, time; "
+                    "print('started'); sys.stdout.flush(); "
+                    "time.sleep(5)"
+                ),
+            ],
+            cwd=tmp_path,
+            timeout_seconds=0.2,
+            idle_timeout_seconds=10.0,
+        )
+
+    exc = exc_info.value
+    assert exc.timeout_kind == "wall_clock"
+    assert exc.timeout_seconds == 0.2
+    assert "started\n" in exc.stdout
+    assert exc.pid > 0

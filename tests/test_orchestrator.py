@@ -104,7 +104,7 @@ from mergexo.orchestrator import (
     _truncate_feedback_text,
 )
 from mergexo.observability import configure_logging
-from mergexo.shell import CommandError
+from mergexo.shell import CommandError, CommandTimeoutError
 from mergexo.state import (
     ActionTokenScopeKind,
     ActionTokenState,
@@ -1011,6 +1011,12 @@ class FakeState:
         return ()
 
     def list_legacy_running_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[object, ...]:
+        _ = repo_full_name
+        return ()
+
+    def list_unfinished_agent_runs(
         self, *, repo_full_name: str | None = None
     ) -> tuple[object, ...]:
         _ = repo_full_name
@@ -4656,6 +4662,47 @@ def test_repair_stale_running_runs_skips_active_and_empty_branch_rows(tmp_path: 
 
     assert len(github.created_prs) == 1
     assert github.created_prs[0][1] == "agent/design/3-three"
+
+
+def test_cleanup_persisted_codex_processes_terminates_active_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    state.list_unfinished_agent_runs = lambda **kwargs: (  # type: ignore[method-assign]
+        type(
+            "Run",
+            (),
+            {
+                "run_id": "run-1",
+                "issue_number": 7,
+                "pr_number": None,
+                "meta_json": json.dumps(
+                    {
+                        "codex_active": True,
+                        "codex_pid": 321,
+                        "codex_pgid": 654,
+                    }
+                ),
+            },
+        )(),
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    killed: list[tuple[int, int | None, float]] = []
+
+    def fake_terminate_process_tree(
+        *, pid: int, pgid: int | None = None, graceful_shutdown_seconds: float = 5.0
+    ) -> None:
+        killed.append((pid, pgid, graceful_shutdown_seconds))
+
+    monkeypatch.setattr("mergexo.orchestrator.terminate_process_tree", fake_terminate_process_tree)
+    orch._cleanup_persisted_codex_processes()
+
+    assert killed == [(321, 654, 5.0)]
 
 
 def test_recover_missing_pr_branch_returns_for_unauthorized_issue_author(tmp_path: Path) -> None:
@@ -9720,19 +9767,42 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     bad_feedback: Future[str] = Future()
-    bad_feedback.set_exception(RuntimeError("feedback boom"))
+    bad_feedback.set_exception(DirectFlowBlockedError("feedback flow blocked: blocked for test"))
     orch._running_feedback = {
         101: _FeedbackFuture(issue_number=7, run_id="run-bad", future=bad_feedback)
     }
 
     orch._reap_finished()
-    assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
+    assert state.status_updates == [
+        (101, 7, "blocked", None, "feedback flow blocked: blocked for test")
+    ]
     assert len(github.comments) == 1
-    assert "unexpected error occurred" in github.comments[0][1].lower()
+    assert "feedback loop is blocked" in github.comments[0][1].lower()
     assert state.released_feedback_claims == [(101, "run-bad")]
 
 
-def test_reap_finished_blocks_with_concise_transient_git_retry_message(tmp_path: Path) -> None:
+def test_reap_finished_retries_unknown_feedback_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    unknown_failure: Future[str] = Future()
+    unknown_failure.set_exception(RuntimeError("feedback boom"))
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-unknown", future=unknown_failure)
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
+    assert state.run_finishes == [("run-unknown", "failed", "unknown", "feedback boom")]
+    assert github.comments == []
+    assert state.released_feedback_claims == [(101, "run-unknown")]
+
+
+def test_reap_finished_retries_transient_feedback_git_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
@@ -9752,16 +9822,7 @@ def test_reap_finished_blocks_with_concise_transient_git_retry_message(tmp_path:
     }
 
     orch._reap_finished()
-    assert state.status_updates == [
-        (
-            101,
-            7,
-            "blocked",
-            None,
-            "Unable to reach GitHub during feedback operations after 4 attempts. "
-            "Last error: ERROR: no healthy upstream",
-        )
-    ]
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
     assert state.run_finishes == [
         (
             "run-transient",
@@ -9771,11 +9832,7 @@ def test_reap_finished_blocks_with_concise_transient_git_retry_message(tmp_path:
             "Last error: ERROR: no healthy upstream",
         )
     ]
-    assert len(github.comments) == 1
-    assert (
-        "unable to reach github during feedback operations after 4 attempts"
-        in github.comments[0][1].lower()
-    )
+    assert github.comments == []
     assert state.released_feedback_claims == [(101, "run-transient")]
 
 
@@ -9829,6 +9886,42 @@ def test_reap_finished_keeps_feedback_tracked_on_github_polling_error(tmp_path: 
         )
     ]
     assert state.released_feedback_claims == [(101, "run-poll")]
+
+
+def test_reap_finished_retries_feedback_timeout(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    timeout_failure: Future[str] = Future()
+    timeout_failure.set_exception(
+        CommandTimeoutError(
+            argv=["codex", "exec"],
+            timeout_kind="wall_clock",
+            timeout_seconds=30.0,
+            pid=111,
+            pgid=111,
+            stdout="",
+            stderr="",
+        )
+    )
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-timeout", future=timeout_failure)
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
+    assert len(state.run_finishes) == 1
+    assert state.run_finishes[0][0] == "run-timeout"
+    assert state.run_finishes[0][1] == "failed"
+    assert state.run_finishes[0][2] == "timeout"
+    assert state.run_finishes[0][3] is not None
+    assert "timeout_kind: wall_clock" in cast(str, state.run_finishes[0][3])
+    assert github.comments == []
+    assert state.released_feedback_claims == [(101, "run-timeout")]
 
 
 def test_reap_finished_marks_feedback_success(tmp_path: Path) -> None:

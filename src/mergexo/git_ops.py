@@ -378,6 +378,12 @@ class GitRepoManager:
     def current_head_sha(self, checkout_path: Path) -> str:
         return run(["git", "-C", str(checkout_path), "rev-parse", "HEAD"]).strip()
 
+    def has_working_tree_changes(self, checkout_path: Path) -> bool:
+        status = run(
+            ["git", "-C", str(checkout_path), "status", "--porcelain", "--untracked-files=normal"]
+        ).strip()
+        return bool(status)
+
     def is_ancestor(self, checkout_path: Path, older_sha: str, newer_sha: str) -> bool:
         if older_sha == newer_sha:
             return True

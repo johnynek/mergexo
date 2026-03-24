@@ -47,6 +47,7 @@ AgentRunFailureClass = Literal[
     "policy_block",
     "github_error",
     "history_rewrite",
+    "timeout",
     "unknown",
 ]
 GitHubCommentSurface = Literal[
@@ -76,6 +77,19 @@ class TrackedPullRequestState:
     status: str
     last_seen_head_sha: str | None
     repo_full_name: str = ""
+
+
+@dataclass(frozen=True)
+class UnfinishedAgentRunState:
+    run_id: str
+    repo_full_name: str
+    run_kind: AgentRunKind
+    issue_number: int
+    pr_number: int | None
+    flow: str | None
+    branch: str | None
+    started_at: str
+    meta_json: str
 
 
 @dataclass(frozen=True)
@@ -1244,6 +1258,64 @@ class StateStore:
                 meta_json=meta_json,
             )
         return run_key
+
+    def list_unfinished_agent_runs(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[UnfinishedAgentRunState, ...]:
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        with self._lock, self._connect() as conn:
+            if repo_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        run_id,
+                        repo_full_name,
+                        run_kind,
+                        issue_number,
+                        pr_number,
+                        flow,
+                        branch,
+                        started_at,
+                        meta_json
+                    FROM agent_run_history
+                    WHERE finished_at IS NULL
+                    ORDER BY started_at ASC, repo_full_name ASC, issue_number ASC, run_id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        run_id,
+                        repo_full_name,
+                        run_kind,
+                        issue_number,
+                        pr_number,
+                        flow,
+                        branch,
+                        started_at,
+                        meta_json
+                    FROM agent_run_history
+                    WHERE finished_at IS NULL
+                      AND repo_full_name = ?
+                    ORDER BY started_at ASC, issue_number ASC, run_id ASC
+                    """,
+                    (repo_key,),
+                ).fetchall()
+        return tuple(
+            UnfinishedAgentRunState(
+                run_id=cast(str, row[0]),
+                repo_full_name=cast(str, row[1]),
+                run_kind=cast(AgentRunKind, row[2]),
+                issue_number=cast(int, row[3]),
+                pr_number=cast(int | None, row[4]),
+                flow=cast(str | None, row[5]),
+                branch=cast(str | None, row[6]),
+                started_at=cast(str, row[7]),
+                meta_json=cast(str, row[8]),
+            )
+            for row in rows
+        )
 
     def finish_agent_run(
         self,

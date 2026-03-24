@@ -217,7 +217,6 @@ def _effective_verbose_mode(args: argparse.Namespace) -> bool | str | None:
 def _cmd_console(config: AppConfig) -> None:
     config.runtime.base_dir.mkdir(parents=True, exist_ok=True)
     state = StateStore(_state_db_path(config))
-    state.reconcile_unfinished_agent_runs()
     state.prune_observability_history(
         retention_days=config.runtime.observability_history_retention_days
     )
