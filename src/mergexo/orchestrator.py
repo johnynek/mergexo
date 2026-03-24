@@ -213,6 +213,14 @@ class _CreatePullRequestOutboxPayload:
     body: str
 
 
+@dataclass(frozen=True)
+class _RoadmapRevisionPullRequest:
+    branch: str
+    graph_version: int
+    head_sha: str
+    pull_request: PullRequest
+
+
 class DirectFlowError(RuntimeError):
     """Base class for direct-flow startup failures."""
 
@@ -1322,8 +1330,18 @@ class Phase1Orchestrator:
                 )
                 return True
             if decision.action == "revise":
-                marked = self._state.mark_roadmap_revision_requested(
+                revision_pr = self._open_or_update_roadmap_revision_pr(
+                    roadmap=roadmap,
+                    decision=decision,
+                    checkout_path=checkout_path,
+                )
+                marked = self._state.mark_roadmap_revision_pending(
                     roadmap_issue_number=roadmap.roadmap_issue_number,
+                    claim_token=claim_token,
+                    request_version=revision_pr.graph_version,
+                    pr_number=revision_pr.pull_request.number,
+                    pr_url=revision_pr.pull_request.html_url,
+                    head_sha=revision_pr.head_sha,
                     last_error=decision.summary,
                     repo_full_name=self._state_repo_full_name(),
                 )
@@ -1342,14 +1360,21 @@ class Phase1Orchestrator:
                         issue_number=roadmap.roadmap_issue_number,
                         token=token,
                         body=(
-                            "MergeXO adjustment gate requested a same-roadmap revision before "
+                            "MergeXO adjustment gate opened a same-roadmap revision PR before "
                             "issuing the next frontier.\n"
                             f"- ready frontier: {frontier}\n"
+                            f"- revision PR: {revision_pr.pull_request.html_url}\n"
+                            f"- revision branch: `{revision_pr.branch}`\n"
+                            f"- target graph version: `{revision_pr.graph_version}`\n"
                             f"- summary: {decision.summary}\n\n"
                             f"{decision.details}"
                         ),
-                        source="roadmap_adjustment_revision_requested",
+                        source="roadmap_adjustment_revision_pr_opened",
                         repo_full_name=self._state_repo_full_name(),
+                    )
+                else:
+                    raise RuntimeError(
+                        "failed to transition roadmap into pending same-roadmap revision state"
                     )
                 return False
             self._abandon_roadmap(
@@ -1372,6 +1397,90 @@ class Phase1Orchestrator:
                     claim_token=claim_token,
                     repo_full_name=self._state_repo_full_name(),
                 )
+
+    def _open_or_update_roadmap_revision_pr(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        decision: RoadmapAdjustmentResult,
+        checkout_path: Path,
+    ) -> _RoadmapRevisionPullRequest:
+        if decision.updated_roadmap_markdown is None:
+            raise RuntimeError("revise decision missing updated roadmap markdown")
+        if decision.updated_canonical_graph_json is None:
+            raise RuntimeError("revise decision missing updated roadmap graph")
+
+        parsed = parse_roadmap_graph_json(
+            decision.updated_canonical_graph_json,
+            expected_issue_number=roadmap.roadmap_issue_number,
+        )
+        branch = _roadmap_revision_branch(
+            issue_number=roadmap.roadmap_issue_number,
+            graph_version=parsed.graph.version,
+        )
+        issue = self._github.get_issue(roadmap.roadmap_issue_number)
+        self._git.create_or_reset_branch(checkout_path, branch)
+
+        roadmap_abs_path = checkout_path / roadmap.roadmap_doc_path
+        graph_abs_path = checkout_path / roadmap.graph_path
+        roadmap_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        graph_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        roadmap_abs_path.write_text(decision.updated_roadmap_markdown, encoding="utf-8")
+        graph_payload = json.loads(parsed.canonical_json)
+        graph_abs_path.write_text(
+            json.dumps(graph_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        if self._git.list_staged_files(checkout_path):
+            self._git.commit_all(
+                checkout_path,
+                f"docs: revise roadmap for issue #{roadmap.roadmap_issue_number}",
+            )
+            required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+            if required_tests_error is not None:
+                required_tests_command = self._repo.required_tests or "<unset>"
+                error_summary = _summarize_git_error(required_tests_error)
+                self._github.post_issue_comment(
+                    issue_number=roadmap.roadmap_issue_number,
+                    body=(
+                        "MergeXO could not push the same-roadmap revision branch because the "
+                        f"required pre-push test `{required_tests_command}` failed.\n"
+                        f"Failure summary: {error_summary}"
+                    ),
+                )
+                raise DirectFlowValidationError(
+                    "required pre-push tests failed before pushing roadmap revision branch"
+                )
+            self._push_pre_pr_branch(
+                issue=issue,
+                flow_label="roadmap revision",
+                checkout_path=checkout_path,
+                branch=branch,
+            )
+
+        pr = self._create_pull_request_with_outbox(
+            issue_number=roadmap.roadmap_issue_number,
+            run_id=None,
+            title=f"Roadmap revision for #{roadmap.roadmap_issue_number} (v{parsed.graph.version})",
+            head=branch,
+            base=self._repo.default_branch,
+            body=(
+                "Automated roadmap revision generated by the adjustment gate.\n\n"
+                f"- target graph version: `{parsed.graph.version}`\n"
+                f"- roadmap doc path: `{roadmap.roadmap_doc_path}`\n"
+                f"- graph path: `{roadmap.graph_path}`\n"
+                f"- summary: {decision.summary}\n\n"
+                f"{decision.details}\n\n"
+                f"Refs #{roadmap.roadmap_issue_number}"
+            ),
+        )
+        return _RoadmapRevisionPullRequest(
+            branch=branch,
+            graph_version=parsed.graph.version,
+            head_sha=self._git.current_head_sha(checkout_path),
+            pull_request=pr,
+        )
 
     def _evaluate_roadmap_frontier_adjustment(
         self,
@@ -8815,6 +8924,10 @@ def _issue_branch(*, flow: IssueFlow, issue_number: int, slug: str) -> str:
     if flow == "bugfix":
         return f"agent/bugfix/{issue_number}-{slug}"
     return f"agent/small/{issue_number}-{slug}"
+
+
+def _roadmap_revision_branch(*, issue_number: int, graph_version: int) -> str:
+    return f"agent/roadmap/{issue_number}-revision-v{graph_version}"
 
 
 def _default_commit_message(*, flow: IssueFlow, issue_number: int) -> str:

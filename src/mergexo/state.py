@@ -5905,6 +5905,58 @@ class StateStore:
             )
         return cursor.rowcount > 0
 
+    def mark_roadmap_revision_pending(
+        self,
+        *,
+        roadmap_issue_number: int,
+        claim_token: str,
+        request_version: int,
+        pr_number: int,
+        pr_url: str,
+        head_sha: str | None,
+        last_error: str | None = None,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        if request_version < 1:
+            raise ValueError("request_version must be >= 1")
+        if pr_number < 1:
+            raise ValueError("pr_number must be >= 1")
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE roadmap_state
+                SET
+                    adjustment_state = 'awaiting_revision_merge',
+                    adjustment_request_version = ?,
+                    pending_revision_pr_number = ?,
+                    pending_revision_pr_url = ?,
+                    pending_revision_head_sha = ?,
+                    revision_requested_at = COALESCE(
+                        revision_requested_at,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    last_error = COALESCE(?, last_error),
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE repo_full_name = ?
+                  AND roadmap_issue_number = ?
+                  AND status = 'active'
+                  AND adjustment_state = 'evaluating'
+                  AND adjustment_claim_token = ?
+                """,
+                (
+                    request_version,
+                    pr_number,
+                    pr_url,
+                    head_sha,
+                    last_error,
+                    repo_key,
+                    roadmap_issue_number,
+                    claim_token,
+                ),
+            )
+        return cursor.rowcount > 0
+
     def set_roadmap_adjustment_request_version(
         self,
         *,

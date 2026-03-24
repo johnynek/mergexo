@@ -4605,6 +4605,94 @@ def test_list_ready_roadmap_frontier_and_adjustment_request_version_paths(tmp_pa
         )
 
 
+def test_mark_roadmap_revision_pending_preserves_claim_and_tracks_pr(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo"
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=213,
+        roadmap_pr_number=2131,
+        roadmap_doc_path="docs/roadmap/213.md",
+        graph_path="docs/roadmap/213.graph.json",
+        graph_checksum="sum213",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim = store.claim_roadmap_adjustment(roadmap_issue_number=213, repo_full_name=repo)
+    assert claim is not None
+
+    assert (
+        store.mark_roadmap_revision_pending(
+            roadmap_issue_number=213,
+            claim_token=claim,
+            request_version=2,
+            pr_number=2139,
+            pr_url="https://example/pr/2139",
+            head_sha="head-2139",
+            last_error="Need revision",
+            repo_full_name=repo,
+        )
+        is True
+    )
+
+    refreshed = store.get_roadmap_state(roadmap_issue_number=213, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.adjustment_state == "awaiting_revision_merge"
+    assert refreshed.adjustment_claim_token == claim
+    assert refreshed.adjustment_request_version == 2
+    assert refreshed.pending_revision_pr_number == 2139
+    assert refreshed.pending_revision_pr_url == "https://example/pr/2139"
+    assert refreshed.pending_revision_head_sha == "head-2139"
+    assert refreshed.last_error == "Need revision"
+    assert (
+        store.release_roadmap_adjustment(
+            roadmap_issue_number=213,
+            claim_token=claim,
+            repo_full_name=repo,
+        )
+        is False
+    )
+    assert (
+        store.mark_roadmap_revision_pending(
+            roadmap_issue_number=213,
+            claim_token="wrong",
+            request_version=3,
+            pr_number=2140,
+            pr_url="https://example/pr/2140",
+            head_sha=None,
+            repo_full_name=repo,
+        )
+        is False
+    )
+    with pytest.raises(ValueError, match="request_version must be >= 1"):
+        store.mark_roadmap_revision_pending(
+            roadmap_issue_number=213,
+            claim_token=claim,
+            request_version=0,
+            pr_number=2140,
+            pr_url="https://example/pr/2140",
+            head_sha=None,
+            repo_full_name=repo,
+        )
+    with pytest.raises(ValueError, match="pr_number must be >= 1"):
+        store.mark_roadmap_revision_pending(
+            roadmap_issue_number=213,
+            claim_token=claim,
+            request_version=3,
+            pr_number=0,
+            pr_url="https://example/pr/2140",
+            head_sha=None,
+            repo_full_name=repo,
+        )
+
+
 def test_upsert_roadmap_graph_validates_version_transitions(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     repo = "o/repo"

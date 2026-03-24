@@ -30,6 +30,8 @@ The current branch already contains the enabling foundation:
    nodes.
 5. The adjustment decision can currently return `proceed`,
    `revise(updated_markdown, updated_graph, rationale)`, or `abandon`.
+6. A `revise(...)` decision now auto-creates or reuses a same-roadmap revision
+   branch and PR, then records the pending PR metadata in roadmap state.
 
 This is enough to support manual same-roadmap revision, but it is not yet the
 full continuous-adjustment system.
@@ -56,6 +58,12 @@ full continuous-adjustment system.
   roadmap markdown plus revised graph JSON, and the Codex adapter validates
   that a `revise` payload targets the correct roadmap issue and bumps the graph
   version by exactly one step before returning it to orchestration.
+- Checkpoint 4 completed: a `revise(...)` adjustment decision now materializes
+  a same-roadmap revision branch and PR automatically. The orchestrator writes
+  the revised roadmap markdown and graph to the canonical paths, commits and
+  pushes a deterministic revision branch when needed, opens or reuses the
+  corresponding PR through the GitHub outbox path, and persists the pending PR
+  number, URL, and head SHA while the roadmap waits for that PR to merge.
 
 ## Current Job
 
@@ -63,9 +71,9 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 
 ## Remaining Work
 
-- Automatic same-roadmap revision PR creation is still missing. A
-  `revise` decision pauses the roadmap and comments on the roadmap issue, but
-  it does not create or update the roadmap revision PR.
+- Manual revision requests from labels or escalations still do not auto-author
+  a roadmap update PR, because those paths do not yet produce a concrete
+  revised roadmap payload.
 - Active roadmaps still treat unsolicited merged graph changes as drift. A
   graph update is only accepted when the roadmap has already entered the
   revision flow.
