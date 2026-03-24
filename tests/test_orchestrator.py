@@ -16094,6 +16094,142 @@ def test_run_roadmap_adjustment_gate_no_frontier_no_claim_and_error_paths(
     assert after_error.adjustment_state == "idle"
 
 
+def test_run_roadmap_adjustment_gate_skips_cached_proceed_and_reclaims_stale_evaluation(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=1011,
+        roadmap_pr_number=10110,
+        roadmap_doc_path="docs/roadmap/1011.md",
+        graph_path="docs/roadmap/1011.graph.json",
+        graph_checksum="sum1011",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    git = FakeGitManager(tmp_path / "checkouts-cached-proceed")
+    checkout = git.ensure_checkout(0)
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/1011.graph.json",
+        content=(
+            '{"nodes":[{"body_markdown":"One","depends_on":[],"kind":"small_job",'
+            '"node_id":"n1","title":"One"}],"roadmap_issue_number":1011,"version":1}'
+        ),
+        slot=0,
+    )
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/1011.md",
+        content="# Roadmap\n\nOne node.",
+        slot=0,
+    )
+    agent = FakeAgent()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(1011, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=git,
+        agent=agent,
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=1011, repo_full_name=repo)
+    assert roadmap is not None
+
+    assert orch._run_roadmap_adjustment_gate(roadmap=roadmap, checkout_path=checkout) is True
+
+    after_first = state.get_roadmap_state(roadmap_issue_number=1011, repo_full_name=repo)
+    assert after_first is not None
+    assert after_first.adjustment_state == "idle"
+    assert after_first.last_adjustment_basis_digest is not None
+    assert len(agent.roadmap_adjustment_calls) == 1
+
+    assert orch._run_roadmap_adjustment_gate(roadmap=after_first, checkout_path=checkout) is True
+    assert len(agent.roadmap_adjustment_calls) == 1
+
+    with state._connect() as conn:
+        conn.execute(
+            """
+            UPDATE roadmap_state
+            SET
+                adjustment_state = 'evaluating',
+                adjustment_claim_token = 'stale-claim',
+                adjustment_started_at = '2000-01-01T00:00:00.000Z'
+            WHERE repo_full_name = ? AND roadmap_issue_number = ?
+            """,
+            (repo, 1011),
+        )
+    stale = state.get_roadmap_state(roadmap_issue_number=1011, repo_full_name=repo)
+    assert stale is not None
+    assert stale.adjustment_state == "evaluating"
+
+    assert orch._run_roadmap_adjustment_gate(roadmap=stale, checkout_path=checkout) is True
+
+    recovered = state.get_roadmap_state(roadmap_issue_number=1011, repo_full_name=repo)
+    assert recovered is not None
+    assert recovered.adjustment_state == "idle"
+    assert recovered.adjustment_claim_token is None
+    assert recovered.last_adjustment_basis_digest == after_first.last_adjustment_basis_digest
+    assert len(agent.roadmap_adjustment_calls) == 1
+
+
+def test_run_roadmap_adjustment_gate_handles_missing_claimed_roadmap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=1012,
+        roadmap_pr_number=10120,
+        roadmap_doc_path="docs/roadmap/1012.md",
+        graph_path="docs/roadmap/1012.graph.json",
+        graph_checksum="sum1012",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    git = FakeGitManager(tmp_path / "checkouts-missing-claimed-roadmap")
+    checkout = git.ensure_checkout(0)
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/1012.graph.json",
+        content=(
+            '{"nodes":[{"body_markdown":"One","depends_on":[],"kind":"small_job",'
+            '"node_id":"n1","title":"One"}],"roadmap_issue_number":1012,"version":1}'
+        ),
+        slot=0,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(1012, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=1012, repo_full_name=repo)
+    assert roadmap is not None
+    monkeypatch.setattr(orch._state, "get_roadmap_state", lambda **kwargs: None)
+
+    assert orch._run_roadmap_adjustment_gate(roadmap=roadmap, checkout_path=checkout) is False
+
+
 def test_advance_roadmap_nodes_invokes_pending_revision_apply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -36,6 +36,10 @@ The current branch already contains the enabling foundation:
 7. A tracked pending same-roadmap revision PR is now applied only after merge,
    and roadmap advancement resumes on the updated graph in the same scheduler
    pass.
+8. Successful no-op `proceed` decisions now cache a deterministic adjustment
+   basis digest, repeated identical polls short-circuit without another agent
+   turn, and stale `evaluating` adjustment locks can be reclaimed after worker
+   interruption.
 
 This is enough to support manual same-roadmap revision, but it is not yet the
 full continuous-adjustment system.
@@ -79,6 +83,12 @@ full continuous-adjustment system.
   retired and replaced under a new `node_id`, and revisions cannot silently
   retire a pending node only to reintroduce the same work under a different
   identifier.
+- Checkpoint 7 completed: roadmap adjustment ownership is now robust across
+  retries and interrupted workers. The state schema persists a last adjustment
+  basis digest, stale `evaluating` locks can be reclaimed safely, successful
+  `proceed` decisions cache the evaluated basis, and repeated polls with the
+  same ready frontier plus dependency artifacts now skip a redundant agent
+  evaluation while leaving `./scripts/test.sh` green.
 
 ## Current Job
 
@@ -89,14 +99,9 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 - Manual revision requests from labels or escalations still do not auto-author
   a roadmap update PR, because those paths do not yet produce a concrete
   revised roadmap payload.
-- The adjustment lock is only partially realized operationally. We have claim
-  APIs and adjustment state, but not the full "worker owns the adjustment until
-  the revision PR is resolved" lifecycle with pending PR metadata.
 - Status and observability are still thin. The current status output shows
   roadmap version and adjustment state, but not pending revision PR details,
   adjustment rationale history, or revision history.
-- We do not yet persist learned adjustment context or a basis digest strong
-  enough to skip redundant no-op adjustment runs.
 
 ## Target End State
 

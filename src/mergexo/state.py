@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import sqlite3
@@ -42,6 +42,7 @@ _TRANSIENT_RETRY_MAX_ATTEMPTS = 3
 _TRANSIENT_RETRY_INITIAL_DELAY_SECONDS = 30
 _TRANSIENT_RETRY_MAX_DELAY_SECONDS = 300
 _STALE_RUNNING_RETRY_ERROR = "stale_running_issue_without_active_run"
+_ROADMAP_ADJUSTMENT_STALE_AFTER = timedelta(minutes=30)
 PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "roadmap", "implementation"]
 AgentRunKind = Literal["issue_flow", "implementation_flow", "pre_pr_followup", "feedback_turn"]
 AgentRunTerminalStatus = Literal[
@@ -82,6 +83,10 @@ RoadmapNodeStatus = Literal["pending", "issued", "completed", "blocked", "abando
 RoadmapAdjustmentState = Literal["idle", "evaluating", "awaiting_revision_merge"]
 
 
+def _format_db_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 @dataclass(frozen=True)
 class RoadmapDependencyState:
     node_id: str
@@ -114,6 +119,7 @@ class RoadmapStateRecord:
     pending_revision_pr_number: int | None
     pending_revision_pr_url: str | None
     pending_revision_head_sha: str | None
+    last_adjustment_basis_digest: str | None
     parent_roadmap_issue_number: int | None
     superseding_roadmap_issue_number: int | None
     revision_requested_at: str | None
@@ -935,6 +941,7 @@ class StateStore:
                     pending_revision_pr_number INTEGER NULL,
                     pending_revision_pr_url TEXT NULL,
                     pending_revision_head_sha TEXT NULL,
+                    last_adjustment_basis_digest TEXT NULL,
                     parent_roadmap_issue_number INTEGER NULL,
                     superseding_roadmap_issue_number INTEGER NULL,
                     revision_requested_at TEXT NULL,
@@ -1005,6 +1012,13 @@ class StateStore:
                     """
                     ALTER TABLE roadmap_state
                     ADD COLUMN pending_revision_head_sha TEXT NULL
+                    """
+                )
+            if "last_adjustment_basis_digest" not in roadmap_state_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE roadmap_state
+                    ADD COLUMN last_adjustment_basis_digest TEXT NULL
                     """
                 )
             conn.execute(
@@ -4835,6 +4849,7 @@ class StateStore:
                     pending_revision_pr_number,
                     pending_revision_pr_url,
                     pending_revision_head_sha,
+                    last_adjustment_basis_digest,
                     parent_roadmap_issue_number,
                     superseding_roadmap_issue_number,
                     revision_requested_at,
@@ -4956,6 +4971,7 @@ class StateStore:
                     pending_revision_pr_number,
                     pending_revision_pr_url,
                     pending_revision_head_sha,
+                    last_adjustment_basis_digest,
                     parent_roadmap_issue_number,
                     superseding_roadmap_issue_number,
                     revision_requested_at,
@@ -5071,6 +5087,7 @@ class StateStore:
                         pending_revision_pr_number,
                         pending_revision_pr_url,
                         pending_revision_head_sha,
+                        last_adjustment_basis_digest,
                         parent_roadmap_issue_number,
                         superseding_roadmap_issue_number,
                         revision_requested_at,
@@ -5078,7 +5095,7 @@ class StateStore:
                     )
                     VALUES(
                         ?, ?, ?, ?, ?, ?, ?, 'active', 'idle', NULL, NULL, NULL,
-                        NULL, NULL, NULL, ?, NULL, NULL, NULL
+                        NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL
                     )
                     """,
                     (
@@ -5132,6 +5149,11 @@ class StateStore:
                         pending_revision_head_sha = CASE
                             WHEN status IN ('superseded', 'abandoned', 'completed')
                             THEN pending_revision_head_sha
+                            ELSE NULL
+                        END,
+                        last_adjustment_basis_digest = CASE
+                            WHEN status IN ('superseded', 'abandoned', 'completed')
+                            THEN last_adjustment_basis_digest
                             ELSE NULL
                         END,
                         parent_roadmap_issue_number = COALESCE(
@@ -5266,6 +5288,7 @@ class StateStore:
                     pending_revision_pr_number,
                     pending_revision_pr_url,
                     pending_revision_head_sha,
+                    last_adjustment_basis_digest,
                     parent_roadmap_issue_number,
                     superseding_roadmap_issue_number,
                     revision_requested_at,
@@ -5368,6 +5391,7 @@ class StateStore:
                         pending_revision_pr_number,
                         pending_revision_pr_url,
                         pending_revision_head_sha,
+                        last_adjustment_basis_digest,
                         parent_roadmap_issue_number,
                         superseding_roadmap_issue_number,
                         revision_requested_at,
@@ -5396,6 +5420,7 @@ class StateStore:
                         pending_revision_pr_number,
                         pending_revision_pr_url,
                         pending_revision_head_sha,
+                        last_adjustment_basis_digest,
                         parent_roadmap_issue_number,
                         superseding_roadmap_issue_number,
                         revision_requested_at,
@@ -5426,6 +5451,7 @@ class StateStore:
                         pending_revision_pr_number,
                         pending_revision_pr_url,
                         pending_revision_head_sha,
+                        last_adjustment_basis_digest,
                         parent_roadmap_issue_number,
                         superseding_roadmap_issue_number,
                         revision_requested_at,
@@ -5450,6 +5476,7 @@ class StateStore:
                     pending_revision_pr_number,
                     pending_revision_pr_url,
                     pending_revision_head_sha,
+                    last_adjustment_basis_digest,
                     parent_roadmap_issue_number,
                     superseding_roadmap_issue_number,
                     revision_requested_at,
@@ -5628,6 +5655,9 @@ class StateStore:
     ) -> str | None:
         repo_key = _normalize_repo_full_name(repo_full_name)
         claim = uuid.uuid4().hex
+        stale_before = _format_db_timestamp(
+            datetime.now(timezone.utc) - _ROADMAP_ADJUSTMENT_STALE_AFTER
+        )
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -5640,9 +5670,18 @@ class StateStore:
                 WHERE repo_full_name = ?
                   AND roadmap_issue_number = ?
                   AND status = 'active'
-                  AND adjustment_state = 'idle'
+                  AND (
+                        adjustment_state = 'idle'
+                        OR (
+                            adjustment_state = 'evaluating'
+                            AND (
+                                adjustment_started_at IS NULL
+                                OR adjustment_started_at < ?
+                            )
+                        )
+                  )
                 """,
-                (claim, repo_key, roadmap_issue_number),
+                (claim, repo_key, roadmap_issue_number, stale_before),
             )
         if cursor.rowcount <= 0:
             return None
@@ -5653,6 +5692,7 @@ class StateStore:
         *,
         roadmap_issue_number: int,
         claim_token: str,
+        basis_digest: str | None = None,
         repo_full_name: str | None = None,
     ) -> bool:
         repo_key = _normalize_repo_full_name(repo_full_name)
@@ -5664,13 +5704,17 @@ class StateStore:
                     adjustment_state = 'idle',
                     adjustment_claim_token = NULL,
                     adjustment_started_at = NULL,
+                    last_adjustment_basis_digest = CASE
+                        WHEN ? IS NULL THEN last_adjustment_basis_digest
+                        ELSE ?
+                    END,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE repo_full_name = ?
                   AND roadmap_issue_number = ?
                   AND adjustment_state = 'evaluating'
                   AND adjustment_claim_token = ?
                 """,
-                (repo_key, roadmap_issue_number, claim_token),
+                (basis_digest, basis_digest, repo_key, roadmap_issue_number, claim_token),
             )
         return cursor.rowcount > 0
 
@@ -5891,6 +5935,7 @@ class StateStore:
                     adjustment_claim_token = NULL,
                     adjustment_started_at = NULL,
                     adjustment_request_version = graph_version,
+                    last_adjustment_basis_digest = NULL,
                     revision_requested_at = COALESCE(
                         revision_requested_at,
                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -5932,6 +5977,7 @@ class StateStore:
                     pending_revision_pr_number = ?,
                     pending_revision_pr_url = ?,
                     pending_revision_head_sha = ?,
+                    last_adjustment_basis_digest = NULL,
                     revision_requested_at = COALESCE(
                         revision_requested_at,
                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -6051,6 +6097,7 @@ class StateStore:
                     pending_revision_pr_number = NULL,
                     pending_revision_pr_url = NULL,
                     pending_revision_head_sha = NULL,
+                    last_adjustment_basis_digest = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE repo_full_name = ?
                   AND roadmap_issue_number = ?
@@ -6097,6 +6144,7 @@ class StateStore:
                     pending_revision_pr_number = NULL,
                     pending_revision_pr_url = NULL,
                     pending_revision_head_sha = NULL,
+                    last_adjustment_basis_digest = NULL,
                     last_error = COALESCE(?, last_error),
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE repo_full_name = ?
@@ -6139,6 +6187,7 @@ class StateStore:
                     pending_revision_pr_number = NULL,
                     pending_revision_pr_url = NULL,
                     pending_revision_head_sha = NULL,
+                    last_adjustment_basis_digest = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE repo_full_name = ?
                   AND roadmap_issue_number = ?
@@ -6947,6 +6996,7 @@ def _parse_roadmap_state_row(row: tuple[object, ...], *, repo_full_name: str) ->
         pending_revision_pr_number = None
         pending_revision_pr_url = None
         pending_revision_head_sha = None
+        last_adjustment_basis_digest = None
     elif len(row) == 16:
         (
             roadmap_issue_number,
@@ -6969,6 +7019,7 @@ def _parse_roadmap_state_row(row: tuple[object, ...], *, repo_full_name: str) ->
         pending_revision_pr_number = None
         pending_revision_pr_url = None
         pending_revision_head_sha = None
+        last_adjustment_basis_digest = None
     elif len(row) == 19:
         (
             roadmap_issue_number,
@@ -6985,6 +7036,30 @@ def _parse_roadmap_state_row(row: tuple[object, ...], *, repo_full_name: str) ->
             pending_revision_pr_number,
             pending_revision_pr_url,
             pending_revision_head_sha,
+            parent_roadmap_issue_number,
+            superseding_roadmap_issue_number,
+            revision_requested_at,
+            last_error,
+            updated_at,
+        ) = row
+        last_adjustment_basis_digest = None
+    elif len(row) == 20:
+        (
+            roadmap_issue_number,
+            roadmap_pr_number,
+            roadmap_doc_path,
+            graph_path,
+            graph_checksum,
+            graph_version,
+            status,
+            adjustment_state,
+            adjustment_claim_token,
+            adjustment_started_at,
+            adjustment_request_version,
+            pending_revision_pr_number,
+            pending_revision_pr_url,
+            pending_revision_head_sha,
+            last_adjustment_basis_digest,
             parent_roadmap_issue_number,
             superseding_roadmap_issue_number,
             revision_requested_at,
@@ -7017,6 +7092,10 @@ def _parse_roadmap_state_row(row: tuple[object, ...], *, repo_full_name: str) ->
         raise RuntimeError("Invalid pending_revision_pr_url value stored in roadmap_state")
     if pending_revision_head_sha is not None and not isinstance(pending_revision_head_sha, str):
         raise RuntimeError("Invalid pending_revision_head_sha value stored in roadmap_state")
+    if last_adjustment_basis_digest is not None and not isinstance(
+        last_adjustment_basis_digest, str
+    ):
+        raise RuntimeError("Invalid last_adjustment_basis_digest value stored in roadmap_state")
     if parent_roadmap_issue_number is not None and not isinstance(parent_roadmap_issue_number, int):
         raise RuntimeError("Invalid parent_roadmap_issue_number value stored in roadmap_state")
     if superseding_roadmap_issue_number is not None and not isinstance(
@@ -7045,6 +7124,7 @@ def _parse_roadmap_state_row(row: tuple[object, ...], *, repo_full_name: str) ->
         pending_revision_pr_number=pending_revision_pr_number,
         pending_revision_pr_url=pending_revision_pr_url,
         pending_revision_head_sha=pending_revision_head_sha,
+        last_adjustment_basis_digest=last_adjustment_basis_digest,
         parent_roadmap_issue_number=parent_roadmap_issue_number,
         superseding_roadmap_issue_number=superseding_roadmap_issue_number,
         revision_requested_at=revision_requested_at,

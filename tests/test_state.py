@@ -304,6 +304,7 @@ def test_state_store_migrates_legacy_roadmap_schema(tmp_path: Path) -> None:
         "pending_revision_pr_number",
         "pending_revision_pr_url",
         "pending_revision_head_sha",
+        "last_adjustment_basis_digest",
     }.issubset(roadmap_state_columns)
     assert {"introduced_in_version", "retired_in_version", "is_active", "claim_token"}.issubset(
         roadmap_node_columns
@@ -3429,6 +3430,7 @@ def test_roadmap_state_helper_parsers_validate_shapes() -> None:
             202,
             "https://example/pr/202",
             "head-202",
+            "digest-202",
             None,
             None,
             "requested",
@@ -3440,6 +3442,7 @@ def test_roadmap_state_helper_parsers_validate_shapes() -> None:
     assert current_state.pending_revision_pr_number == 202
     assert current_state.pending_revision_pr_url == "https://example/pr/202"
     assert current_state.pending_revision_head_sha == "head-202"
+    assert current_state.last_adjustment_basis_digest == "digest-202"
     node = _parse_roadmap_node_row(
         (
             1,
@@ -3822,6 +3825,32 @@ def test_roadmap_state_helper_parsers_validate_shapes() -> None:
                 1,
                 "active",
                 "idle",
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+                "t",
+            ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid last_adjustment_basis_digest"):
+        _parse_roadmap_state_row(
+            (
+                1,
+                None,
+                "docs/roadmap/1.md",
+                "docs/roadmap/1.graph.json",
+                "sum",
+                1,
+                "active",
+                "idle",
+                None,
                 None,
                 None,
                 None,
@@ -4691,6 +4720,58 @@ def test_mark_roadmap_revision_pending_preserves_claim_and_tracks_pr(tmp_path: P
             head_sha=None,
             repo_full_name=repo,
         )
+
+
+def test_claim_roadmap_adjustment_reclaims_stale_lock_and_release_stores_basis_digest(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo"
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=214,
+        roadmap_pr_number=2141,
+        roadmap_doc_path="docs/roadmap/214.md",
+        graph_path="docs/roadmap/214.graph.json",
+        graph_checksum="sum214",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    first_claim = store.claim_roadmap_adjustment(roadmap_issue_number=214, repo_full_name=repo)
+    assert first_claim is not None
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE roadmap_state
+            SET adjustment_started_at = '2000-01-01T00:00:00.000Z'
+            WHERE repo_full_name = ? AND roadmap_issue_number = ?
+            """,
+            (repo, 214),
+        )
+    reclaimed_claim = store.claim_roadmap_adjustment(roadmap_issue_number=214, repo_full_name=repo)
+    assert reclaimed_claim is not None
+    assert reclaimed_claim != first_claim
+    assert (
+        store.release_roadmap_adjustment(
+            roadmap_issue_number=214,
+            claim_token=reclaimed_claim,
+            basis_digest="digest-214",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    refreshed = store.get_roadmap_state(roadmap_issue_number=214, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.adjustment_state == "idle"
+    assert refreshed.adjustment_claim_token is None
+    assert refreshed.last_adjustment_basis_digest == "digest-214"
 
 
 def test_upsert_roadmap_graph_validates_version_transitions(tmp_path: Path) -> None:

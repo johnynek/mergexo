@@ -4,6 +4,7 @@ from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import logging
@@ -219,6 +220,16 @@ class _RoadmapRevisionPullRequest:
     graph_version: int
     head_sha: str
     pull_request: PullRequest
+
+
+@dataclass(frozen=True)
+class _RoadmapAdjustmentContext:
+    issue: Issue
+    roadmap_markdown: str
+    canonical_graph_json: str
+    dependency_artifacts: tuple[RoadmapDependencyArtifact, ...]
+    status_report: str
+    basis_digest: str
 
 
 class DirectFlowError(RuntimeError):
@@ -1310,33 +1321,66 @@ class Phase1Orchestrator:
             return False
 
         release_claim = True
+        release_basis_digest: str | None = None
         try:
+            claimed_roadmap = self._state.get_roadmap_state(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if claimed_roadmap is None:
+                return False
             ready_node_ids = self._state.list_ready_roadmap_frontier(
                 roadmap_issue_number=roadmap.roadmap_issue_number,
                 repo_full_name=self._state_repo_full_name(),
             )
             if not ready_node_ids:
                 return True
-            decision = self._evaluate_roadmap_frontier_adjustment(
-                roadmap=roadmap,
+            context = self._build_roadmap_adjustment_context(
+                roadmap=claimed_roadmap,
                 ready_node_ids=ready_node_ids,
                 checkout_path=checkout_path,
             )
-            if decision.action == "proceed":
+            if context.basis_digest == claimed_roadmap.last_adjustment_basis_digest:
                 self._state.set_roadmap_last_error(
-                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
                     error=None,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                release_basis_digest = context.basis_digest
+                return True
+            decision = self._agent.evaluate_roadmap_adjustment(
+                issue=context.issue,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                coding_guidelines_path=self._coding_guidelines_path_for_checkout(
+                    checkout_path=checkout_path
+                ),
+                roadmap_doc_path=claimed_roadmap.roadmap_doc_path,
+                graph_path=claimed_roadmap.graph_path,
+                graph_version=claimed_roadmap.graph_version,
+                ready_node_ids=ready_node_ids,
+                dependency_artifacts=context.dependency_artifacts,
+                roadmap_status_report=context.status_report,
+                roadmap_markdown=context.roadmap_markdown,
+                canonical_graph_json=context.canonical_graph_json,
+                cwd=checkout_path,
+            )
+            if decision.action == "proceed":
+                self._state.set_roadmap_last_error(
+                    roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
+                    error=None,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                release_basis_digest = context.basis_digest
                 return True
             if decision.action == "revise":
                 revision_pr = self._open_or_update_roadmap_revision_pr(
-                    roadmap=roadmap,
+                    roadmap=claimed_roadmap,
                     decision=decision,
                     checkout_path=checkout_path,
                 )
                 marked = self._state.mark_roadmap_revision_pending(
-                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
                     claim_token=claim_token,
                     request_version=revision_pr.graph_version,
                     pr_number=revision_pr.pull_request.number,
@@ -1348,8 +1392,8 @@ class Phase1Orchestrator:
                 if marked:
                     release_claim = False
                     token = compute_roadmap_adjustment_decision_token(
-                        roadmap_issue_number=roadmap.roadmap_issue_number,
-                        graph_version=roadmap.graph_version,
+                        roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
+                        graph_version=claimed_roadmap.graph_version,
                         ready_node_ids=ready_node_ids,
                         action=decision.action,
                         summary=decision.summary,
@@ -1357,7 +1401,7 @@ class Phase1Orchestrator:
                     frontier = ", ".join(ready_node_ids)
                     self._ensure_tokenized_issue_comment(
                         github=self._github,
-                        issue_number=roadmap.roadmap_issue_number,
+                        issue_number=claimed_roadmap.roadmap_issue_number,
                         token=token,
                         body=(
                             "MergeXO adjustment gate opened a same-roadmap revision PR before "
@@ -1378,7 +1422,7 @@ class Phase1Orchestrator:
                     )
                 return False
             self._abandon_roadmap(
-                roadmap=roadmap,
+                roadmap=claimed_roadmap,
                 reason=f"{decision.summary}\n\n{decision.details}".strip(),
             )
             release_claim = False
@@ -1395,6 +1439,7 @@ class Phase1Orchestrator:
                 self._state.release_roadmap_adjustment(
                     roadmap_issue_number=roadmap.roadmap_issue_number,
                     claim_token=claim_token,
+                    basis_digest=release_basis_digest,
                     repo_full_name=self._state_repo_full_name(),
                 )
 
@@ -1482,13 +1527,13 @@ class Phase1Orchestrator:
             pull_request=pr,
         )
 
-    def _evaluate_roadmap_frontier_adjustment(
+    def _build_roadmap_adjustment_context(
         self,
         *,
         roadmap: RoadmapStateRecord,
         ready_node_ids: tuple[str, ...],
         checkout_path: Path,
-    ) -> RoadmapAdjustmentResult:
+    ) -> _RoadmapAdjustmentContext:
         graph_raw = (checkout_path / roadmap.graph_path).read_text(encoding="utf-8")
         roadmap_doc_path = checkout_path / roadmap.roadmap_doc_path
         try:
@@ -1508,9 +1553,6 @@ class Phase1Orchestrator:
             roadmap_issue_number=roadmap.roadmap_issue_number,
             ready_node_ids=ready_node_ids,
         )
-        coding_guidelines_path = self._coding_guidelines_path_for_checkout(
-            checkout_path=checkout_path
-        )
         status_report = _render_roadmap_status_report(
             roadmap_status=roadmap.status,
             graph_version=roadmap.graph_version,
@@ -1519,19 +1561,50 @@ class Phase1Orchestrator:
             blockers=blockers,
             request_comment_id=0,
         )
-        return self._agent.evaluate_roadmap_adjustment(
+        return _RoadmapAdjustmentContext(
             issue=issue,
+            roadmap_markdown=roadmap_markdown,
+            canonical_graph_json=graph_raw,
+            dependency_artifacts=dependency_artifacts,
+            status_report=status_report,
+            basis_digest=_roadmap_adjustment_basis_digest(
+                issue=issue,
+                graph_version=roadmap.graph_version,
+                ready_node_ids=ready_node_ids,
+                dependency_artifacts=dependency_artifacts,
+                roadmap_status_report=status_report,
+                roadmap_markdown=roadmap_markdown,
+                canonical_graph_json=graph_raw,
+            ),
+        )
+
+    def _evaluate_roadmap_frontier_adjustment(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        ready_node_ids: tuple[str, ...],
+        checkout_path: Path,
+    ) -> RoadmapAdjustmentResult:
+        context = self._build_roadmap_adjustment_context(
+            roadmap=roadmap,
+            ready_node_ids=ready_node_ids,
+            checkout_path=checkout_path,
+        )
+        return self._agent.evaluate_roadmap_adjustment(
+            issue=context.issue,
             repo_full_name=self._state_repo_full_name(),
             default_branch=self._repo.default_branch,
-            coding_guidelines_path=coding_guidelines_path,
+            coding_guidelines_path=self._coding_guidelines_path_for_checkout(
+                checkout_path=checkout_path
+            ),
             roadmap_doc_path=roadmap.roadmap_doc_path,
             graph_path=roadmap.graph_path,
             graph_version=roadmap.graph_version,
             ready_node_ids=ready_node_ids,
-            dependency_artifacts=dependency_artifacts,
-            roadmap_status_report=status_report,
-            roadmap_markdown=roadmap_markdown,
-            canonical_graph_json=graph_raw,
+            dependency_artifacts=context.dependency_artifacts,
+            roadmap_status_report=context.status_report,
+            roadmap_markdown=context.roadmap_markdown,
+            canonical_graph_json=context.canonical_graph_json,
             cwd=checkout_path,
         )
 
@@ -8832,6 +8905,88 @@ def _roadmap_dependency_resolution_markers(
         if issue_run.error is not None:
             markers.append(f"issue_run_error={issue_run.error}")
     return tuple(markers)
+
+
+def _roadmap_adjustment_basis_digest(
+    *,
+    issue: Issue,
+    graph_version: int,
+    ready_node_ids: tuple[str, ...],
+    dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
+    roadmap_status_report: str,
+    roadmap_markdown: str,
+    canonical_graph_json: str,
+) -> str:
+    payload = {
+        "issue": {
+            "number": issue.number,
+            "title": issue.title,
+            "body": issue.body,
+            "html_url": issue.html_url,
+            "labels": list(issue.labels),
+            "author_login": issue.author_login,
+        },
+        "graph_version": graph_version,
+        "ready_node_ids": list(ready_node_ids),
+        "dependency_artifacts": [
+            _serialize_roadmap_dependency_artifact(artifact) for artifact in dependency_artifacts
+        ],
+        "roadmap_status_report": roadmap_status_report,
+        "roadmap_markdown": roadmap_markdown,
+        "canonical_graph_json": canonical_graph_json,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _serialize_roadmap_dependency_artifact(
+    artifact: RoadmapDependencyArtifact,
+) -> dict[str, object]:
+    return {
+        "dependency_node_id": artifact.dependency_node_id,
+        "dependency_kind": artifact.dependency_kind,
+        "dependency_title": artifact.dependency_title,
+        "frontier_references": [
+            {
+                "ready_node_id": reference.ready_node_id,
+                "requires": reference.requires,
+            }
+            for reference in artifact.frontier_references
+        ],
+        "child_issue_number": artifact.child_issue_number,
+        "child_issue_url": artifact.child_issue_url,
+        "child_issue_title": artifact.child_issue_title,
+        "child_issue_body": artifact.child_issue_body,
+        "issue_run_status": artifact.issue_run_status,
+        "issue_run_branch": artifact.issue_run_branch,
+        "issue_run_error": artifact.issue_run_error,
+        "resolution_markers": list(artifact.resolution_markers),
+        "pr_number": artifact.pr_number,
+        "pr_url": artifact.pr_url,
+        "pr_title": artifact.pr_title,
+        "pr_body": artifact.pr_body,
+        "pr_state": artifact.pr_state,
+        "pr_merged": artifact.pr_merged,
+        "changed_files": list(artifact.changed_files),
+        "review_summaries": [
+            _serialize_pull_request_issue_comment(comment) for comment in artifact.review_summaries
+        ],
+        "issue_comments": [
+            _serialize_pull_request_issue_comment(comment) for comment in artifact.issue_comments
+        ],
+    }
+
+
+def _serialize_pull_request_issue_comment(comment: PullRequestIssueComment) -> dict[str, object]:
+    return {
+        "comment_id": comment.comment_id,
+        "body": comment.body,
+        "user_login": comment.user_login,
+        "html_url": comment.html_url,
+        "created_at": comment.created_at,
+        "updated_at": comment.updated_at,
+    }
 
 
 def _render_roadmap_status_report(
