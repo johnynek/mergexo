@@ -19,6 +19,7 @@ from mergexo.state import (
     _parse_roadmap_dependencies_json,
     _parse_roadmap_node_kind,
     _parse_roadmap_node_row,
+    _parse_roadmap_revision_draft_row,
     _parse_roadmap_revision_row,
     _parse_roadmap_node_status,
     _parse_roadmap_state_row,
@@ -1020,10 +1021,439 @@ def test_state_store_apply_succeeded_create_pr_call_rejects_invalid_rows(tmp_pat
         is False
     )
 
+
+def test_state_store_apply_succeeded_create_issue_and_post_comment_calls(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo-a"
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=91,
+        roadmap_pr_number=910,
+        roadmap_doc_path="docs/roadmap/91.md",
+        graph_path="docs/roadmap/91.graph.json",
+        graph_checksum="sum91",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+
+    assert (
+        store.apply_succeeded_create_issue_call(
+            call_id=999,
+            roadmap_issue_number=91,
+            node_id="n1",
+            child_issue_number=101,
+            child_issue_url="https://example/issues/101",
+            repo_full_name=repo,
+        )
+        is False
+    )
+    intent = store.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:91:n1",
+        payload_json=(
+            '{"roadmap_issue_number":91,"node_id":"n1","title":"One","body":"One",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+        issue_number=91,
+        repo_full_name=repo,
+    )
+    assert (
+        store.apply_succeeded_create_issue_call(
+            call_id=intent.call_id,
+            roadmap_issue_number=91,
+            node_id="n1",
+            child_issue_number=101,
+            child_issue_url="https://example/issues/101",
+            repo_full_name=repo,
+        )
+        is False
+    )
+    assert store.mark_github_call_succeeded(
+        call_id=intent.call_id,
+        result_json='{"issue_number":101,"issue_url":"https://example/issues/101"}',
+        repo_full_name=repo,
+    )
+    assert (
+        store.apply_succeeded_create_issue_call(
+            call_id=intent.call_id,
+            roadmap_issue_number=91,
+            node_id="missing",
+            child_issue_number=101,
+            child_issue_url="https://example/issues/101",
+            repo_full_name=repo,
+        )
+        is False
+    )
+    assert store.apply_succeeded_create_issue_call(
+        call_id=intent.call_id,
+        roadmap_issue_number=91,
+        node_id="n1",
+        child_issue_number=101,
+        child_issue_url="https://example/issues/101",
+        repo_full_name=repo,
+    )
+    assert (
+        store.apply_succeeded_create_issue_call(
+            call_id=intent.call_id,
+            roadmap_issue_number=91,
+            node_id="n1",
+            child_issue_number=101,
+            child_issue_url="https://example/issues/101",
+            repo_full_name=repo,
+        )
+        is False
+    )
+
+    mismatch = store.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:91:n1:mismatch",
+        payload_json=(
+            '{"roadmap_issue_number":91,"node_id":"n1","title":"One","body":"One",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+        issue_number=91,
+        repo_full_name=repo,
+    )
+    assert store.mark_github_call_succeeded(
+        call_id=mismatch.call_id,
+        result_json='{"issue_number":102,"issue_url":"https://example/issues/102"}',
+        repo_full_name=repo,
+    )
+    assert (
+        store.apply_succeeded_create_issue_call(
+            call_id=mismatch.call_id,
+            roadmap_issue_number=91,
+            node_id="n1",
+            child_issue_number=102,
+            child_issue_url="https://example/issues/102",
+            repo_full_name=repo,
+        )
+        is False
+    )
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    try:
+        conn.execute(
+            """
+            UPDATE roadmap_nodes
+            SET child_issue_number = 103, child_issue_url = 'https://example/issues/103',
+                status = 'pending', planned_at = NULL
+            WHERE repo_full_name = ? AND roadmap_issue_number = 91 AND node_id = 'n1'
+            """,
+            (repo,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    same_issue = store.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:91:n1:same",
+        payload_json=(
+            '{"roadmap_issue_number":91,"node_id":"n1","title":"One","body":"One",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+        issue_number=91,
+        repo_full_name=repo,
+    )
+    assert store.mark_github_call_succeeded(
+        call_id=same_issue.call_id,
+        result_json='{"issue_number":103,"issue_url":"https://example/issues/103"}',
+        repo_full_name=repo,
+    )
+    assert store.apply_succeeded_create_issue_call(
+        call_id=same_issue.call_id,
+        roadmap_issue_number=91,
+        node_id="n1",
+        child_issue_number=103,
+        child_issue_url="https://example/issues/103",
+        repo_full_name=repo,
+    )
+
+    assert (
+        store.apply_succeeded_post_issue_comment_call(
+            call_id=777,
+            issue_number=91,
+            token="tok",
+            source="src",
+            repo_full_name=repo,
+        )
+        is False
+    )
+    comment_intent = store.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:91:tok",
+        payload_json='{"issue_number":91,"token":"tok","body":"Hello","source":"src"}',
+        issue_number=91,
+        repo_full_name=repo,
+    )
+    assert (
+        store.apply_succeeded_post_issue_comment_call(
+            call_id=comment_intent.call_id,
+            issue_number=91,
+            token="tok",
+            source="src",
+            repo_full_name=repo,
+        )
+        is False
+    )
+    assert store.mark_github_call_succeeded(
+        call_id=comment_intent.call_id,
+        result_json='{"issue_number":91,"posted":true}',
+        repo_full_name=repo,
+    )
+    assert store.apply_succeeded_post_issue_comment_call(
+        call_id=comment_intent.call_id,
+        issue_number=91,
+        token="tok",
+        source="src",
+        repo_full_name=repo,
+    )
+    assert (
+        store.apply_succeeded_post_issue_comment_call(
+            call_id=comment_intent.call_id,
+            issue_number=91,
+            token="tok",
+            source="src",
+            repo_full_name=repo,
+        )
+        is False
+    )
+
+
+def test_state_store_roadmap_revision_draft_lifecycle_and_parser(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo-a"
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=111,
+        roadmap_pr_number=1110,
+        roadmap_doc_path="docs/roadmap/111.md",
+        graph_path="docs/roadmap/111.graph.json",
+        graph_checksum="sum111",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    assert store.get_roadmap_revision_draft(roadmap_issue_number=111, repo_full_name=repo) is None
+    with pytest.raises(ValueError, match="request_version"):
+        store.prepare_roadmap_revision_draft_from_adjustment(
+            roadmap_issue_number=111,
+            claim_token="claim",
+            request_version=0,
+            summary="s",
+            details="d",
+            updated_roadmap_markdown="# x",
+            updated_canonical_graph_json="{}",
+            ready_node_ids_json=None,
+            repo_full_name=repo,
+        )
+    with pytest.raises(ValueError, match="request_version"):
+        store.prepare_requested_roadmap_revision_draft(
+            roadmap_issue_number=111,
+            request_version=0,
+            summary="s",
+            details="d",
+            updated_roadmap_markdown="# x",
+            updated_canonical_graph_json="{}",
+            request_reason="why",
+            repo_full_name=repo,
+        )
+    with pytest.raises(ValueError, match="request_version"):
+        store.mark_roadmap_revision_materialized(
+            roadmap_issue_number=111,
+            request_version=0,
+            pr_number=1,
+            pr_url="https://example/pr/1",
+            head_sha="sha",
+            repo_full_name=repo,
+        )
+    with pytest.raises(ValueError, match="pr_number"):
+        store.mark_roadmap_revision_materialized(
+            roadmap_issue_number=111,
+            request_version=2,
+            pr_number=0,
+            pr_url="https://example/pr/1",
+            head_sha="sha",
+            repo_full_name=repo,
+        )
+    assert (
+        store.prepare_roadmap_revision_draft_from_adjustment(
+            roadmap_issue_number=111,
+            claim_token="missing",
+            request_version=2,
+            summary="s",
+            details="d",
+            updated_roadmap_markdown="# x",
+            updated_canonical_graph_json="{}",
+            ready_node_ids_json='["n1"]',
+            repo_full_name=repo,
+        )
+        is False
+    )
+    assert store.mark_roadmap_revision_requested(
+        roadmap_issue_number=111,
+        repo_full_name=repo,
+    )
+    assert (
+        store.prepare_requested_roadmap_revision_draft(
+            roadmap_issue_number=111,
+            request_version=2,
+            summary="s",
+            details="d",
+            updated_roadmap_markdown="# x",
+            updated_canonical_graph_json="{}",
+            request_reason="why",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    draft = store.get_roadmap_revision_draft(roadmap_issue_number=111, repo_full_name=repo)
+    assert draft is not None
+    assert draft.request_version == 2
+    assert draft.source_kind == "manual"
+    assert (
+        store.mark_roadmap_revision_materialized(
+            roadmap_issue_number=111,
+            request_version=2,
+            pr_number=12,
+            pr_url="https://example/pr/12",
+            head_sha="sha",
+            repo_full_name=repo,
+        )
+        is True
+    )
+    assert store.get_roadmap_revision_draft(roadmap_issue_number=111, repo_full_name=repo) is None
+    assert (
+        store.mark_roadmap_revision_materialized(
+            roadmap_issue_number=111,
+            request_version=2,
+            pr_number=12,
+            pr_url="https://example/pr/12",
+            head_sha="sha",
+            repo_full_name=repo,
+        )
+        is False
+    )
+    assert (
+        store.prepare_requested_roadmap_revision_draft(
+            roadmap_issue_number=111,
+            request_version=3,
+            summary="later",
+            details="later",
+            updated_roadmap_markdown="# later",
+            updated_canonical_graph_json=('{"roadmap_issue_number":111,"version":3,"nodes":[]}'),
+            request_reason="later",
+            repo_full_name=repo,
+        )
+        is False
+    )
+    claim = store.claim_roadmap_adjustment(roadmap_issue_number=111, repo_full_name=repo)
+    assert claim is None
+
+    valid = (
+        111,
+        2,
+        "summary",
+        "details",
+        "# x",
+        '{"roadmap_issue_number":111,"version":2,"nodes":[]}',
+        "manual",
+        '["n1"]',
+        "why",
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z",
+    )
+    parsed = _parse_roadmap_revision_draft_row(valid, repo_full_name=repo)
+    assert parsed.roadmap_issue_number == 111
+    with pytest.raises(RuntimeError, match="row shape"):
+        _parse_roadmap_revision_draft_row((1,), repo_full_name=repo)
+    with pytest.raises(RuntimeError, match="roadmap_issue_number"):
+        _parse_roadmap_revision_draft_row(("111", *valid[1:]), repo_full_name=repo)
+    with pytest.raises(RuntimeError, match="request_version"):
+        _parse_roadmap_revision_draft_row((valid[0], "2", *valid[2:]), repo_full_name=repo)
+    with pytest.raises(RuntimeError, match="summary"):
+        _parse_roadmap_revision_draft_row((valid[0], valid[1], 1, *valid[3:]), repo_full_name=repo)
+    with pytest.raises(RuntimeError, match="details"):
+        _parse_roadmap_revision_draft_row(
+            (valid[0], valid[1], valid[2], 1, *valid[4:]), repo_full_name=repo
+        )
+    with pytest.raises(RuntimeError, match="updated_roadmap_markdown"):
+        _parse_roadmap_revision_draft_row(
+            (valid[0], valid[1], valid[2], valid[3], 1, *valid[5:]), repo_full_name=repo
+        )
+    with pytest.raises(RuntimeError, match="updated_canonical_graph_json"):
+        _parse_roadmap_revision_draft_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], 1, *valid[6:]),
+            repo_full_name=repo,
+        )
+    with pytest.raises(RuntimeError, match="source_kind"):
+        _parse_roadmap_revision_draft_row(
+            (valid[0], valid[1], valid[2], valid[3], valid[4], valid[5], 1, *valid[7:]),
+            repo_full_name=repo,
+        )
+    with pytest.raises(RuntimeError, match="ready_node_ids_json"):
+        _parse_roadmap_revision_draft_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                1,
+                *valid[8:],
+            ),
+            repo_full_name=repo,
+        )
+    with pytest.raises(RuntimeError, match="request_reason"):
+        _parse_roadmap_revision_draft_row(
+            (
+                valid[0],
+                valid[1],
+                valid[2],
+                valid[3],
+                valid[4],
+                valid[5],
+                valid[6],
+                valid[7],
+                1,
+                *valid[9:],
+            ),
+            repo_full_name=repo,
+        )
+    with pytest.raises(RuntimeError, match="created_at"):
+        _parse_roadmap_revision_draft_row((*valid[:9], 1, valid[10]), repo_full_name=repo)
+    with pytest.raises(RuntimeError, match="updated_at"):
+        _parse_roadmap_revision_draft_row((*valid[:10], 1), repo_full_name=repo)
+
+    intent = store.upsert_github_call_intent(
+        call_kind="create_pull_request",
+        dedupe_key="create_pr:7:main:agent/design/7:run-7",
+        payload_json='{"issue_number":7,"title":"t","head":"h","base":"main","body":"b"}',
+        run_id="run-7",
+        issue_number=7,
+        branch="agent/design/7",
+        repo_full_name=repo,
+    )
     assert store.mark_github_call_succeeded(
         call_id=intent.call_id,
         result_json='{"pr_number":101,"pr_url":"https://example/pr/101"}',
         pr_number=101,
+        repo_full_name=repo,
     )
     assert store.apply_succeeded_create_pr_call(
         call_id=intent.call_id,
@@ -1031,6 +1461,7 @@ def test_state_store_apply_succeeded_create_pr_call_rejects_invalid_rows(tmp_pat
         branch="agent/design/7",
         pr_number=101,
         pr_url="https://example/pr/101",
+        repo_full_name=repo,
     )
     assert (
         store.apply_succeeded_create_pr_call(
@@ -1039,6 +1470,7 @@ def test_state_store_apply_succeeded_create_pr_call_rejects_invalid_rows(tmp_pat
             branch="agent/design/7",
             pr_number=101,
             pr_url="https://example/pr/101",
+            repo_full_name=repo,
         )
         is False
     )

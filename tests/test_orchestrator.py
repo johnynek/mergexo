@@ -96,6 +96,7 @@ from mergexo.orchestrator import (
     _operator_reply_issue_number,
     _operator_reply_status_for_record,
     _operator_source_comment_url,
+    _parse_ready_node_ids_json,
     _pre_pr_flow_label,
     _pull_request_url,
     _parse_utc_timestamp,
@@ -135,10 +136,12 @@ from mergexo.state import (
     PrFlakeState,
     PrFlakeStatus,
     PrePrFollowupState,
+    ReadyRoadmapNodeClaim,
     RoadmapBlockerRow,
     RoadmapDependencyState,
     RoadmapNodeGraphInput,
     RoadmapNodeRecord,
+    RoadmapRevisionDraftRecord,
     RoadmapRevisionRecord,
     RoadmapStatusSnapshotRow,
     IssueRunRecord,
@@ -744,6 +747,7 @@ class FakeState:
         self._next_github_call_id = 1
         self._github_calls_by_id: dict[int, dict[str, object]] = {}
         self._github_call_id_by_dedupe: dict[str, int] = {}
+        self._roadmap_revision_drafts: dict[int, object] = {}
         self.claim_blocked_implementation_issue_numbers: set[int] = set()
         self.claim_blocked_pre_pr_followup_issue_numbers: set[int] = set()
         self.claim_blocked_feedback_pr_numbers: set[int] = set()
@@ -909,6 +913,22 @@ class FakeState:
             updated += 1
         return updated
 
+    def mark_github_call_state_applied(
+        self,
+        *,
+        call_id: int,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = repo_full_name
+        row = self._github_calls_by_id.get(call_id)
+        if row is None:
+            return False
+        if row["status"] != "succeeded" or cast(bool, row["state_applied"]):
+            return False
+        row["state_applied"] = True
+        row["updated_at"] = "now"
+        return True
+
     def apply_succeeded_create_pr_call(
         self,
         *,
@@ -936,6 +956,37 @@ class FakeState:
             repo_full_name=repo_full_name,
         )
         return True
+
+    def apply_succeeded_create_issue_call(
+        self,
+        *,
+        call_id: int,
+        roadmap_issue_number: int,
+        node_id: str,
+        child_issue_number: int,
+        child_issue_url: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        _ = roadmap_issue_number, node_id, child_issue_number, child_issue_url
+        return self.mark_github_call_state_applied(call_id=call_id, repo_full_name=repo_full_name)
+
+    def apply_succeeded_post_issue_comment_call(
+        self,
+        *,
+        call_id: int,
+        issue_number: int,
+        token: str,
+        source: str,
+        repo_full_name: str | None = None,
+    ) -> bool:
+        self.record_action_token_posted(
+            token=token,
+            scope_kind="issue",
+            scope_number=issue_number,
+            source=source,
+            repo_full_name=repo_full_name,
+        )
+        return self.mark_github_call_state_applied(call_id=call_id, repo_full_name=repo_full_name)
 
     def can_enqueue(self, issue_number: int, *, repo_full_name: str | None = None) -> bool:
         _ = repo_full_name
@@ -15332,7 +15383,7 @@ def test_maybe_apply_pending_roadmap_revision_manual_authoring_fails_when_reques
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     monkeypatch.setattr(
         orch._state,
-        "set_roadmap_adjustment_request_version",
+        "prepare_requested_roadmap_revision_draft",
         lambda **kwargs: False,
     )
     roadmap = state.get_roadmap_state(roadmap_issue_number=10008, repo_full_name=repo)
@@ -15344,7 +15395,7 @@ def test_maybe_apply_pending_roadmap_revision_manual_authoring_fails_when_reques
     refreshed = state.get_roadmap_state(roadmap_issue_number=10008, repo_full_name=repo)
     assert refreshed is not None
     assert refreshed.last_error is not None
-    assert "failed to persist requested roadmap revision version" in refreshed.last_error
+    assert "failed to persist requested roadmap revision draft" in refreshed.last_error
 
 
 def test_maybe_apply_pending_roadmap_revision_manual_authoring_fails_when_pr_persist_fails(
@@ -15423,7 +15474,7 @@ def test_maybe_apply_pending_roadmap_revision_manual_authoring_fails_when_pr_per
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     monkeypatch.setattr(
         orch._state,
-        "set_roadmap_pending_revision_pr",
+        "mark_roadmap_revision_materialized",
         lambda **kwargs: False,
     )
     roadmap = state.get_roadmap_state(roadmap_issue_number=10009, repo_full_name=repo)
@@ -15432,10 +15483,11 @@ def test_maybe_apply_pending_roadmap_revision_manual_authoring_fails_when_pr_per
     updated = orch._maybe_apply_pending_roadmap_revision(roadmap=roadmap, checkout_path=checkout)
 
     assert updated.pending_revision_pr_number is None
+    assert updated.adjustment_request_version == 1
     refreshed = state.get_roadmap_state(roadmap_issue_number=10009, repo_full_name=repo)
     assert refreshed is not None
     assert refreshed.last_error is not None
-    assert "failed to persist requested roadmap revision pull request" in refreshed.last_error
+    assert "failed to persist materialized roadmap revision pull request" in refreshed.last_error
 
 
 def test_maybe_apply_pending_roadmap_revision_short_circuit_and_waiting_error_paths(
@@ -16235,7 +16287,7 @@ def test_run_roadmap_adjustment_gate_revise_and_abandon_paths(tmp_path: Path) ->
             "Roadmap revision for #1003 (v2)",
             "agent/roadmap/1003-revision-v2",
             "main",
-            "Automated roadmap revision generated by the adjustment gate.\n\n"
+            "Automated same-roadmap revision.\n\n"
             "- target graph version: `2`\n"
             "- roadmap doc path: `docs/roadmap/1003.md`\n"
             "- graph path: `docs/roadmap/1003.graph.json`\n"
@@ -16425,7 +16477,9 @@ def test_run_roadmap_adjustment_gate_handles_failed_revision_pending_transition(
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     roadmap = state.get_roadmap_state(roadmap_issue_number=1006, repo_full_name=repo)
     assert roadmap is not None
-    orch._state.mark_roadmap_revision_pending = lambda **kwargs: False  # type: ignore[method-assign]
+    orch._state.prepare_roadmap_revision_draft_from_adjustment = (  # type: ignore[method-assign]
+        lambda **kwargs: False
+    )
 
     assert orch._run_roadmap_adjustment_gate(roadmap=roadmap, checkout_path=checkout) is False
 
@@ -16433,10 +16487,7 @@ def test_run_roadmap_adjustment_gate_handles_failed_revision_pending_transition(
     assert refreshed is not None
     assert refreshed.adjustment_state == "idle"
     assert refreshed.last_error is not None
-    assert (
-        "failed to transition roadmap into pending same-roadmap revision state"
-        in refreshed.last_error
-    )
+    assert "failed to persist same-roadmap revision draft" in refreshed.last_error
 
 
 def test_open_or_update_roadmap_revision_pr_rejects_missing_payloads(tmp_path: Path) -> None:
@@ -17833,3 +17884,946 @@ def test_process_issue_roadmap_posts_size_recommendation(tmp_path: Path) -> None
         issue_number == 130 and "sizing recommendation" in body.lower()
         for issue_number, body in github.comments
     )
+
+
+def test_ensure_poll_setup_logs_issue_and_comment_replay_counts(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+
+    class ReplayCountsOrchestrator(Phase1Orchestrator):
+        def _replay_pending_create_pr_calls(self) -> int:
+            return 0
+
+        def _replay_pending_create_issue_calls(self) -> int:
+            return 1
+
+        def _replay_pending_post_issue_comment_calls(self) -> int:
+            return 1
+
+    orch = ReplayCountsOrchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    orch._ensure_poll_setup()
+
+
+def test_roadmap_revision_draft_helpers_reject_version_mismatches(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    initial_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 10111,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "One",
+                        "body_markdown": "One",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=10111,
+    )
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=10111,
+        roadmap_pr_number=101110,
+        roadmap_doc_path="docs/roadmap/10111.md",
+        graph_path="docs/roadmap/10111.graph.json",
+        graph_checksum=initial_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(10111, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=10111, repo_full_name=repo)
+    assert roadmap is not None
+
+    with pytest.raises(RuntimeError, match="must bump roadmap graph version by exactly 1"):
+        orch._roadmap_revision_draft_from_decision(
+            roadmap=roadmap,
+            decision=RoadmapAdjustmentResult(
+                action="revise",
+                summary="Need revision",
+                details="Bad version",
+                updated_roadmap_markdown="# Revised roadmap",
+                updated_canonical_graph_json=(
+                    '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
+                    '"node_id":"n2","title":"Two"}],"roadmap_issue_number":10111,"version":1}'
+                ),
+            ),
+            source_kind="adjustment",
+            ready_node_ids=(),
+            request_reason=None,
+        )
+
+    with pytest.raises(RuntimeError, match="stored roadmap revision draft version does not match"):
+        orch._open_or_update_roadmap_revision_pr_from_draft(
+            roadmap=roadmap,
+            draft=RoadmapRevisionDraftRecord(
+                repo_full_name=repo,
+                roadmap_issue_number=10111,
+                request_version=3,
+                summary="Need revision",
+                details="Bad stored version",
+                updated_roadmap_markdown="# Revised roadmap",
+                updated_canonical_graph_json=(
+                    '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
+                    '"node_id":"n2","title":"Two"}],"roadmap_issue_number":10111,"version":2}'
+                ),
+                source_kind="manual",
+                ready_node_ids_json=None,
+                request_reason="manual",
+                created_at="now",
+                updated_at="now",
+            ),
+            checkout_path=tmp_path,
+        )
+
+
+def test_run_roadmap_adjustment_gate_records_missing_refreshed_roadmap_after_draft_prepare(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    initial_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 10112,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "One",
+                        "body_markdown": "One",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=10112,
+    )
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=10112,
+        roadmap_pr_number=101120,
+        roadmap_doc_path="docs/roadmap/10112.md",
+        graph_path="docs/roadmap/10112.graph.json",
+        graph_checksum=initial_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    git = FakeGitManager(tmp_path / "checkouts-adjustment-refresh-missing")
+    checkout = git.ensure_checkout(0)
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/10112.graph.json",
+        content=initial_graph.canonical_json,
+        slot=0,
+    )
+    github = FakeGitHub([_issue(10112, "Plan", labels=(cfg.repo.roadmap_label,))])
+    agent = FakeAgent()
+    agent.roadmap_adjustment_result = RoadmapAdjustmentResult(
+        action="revise",
+        summary="Need revision",
+        details="Refresh disappears after draft persist.",
+        updated_roadmap_markdown="# Revised roadmap",
+        updated_canonical_graph_json=(
+            '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
+            '"node_id":"n2","title":"Two"}],"roadmap_issue_number":10112,"version":2}'
+        ),
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    roadmap = state.get_roadmap_state(roadmap_issue_number=10112, repo_full_name=repo)
+    assert roadmap is not None
+    original_get = state.get_roadmap_state
+    get_calls = 0
+
+    def flaky_get_roadmap_state(**kwargs) -> object:  # type: ignore[no-untyped-def]
+        nonlocal get_calls
+        get_calls += 1
+        if get_calls >= 2:
+            return None
+        return original_get(**kwargs)
+
+    orch._state.get_roadmap_state = flaky_get_roadmap_state  # type: ignore[method-assign]
+
+    assert orch._run_roadmap_adjustment_gate(roadmap=roadmap, checkout_path=checkout) is False
+
+    refreshed = original_get(roadmap_issue_number=10112, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.last_error is not None
+    assert "roadmap disappeared after revision draft prepare" in refreshed.last_error
+
+
+def test_maybe_apply_pending_roadmap_revision_records_materialization_failure_for_stored_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    initial_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 10113,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "One",
+                        "body_markdown": "One",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=10113,
+    )
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=10113,
+        roadmap_pr_number=101130,
+        roadmap_doc_path="docs/roadmap/10113.md",
+        graph_path="docs/roadmap/10113.graph.json",
+        graph_checksum=initial_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    assert state.mark_roadmap_revision_requested(
+        roadmap_issue_number=10113,
+        last_error="manual roadmap revision requested",
+        repo_full_name=repo,
+    )
+    assert state.prepare_requested_roadmap_revision_draft(
+        roadmap_issue_number=10113,
+        request_version=2,
+        summary="Need revision",
+        details="Stored draft exists.",
+        updated_roadmap_markdown="# Revised roadmap",
+        updated_canonical_graph_json=(
+            '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
+            '"node_id":"n2","title":"Two"}],"roadmap_issue_number":10113,"version":2}'
+        ),
+        request_reason="manual roadmap revision requested",
+        repo_full_name=repo,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(10113, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=FakeGitManager(tmp_path / "checkouts-stored-draft"),
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_materialize_roadmap_revision_draft",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    roadmap = state.get_roadmap_state(roadmap_issue_number=10113, repo_full_name=repo)
+    assert roadmap is not None
+
+    updated = orch._maybe_apply_pending_roadmap_revision(roadmap=roadmap, checkout_path=tmp_path)
+
+    assert updated.last_error == "roadmap revision materialization failed: boom"
+
+
+def test_maybe_apply_pending_roadmap_revision_manual_authoring_handles_missing_refreshed_roadmap_after_prepare(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    initial_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 10114,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "One",
+                        "body_markdown": "One",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        expected_issue_number=10114,
+    )
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=10114,
+        roadmap_pr_number=101140,
+        roadmap_doc_path="docs/roadmap/10114.md",
+        graph_path="docs/roadmap/10114.graph.json",
+        graph_checksum=initial_graph.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="One",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    assert state.mark_roadmap_revision_requested(
+        roadmap_issue_number=10114,
+        last_error="manual roadmap revision requested",
+        repo_full_name=repo,
+    )
+    git = FakeGitManager(tmp_path / "checkouts-manual-refresh-missing")
+    checkout = git.ensure_checkout(0)
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/10114.graph.json",
+        content=initial_graph.canonical_json,
+        slot=0,
+    )
+    github = FakeGitHub([_issue(10114, "Plan", labels=(cfg.repo.roadmap_label,))])
+    agent = FakeAgent()
+    agent.requested_roadmap_revision_result = RoadmapAdjustmentResult(
+        action="revise",
+        summary="Need revision",
+        details="Refresh disappears after request draft persist.",
+        updated_roadmap_markdown="# Revised roadmap",
+        updated_canonical_graph_json=(
+            '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
+            '"node_id":"n2","title":"Two"}],"roadmap_issue_number":10114,"version":2}'
+        ),
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    roadmap = state.get_roadmap_state(roadmap_issue_number=10114, repo_full_name=repo)
+    assert roadmap is not None
+    original_get = state.get_roadmap_state
+    orch._state.get_roadmap_state = lambda **kwargs: None  # type: ignore[method-assign]
+
+    updated = orch._maybe_apply_pending_roadmap_revision(roadmap=roadmap, checkout_path=checkout)
+
+    assert updated == roadmap
+    refreshed = original_get(roadmap_issue_number=10114, repo_full_name=repo)
+    assert refreshed is not None
+    assert refreshed.last_error is not None
+    assert "roadmap disappeared after requested revision draft prepare" in refreshed.last_error
+
+
+@pytest.mark.parametrize(
+    ("payload_json", "message"),
+    [
+        ("[]", "Invalid create_issue outbox payload"),
+        (
+            '{"node_id":"n1","title":"T","body":"B","labels":["l"],"marker":"m"}',
+            "roadmap_issue_number",
+        ),
+        (
+            '{"roadmap_issue_number":1,"title":"T","body":"B","labels":["l"],"marker":"m"}',
+            "node_id",
+        ),
+        (
+            '{"roadmap_issue_number":1,"node_id":"n1","body":"B","labels":["l"],"marker":"m"}',
+            "title",
+        ),
+        (
+            '{"roadmap_issue_number":1,"node_id":"n1","title":"T","labels":["l"],"marker":"m"}',
+            "body",
+        ),
+        (
+            '{"roadmap_issue_number":1,"node_id":"n1","title":"T","body":"B","labels":[],"marker":"m"}',
+            "labels",
+        ),
+        (
+            '{"roadmap_issue_number":1,"node_id":"n1","title":"T","body":"B","labels":["l"]}',
+            "marker",
+        ),
+    ],
+)
+def test_parse_create_issue_outbox_payload_validation(
+    tmp_path: Path, payload_json: str, message: str
+) -> None:
+    orch = Phase1Orchestrator(
+        _config(tmp_path),
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        orch._parse_create_issue_outbox_payload(payload_json)
+
+
+@pytest.mark.parametrize(
+    ("result_json", "expected_number"),
+    [
+        (None, None),
+        ("[]", None),
+        ('{"issue_number":"1","issue_url":"https://example/issues/1"}', None),
+        ('{"issue_number":1,"issue_url":1}', None),
+        ('{"issue_number":1,"issue_url":"https://example/issues/1"}', 1),
+    ],
+)
+def test_issue_from_outbox_result_validation(
+    tmp_path: Path, result_json: str | None, expected_number: int | None
+) -> None:
+    orch = Phase1Orchestrator(
+        _config(tmp_path),
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    issue = orch._issue_from_outbox_result(result_json)
+
+    if expected_number is None:
+        assert issue is None
+    else:
+        assert issue is not None
+        assert issue.number == expected_number
+
+
+def test_execute_create_issue_outbox_call_recovers_missing_result_and_post_create_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+
+    class FailingCreateGitHub(FakeGitHub):
+        def create_issue(
+            self,
+            *,
+            title: str,
+            body: str,
+            labels: tuple[str, ...] | None = None,
+        ) -> Issue:
+            _ = title, body, labels
+            raise RuntimeError("boom")
+
+    github = FailingCreateGitHub([])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:91:n1",
+        payload_json=(
+            '{"roadmap_issue_number":91,"node_id":"n1","title":"One","body":"Body",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+    )
+    row = state._github_calls_by_id[intent.call_id]
+    row["status"] = "succeeded"
+    row["result_json"] = None
+    recovered = Issue(
+        number=901,
+        title="One",
+        body="Body",
+        html_url="https://example/issues/901",
+        labels=("agent:small-job",),
+        author_login="issue-author",
+    )
+    found = [None, recovered]
+    monkeypatch.setattr(
+        orch,
+        "_find_existing_roadmap_child_issue",
+        lambda **kwargs: found.pop(0),
+    )
+
+    issue = orch._execute_create_issue_outbox_call(state._github_call_state(row))
+
+    assert issue.number == 901
+
+
+def test_execute_create_issue_outbox_call_returns_stored_issue_from_succeeded_result(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:911:n1",
+        payload_json=(
+            '{"roadmap_issue_number":911,"node_id":"n1","title":"One","body":"Body",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+    )
+    row = state._github_calls_by_id[intent.call_id]
+    row["status"] = "succeeded"
+    row["result_json"] = '{"issue_number":9111,"issue_url":"https://example/issues/9111"}'
+
+    issue = orch._execute_create_issue_outbox_call(state._github_call_state(row))
+
+    assert issue.number == 9111
+
+
+def test_create_roadmap_child_issue_with_outbox_rejects_applied_row_without_result_payload(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:92:n1",
+        payload_json=(
+            '{"roadmap_issue_number":92,"node_id":"n1","title":"One","body":"Body",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+    )
+    row = state._github_calls_by_id[intent.call_id]
+    row["status"] = "succeeded"
+    row["state_applied"] = True
+    row["result_json"] = None
+
+    with pytest.raises(RuntimeError, match="applied without result payload"):
+        orch._create_roadmap_child_issue_with_outbox(
+            claim=ReadyRoadmapNodeClaim(
+                repo_full_name=cfg.repo.full_name,
+                roadmap_issue_number=92,
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="Body",
+                dependencies_json="[]",
+                claim_token="claim",
+            ),
+            issue_body="Body",
+            marker="<!-- x -->",
+            labels=("agent:small-job",),
+        )
+
+
+def test_create_roadmap_child_issue_with_outbox_returns_applied_issue_from_stored_result(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:912:n1",
+        payload_json=(
+            '{"roadmap_issue_number":912,"node_id":"n1","title":"One","body":"Body",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+    )
+    row = state._github_calls_by_id[intent.call_id]
+    row["status"] = "succeeded"
+    row["state_applied"] = True
+    row["result_json"] = '{"issue_number":9121,"issue_url":"https://example/issues/9121"}'
+
+    issue = orch._create_roadmap_child_issue_with_outbox(
+        claim=ReadyRoadmapNodeClaim(
+            repo_full_name=cfg.repo.full_name,
+            roadmap_issue_number=912,
+            node_id="n1",
+            kind="small_job",
+            title="One",
+            body_markdown="Body",
+            dependencies_json="[]",
+            claim_token="claim",
+        ),
+        issue_body="Body",
+        marker="<!-- x -->",
+        labels=("agent:small-job",),
+    )
+
+    assert issue.number == 9121
+
+
+def test_create_roadmap_child_issue_with_outbox_raises_when_apply_does_not_persist(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+
+    class NoApplyState(FakeState):
+        def apply_succeeded_create_issue_call(self, **kwargs) -> bool:  # type: ignore[no-untyped-def]
+            _ = kwargs
+            return False
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=NoApplyState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to apply succeeded roadmap child issue outbox"):
+        orch._create_roadmap_child_issue_with_outbox(
+            claim=ReadyRoadmapNodeClaim(
+                repo_full_name=cfg.repo.full_name,
+                roadmap_issue_number=93,
+                node_id="n1",
+                kind="small_job",
+                title="One",
+                body_markdown="Body",
+                dependencies_json="[]",
+                claim_token="claim",
+            ),
+            issue_body="Body",
+            marker="<!-- x -->",
+            labels=("agent:small-job",),
+        )
+
+
+def test_replay_pending_create_issue_calls_replays_success_and_skips_invalid_payload(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    state.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:bad",
+        payload_json="[]",
+    )
+    state.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:94:n1",
+        payload_json=(
+            '{"roadmap_issue_number":94,"node_id":"n1","title":"One","body":"Body",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+    )
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    replayed = orch._replay_pending_create_issue_calls()
+
+    assert replayed == 1
+    assert len(github.created_issues) == 1
+
+
+def test_replay_pending_create_issue_calls_propagates_github_polling_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    state.upsert_github_call_intent(
+        call_kind="create_issue",
+        dedupe_key="create_issue:roadmap_node:95:n1",
+        payload_json=(
+            '{"roadmap_issue_number":95,"node_id":"n1","title":"One","body":"Body",'
+            '"labels":["agent:small-job"],"marker":"<!-- x -->"}'
+        ),
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_execute_create_issue_outbox_call",
+        lambda entry: (_ for _ in ()).throw(GitHubPollingError("temporary outage")),
+    )
+
+    with pytest.raises(GitHubPollingError, match="temporary outage"):
+        orch._replay_pending_create_issue_calls()
+
+
+@pytest.mark.parametrize(
+    ("payload_json", "message"),
+    [
+        ("[]", "Invalid post_issue_comment outbox payload"),
+        ('{"token":"tok","body":"Body","source":"src"}', "issue_number"),
+        ('{"issue_number":1,"body":"Body","source":"src"}', "token"),
+        ('{"issue_number":1,"token":"tok","source":"src"}', "body"),
+        ('{"issue_number":1,"token":"tok","body":"Body"}', "source"),
+    ],
+)
+def test_parse_post_issue_comment_outbox_payload_validation(
+    tmp_path: Path, payload_json: str, message: str
+) -> None:
+    orch = Phase1Orchestrator(
+        _config(tmp_path),
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        orch._parse_post_issue_comment_outbox_payload(payload_json)
+
+
+def test_execute_post_issue_comment_outbox_call_recovers_missing_result_when_token_already_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:91:tok",
+        payload_json='{"issue_number":91,"token":"tok","body":"Body","source":"src"}',
+    )
+    row = state._github_calls_by_id[intent.call_id]
+    row["status"] = "succeeded"
+    row["result_json"] = None
+    monkeypatch.setattr(orch, "_is_action_token_observed", lambda **kwargs: True)
+
+    posted = orch._execute_post_issue_comment_outbox_call(state._github_call_state(row))
+
+    assert posted is False
+
+
+def test_execute_post_issue_comment_outbox_call_returns_stored_posted_flag(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:913:tok",
+        payload_json='{"issue_number":913,"token":"tok","body":"Body","source":"src"}',
+    )
+    row = state._github_calls_by_id[intent.call_id]
+    row["status"] = "succeeded"
+    row["result_json"] = '{"issue_number":913,"posted":true}'
+
+    assert orch._execute_post_issue_comment_outbox_call(state._github_call_state(row)) is True
+
+
+def test_execute_post_issue_comment_outbox_call_recovers_after_post_error_when_token_is_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+
+    class FailingCommentGitHub(FakeGitHub):
+        def post_issue_comment(self, issue_number: int, body: str) -> None:
+            _ = issue_number, body
+            raise RuntimeError("boom")
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FailingCommentGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:92:tok",
+        payload_json='{"issue_number":92,"token":"tok","body":"Body","source":"src"}',
+    )
+    observed_results = iter([False, True])
+    monkeypatch.setattr(
+        orch,
+        "_is_action_token_observed",
+        lambda **kwargs: next(observed_results),
+    )
+
+    posted = orch._execute_post_issue_comment_outbox_call(intent)
+
+    assert posted is False
+
+
+def test_execute_post_issue_comment_outbox_call_requeues_and_raises_when_token_is_not_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+
+    class FailingCommentGitHub(FakeGitHub):
+        def post_issue_comment(self, issue_number: int, body: str) -> None:
+            _ = issue_number, body
+            raise RuntimeError("boom")
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FailingCommentGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    intent = state.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:93:tok",
+        payload_json='{"issue_number":93,"token":"tok","body":"Body","source":"src"}',
+    )
+    monkeypatch.setattr(orch, "_is_action_token_observed", lambda **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        orch._execute_post_issue_comment_outbox_call(intent)
+
+    row = state._github_calls_by_id[intent.call_id]
+    assert row["status"] == "pending"
+    assert row["last_error"] == "boom"
+
+
+def test_post_issue_comment_with_outbox_raises_when_apply_does_not_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+
+    class NoApplyState(FakeState):
+        def apply_succeeded_post_issue_comment_call(self, **kwargs) -> bool:  # type: ignore[no-untyped-def]
+            _ = kwargs
+            return False
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=NoApplyState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(orch, "_is_action_token_observed", lambda **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="failed to apply succeeded post_issue_comment outbox"):
+        orch._post_issue_comment_with_outbox(
+            issue_number=94,
+            token="tok",
+            body="Body",
+            source="src",
+            repo_full_name=cfg.repo.full_name,
+        )
+
+
+def test_replay_pending_post_issue_comment_calls_replays_success_and_skips_invalid_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    state.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:bad",
+        payload_json="[]",
+    )
+    state.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:95:tok",
+        payload_json='{"issue_number":95,"token":"tok","body":"Body","source":"src"}',
+    )
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(orch, "_is_action_token_observed", lambda **kwargs: False)
+
+    replayed = orch._replay_pending_post_issue_comment_calls()
+
+    assert replayed == 1
+    assert len(github.comments) == 1
+
+
+def test_replay_pending_post_issue_comment_calls_propagates_github_polling_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    state = FakeState()
+    state.upsert_github_call_intent(
+        call_kind="post_issue_comment",
+        dedupe_key="post_issue_comment:96:tok",
+        payload_json='{"issue_number":96,"token":"tok","body":"Body","source":"src"}',
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_execute_post_issue_comment_outbox_call",
+        lambda entry: (_ for _ in ()).throw(GitHubPollingError("temporary outage")),
+    )
+
+    with pytest.raises(GitHubPollingError, match="temporary outage"):
+        orch._replay_pending_post_issue_comment_calls()
+
+
+def test_parse_ready_node_ids_json_validation() -> None:
+    assert _parse_ready_node_ids_json(None) == ()
+    assert _parse_ready_node_ids_json('["n1","n2"]') == ("n1", "n2")
+    with pytest.raises(RuntimeError, match="Invalid ready_node_ids_json"):
+        _parse_ready_node_ids_json('{"node_ids":["n1"]}')
