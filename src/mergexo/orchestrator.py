@@ -1321,7 +1321,7 @@ class Phase1Orchestrator:
                     repo_full_name=self._state_repo_full_name(),
                 )
                 return True
-            if decision.action == "request_revision":
+            if decision.action == "revise":
                 marked = self._state.mark_roadmap_revision_requested(
                     roadmap_issue_number=roadmap.roadmap_issue_number,
                     last_error=decision.summary,

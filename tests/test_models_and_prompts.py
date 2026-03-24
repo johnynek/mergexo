@@ -308,8 +308,11 @@ def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
 
     assert "roadmap-adjustment agent" in prompt
     assert '`action = "proceed"`' in prompt
-    assert '`action = "request_revision"`' in prompt
+    assert '`action = "revise"`' in prompt
     assert '`action = "abandon"`' in prompt
+    assert "`updated_roadmap_markdown`" in prompt
+    assert "`updated_graph_json`" in prompt
+    assert "bump the graph `version` from 3 to 4" in prompt
     assert "ready frontier node_ids" in prompt
     assert '["n2","n3"]' in prompt
     assert '"dependency_node_id":"n1"' in prompt

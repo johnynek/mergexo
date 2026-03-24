@@ -379,11 +379,10 @@ Task:
 - Evaluate whether roadmap issue #{issue.number} should proceed with its ready frontier or pause for a same-roadmap revision.
 - Base branch is: {default_branch}
 {coding_guidelines_lines}
-- This is a decision step only. Do not generate a revised roadmap graph or PR content here.
 
 Decision rules:
 - Return `action = "proceed"` when the current roadmap still looks sound for the ready frontier.
-- Return `action = "request_revision"` when the roadmap should change before issuing more child work.
+- Return `action = "revise"` when the roadmap should change before issuing more child work.
 - Return `action = "abandon"` only when continuing the roadmap is no longer viable.
 - Prefer `proceed` unless the current roadmap is materially wrong.
 
@@ -393,9 +392,19 @@ Response format:
 - Do not include markdown code fences in the JSON fields.
 
 Required output fields:
-- `action`: one of `proceed`, `request_revision`, `abandon`
+- `action`: one of `proceed`, `revise`, `abandon`
 - `summary`: short rationale
 - `details`: full rationale, referencing the ready frontier and the current roadmap state
+- `updated_roadmap_markdown`: string or null
+- `updated_graph_json`: object or null
+
+Payload rules:
+- When `action = "revise"`, set both `updated_roadmap_markdown` and `updated_graph_json`.
+- When `action` is `proceed` or `abandon`, set both `updated_roadmap_markdown` and `updated_graph_json` to null.
+- `updated_roadmap_markdown` must be the full revised markdown body for `{roadmap_doc_path}`.
+- `updated_graph_json` must be a valid revised roadmap graph object for issue #{issue.number}.
+- The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
+- Keep the revised graph internally consistent with the revised markdown narrative.
 
 Current roadmap metadata:
 - roadmap markdown path: {roadmap_doc_path}

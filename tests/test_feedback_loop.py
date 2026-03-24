@@ -166,21 +166,21 @@ def test_roadmap_tokens_are_stable_and_specific() -> None:
         roadmap_issue_number=44,
         graph_version=3,
         ready_node_ids=("n2", "n3"),
-        action="request_revision",
+        action="revise",
         summary="Need revision",
     )
     adjustment_b = compute_roadmap_adjustment_decision_token(
         roadmap_issue_number=44,
         graph_version=3,
         ready_node_ids=("n2", "n3"),
-        action="request_revision",
+        action="revise",
         summary="Need revision",
     )
     adjustment_c = compute_roadmap_adjustment_decision_token(
         roadmap_issue_number=44,
         graph_version=3,
         ready_node_ids=("n2",),
-        action="request_revision",
+        action="revise",
         summary="Need revision",
     )
     assert adjustment_a == adjustment_b

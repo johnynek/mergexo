@@ -14980,7 +14980,7 @@ def test_maybe_apply_pending_roadmap_revision_rejects_invalid_transition(tmp_pat
     assert any("rejected the merged same-roadmap revision" in body for _, body in github.comments)
 
 
-def test_run_roadmap_adjustment_gate_request_revision_and_abandon_paths(tmp_path: Path) -> None:
+def test_run_roadmap_adjustment_gate_revise_and_abandon_paths(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_roadmaps=True)
     repo = cfg.repo.full_name
 
@@ -15012,9 +15012,14 @@ def test_run_roadmap_adjustment_gate_request_revision_and_abandon_paths(tmp_path
     )
     revise_agent = FakeAgent()
     revise_agent.roadmap_adjustment_result = RoadmapAdjustmentResult(
-        action="request_revision",
+        action="revise",
         summary="Need revision",
         details="The frontier should be revised before continuing.",
+        updated_roadmap_markdown="# Revised roadmap",
+        updated_canonical_graph_json=(
+            '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
+            '"node_id":"n2","title":"Two"}],"roadmap_issue_number":1003,"version":2}'
+        ),
     )
     revise_github = FakeGitHub([_issue(1003, "Plan", labels=(cfg.repo.roadmap_label,))])
     revise_orch = Phase1Orchestrator(

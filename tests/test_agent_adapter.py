@@ -346,6 +346,8 @@ def test_agent_adapter_data_model() -> None:
     assert start.session.thread_id == "th"
     assert roadmap.roadmap.title == "Roadmap"
     assert adjustment.action == "proceed"
+    assert adjustment.updated_roadmap_markdown is None
+    assert adjustment.updated_canonical_graph_json is None
     assert bugfix.pr_title == "Fix bug"
     assert small_job.pr_title == "Small job"
     assert implementation.pr_title == "Implement design"

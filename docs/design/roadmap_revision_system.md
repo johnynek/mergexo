@@ -29,7 +29,7 @@ The current branch already contains the enabling foundation:
 4. Roadmap advancement now pauses at an adjustment gate before issuing ready
    nodes.
 5. The adjustment decision can currently return `proceed`,
-   `request_revision`, or `abandon`.
+   `revise(updated_markdown, updated_graph, rationale)`, or `abandon`.
 
 This is enough to support manual same-roadmap revision, but it is not yet the
 full continuous-adjustment system.
@@ -50,6 +50,12 @@ full continuous-adjustment system.
   changed files, review summaries, issue comments, and resolution markers for
   the ready frontier dependencies, then passes that typed payload through the
   adapter stack into the adjustment prompt.
+- Checkpoint 3 completed: roadmap adjustment now returns a concrete
+  `Revise(...)` payload instead of a coarse revision request. The prompt
+  contract, typed result model, and Codex output schema now carry revised
+  roadmap markdown plus revised graph JSON, and the Codex adapter validates
+  that a `revise` payload targets the correct roadmap issue and bumps the graph
+  version by exactly one step before returning it to orchestration.
 
 ## Current Job
 
@@ -58,11 +64,8 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 ## Remaining Work
 
 - Automatic same-roadmap revision PR creation is still missing. A
-  `request_revision` decision pauses the roadmap and comments on the roadmap
-  issue, but it does not create or update the roadmap revision PR.
-- The adjustment decision does not yet produce a concrete revision payload. It
-  returns a coarse decision plus rationale, not a PR-ready roadmap markdown
-  and graph update.
+  `revise` decision pauses the roadmap and comments on the roadmap issue, but
+  it does not create or update the roadmap revision PR.
 - Active roadmaps still treat unsolicited merged graph changes as drift. A
   graph update is only accepted when the roadmap has already entered the
   revision flow.
@@ -160,7 +163,7 @@ Changes:
   - resolution markers from dependency child issues
 - Thread that data through the orchestrator into the adjustment request.
 - Keep the behavior decision-compatible with the current `proceed |
-  request_revision | abandon` shape.
+  revise | abandon` shape.
 
 Primary files:
 

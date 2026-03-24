@@ -54,7 +54,7 @@ class ReviewReply:
 
 
 GitOpName = Literal["fetch_origin", "merge_origin_default_branch"]
-RoadmapAdjustmentAction = Literal["proceed", "request_revision", "abandon"]
+RoadmapAdjustmentAction = Literal["proceed", "revise", "abandon"]
 
 
 @dataclass(frozen=True)
@@ -98,6 +98,8 @@ class RoadmapAdjustmentResult:
     action: RoadmapAdjustmentAction
     summary: str
     details: str
+    updated_roadmap_markdown: str | None = None
+    updated_canonical_graph_json: str | None = None
 
 
 @dataclass(frozen=True)
