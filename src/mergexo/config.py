@@ -328,19 +328,13 @@ def _parse_codex_config(
     sandbox_default = defaults.sandbox if defaults is not None else None
     profile_default = defaults.profile if defaults is not None else None
     extra_args_default = defaults.extra_args if defaults is not None else ()
-    design_timeout_default = (
-        defaults.design_turn_timeout_seconds if defaults is not None else 3600
-    )
-    direct_timeout_default = (
-        defaults.direct_turn_timeout_seconds if defaults is not None else 5400
-    )
+    design_timeout_default = defaults.design_turn_timeout_seconds if defaults is not None else 3600
+    direct_timeout_default = defaults.direct_turn_timeout_seconds if defaults is not None else 5400
     feedback_timeout_default = (
         defaults.feedback_turn_timeout_seconds if defaults is not None else 1800
     )
     idle_timeout_default = defaults.idle_timeout_seconds if defaults is not None else 900
-    graceful_shutdown_default = (
-        defaults.graceful_shutdown_seconds if defaults is not None else 5
-    )
+    graceful_shutdown_default = defaults.graceful_shutdown_seconds if defaults is not None else 5
     return CodexConfig(
         enabled=_bool_with_default(codex_data, "enabled", enabled_default),
         model=_optional_str_with_default(codex_data, "model", model_default),

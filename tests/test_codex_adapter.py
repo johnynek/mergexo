@@ -296,6 +296,146 @@ def test_start_design_from_issue_reports_process_start_and_progress(
     assert progress_ticks == ["tick"]
 
 
+def test_observe_invocations_restores_outer_hooks_after_nested_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    outer_started: list[int] = []
+    outer_progress: list[str] = []
+    inner_started: list[int] = []
+    inner_progress: list[str] = []
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        on_start=None,
+        on_output=None,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, input_text, check
+        if on_start is not None:
+            on_start(
+                RunningCommand(
+                    argv=tuple(cmd),
+                    cwd=tmp_path,
+                    pid=321,
+                    pgid=654,
+                    timeout_seconds=3600.0,
+                    idle_timeout_seconds=900.0,
+                )
+            )
+        if on_output is not None:
+            on_output("stdout", "progress\n")
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "title": "Design",
+                    "summary": "Summary",
+                    "touch_paths": ["src/a.py"],
+                    "design_doc_markdown": "Doc",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-abc"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    adapter = CodexAdapter(_enabled_config())
+
+    with adapter.observe_invocations(
+        CodexInvocationHooks(
+            on_start=lambda command: outer_started.append(command.pid),
+            on_progress=lambda: outer_progress.append("outer"),
+        )
+    ):
+        with adapter.observe_invocations(
+            CodexInvocationHooks(
+                on_start=lambda command: inner_started.append(command.pid),
+                on_progress=lambda: inner_progress.append("inner"),
+            )
+        ):
+            adapter.start_design_from_issue(
+                issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+                repo_full_name="johnynek/mergexo",
+                design_doc_path="docs/design/1-issue.md",
+                default_branch="main",
+                cwd=tmp_path,
+            )
+
+        adapter.start_design_from_issue(
+            issue=Issue(number=2, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            design_doc_path="docs/design/2-issue.md",
+            default_branch="main",
+            cwd=tmp_path,
+        )
+
+    assert inner_started == [321]
+    assert inner_progress == ["inner"]
+    assert outer_started == [321]
+    assert outer_progress == ["outer"]
+
+
+def test_observe_invocations_allows_missing_callback_functions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        on_start=None,
+        on_output=None,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, input_text, check
+        assert on_start is not None
+        assert on_output is not None
+        on_start(
+            RunningCommand(
+                argv=tuple(cmd),
+                cwd=tmp_path,
+                pid=222,
+                pgid=333,
+                timeout_seconds=3600.0,
+                idle_timeout_seconds=900.0,
+            )
+        )
+        on_output("stdout", "progress\n")
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "title": "Design",
+                    "summary": "Summary",
+                    "touch_paths": ["src/a.py"],
+                    "design_doc_markdown": "Doc",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-optional"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    adapter = CodexAdapter(_enabled_config())
+
+    with adapter.observe_invocations(CodexInvocationHooks()):
+        result = adapter.start_design_from_issue(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            design_doc_path="docs/design/1-issue.md",
+            default_branch="main",
+            cwd=tmp_path,
+        )
+
+    assert result.session is not None
+    assert result.session.thread_id == "thread-optional"
+
+
 def test_start_bugfix_from_issue_happy_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

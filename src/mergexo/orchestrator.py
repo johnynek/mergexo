@@ -78,7 +78,13 @@ from mergexo.prompts import (
     build_implementation_prompt,
     build_small_job_prompt,
 )
-from mergexo.shell import CommandError, CommandTimeoutError, RunningCommand, run, terminate_process_tree
+from mergexo.shell import (
+    CommandError,
+    CommandTimeoutError,
+    RunningCommand,
+    run,
+    terminate_process_tree,
+)
 from mergexo.state import (
     AgentRunFailureClass,
     ActionTokenObservation,
@@ -567,7 +573,9 @@ class Phase1Orchestrator:
         unfinished_runs = self._state.list_unfinished_agent_runs(
             repo_full_name=self._state_repo_full_name()
         )
-        graceful_shutdown_seconds = self._config.codex_for_repo(self._repo).graceful_shutdown_seconds
+        graceful_shutdown_seconds = self._config.codex_for_repo(
+            self._repo
+        ).graceful_shutdown_seconds
         for run in unfinished_runs:
             meta = _run_meta_from_json(run.meta_json)
             if meta.codex_active is not True:
@@ -4234,8 +4242,26 @@ class Phase1Orchestrator:
             pid = meta.get("codex_pid")
             if not isinstance(pid, int) or pid < 1:
                 continue
-            timeout_at = _parse_utc_timestamp(cast(str | None, meta.get("codex_timeout_at")))
-            if timeout_at is None or timeout_at > now:
+            wall_clock_timed_out = False
+            timeout_at_value = meta.get("codex_timeout_at")
+            if isinstance(timeout_at_value, str):
+                timeout_at = _parse_utc_timestamp(timeout_at_value)
+                wall_clock_timed_out = timeout_at is not None and timeout_at <= now
+
+            idle_timed_out = False
+            last_progress_value = meta.get("last_progress_at")
+            idle_timeout_value = meta.get("codex_idle_timeout_seconds")
+            if isinstance(last_progress_value, str) and isinstance(
+                idle_timeout_value, (int, float)
+            ):
+                last_progress_at = _parse_utc_timestamp(last_progress_value)
+                idle_timeout_seconds = float(idle_timeout_value)
+                if last_progress_at is not None and idle_timeout_seconds > 0:
+                    idle_timed_out = now >= last_progress_at + timedelta(
+                        seconds=idle_timeout_seconds
+                    )
+
+            if not wall_clock_timed_out and not idle_timed_out:
                 continue
             pgid_value = meta.get("codex_pgid")
             pgid = pgid_value if isinstance(pgid_value, int) else None

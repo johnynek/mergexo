@@ -146,14 +146,16 @@ def run(
 
     stdin_thread: threading.Thread | None = None
     if input_text is not None and proc.stdin is not None:
+        stdin = proc.stdin
+
         def _writer() -> None:
             try:
-                proc.stdin.write(input_text)
-                proc.stdin.flush()
+                stdin.write(input_text)
+                stdin.flush()
             except BrokenPipeError:
                 return
             finally:
-                proc.stdin.close()
+                stdin.close()
 
         stdin_thread = threading.Thread(target=_writer, daemon=True)
         stdin_thread.start()
@@ -186,7 +188,9 @@ def run(
                     pgid=pgid,
                     graceful_shutdown_seconds=graceful_shutdown_seconds,
                 )
-            elif idle_timeout_seconds is not None and now - last_progress_at >= idle_timeout_seconds:
+            elif (
+                idle_timeout_seconds is not None and now - last_progress_at >= idle_timeout_seconds
+            ):
                 timeout_kind = "idle"
                 timeout_value = idle_timeout_seconds
                 terminate_process_tree(
