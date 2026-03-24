@@ -581,8 +581,20 @@ def load_roadmap_lifecycle_counts(
         row = conn.execute(
             f"""
             SELECT
-                SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_count,
-                SUM(CASE WHEN status = 'revision_requested' THEN 1 ELSE 0 END) AS revision_count,
+                SUM(
+                    CASE
+                        WHEN status = 'active' AND adjustment_state != 'awaiting_revision_merge'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS active_count,
+                SUM(
+                    CASE
+                        WHEN status = 'active' AND adjustment_state = 'awaiting_revision_merge'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS revision_count,
                 SUM(CASE WHEN status = 'superseded' THEN 1 ELSE 0 END) AS superseded_count,
                 SUM(CASE WHEN status = 'abandoned' THEN 1 ELSE 0 END) AS abandoned_count,
                 SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_count
@@ -630,7 +642,7 @@ def load_roadmap_blocker_ages(
                 ON r.repo_full_name = n.repo_full_name
                AND r.roadmap_issue_number = n.roadmap_issue_number
             WHERE n.blocked_since_at IS NOT NULL
-              AND r.status IN ('active', 'revision_requested')
+              AND r.status = 'active'
               {repo_clause}
             ORDER BY n.blocked_since_at ASC, n.repo_full_name ASC, n.roadmap_issue_number ASC
             LIMIT ?

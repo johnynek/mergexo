@@ -25,6 +25,7 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_roadmap_adjustment_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
 )
@@ -239,6 +240,39 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "under 32000 characters" in prompt
     assert "If flaky_test_report is non-null, commit_message MUST be null." in prompt
     assert '"escalation"' in prompt
+
+
+def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
+    issue = Issue(
+        number=22,
+        title="Roadmap",
+        body="Continue implementing the roadmap.",
+        html_url="https://example/issue/22",
+        labels=("agent:roadmap",),
+    )
+
+    prompt = build_roadmap_adjustment_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        roadmap_doc_path="docs/roadmap/22-roadmap.md",
+        graph_path="docs/roadmap/22-roadmap.graph.json",
+        graph_version=3,
+        ready_node_ids=("n2", "n3"),
+        roadmap_status_report="status report",
+        roadmap_markdown="# Roadmap",
+        canonical_graph_json='{"roadmap_issue_number":22}',
+    )
+
+    assert "roadmap-adjustment agent" in prompt
+    assert '`action = "proceed"`' in prompt
+    assert '`action = "request_revision"`' in prompt
+    assert '`action = "abandon"`' in prompt
+    assert "ready frontier node_ids" in prompt
+    assert '["n2","n3"]' in prompt
+    assert "docs/roadmap/22-roadmap.graph.json" in prompt
+    assert "status report" in prompt
 
 
 def test_build_bugfix_prompt_requires_regression_tests() -> None:

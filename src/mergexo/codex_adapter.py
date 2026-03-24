@@ -15,6 +15,8 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapAdjustmentAction,
+    RoadmapAdjustmentResult,
     RoadmapStartResult,
     ReviewReply,
 )
@@ -32,6 +34,7 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_roadmap_adjustment_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
 )
@@ -91,6 +94,20 @@ _ROADMAP_OUTPUT_SCHEMA: dict[str, object] = {
         "summary": {"type": "string", "minLength": 1},
         "roadmap_markdown": {"type": "string", "minLength": 1},
         "graph_json": {"type": "object"},
+    },
+}
+
+_ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["action", "summary", "details"],
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["proceed", "request_revision", "abandon"],
+        },
+        "summary": {"type": "string", "minLength": 1},
+        "details": {"type": "string", "minLength": 1},
     },
 }
 
@@ -329,6 +346,37 @@ class CodexAdapter(AgentAdapter):
             prompt=prompt,
             cwd=cwd,
         )
+
+    def evaluate_roadmap_adjustment(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        ready_node_ids: tuple[str, ...],
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        prompt = build_roadmap_adjustment_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+            roadmap_doc_path=roadmap_doc_path,
+            graph_path=graph_path,
+            graph_version=graph_version,
+            ready_node_ids=ready_node_ids,
+            roadmap_status_report=roadmap_status_report,
+            roadmap_markdown=roadmap_markdown,
+            canonical_graph_json=canonical_graph_json,
+        )
+        return self._run_roadmap_adjustment_turn(prompt=prompt, cwd=cwd)
 
     def start_implementation_from_design(
         self,
@@ -719,6 +767,45 @@ class CodexAdapter(AgentAdapter):
                 escalation=escalation,
             ),
             _extract_thread_id(raw_events),
+        )
+
+    def _run_roadmap_adjustment_turn(self, *, prompt: str, cwd: Path) -> RoadmapAdjustmentResult:
+        if not self._config.enabled:
+            raise RuntimeError("Codex is disabled in config")
+
+        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "schema.json"
+            output_path = tmp_path / "last_message.txt"
+            schema_path.write_text(
+                json.dumps(_ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA),
+                encoding="utf-8",
+            )
+
+            cmd = [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            self._append_common_options(cmd)
+            run(cmd, cwd=cwd, input_text=prompt)
+
+            raw = output_path.read_text(encoding="utf-8").strip()
+            payload = _parse_json_payload(raw)
+
+        action = _require_str(payload, "action")
+        if action not in {"proceed", "request_revision", "abandon"}:
+            raise RuntimeError("action must be one of: proceed, request_revision, abandon")
+        return RoadmapAdjustmentResult(
+            action=cast(RoadmapAdjustmentAction, action),
+            summary=_require_str(payload, "summary"),
+            details=_require_str(payload, "details"),
         )
 
     def _append_common_options(self, cmd: list[str]) -> None:

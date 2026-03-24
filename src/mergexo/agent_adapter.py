@@ -52,11 +52,19 @@ class ReviewReply:
 
 
 GitOpName = Literal["fetch_origin", "merge_origin_default_branch"]
+RoadmapAdjustmentAction = Literal["proceed", "request_revision", "abandon"]
 
 
 @dataclass(frozen=True)
 class GitOpRequest:
     op: GitOpName
+
+
+@dataclass(frozen=True)
+class RoadmapAdjustmentResult:
+    action: RoadmapAdjustmentAction
+    summary: str
+    details: str
 
 
 @dataclass(frozen=True)
@@ -105,6 +113,25 @@ class AgentAdapter(ABC):
         cwd: Path,
     ) -> RoadmapStartResult:
         """Start a roadmap PR lifecycle from an issue and produce roadmap artifacts."""
+
+    @abstractmethod
+    def evaluate_roadmap_adjustment(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        ready_node_ids: tuple[str, ...],
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        """Decide whether a ready roadmap frontier should proceed, revise, or abandon."""
 
     @abstractmethod
     def start_bugfix_from_issue(

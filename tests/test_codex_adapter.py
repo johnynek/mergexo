@@ -294,6 +294,127 @@ def test_start_roadmap_from_issue_requires_graph_json(
         )
 
 
+def test_evaluate_roadmap_adjustment_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert "roadmap-adjustment agent" in input_text
+        assert '["n2","n3"]' in input_text
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "action": "request_revision",
+                    "summary": "Need revision",
+                    "details": "The current frontier needs a revised roadmap.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.evaluate_roadmap_adjustment(
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        roadmap_doc_path="docs/roadmap/1-issue.md",
+        graph_path="docs/roadmap/1-issue.graph.json",
+        graph_version=2,
+        ready_node_ids=("n2", "n3"),
+        roadmap_status_report="status report",
+        roadmap_markdown="# Roadmap",
+        canonical_graph_json='{"roadmap_issue_number":1}',
+        cwd=tmp_path,
+    )
+
+    assert result.action == "request_revision"
+    assert result.summary == "Need revision"
+    assert "revised roadmap" in result.details
+
+
+def test_evaluate_roadmap_adjustment_rejects_invalid_action(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+    ) -> str:
+        _ = cwd, input_text, check
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "action": "maybe",
+                    "summary": "Need revision",
+                    "details": "The current frontier needs a revised roadmap.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(RuntimeError, match="action must be one of"):
+        adapter.evaluate_roadmap_adjustment(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            coding_guidelines_path="docs/python_style.md",
+            roadmap_doc_path="docs/roadmap/1-issue.md",
+            graph_path="docs/roadmap/1-issue.graph.json",
+            graph_version=2,
+            ready_node_ids=("n2",),
+            roadmap_status_report="status report",
+            roadmap_markdown="# Roadmap",
+            canonical_graph_json='{"roadmap_issue_number":1}',
+            cwd=tmp_path,
+        )
+
+
+def test_evaluate_roadmap_adjustment_requires_enabled_config(tmp_path: Path) -> None:
+    adapter = CodexAdapter(
+        CodexConfig(
+            enabled=False,
+            model=None,
+            sandbox=None,
+            profile=None,
+            extra_args=(),
+        )
+    )
+    with pytest.raises(RuntimeError, match="Codex is disabled in config"):
+        adapter.evaluate_roadmap_adjustment(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            coding_guidelines_path="docs/python_style.md",
+            roadmap_doc_path="docs/roadmap/1-issue.md",
+            graph_path="docs/roadmap/1-issue.graph.json",
+            graph_version=2,
+            ready_node_ids=("n2",),
+            roadmap_status_report="status report",
+            roadmap_markdown="# Roadmap",
+            canonical_graph_json='{"roadmap_issue_number":1}',
+            cwd=tmp_path,
+        )
+
+
 def test_start_bugfix_from_issue_happy_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

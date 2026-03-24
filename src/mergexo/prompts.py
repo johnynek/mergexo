@@ -282,6 +282,75 @@ Issue body:
 """.strip()
 
 
+def build_roadmap_adjustment_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    coding_guidelines_path: str | None,
+    roadmap_doc_path: str,
+    graph_path: str,
+    graph_version: int,
+    ready_node_ids: tuple[str, ...],
+    roadmap_status_report: str,
+    roadmap_markdown: str,
+    canonical_graph_json: str,
+) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    ready_frontier_json = json.dumps(list(ready_node_ids), separators=(",", ":"))
+    return f"""
+You are the roadmap-adjustment agent for repository {repo_full_name}.
+
+Task:
+- Evaluate whether roadmap issue #{issue.number} should proceed with its ready frontier or pause for a same-roadmap revision.
+- Base branch is: {default_branch}
+{coding_guidelines_lines}
+- This is a decision step only. Do not generate a revised roadmap graph or PR content here.
+
+Decision rules:
+- Return `action = "proceed"` when the current roadmap still looks sound for the ready frontier.
+- Return `action = "request_revision"` when the roadmap should change before issuing more child work.
+- Return `action = "abandon"` only when continuing the roadmap is no longer viable.
+- Prefer `proceed` unless the current roadmap is materially wrong.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Required output fields:
+- `action`: one of `proceed`, `request_revision`, `abandon`
+- `summary`: short rationale
+- `details`: full rationale, referencing the ready frontier and the current roadmap state
+
+Current roadmap metadata:
+- roadmap markdown path: {roadmap_doc_path}
+- roadmap graph path: {graph_path}
+- roadmap graph version: {graph_version}
+- ready frontier node_ids: {ready_frontier_json}
+
+Roadmap issue title:
+{issue.title}
+
+Roadmap issue URL:
+{issue.html_url}
+
+Roadmap issue body:
+{issue.body}
+
+Current roadmap markdown ({roadmap_doc_path}):
+{roadmap_markdown}
+
+Current canonical roadmap graph JSON ({graph_path}):
+{canonical_graph_json}
+
+Current roadmap status report:
+{roadmap_status_report}
+""".strip()
+
+
 def build_feedback_prompt(*, turn: FeedbackTurn) -> str:
     review_comments = [
         {

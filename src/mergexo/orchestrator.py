@@ -20,6 +20,7 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapAdjustmentResult,
     RoadmapStartResult,
 )
 from mergexo.config import AppConfig, RepoConfig
@@ -33,6 +34,7 @@ from mergexo.feedback_loop import (
     compute_history_rewrite_token,
     compute_operator_command_token,
     compute_pre_pr_checkpoint_token,
+    compute_roadmap_adjustment_decision_token,
     compute_roadmap_graph_drift_token,
     compute_roadmap_node_issue_token,
     compute_roadmap_revision_escalation_token,
@@ -88,6 +90,7 @@ from mergexo.roadmap_parser import (
     RoadmapGraphValidationError,
     parse_roadmap_graph_json,
 )
+from mergexo.roadmap_transition_validator import RoadmapGraphTransitionError
 from mergexo.shell import CommandError, run
 from mergexo.state import (
     AgentRunFailureClass,
@@ -1110,6 +1113,7 @@ class Phase1Orchestrator:
                     roadmap_doc_path=roadmap_relpath,
                     graph_path=graph_relpath,
                     graph_checksum=parsed.checksum,
+                    graph_version=parsed.graph.version,
                     nodes=node_inputs,
                     parent_roadmap_issue_number=parent_roadmap_issue_number,
                     repo_full_name=self._state_repo_full_name(),
@@ -1142,6 +1146,7 @@ class Phase1Orchestrator:
             return
         lease = self._slot_pool.acquire()
         blocked_roadmaps_by_drift: set[int] = set()
+        blocked_roadmaps_by_adjustment: set[int] = set()
         try:
             self._git.prepare_checkout(lease.path)
             for roadmap in roadmaps:
@@ -1154,6 +1159,11 @@ class Phase1Orchestrator:
                     continue
                 self._reconcile_roadmap_parent_supersede(roadmap=refreshed)
                 self._sync_roadmap_node_progress(roadmap=refreshed)
+                if refreshed.adjustment_state == "awaiting_revision_merge":
+                    refreshed = self._maybe_apply_pending_roadmap_revision(
+                        roadmap=refreshed,
+                        checkout_path=lease.path,
+                    )
                 if refreshed.status != "active":
                     continue
                 if not self._verify_roadmap_graph_checksum(
@@ -1185,11 +1195,19 @@ class Phase1Orchestrator:
                         roadmap_issue_number=refreshed.roadmap_issue_number,
                         repo_full_name=self._state_repo_full_name(),
                     )
+                    continue
+                if not self._run_roadmap_adjustment_gate(
+                    roadmap=refreshed,
+                    checkout_path=lease.path,
+                ):
+                    blocked_roadmaps_by_adjustment.add(refreshed.roadmap_issue_number)
             claims = self._state.claim_ready_roadmap_nodes(
                 repo_full_name=self._state_repo_full_name()
             )
             for claim in claims:
-                if claim.roadmap_issue_number in blocked_roadmaps_by_drift:
+                if claim.roadmap_issue_number in blocked_roadmaps_by_drift.union(
+                    blocked_roadmaps_by_adjustment
+                ):
                     self._state.release_roadmap_node_claim(
                         roadmap_issue_number=claim.roadmap_issue_number,
                         node_id=claim.node_id,
@@ -1269,6 +1287,299 @@ class Phase1Orchestrator:
                     )
         finally:
             self._cleanup_and_release_slot(lease)
+
+    def _run_roadmap_adjustment_gate(
+        self, *, roadmap: RoadmapStateRecord, checkout_path: Path
+    ) -> bool:
+        claim_token = self._state.claim_roadmap_adjustment(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if claim_token is None:
+            return False
+
+        release_claim = True
+        try:
+            ready_node_ids = self._state.list_ready_roadmap_frontier(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if not ready_node_ids:
+                return True
+            decision = self._evaluate_roadmap_frontier_adjustment(
+                roadmap=roadmap,
+                ready_node_ids=ready_node_ids,
+                checkout_path=checkout_path,
+            )
+            if decision.action == "proceed":
+                self._state.set_roadmap_last_error(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    error=None,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                return True
+            if decision.action == "request_revision":
+                marked = self._state.mark_roadmap_revision_requested(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    last_error=decision.summary,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if marked:
+                    release_claim = False
+                    token = compute_roadmap_adjustment_decision_token(
+                        roadmap_issue_number=roadmap.roadmap_issue_number,
+                        graph_version=roadmap.graph_version,
+                        ready_node_ids=ready_node_ids,
+                        action=decision.action,
+                        summary=decision.summary,
+                    )
+                    frontier = ", ".join(ready_node_ids)
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=roadmap.roadmap_issue_number,
+                        token=token,
+                        body=(
+                            "MergeXO adjustment gate requested a same-roadmap revision before "
+                            "issuing the next frontier.\n"
+                            f"- ready frontier: {frontier}\n"
+                            f"- summary: {decision.summary}\n\n"
+                            f"{decision.details}"
+                        ),
+                        source="roadmap_adjustment_revision_requested",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                return False
+            self._abandon_roadmap(
+                roadmap=roadmap,
+                reason=f"{decision.summary}\n\n{decision.details}".strip(),
+            )
+            release_claim = False
+            return False
+        except Exception as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"roadmap adjustment evaluation failed: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
+        finally:
+            if release_claim:
+                self._state.release_roadmap_adjustment(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    claim_token=claim_token,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+
+    def _evaluate_roadmap_frontier_adjustment(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        ready_node_ids: tuple[str, ...],
+        checkout_path: Path,
+    ) -> RoadmapAdjustmentResult:
+        graph_raw = (checkout_path / roadmap.graph_path).read_text(encoding="utf-8")
+        roadmap_doc_path = checkout_path / roadmap.roadmap_doc_path
+        try:
+            roadmap_markdown = roadmap_doc_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            roadmap_markdown = f"(roadmap markdown unavailable at {roadmap.roadmap_doc_path})"
+        issue = self._issue_snapshot_for_poll(issue_number=roadmap.roadmap_issue_number)
+        snapshot = self._state.list_roadmap_status_snapshot(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        blockers = self._state.list_roadmap_blockers_oldest_first(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        coding_guidelines_path = self._coding_guidelines_path_for_checkout(
+            checkout_path=checkout_path
+        )
+        status_report = _render_roadmap_status_report(
+            roadmap_status=roadmap.status,
+            graph_version=roadmap.graph_version,
+            adjustment_state=roadmap.adjustment_state,
+            rows=snapshot,
+            blockers=blockers,
+            request_comment_id=0,
+        )
+        return self._agent.evaluate_roadmap_adjustment(
+            issue=issue,
+            repo_full_name=self._state_repo_full_name(),
+            default_branch=self._repo.default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+            roadmap_doc_path=roadmap.roadmap_doc_path,
+            graph_path=roadmap.graph_path,
+            graph_version=roadmap.graph_version,
+            ready_node_ids=ready_node_ids,
+            roadmap_status_report=status_report,
+            roadmap_markdown=roadmap_markdown,
+            canonical_graph_json=graph_raw,
+            cwd=checkout_path,
+        )
+
+    def _maybe_apply_pending_roadmap_revision(
+        self, *, roadmap: RoadmapStateRecord, checkout_path: Path
+    ) -> RoadmapStateRecord:
+        if roadmap.status != "active":
+            return roadmap
+        if roadmap.adjustment_state != "awaiting_revision_merge":
+            return roadmap
+        graph_path = checkout_path / roadmap.graph_path
+        if not graph_path.exists():
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"awaiting roadmap revision merge: missing graph file {roadmap.graph_path}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="awaiting-revision-missing",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for a same-roadmap revision merge, but the canonical graph "
+                    "file is missing.\n"
+                    f"- expected path: `{roadmap.graph_path}`"
+                ),
+                source="roadmap_revision_waiting_missing_graph",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        try:
+            graph_raw = graph_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"awaiting roadmap revision merge: unreadable graph file: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="awaiting-revision-unreadable",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for a same-roadmap revision merge, but the canonical graph "
+                    "file is unreadable.\n"
+                    f"- path: `{roadmap.graph_path}`\n"
+                    f"- read error: {exc}"
+                ),
+                source="roadmap_revision_waiting_unreadable_graph",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        try:
+            parsed = parse_roadmap_graph_json(
+                graph_raw,
+                expected_issue_number=roadmap.roadmap_issue_number,
+            )
+        except RoadmapGraphValidationError as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=str(exc),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="awaiting-revision-invalid",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for a valid same-roadmap revision merge.\n"
+                    f"- path: `{roadmap.graph_path}`\n"
+                    f"- validation error: {exc}"
+                ),
+                source="roadmap_revision_waiting_invalid_graph",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        if (
+            parsed.graph.version == roadmap.graph_version
+            and parsed.checksum == roadmap.graph_checksum
+        ):
+            return roadmap
+        node_inputs = tuple(
+            RoadmapNodeGraphInput(
+                node_id=node.node_id,
+                kind=node.kind,
+                title=node.title,
+                body_markdown=node.body_markdown,
+                dependencies=tuple(
+                    RoadmapDependencyState(node_id=dep.node_id, requires=dep.requires)
+                    for dep in node.depends_on
+                ),
+            )
+            for node in parsed.graph.nodes
+        )
+        try:
+            updated = self._state.upsert_roadmap_graph(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                roadmap_pr_number=roadmap.roadmap_pr_number,
+                roadmap_doc_path=roadmap.roadmap_doc_path,
+                graph_path=roadmap.graph_path,
+                graph_checksum=parsed.checksum,
+                graph_version=parsed.graph.version,
+                nodes=node_inputs,
+                parent_roadmap_issue_number=roadmap.parent_roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+        except RoadmapGraphTransitionError as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=str(exc),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=parsed.checksum,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO rejected the merged same-roadmap revision.\n"
+                    f"- current version: `{roadmap.graph_version}`\n"
+                    f"- proposed version: `{parsed.graph.version}`\n"
+                    f"- validation error: {exc}\n\n"
+                    "Update the roadmap graph with a valid transition and merge a corrected PR."
+                ),
+                source="roadmap_revision_invalid_transition",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        self._state.set_roadmap_last_error(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            error=None,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        token = compute_roadmap_graph_drift_token(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            graph_checksum=parsed.checksum,
+        )
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=roadmap.roadmap_issue_number,
+            token=token,
+            body=(
+                "MergeXO applied a same-roadmap revision.\n"
+                f"- version: `{roadmap.graph_version}` -> `{updated.graph_version}`\n"
+                f"- graph path: `{roadmap.graph_path}`"
+            ),
+            source="roadmap_revision_applied",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return updated
 
     def _verify_roadmap_graph_checksum(
         self, *, roadmap: RoadmapStateRecord, checkout_path: Path
@@ -1449,13 +1760,12 @@ class Phase1Orchestrator:
             return False, False, blocked
         planned = child_roadmap.status in {
             "active",
-            "revision_requested",
             "superseded",
             "abandoned",
             "completed",
         }
         implemented = child_roadmap.status == "completed"
-        blocked = child_roadmap.status == "revision_requested"
+        blocked = child_roadmap.adjustment_state == "awaiting_revision_merge"
         return planned, implemented, blocked
 
     def _find_existing_roadmap_child_issue(self, *, label: str, marker: str) -> Issue | None:
@@ -1471,22 +1781,43 @@ class Phase1Orchestrator:
         if self._repo.roadmap_abandon_label in labels:
             self._abandon_roadmap(roadmap=roadmap, reason="abandon label set on roadmap issue")
             return
+        if self._repo.roadmap_revision_label not in labels:
+            if roadmap.adjustment_request_version is not None:
+                self._state.set_roadmap_adjustment_request_version(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    request_version=None,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            return
         if self._repo.roadmap_revision_label in labels:
+            if roadmap.adjustment_state == "awaiting_revision_merge":
+                return
+            if roadmap.adjustment_request_version == roadmap.graph_version:
+                return
             self._state.mark_roadmap_revision_requested(
                 roadmap_issue_number=roadmap.roadmap_issue_number,
                 last_error="roadmap revision label applied",
                 repo_full_name=self._state_repo_full_name(),
             )
-            refreshed = self._state.get_roadmap_state(
+            token = compute_roadmap_graph_drift_token(
                 roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"revision-request:{roadmap.graph_version}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO paused roadmap fan-out pending a same-roadmap revision.\n"
+                    f"- current graph version: `{roadmap.graph_version}`\n"
+                    f"- graph path: `{roadmap.graph_path}`\n"
+                    f"- roadmap doc path: `{roadmap.roadmap_doc_path}`\n\n"
+                    "Merge a PR that updates the existing roadmap markdown and `.graph.json` for "
+                    "this issue with a valid graph version bump."
+                ),
+                source="roadmap_revision_requested",
                 repo_full_name=self._state_repo_full_name(),
             )
-            if (
-                refreshed is not None
-                and refreshed.status == "revision_requested"
-                and refreshed.superseding_roadmap_issue_number is None
-            ):
-                self._open_superseding_roadmap_issue(roadmap=refreshed, issue=issue)
 
     def _open_superseding_roadmap_issue(self, *, roadmap: RoadmapStateRecord, issue: Issue) -> None:
         created = self._find_existing_superseding_roadmap_issue(
@@ -1542,7 +1873,7 @@ class Phase1Orchestrator:
             roadmap_issue_number=roadmap.roadmap_issue_number,
             repo_full_name=self._state_repo_full_name(),
         )
-        if refreshed is None or refreshed.status not in {"active", "revision_requested"}:
+        if refreshed is None or refreshed.status != "active":
             return
         nodes = self._state.list_roadmap_nodes(
             roadmap_issue_number=roadmap.roadmap_issue_number,
@@ -1654,6 +1985,8 @@ class Phase1Orchestrator:
                     token=token,
                     body=_render_roadmap_status_report(
                         roadmap_status=roadmap.status,
+                        graph_version=roadmap.graph_version,
+                        adjustment_state=roadmap.adjustment_state,
                         rows=snapshot,
                         blockers=blockers,
                         request_comment_id=comment.comment_id,
@@ -8157,6 +8490,8 @@ def _render_roadmap_child_issue_body(
 def _render_roadmap_status_report(
     *,
     roadmap_status: str,
+    graph_version: int,
+    adjustment_state: str,
     rows: tuple[RoadmapStatusSnapshotRow, ...],
     blockers: tuple[RoadmapBlockerRow, ...],
     request_comment_id: int,
@@ -8184,6 +8519,8 @@ def _render_roadmap_status_report(
         "MergeXO roadmap status report:\n"
         f"- request_comment_id: {request_comment_id}\n"
         f"- roadmap_status: {roadmap_status}\n\n"
+        f"- graph_version: {graph_version}\n"
+        f"- adjustment_state: {adjustment_state}\n\n"
         "Nodes:\n"
         + "\n".join(node_lines)
         + "\n\nBlockers (oldest first):\n"
