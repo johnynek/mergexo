@@ -6,7 +6,7 @@ The goal is agentic development with normal software rigor: decisions are captur
 
 MergeXO is a local-first Python orchestrator that watches labeled issues and routes each issue into one startup flow:
 
-- `roadmap`: open a roadmap PR with canonical DAG JSON that schedules child issues
+- `roadmap`: open a roadmap PR with canonical DAG JSON, then keep the same roadmap updated as dependency work changes what should happen next
 - `design_doc`: open a design-doc PR first, then implementation PR work after merge
 - `bugfix`: open a direct bugfix PR
 - `small_job`: open a direct scoped-change PR
@@ -63,6 +63,8 @@ Why this is minimal:
 
 If issue authors are not the repo owner, set `allowed_users = ["..."]` under each repo table.
 
+Roadmap support is off by default. If you want multi-step roadmap orchestration, enable it explicitly as described in `Optional: Enable Roadmaps` below.
+
 ### 3. Sync dependencies
 
 ```bash
@@ -95,6 +97,84 @@ This is the recommended first run because it gives you both orchestration and vi
 - verify status comments appear on issues
 - watch active/blocked work in the TUI
 
+## MergeXO Roadmaps
+
+Roadmaps are a feature-flagged flow for multi-step work. MergeXO stores the roadmap as canonical markdown plus versioned DAG JSON, then treats that roadmap as a living plan: before issuing each ready frontier, it evaluates whether the current roadmap still matches what completed dependency work taught us.
+
+### Quick Start
+
+Enable roadmap support in config:
+
+```toml
+[runtime]
+enable_roadmaps = true
+
+[repo.mergexo]
+roadmap_label = "agent:roadmap"
+roadmap_docs_dir = "docs/roadmap"
+roadmap_revision_label = "agent:roadmap-revise"
+roadmap_abandon_label = "agent:roadmap-abandon"
+roadmap_recommended_node_count = 7
+```
+
+Then do this:
+
+1. Set `runtime.enable_roadmaps = true`.
+2. Create the GitHub labels you want to use.
+3. Apply `roadmap_label` to a source issue.
+4. Review and merge the generated roadmap PR.
+
+### Example User Stories
+
+1. Starting a roadmap
+   - You open issue `#123` for a larger feature and add `agent:roadmap`.
+   - MergeXO opens a roadmap PR with a narrative plan and canonical graph JSON (`docs/roadmap/123-....graph.json`).
+   - You review and merge it to activate the plan.
+
+2. Watching the roadmap execute
+   - MergeXO finds the "ready frontier" (nodes with satisfied dependencies).
+   - **The Adjustment Gate:** Before opening any child issues, MergeXO gathers "dependency artifacts" from recently completed work: merged PR bodies, code diffs, review summaries, and key comments.
+   - It evaluates these against the current roadmap. If the plan still fits, it returns `proceed` and opens the next batch of child issues.
+
+3. Steering the roadmap as reality changes
+   - If a completed PR reveals a technical hurdle, MergeXO returns `revise`.
+   - **Auto-Revision:** It opens or reuses a **same-roadmap revision PR** (e.g., on branch `agent/roadmap/123-revision-v2`). This PR updates the canonical Markdown and JSON files in your repo.
+   - **Manual Steering:** You can force a revision at any time by adding `agent:roadmap-revise` to the roadmap issue. MergeXO will then ask the agent to propose a concrete update based on current progress.
+   - The roadmap pauses fan-out until you review and merge this revision PR.
+
+### Visibility and Control
+
+The roadmap issue is your durable command center:
+
+- **`/roadmap status`**: Comment this to get a rich report including the active graph, blocked nodes, the latest agent rationale, and links to any pending revision PRs.
+- **Node Linking**: Every child issue created by MergeXO is automatically labeled and includes a "Parent Roadmap" link back to the source issue.
+- **Sizing**: `roadmap_recommended_node_count` (default: 7) encourages small, reviewable epics. If a roadmap gets too large, MergeXO will suggest splitting it into nested roadmaps.
+
+### What To Expect During Execution
+
+Roadmaps are now a continuous control loop, not a one-time plan that fans out unchanged.
+
+- Before issuing each ready frontier, MergeXO evaluates the current roadmap against concrete dependency artifacts from already-completed child work.
+- The adjustment result is one of `proceed`, `revise`, or `abandon`.
+- `proceed` issues the ready child issues now.
+- `revise` creates or reuses a same-roadmap revision PR instead of opening a replacement roadmap issue in the normal revision path.
+- While a tracked revision PR is open, the roadmap stays in `awaiting_revision_merge` and no further child issues are issued from that roadmap.
+- Once the tracked revision PR merges and the updated graph passes transition validation, MergeXO applies the new graph version and resumes in the same scheduler loop.
+- `roadmap_recommended_node_count` is a sizing recommendation, not a hard cap. Oversized roadmaps still work, but MergeXO posts a suggestion to split them when practical.
+
+### How A Roadmap Completes
+
+A roadmap is complete when every roadmap node reaches a terminal outcome.
+
+- If all roadmap nodes end in `completed` or `abandoned`, MergeXO marks the roadmap completed and closes the parent roadmap issue.
+- If the roadmap is no longer viable, MergeXO can abandon it directly and close remaining work without pretending it completed successfully.
+- The roadmap issue remains the durable control point for status, revision, and completion throughout the life of the roadmap.
+
+### Safety And Restart Behavior
+
+- Roadmap child issue creation, same-roadmap revision PR creation, and tokenized roadmap status comments go through the sqlite-backed GitHub outbox.
+- If GitHub calls fail transiently or MergeXO crashes mid-flight, restart and replay can resume from durable intent rows instead of requiring manual cleanup.
+
 ## Expected Workflows
 
 ### Flow Selection Rules
@@ -106,6 +186,8 @@ MergeXO reads these repo labels:
 - `trigger_label` (default design flow)
 - `bugfix_label` (direct bugfix)
 - `small_job_label` (direct small job)
+
+`roadmap_label` is only active when `runtime.enable_roadmaps = true`.
 
 If multiple labels are present, precedence is deterministic:
 
@@ -122,6 +204,9 @@ Assume one repo with labels:
 - `agent:design`
 - `agent:bugfix`
 - `agent:small-job`
+- `agent:roadmap`
+- `agent:roadmap-revise`
+- `agent:roadmap-abandon`
 
 1. Design flow issue:
    - Issue `#120` has `agent:design`.
@@ -144,8 +229,11 @@ Assume one repo with labels:
 4. Roadmap flow issue (feature-flagged):
    - Set `runtime.enable_roadmaps = true` and apply `agent:roadmap` to issue `#123`.
    - MergeXO opens `agent/roadmap/123-...` and creates both `docs/roadmap/123-...md` and `docs/roadmap/123-....graph.json`.
-   - After merge, MergeXO activates the roadmap DAG, opens child issues only when dependency milestones are satisfied, and keeps parent-child links in issue bodies.
-   - Child PRs should reference only their direct child issue; MergeXO closes the parent roadmap issue once all roadmap nodes reach terminal outcomes (or the roadmap is abandoned).
+   - After merge, MergeXO activates the roadmap DAG, then runs an adjustment gate before each ready frontier using the current roadmap plus dependency artifacts from completed child work.
+   - If the gate says `proceed`, MergeXO opens only the currently ready child issues and keeps parent-child links in issue bodies.
+   - If the gate says `revise`, or if a maintainer applies `agent:roadmap-revise`, MergeXO pauses fan-out and opens or reuses a same-roadmap revision PR against the canonical roadmap markdown and graph.
+   - Comment `/roadmap status` on the roadmap issue for a live status report. Apply `agent:roadmap-abandon` to abandon the roadmap entirely.
+   - Child PRs should reference only their direct child issue; MergeXO closes the parent roadmap issue once all roadmap nodes reach terminal outcomes or the roadmap is abandoned.
 
 5. Human takeover flow (`agent:ignore`):
    - Issue `#123` starts in bugfix flow and already has an open PR `#205`.
@@ -334,6 +422,13 @@ Behavior notes:
 - `git_checkout` restart mode runs `git pull --ff-only` and `uv sync` before re-exec
 - `pypi` mode is available only when configured (`restart_supported_modes` + `service_python`)
 
+Roadmap controls are separate from `/mergexo` operator commands:
+
+- `/roadmap status` on a roadmap issue posts a deterministic roadmap status report
+- `roadmap_revision_label` on a roadmap issue requests a same-roadmap revision and pauses further fan-out until that revision is handled
+- `roadmap_abandon_label` on a roadmap issue abandons the roadmap
+- these roadmap controls do not require `enable_github_operations`
+
 Unblock user story (`head_sha` override):
 
 1. PR `#101` is blocked because MergeXO detected a non-fast-forward head change.
@@ -383,6 +478,7 @@ Do not mix both shapes in one file.
 | `worker_count` | yes | none | must be `>= 1` |
 | `poll_interval_seconds` | yes | none | must be `>= 5` |
 | `enable_github_operations` | no | `false` | enables `/mergexo ...` command processing |
+| `enable_roadmaps` | no | `false` | enables the `roadmap_label` flow plus roadmap revision/abandon controls |
 | `enable_issue_comment_routing` | no | `false` | enables pre-PR follow-up + post-PR source redirects |
 | `enable_pr_actions_monitoring` | no | `false` | compatibility fallback: when true, repos without explicit policy behave as `all_complete` |
 | `enable_incremental_comment_fetch` | no | `false` | enables incremental GitHub comment polling with persisted cursors |
@@ -410,6 +506,11 @@ Do not mix both shapes in one file.
 | `bugfix_label` | no | `"agent:bugfix"` | bugfix flow trigger |
 | `small_job_label` | no | `"agent:small-job"` | small-job flow trigger |
 | `ignore_label` | no | `"agent:ignore"` | human takeover label; preempts all automation while present |
+| `roadmap_label` | no | `"agent:roadmap"` | roadmap flow trigger; only active when `runtime.enable_roadmaps = true` |
+| `roadmap_docs_dir` | no | `"docs/roadmap"` | canonical markdown + `.graph.json` output directory for roadmap PRs |
+| `roadmap_revision_label` | no | `"agent:roadmap-revise"` | manual same-roadmap revision request label |
+| `roadmap_abandon_label` | no | `"agent:roadmap-abandon"` | manual roadmap abandon label |
+| `roadmap_recommended_node_count` | no | `7` | sizing recommendation for roadmap graphs; must be `>= 1` |
 | `coding_guidelines_path` | yes | none | repo-relative path for coding/testing guidance |
 | `design_docs_dir` | no | `"docs/design"` | design doc output directory |
 | `allowed_users` | no | `[owner]` | normalized lowercase allowlist |
