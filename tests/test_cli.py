@@ -514,7 +514,7 @@ def test_cmd_console_runs_default_mode_with_runtime_settings(
 
     cli._cmd_console(cfg)
 
-    assert called["reconciled"] is True
+    assert "reconciled" not in called
     assert called["retention_days"] == 42
     default_mode_call = called["default_mode"]
     assert isinstance(default_mode_call, dict)

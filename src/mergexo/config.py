@@ -77,6 +77,11 @@ class CodexConfig:
     sandbox: str | None
     profile: str | None
     extra_args: tuple[str, ...]
+    design_turn_timeout_seconds: int = 3600
+    direct_turn_timeout_seconds: int = 5400
+    feedback_turn_timeout_seconds: int = 1800
+    idle_timeout_seconds: int = 900
+    graceful_shutdown_seconds: int = 5
 
 
 @dataclass(frozen=True)
@@ -209,7 +214,10 @@ def load_config(path: Path) -> AppConfig:
     repos = _load_repo_configs(repo_data=repo_data, auth_data=auth_data)
 
     codex = _parse_codex_config(codex_data=codex_data)
+    _validate_codex_config(codex, prefix="codex")
     codex_overrides = _load_codex_overrides(codex_data=codex_data, repos=repos, defaults=codex)
+    for repo_id, override in codex_overrides:
+        _validate_codex_config(override, prefix=f"codex.repo.{repo_id}")
 
     return AppConfig(
         runtime=runtime,
@@ -320,12 +328,34 @@ def _parse_codex_config(
     sandbox_default = defaults.sandbox if defaults is not None else None
     profile_default = defaults.profile if defaults is not None else None
     extra_args_default = defaults.extra_args if defaults is not None else ()
+    design_timeout_default = defaults.design_turn_timeout_seconds if defaults is not None else 3600
+    direct_timeout_default = defaults.direct_turn_timeout_seconds if defaults is not None else 5400
+    feedback_timeout_default = (
+        defaults.feedback_turn_timeout_seconds if defaults is not None else 1800
+    )
+    idle_timeout_default = defaults.idle_timeout_seconds if defaults is not None else 900
+    graceful_shutdown_default = defaults.graceful_shutdown_seconds if defaults is not None else 5
     return CodexConfig(
         enabled=_bool_with_default(codex_data, "enabled", enabled_default),
         model=_optional_str_with_default(codex_data, "model", model_default),
         sandbox=_optional_str_with_default(codex_data, "sandbox", sandbox_default),
         profile=_optional_str_with_default(codex_data, "profile", profile_default),
         extra_args=_tuple_of_str_with_default(codex_data, "extra_args", extra_args_default),
+        design_turn_timeout_seconds=_int_with_default(
+            codex_data, "design_turn_timeout_seconds", design_timeout_default
+        ),
+        direct_turn_timeout_seconds=_int_with_default(
+            codex_data, "direct_turn_timeout_seconds", direct_timeout_default
+        ),
+        feedback_turn_timeout_seconds=_int_with_default(
+            codex_data, "feedback_turn_timeout_seconds", feedback_timeout_default
+        ),
+        idle_timeout_seconds=_int_with_default(
+            codex_data, "idle_timeout_seconds", idle_timeout_default
+        ),
+        graceful_shutdown_seconds=_int_with_default(
+            codex_data, "graceful_shutdown_seconds", graceful_shutdown_default
+        ),
     )
 
 
@@ -361,6 +391,19 @@ def _load_codex_overrides(
             )
         )
     return tuple(overrides)
+
+
+def _validate_codex_config(codex: CodexConfig, *, prefix: str) -> None:
+    if codex.design_turn_timeout_seconds < 1:
+        raise ConfigError(f"{prefix}.design_turn_timeout_seconds must be >= 1")
+    if codex.direct_turn_timeout_seconds < 1:
+        raise ConfigError(f"{prefix}.direct_turn_timeout_seconds must be >= 1")
+    if codex.feedback_turn_timeout_seconds < 1:
+        raise ConfigError(f"{prefix}.feedback_turn_timeout_seconds must be >= 1")
+    if codex.idle_timeout_seconds < 1:
+        raise ConfigError(f"{prefix}.idle_timeout_seconds must be >= 1")
+    if codex.graceful_shutdown_seconds < 1:
+        raise ConfigError(f"{prefix}.graceful_shutdown_seconds must be >= 1")
 
 
 def _require_table(data: dict[str, object], key: str) -> dict[str, object]:

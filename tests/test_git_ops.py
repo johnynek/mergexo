@@ -110,6 +110,36 @@ def test_prepare_branch_push_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert ["git", "-C", str(checkout), "push", "-u", "origin", "feature"] in calls
 
 
+@pytest.mark.parametrize(
+    ("status_output", "expected"),
+    [
+        ("", False),
+        (" M src/a.py\n", True),
+    ],
+)
+def test_has_working_tree_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status_output: str, expected: bool
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        assert cmd == [
+            "git",
+            "-C",
+            str(tmp_path / "checkout"),
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+        ]
+        return status_output
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    assert manager.has_working_tree_changes(tmp_path / "checkout") is expected
+
+
 def test_prepare_checkout_retries_when_checkout_would_overwrite_local_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
