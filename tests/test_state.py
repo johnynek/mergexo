@@ -19,6 +19,7 @@ from mergexo.state import (
     _parse_roadmap_dependencies_json,
     _parse_roadmap_node_kind,
     _parse_roadmap_node_row,
+    _parse_roadmap_revision_row,
     _parse_roadmap_node_status,
     _parse_roadmap_state_row,
     _parse_roadmap_status,
@@ -3443,6 +3444,19 @@ def test_roadmap_state_helper_parsers_validate_shapes() -> None:
     assert current_state.pending_revision_pr_url == "https://example/pr/202"
     assert current_state.pending_revision_head_sha == "head-202"
     assert current_state.last_adjustment_basis_digest == "digest-202"
+    revision = _parse_roadmap_revision_row(
+        (
+            2,
+            3,
+            22,
+            "docs/roadmap/2.md",
+            "docs/roadmap/2.graph.json",
+            "sum2",
+            "applied",
+        ),
+        repo_full_name="o/r",
+    )
+    assert revision.version == 3
     node = _parse_roadmap_node_row(
         (
             1,
@@ -3863,6 +3877,43 @@ def test_roadmap_state_helper_parsers_validate_shapes() -> None:
                 None,
                 "t",
             ),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="roadmap_revisions row shape"):
+        _parse_roadmap_revision_row((1,), repo_full_name="o/r")
+    with pytest.raises(RuntimeError, match="Invalid roadmap_issue_number"):
+        _parse_roadmap_revision_row(
+            ("1", 1, None, "docs/roadmap/1.md", "docs/roadmap/1.graph.json", "sum", "t"),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid version"):
+        _parse_roadmap_revision_row(
+            (1, "1", None, "docs/roadmap/1.md", "docs/roadmap/1.graph.json", "sum", "t"),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid roadmap_pr_number"):
+        _parse_roadmap_revision_row(
+            (1, 1, "p", "docs/roadmap/1.md", "docs/roadmap/1.graph.json", "sum", "t"),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid roadmap_doc_path"):
+        _parse_roadmap_revision_row(
+            (1, 1, None, 1, "docs/roadmap/1.graph.json", "sum", "t"),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid graph_path"):
+        _parse_roadmap_revision_row(
+            (1, 1, None, "docs/roadmap/1.md", 1, "sum", "t"),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid graph_checksum"):
+        _parse_roadmap_revision_row(
+            (1, 1, None, "docs/roadmap/1.md", "docs/roadmap/1.graph.json", 1, "t"),
+            repo_full_name="o/r",
+        )
+    with pytest.raises(RuntimeError, match="Invalid applied_at"):
+        _parse_roadmap_revision_row(
+            (1, 1, None, "docs/roadmap/1.md", "docs/roadmap/1.graph.json", "sum", 1),
             repo_full_name="o/r",
         )
     with pytest.raises(RuntimeError, match="Invalid node_id"):
@@ -4772,6 +4823,61 @@ def test_claim_roadmap_adjustment_reclaims_stale_lock_and_release_stores_basis_d
     assert refreshed.adjustment_state == "idle"
     assert refreshed.adjustment_claim_token is None
     assert refreshed.last_adjustment_basis_digest == "digest-214"
+
+
+def test_list_roadmap_revisions_returns_recent_versions(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo"
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=215,
+        roadmap_pr_number=2151,
+        roadmap_doc_path="docs/roadmap/215.md",
+        graph_path="docs/roadmap/215.graph.json",
+        graph_checksum="sum215-v1",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=215,
+        roadmap_pr_number=2151,
+        roadmap_doc_path="docs/roadmap/215.md",
+        graph_path="docs/roadmap/215.graph.json",
+        graph_checksum="sum215-v2",
+        graph_version=2,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+
+    revisions = store.list_roadmap_revisions(
+        roadmap_issue_number=215,
+        repo_full_name=repo,
+    )
+
+    assert [revision.version for revision in revisions] == [2, 1]
+    assert revisions[0].graph_checksum == "sum215-v2"
+    assert revisions[1].graph_checksum == "sum215-v1"
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        store.list_roadmap_revisions(
+            roadmap_issue_number=215,
+            limit=0,
+            repo_full_name=repo,
+        )
 
 
 def test_upsert_roadmap_graph_validates_version_transitions(tmp_path: Path) -> None:

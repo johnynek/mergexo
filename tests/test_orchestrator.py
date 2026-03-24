@@ -139,6 +139,7 @@ from mergexo.state import (
     RoadmapDependencyState,
     RoadmapNodeGraphInput,
     RoadmapNodeRecord,
+    RoadmapRevisionRecord,
     RoadmapStatusSnapshotRow,
     IssueRunRecord,
     StateStore,
@@ -2685,6 +2686,23 @@ def test_flow_helpers() -> None:
         roadmap_status="active",
         graph_version=1,
         adjustment_state="idle",
+        pending_revision_pr_number=205,
+        pending_revision_pr_url="https://example/pr/205",
+        adjustment_request_version=2,
+        latest_note="Need revision",
+        revision_requested_at="2026-03-02T00:00:00.000Z",
+        revisions=(
+            RoadmapRevisionRecord(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                version=1,
+                roadmap_pr_number=70,
+                roadmap_doc_path="docs/roadmap/7.md",
+                graph_path="docs/roadmap/7.graph.json",
+                graph_checksum="sum7",
+                applied_at="2026-03-01T00:00:00.000Z",
+            ),
+        ),
         rows=(
             RoadmapStatusSnapshotRow(
                 repo_full_name="o/r",
@@ -2716,10 +2734,22 @@ def test_flow_helpers() -> None:
     assert "request_comment_id: 123" in status_body
     assert "n1 [small_job]" in status_body
     assert "n2: blocked_since" in status_body
+    assert "pending_revision_pr: #205 (https://example/pr/205)" in status_body
+    assert "requested_revision_version: 2" in status_body
+    assert "latest_note: Need revision" in status_body
+    assert (
+        "Recent revisions:\n- v1: applied_at=2026-03-01T00:00:00.000Z checksum=sum7" in status_body
+    )
     empty_status_body = _render_roadmap_status_report(
         roadmap_status="active",
         graph_version=1,
         adjustment_state="idle",
+        pending_revision_pr_number=None,
+        pending_revision_pr_url=None,
+        adjustment_request_version=None,
+        latest_note=None,
+        revision_requested_at=None,
+        revisions=(),
         rows=(),
         blockers=(),
         request_comment_id=321,
@@ -2728,6 +2758,25 @@ def test_flow_helpers() -> None:
     assert "Blockers (oldest first):\n- none" in empty_status_body
     assert "graph_version: 1" in empty_status_body
     assert "adjustment_state: idle" in empty_status_body
+    assert "pending_revision_pr: none" in empty_status_body
+    assert "requested_revision_version: none" in empty_status_body
+    assert "latest_note: none" in empty_status_body
+    assert "Recent revisions:\n- none recorded" in empty_status_body
+    no_url_status_body = _render_roadmap_status_report(
+        roadmap_status="active",
+        graph_version=1,
+        adjustment_state="awaiting_revision_merge",
+        pending_revision_pr_number=206,
+        pending_revision_pr_url=None,
+        adjustment_request_version=3,
+        latest_note="Waiting on revision PR",
+        revision_requested_at="2026-03-03T00:00:00.000Z",
+        revisions=(),
+        rows=(),
+        blockers=(),
+        request_comment_id=555,
+    )
+    assert "pending_revision_pr: #206" in no_url_status_body
     dependency_refs = _ready_frontier_dependency_references(
         nodes_by_id={
             "n2": RoadmapNodeRecord(
@@ -13803,6 +13852,23 @@ def test_publish_roadmap_status_reports_and_abandon_flow(tmp_path: Path) -> None
         node_id="n1",
         repo_full_name=repo,
     )
+    state.mark_roadmap_revision_requested(
+        roadmap_issue_number=70,
+        last_error="Need roadmap revision",
+        repo_full_name=repo,
+    )
+    state.set_roadmap_adjustment_request_version(
+        roadmap_issue_number=70,
+        request_version=2,
+        repo_full_name=repo,
+    )
+    state.set_roadmap_pending_revision_pr(
+        roadmap_issue_number=70,
+        pr_number=702,
+        pr_url="https://example/pr/702",
+        head_sha="head-702",
+        repo_full_name=repo,
+    )
 
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
     orch._publish_roadmap_status_reports()
@@ -13810,6 +13876,13 @@ def test_publish_roadmap_status_reports_and_abandon_flow(tmp_path: Path) -> None
         issue_number == 70 and "roadmap status report" in body.lower()
         for issue_number, body in github.comments
     )
+    status_bodies = [body for issue_number, body in github.comments if issue_number == 70]
+    assert any(
+        "pending_revision_pr: #702 (https://example/pr/702)" in body for body in status_bodies
+    )
+    assert any("requested_revision_version: 2" in body for body in status_bodies)
+    assert any("latest_note: Need roadmap revision" in body for body in status_bodies)
+    assert any("Recent revisions:\n- v1:" in body for body in status_bodies)
 
     orch._advance_roadmap_nodes()
     assert 70 in github.closed_issue_numbers

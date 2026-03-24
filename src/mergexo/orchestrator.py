@@ -110,6 +110,7 @@ from mergexo.state import (
     RoadmapDependencyState,
     RoadmapNodeGraphInput,
     RoadmapNodeRecord,
+    RoadmapRevisionRecord,
     RoadmapStateRecord,
     RoadmapStatusSnapshotRow,
     RoadmapBlockerRow,
@@ -1549,6 +1550,10 @@ class Phase1Orchestrator:
             roadmap_issue_number=roadmap.roadmap_issue_number,
             repo_full_name=self._state_repo_full_name(),
         )
+        revisions = self._state.list_roadmap_revisions(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
         dependency_artifacts = self._collect_roadmap_dependency_artifacts(
             roadmap_issue_number=roadmap.roadmap_issue_number,
             ready_node_ids=ready_node_ids,
@@ -1557,6 +1562,12 @@ class Phase1Orchestrator:
             roadmap_status=roadmap.status,
             graph_version=roadmap.graph_version,
             adjustment_state=roadmap.adjustment_state,
+            pending_revision_pr_number=roadmap.pending_revision_pr_number,
+            pending_revision_pr_url=roadmap.pending_revision_pr_url,
+            adjustment_request_version=roadmap.adjustment_request_version,
+            latest_note=roadmap.last_error,
+            revision_requested_at=roadmap.revision_requested_at,
+            revisions=revisions,
             rows=snapshot,
             blockers=blockers,
             request_comment_id=0,
@@ -2322,6 +2333,10 @@ class Phase1Orchestrator:
                     roadmap_issue_number=roadmap.roadmap_issue_number,
                     repo_full_name=self._state_repo_full_name(),
                 )
+                revisions = self._state.list_roadmap_revisions(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
                 self._ensure_tokenized_issue_comment(
                     github=self._github,
                     issue_number=roadmap.roadmap_issue_number,
@@ -2330,6 +2345,12 @@ class Phase1Orchestrator:
                         roadmap_status=roadmap.status,
                         graph_version=roadmap.graph_version,
                         adjustment_state=roadmap.adjustment_state,
+                        pending_revision_pr_number=roadmap.pending_revision_pr_number,
+                        pending_revision_pr_url=roadmap.pending_revision_pr_url,
+                        adjustment_request_version=roadmap.adjustment_request_version,
+                        latest_note=roadmap.last_error,
+                        revision_requested_at=roadmap.revision_requested_at,
+                        revisions=revisions,
                         rows=snapshot,
                         blockers=blockers,
                         request_comment_id=comment.comment_id,
@@ -8994,6 +9015,12 @@ def _render_roadmap_status_report(
     roadmap_status: str,
     graph_version: int,
     adjustment_state: str,
+    pending_revision_pr_number: int | None,
+    pending_revision_pr_url: str | None,
+    adjustment_request_version: int | None,
+    latest_note: str | None,
+    revision_requested_at: str | None,
+    revisions: tuple[RoadmapRevisionRecord, ...],
     rows: tuple[RoadmapStatusSnapshotRow, ...],
     blockers: tuple[RoadmapBlockerRow, ...],
     request_comment_id: int,
@@ -9017,16 +9044,50 @@ def _render_roadmap_status_report(
     ]
     if not blocker_lines:
         blocker_lines = ["- none"]
+    if pending_revision_pr_number is None:
+        pending_revision_line = "- pending_revision_pr: none"
+    elif pending_revision_pr_url is None:
+        pending_revision_line = f"- pending_revision_pr: #{pending_revision_pr_number}"
+    else:
+        pending_revision_line = (
+            f"- pending_revision_pr: #{pending_revision_pr_number} ({pending_revision_pr_url})"
+        )
+    requested_version_line = (
+        f"- requested_revision_version: {adjustment_request_version}"
+        if adjustment_request_version is not None
+        else "- requested_revision_version: none"
+    )
+    latest_note_line = f"- latest_note: {latest_note}" if latest_note else "- latest_note: none"
+    revision_requested_line = (
+        f"- revision_requested_at: {revision_requested_at}"
+        if revision_requested_at is not None
+        else "- revision_requested_at: none"
+    )
+    revision_lines = [
+        (
+            f"- v{revision.version}: applied_at={revision.applied_at} "
+            f"checksum={revision.graph_checksum}"
+        )
+        for revision in revisions
+    ]
+    if not revision_lines:
+        revision_lines = ["- none recorded"]
     return (
         "MergeXO roadmap status report:\n"
         f"- request_comment_id: {request_comment_id}\n"
         f"- roadmap_status: {roadmap_status}\n\n"
         f"- graph_version: {graph_version}\n"
-        f"- adjustment_state: {adjustment_state}\n\n"
+        f"- adjustment_state: {adjustment_state}\n"
+        f"{pending_revision_line}\n"
+        f"{requested_version_line}\n"
+        f"{latest_note_line}\n"
+        f"{revision_requested_line}\n\n"
         "Nodes:\n"
         + "\n".join(node_lines)
         + "\n\nBlockers (oldest first):\n"
         + "\n".join(blocker_lines)
+        + "\n\nRecent revisions:\n"
+        + "\n".join(revision_lines)
     )
 
 

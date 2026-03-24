@@ -40,6 +40,8 @@ The current branch already contains the enabling foundation:
    basis digest, repeated identical polls short-circuit without another agent
    turn, and stale `evaluating` adjustment locks can be reclaimed after worker
    interruption.
+9. `/roadmap status` now includes pending revision PR details, the latest known
+   roadmap note, and recent applied roadmap versions.
 
 This is enough to support manual same-roadmap revision, but it is not yet the
 full continuous-adjustment system.
@@ -89,6 +91,11 @@ full continuous-adjustment system.
   `proceed` decisions cache the evaluated basis, and repeated polls with the
   same ready frontier plus dependency artifacts now skip a redundant agent
   evaluation while leaving `./scripts/test.sh` green.
+- Checkpoint 8 completed: operator-facing roadmap status is now more legible.
+  `/roadmap status` shows pending revision PR details, the latest known roadmap
+  note, and recent applied roadmap versions; the state layer exposes recent
+  revision history directly, and the richer report is also threaded through the
+  adjustment context.
 
 ## Current Job
 
@@ -99,9 +106,6 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 - Manual revision requests from labels or escalations still do not auto-author
   a roadmap update PR, because those paths do not yet produce a concrete
   revised roadmap payload.
-- Status and observability are still thin. The current status output shows
-  roadmap version and adjustment state, but not pending revision PR details,
-  adjustment rationale history, or revision history.
 
 ## Target End State
 

@@ -161,6 +161,18 @@ class RoadmapActivationCandidate:
 
 
 @dataclass(frozen=True)
+class RoadmapRevisionRecord:
+    repo_full_name: str
+    roadmap_issue_number: int
+    version: int
+    roadmap_pr_number: int | None
+    roadmap_doc_path: str
+    graph_path: str
+    graph_checksum: str
+    applied_at: str
+
+
+@dataclass(frozen=True)
 class ReadyRoadmapNodeClaim:
     repo_full_name: str
     roadmap_issue_number: int
@@ -204,18 +216,6 @@ class RoadmapBlockerRow:
     child_issue_number: int | None
     child_issue_url: str | None
     last_progress_at: str | None
-
-
-@dataclass(frozen=True)
-class RoadmapRevisionRecord:
-    repo_full_name: str
-    roadmap_issue_number: int
-    version: int
-    roadmap_pr_number: int | None
-    roadmap_doc_path: str
-    graph_path: str
-    graph_checksum: str
-    applied_at: str
 
 
 @dataclass(frozen=True)
@@ -5486,6 +5486,36 @@ class StateStore:
             )
         return tuple(_parse_roadmap_state_row(row, repo_full_name=repo_key) for row in rows)
 
+    def list_roadmap_revisions(
+        self,
+        *,
+        roadmap_issue_number: int,
+        limit: int = 5,
+        repo_full_name: str | None = None,
+    ) -> tuple[RoadmapRevisionRecord, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    roadmap_issue_number,
+                    version,
+                    roadmap_pr_number,
+                    roadmap_doc_path,
+                    graph_path,
+                    graph_checksum,
+                    applied_at
+                FROM roadmap_revisions
+                WHERE repo_full_name = ? AND roadmap_issue_number = ?
+                ORDER BY version DESC
+                LIMIT ?
+                """,
+                (repo_key, roadmap_issue_number, limit),
+            ).fetchall()
+        return tuple(_parse_roadmap_revision_row(row, repo_full_name=repo_key) for row in rows)
+
     def claim_ready_roadmap_nodes(
         self,
         *,
@@ -6939,6 +6969,46 @@ def _parse_pre_pr_followup_flow(value: object) -> PrePrFollowupFlow:
     if value not in {"design_doc", "bugfix", "small_job", "roadmap", "implementation"}:
         raise RuntimeError(f"Unknown flow value stored in pre_pr_followup_state: {value}")
     return cast(PrePrFollowupFlow, value)
+
+
+def _parse_roadmap_revision_row(
+    row: tuple[object, ...], *, repo_full_name: str
+) -> RoadmapRevisionRecord:
+    if len(row) != 7:
+        raise RuntimeError("Invalid roadmap_revisions row shape")
+    (
+        roadmap_issue_number,
+        version,
+        roadmap_pr_number,
+        roadmap_doc_path,
+        graph_path,
+        graph_checksum,
+        applied_at,
+    ) = row
+    if not isinstance(roadmap_issue_number, int):
+        raise RuntimeError("Invalid roadmap_issue_number value stored in roadmap_revisions")
+    if not isinstance(version, int):
+        raise RuntimeError("Invalid version value stored in roadmap_revisions")
+    if roadmap_pr_number is not None and not isinstance(roadmap_pr_number, int):
+        raise RuntimeError("Invalid roadmap_pr_number value stored in roadmap_revisions")
+    if not isinstance(roadmap_doc_path, str):
+        raise RuntimeError("Invalid roadmap_doc_path value stored in roadmap_revisions")
+    if not isinstance(graph_path, str):
+        raise RuntimeError("Invalid graph_path value stored in roadmap_revisions")
+    if not isinstance(graph_checksum, str):
+        raise RuntimeError("Invalid graph_checksum value stored in roadmap_revisions")
+    if not isinstance(applied_at, str):
+        raise RuntimeError("Invalid applied_at value stored in roadmap_revisions")
+    return RoadmapRevisionRecord(
+        repo_full_name=repo_full_name,
+        roadmap_issue_number=roadmap_issue_number,
+        version=version,
+        roadmap_pr_number=roadmap_pr_number,
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        graph_checksum=graph_checksum,
+        applied_at=applied_at,
+    )
 
 
 def _parse_roadmap_status(value: object) -> RoadmapStatus:
