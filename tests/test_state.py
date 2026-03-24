@@ -952,6 +952,7 @@ def test_state_store_migrates_roadmap_nodes_claim_token_column(tmp_path: Path) -
     finally:
         conn.close()
     assert "claim_token" in columns
+    assert "claim_started_at" in columns
 
 
 def test_state_store_upsert_github_call_intent_raises_when_insert_not_visible(
@@ -5066,6 +5067,65 @@ def test_claim_ready_roadmap_nodes_limit_and_conflict_paths(tmp_path: Path) -> N
     assert all(
         not (claim.roadmap_issue_number == 303 and claim.node_id == "a") for claim in after_conflict
     )
+
+
+def test_claim_ready_roadmap_nodes_reclaims_stale_claims_and_frontier(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    repo = "o/repo"
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=304,
+        roadmap_pr_number=3004,
+        roadmap_doc_path="docs/roadmap/304.md",
+        graph_path="docs/roadmap/304.graph.json",
+        graph_checksum="sum304",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="a",
+                kind="small_job",
+                title="A",
+                body_markdown="A",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    initial_claim = store.claim_ready_roadmap_nodes(repo_full_name=repo)
+    assert len(initial_claim) == 1
+
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute(
+            """
+            UPDATE roadmap_nodes
+            SET claim_started_at = ?
+            WHERE repo_full_name = ? AND roadmap_issue_number = ? AND node_id = ?
+            """,
+            ("2000-01-01T00:00:00.000Z", repo, 304, "a"),
+        )
+        conn.commit()
+
+    assert store.list_ready_roadmap_frontier(roadmap_issue_number=304, repo_full_name=repo) == (
+        "a",
+    )
+    reclaimed_claim = store.claim_ready_roadmap_nodes(repo_full_name=repo)
+    assert len(reclaimed_claim) == 1
+    assert reclaimed_claim[0].node_id == "a"
+    assert reclaimed_claim[0].claim_token != initial_claim[0].claim_token
+
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        row = conn.execute(
+            """
+            SELECT claim_token, claim_started_at
+            FROM roadmap_nodes
+            WHERE repo_full_name = ? AND roadmap_issue_number = ? AND node_id = ?
+            """,
+            (repo, 304, "a"),
+        ).fetchone()
+    assert row is not None
+    claim_token, claim_started_at = row
+    assert claim_token == reclaimed_claim[0].claim_token
+    assert isinstance(claim_started_at, str)
+    assert claim_started_at != "2000-01-01T00:00:00.000Z"
 
 
 def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:

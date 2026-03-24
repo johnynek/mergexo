@@ -14431,6 +14431,72 @@ def test_advance_roadmap_nodes_handles_issue_creation_exception_and_mark_false(
     orch._advance_roadmap_nodes()
 
 
+def test_advance_roadmap_nodes_reclaims_stale_node_claim_after_crash(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    graph_payload = {
+        "roadmap_issue_number": 920,
+        "version": 1,
+        "nodes": [
+            {
+                "node_id": "n1",
+                "kind": "small_job",
+                "title": "Ship",
+                "body_markdown": "Do it",
+                "depends_on": [],
+            }
+        ],
+    }
+    parsed = parse_roadmap_graph_json(json.dumps(graph_payload), expected_issue_number=920)
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=920,
+        roadmap_pr_number=9200,
+        roadmap_doc_path="docs/roadmap/920.md",
+        graph_path="docs/roadmap/920.graph.json",
+        graph_checksum=parsed.checksum,
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="small_job",
+                title="Ship",
+                body_markdown="Do it",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    crashed_claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)
+    assert len(crashed_claim) == 1
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute(
+            """
+            UPDATE roadmap_nodes
+            SET claim_started_at = ?
+            WHERE repo_full_name = ? AND roadmap_issue_number = ? AND node_id = ?
+            """,
+            ("2000-01-01T00:00:00.000Z", repo, 920, "n1"),
+        )
+        conn.commit()
+
+    git = FakeGitManager(tmp_path / "checkouts-stale-node-claim")
+    checkout = git.ensure_checkout(0)
+    docs_dir = checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "920.graph.json").write_text(parsed.canonical_json, encoding="utf-8")
+
+    github = FakeGitHub([_issue(920, "Plan", labels=(cfg.repo.roadmap_label,))])
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+
+    orch._advance_roadmap_nodes()
+
+    node = state.list_roadmap_nodes(roadmap_issue_number=920, repo_full_name=repo)[0]
+    assert node.claim_token is None
+    assert node.child_issue_number is not None
+    assert len(github.created_issues) == 1
+    assert github.created_issues[0][0] == "Ship"
+
+
 def test_verify_roadmap_graph_checksum_invalid_and_mismatch_paths(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_roadmaps=True)
     repo = cfg.repo.full_name

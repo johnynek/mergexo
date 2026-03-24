@@ -43,6 +43,7 @@ _TRANSIENT_RETRY_INITIAL_DELAY_SECONDS = 30
 _TRANSIENT_RETRY_MAX_DELAY_SECONDS = 300
 _STALE_RUNNING_RETRY_ERROR = "stale_running_issue_without_active_run"
 _ROADMAP_ADJUSTMENT_STALE_AFTER = timedelta(minutes=30)
+_ROADMAP_NODE_CLAIM_STALE_AFTER = timedelta(minutes=30)
 PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "roadmap", "implementation"]
 AgentRunKind = Literal["issue_flow", "implementation_flow", "pre_pr_followup", "feedback_turn"]
 AgentRunTerminalStatus = Literal[
@@ -1056,6 +1057,7 @@ class StateStore:
                     last_progress_at TEXT NULL,
                     blocked_since_at TEXT NULL,
                     claim_token TEXT NULL,
+                    claim_started_at TEXT NULL,
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     PRIMARY KEY (repo_full_name, roadmap_issue_number, node_id)
                 )
@@ -1088,6 +1090,13 @@ class StateStore:
                     """
                     ALTER TABLE roadmap_nodes
                     ADD COLUMN claim_token TEXT NULL
+                    """
+                )
+            if "claim_started_at" not in roadmap_node_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE roadmap_nodes
+                    ADD COLUMN claim_started_at TEXT NULL
                     """
                 )
             conn.execute(
@@ -5189,6 +5198,8 @@ class StateStore:
                         SET
                             is_active = 0,
                             retired_in_version = ?,
+                            claim_token = NULL,
+                            claim_started_at = NULL,
                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                         WHERE repo_full_name = ?
                           AND roadmap_issue_number = ?
@@ -5525,6 +5536,9 @@ class StateStore:
         if limit < 1:
             raise ValueError("limit must be >= 1")
         repo_key = _normalize_repo_full_name(repo_full_name)
+        stale_before = _format_db_timestamp(
+            datetime.now(timezone.utc) - _ROADMAP_NODE_CLAIM_STALE_AFTER
+        )
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
@@ -5539,7 +5553,8 @@ class StateStore:
                     n.planned_at,
                     n.implemented_at,
                     n.child_issue_number,
-                    n.claim_token
+                    n.claim_token,
+                    n.claim_started_at
                 FROM roadmap_nodes AS n
                 INNER JOIN roadmap_state AS r
                     ON r.repo_full_name = n.repo_full_name
@@ -5571,11 +5586,15 @@ class StateStore:
                     status = _parse_roadmap_node_status(row[6])
                     child_issue_number = int(row[9]) if isinstance(row[9], int) else None
                     claim_token = str(row[10]) if isinstance(row[10], str) else None
-                    if (
-                        status != "pending"
-                        or child_issue_number is not None
-                        or claim_token is not None
-                    ):
+                    claim_started_at = str(row[11]) if isinstance(row[11], str) else None
+                    if status != "pending" or child_issue_number is not None:
+                        continue
+                    stale_claim = _roadmap_node_claim_is_stale(
+                        claim_token=claim_token,
+                        claim_started_at=claim_started_at,
+                        stale_before=stale_before,
+                    )
+                    if claim_token is not None and not stale_claim:
                         continue
                     dependencies = _parse_roadmap_dependencies_json(str(row[5]))
                     if not _roadmap_node_dependencies_satisfied(
@@ -5588,6 +5607,7 @@ class StateStore:
                         """
                         UPDATE roadmap_nodes
                         SET claim_token = ?,
+                            claim_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                         WHERE repo_full_name = ?
                           AND roadmap_issue_number = ?
@@ -5595,9 +5615,25 @@ class StateStore:
                           AND is_active = 1
                           AND status = 'pending'
                           AND child_issue_number IS NULL
-                          AND claim_token IS NULL
+                          AND (
+                                claim_token IS NULL
+                                OR (
+                                    claim_token = ?
+                                    AND (
+                                        claim_started_at IS NULL
+                                        OR claim_started_at < ?
+                                    )
+                                )
+                          )
                         """,
-                        (claim, repo_key, roadmap_issue_number, node_id),
+                        (
+                            claim,
+                            repo_key,
+                            roadmap_issue_number,
+                            node_id,
+                            claim_token,
+                            stale_before,
+                        ),
                     )
                     if cursor.rowcount <= 0:
                         continue
@@ -5619,6 +5655,9 @@ class StateStore:
         self, *, roadmap_issue_number: int, repo_full_name: str | None = None
     ) -> tuple[str, ...]:
         repo_key = _normalize_repo_full_name(repo_full_name)
+        stale_before = _format_db_timestamp(
+            datetime.now(timezone.utc) - _ROADMAP_NODE_CLAIM_STALE_AFTER
+        )
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
@@ -5629,7 +5668,8 @@ class StateStore:
                     planned_at,
                     implemented_at,
                     child_issue_number,
-                    claim_token
+                    claim_token,
+                    claim_started_at
                 FROM roadmap_nodes
                 WHERE repo_full_name = ?
                   AND roadmap_issue_number = ?
@@ -5651,6 +5691,7 @@ class StateStore:
                 implemented_at,
                 child_issue_number,
                 claim_token,
+                claim_started_at,
             )
             for (
                 node_id,
@@ -5660,6 +5701,7 @@ class StateStore:
                 implemented_at,
                 child_issue_number,
                 claim_token,
+                claim_started_at,
             ) in rows
         }
         ready: list[str] = []
@@ -5667,7 +5709,17 @@ class StateStore:
             status = _parse_roadmap_node_status(row[6])
             child_issue_number = int(row[9]) if isinstance(row[9], int) else None
             claim_token = str(row[10]) if isinstance(row[10], str) else None
-            if status != "pending" or child_issue_number is not None or claim_token is not None:
+            claim_started_at = str(row[11]) if isinstance(row[11], str) else None
+            if status != "pending" or child_issue_number is not None:
+                continue
+            if (
+                not _roadmap_node_claim_is_stale(
+                    claim_token=claim_token,
+                    claim_started_at=claim_started_at,
+                    stale_before=stale_before,
+                )
+                and claim_token is not None
+            ):
                 continue
             dependencies = _parse_roadmap_dependencies_json(str(row[5]))
             if _roadmap_node_dependencies_satisfied(
@@ -5762,6 +5814,7 @@ class StateStore:
                 """
                 UPDATE roadmap_nodes
                 SET claim_token = NULL,
+                    claim_started_at = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE repo_full_name = ?
                   AND roadmap_issue_number = ?
@@ -5801,6 +5854,7 @@ class StateStore:
                     last_progress_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     blocked_since_at = NULL,
                     claim_token = NULL,
+                    claim_started_at = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE repo_full_name = ?
                   AND roadmap_issue_number = ?
@@ -5869,6 +5923,7 @@ class StateStore:
                         last_progress_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                         blocked_since_at = NULL,
                         claim_token = NULL,
+                        claim_started_at = NULL,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE repo_full_name = ?
                       AND roadmap_issue_number = ?
@@ -6143,7 +6198,8 @@ class StateStore:
                         status = 'abandoned',
                         status_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                        claim_token = NULL
+                        claim_token = NULL,
+                        claim_started_at = NULL
                     WHERE repo_full_name = ?
                       AND roadmap_issue_number = ?
                       AND is_active = 1
@@ -6191,7 +6247,8 @@ class StateStore:
                         status = 'abandoned',
                         status_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                        claim_token = NULL
+                        claim_token = NULL,
+                        claim_started_at = NULL
                     WHERE repo_full_name = ?
                       AND roadmap_issue_number = ?
                       AND is_active = 1
@@ -7362,6 +7419,15 @@ def _roadmap_node_dependencies_satisfied(
         if dep_implemented_at is None:
             return False
     return True
+
+
+def _roadmap_node_claim_is_stale(
+    *,
+    claim_token: str | None,
+    claim_started_at: str | None,
+    stale_before: str,
+) -> bool:
+    return claim_token is not None and (claim_started_at is None or claim_started_at < stale_before)
 
 
 def _parse_github_comment_surface(value: object) -> GitHubCommentSurface:
