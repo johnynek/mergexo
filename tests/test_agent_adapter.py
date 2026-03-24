@@ -10,6 +10,9 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapDependencyArtifact,
+    RoadmapDependencyReference,
+    RoadmapAdjustmentResult,
     RoadmapStartResult,
     ReviewReply,
 )
@@ -100,6 +103,85 @@ class DummyAdapter(AgentAdapter):
                 ),
             ),
             session=AgentSession(adapter="dummy", thread_id="th"),
+        )
+
+    def evaluate_roadmap_adjustment(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        ready_node_ids: tuple[str, ...],
+        dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        _ = (
+            issue,
+            repo_full_name,
+            default_branch,
+            coding_guidelines_path,
+            roadmap_doc_path,
+            graph_path,
+            graph_version,
+            ready_node_ids,
+            dependency_artifacts,
+            roadmap_status_report,
+            roadmap_markdown,
+            canonical_graph_json,
+            cwd,
+        )
+        return RoadmapAdjustmentResult(
+            action="proceed",
+            summary="Proceed",
+            details="The roadmap frontier can proceed.",
+        )
+
+    def author_requested_roadmap_revision(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        request_reason: str,
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        _ = (
+            issue,
+            repo_full_name,
+            default_branch,
+            coding_guidelines_path,
+            roadmap_doc_path,
+            graph_path,
+            graph_version,
+            request_reason,
+            roadmap_status_report,
+            roadmap_markdown,
+            canonical_graph_json,
+            cwd,
+        )
+        return RoadmapAdjustmentResult(
+            action="revise",
+            summary="Revise",
+            details="Author the requested revision.",
+            updated_roadmap_markdown="# Revised roadmap",
+            updated_canonical_graph_json=(
+                '{"nodes":[{"body_markdown":"Do it","depends_on":[],"kind":"small_job",'
+                '"node_id":"n1","title":"Ship"}],"roadmap_issue_number":1,"version":2}'
+            ),
         )
 
     def start_bugfix_from_issue(
@@ -229,6 +311,47 @@ def test_agent_adapter_data_model() -> None:
         recommended_node_count=7,
         cwd=Path("."),
     )
+    adjustment = adapter.evaluate_roadmap_adjustment(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        roadmap_doc_path="docs/roadmap/1-t.md",
+        graph_path="docs/roadmap/1-t.graph.json",
+        graph_version=1,
+        ready_node_ids=("n1",),
+        dependency_artifacts=(
+            RoadmapDependencyArtifact(
+                dependency_node_id="d1",
+                dependency_kind="small_job",
+                dependency_title="Dependency",
+                frontier_references=(
+                    RoadmapDependencyReference(ready_node_id="n1", requires="implemented"),
+                ),
+                child_issue_number=10,
+                child_issue_url="https://example/issues/10",
+                child_issue_title="Dependency issue",
+                child_issue_body="Dependency issue body",
+                issue_run_status="merged",
+                issue_run_branch="agent/impl/10-dependency",
+                issue_run_error=None,
+                resolution_markers=("issue_run_status=merged",),
+                pr_number=11,
+                pr_url="https://example/pr/11",
+                pr_title="Dependency PR",
+                pr_body="PR body",
+                pr_state="closed",
+                pr_merged=True,
+                changed_files=("src/a.py",),
+                review_summaries=(),
+                issue_comments=(),
+            ),
+        ),
+        roadmap_status_report="status",
+        roadmap_markdown="# Roadmap",
+        canonical_graph_json="{}",
+        cwd=Path("."),
+    )
     bugfix = adapter.start_bugfix_from_issue(
         issue=issue,
         repo_full_name="johnynek/mergexo",
@@ -263,6 +386,9 @@ def test_agent_adapter_data_model() -> None:
     assert start.session is not None
     assert start.session.thread_id == "th"
     assert roadmap.roadmap.title == "Roadmap"
+    assert adjustment.action == "proceed"
+    assert adjustment.updated_roadmap_markdown is None
+    assert adjustment.updated_canonical_graph_json is None
     assert bugfix.pr_title == "Fix bug"
     assert small_job.pr_title == "Small job"
     assert implementation.pr_title == "Implement design"

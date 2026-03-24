@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from mergexo.agent_adapter import FeedbackTurn
+from mergexo.agent_adapter import FeedbackTurn, RoadmapDependencyArtifact
 from mergexo.models import Issue
 
 
@@ -19,6 +19,76 @@ def _implementation_checks_line(*, coding_guidelines_path: str | None) -> str:
     if coding_guidelines_path:
         return f"  - Re-run formatting and CI-required checks from {coding_guidelines_path}."
     return "  - Re-run formatting and tests expected by this repo and target 100% test coverage."
+
+
+def _truncate_prompt_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 15] + "... [truncated]"
+
+
+def _roadmap_dependency_artifacts_json(
+    artifacts: tuple[RoadmapDependencyArtifact, ...],
+) -> str:
+    payload = [
+        {
+            "dependency_node_id": artifact.dependency_node_id,
+            "dependency_kind": artifact.dependency_kind,
+            "dependency_title": artifact.dependency_title,
+            "frontier_references": [
+                {
+                    "ready_node_id": reference.ready_node_id,
+                    "requires": reference.requires,
+                }
+                for reference in artifact.frontier_references
+            ],
+            "child_issue_number": artifact.child_issue_number,
+            "child_issue_url": artifact.child_issue_url,
+            "child_issue_title": artifact.child_issue_title,
+            "child_issue_body": (
+                _truncate_prompt_text(artifact.child_issue_body, max_chars=1200)
+                if artifact.child_issue_body is not None
+                else None
+            ),
+            "issue_run_status": artifact.issue_run_status,
+            "issue_run_branch": artifact.issue_run_branch,
+            "issue_run_error": (
+                _truncate_prompt_text(artifact.issue_run_error, max_chars=600)
+                if artifact.issue_run_error is not None
+                else None
+            ),
+            "resolution_markers": list(artifact.resolution_markers),
+            "pr_number": artifact.pr_number,
+            "pr_url": artifact.pr_url,
+            "pr_title": artifact.pr_title,
+            "pr_body": (
+                _truncate_prompt_text(artifact.pr_body, max_chars=1600)
+                if artifact.pr_body is not None
+                else None
+            ),
+            "pr_state": artifact.pr_state,
+            "pr_merged": artifact.pr_merged,
+            "changed_files": list(artifact.changed_files),
+            "review_summaries": [
+                {
+                    "user_login": comment.user_login,
+                    "body": _truncate_prompt_text(comment.body, max_chars=600),
+                    "html_url": comment.html_url,
+                }
+                for comment in artifact.review_summaries
+            ],
+            "issue_comments": [
+                {
+                    "user_login": comment.user_login,
+                    "body": _truncate_prompt_text(comment.body, max_chars=600),
+                    "html_url": comment.html_url,
+                }
+                for comment in artifact.issue_comments
+            ],
+        }
+        for artifact in artifacts
+    ]
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
 def build_design_prompt(
@@ -279,6 +349,168 @@ Issue URL:
 
 Issue body:
 {issue.body}
+""".strip()
+
+
+def build_roadmap_adjustment_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    coding_guidelines_path: str | None,
+    roadmap_doc_path: str,
+    graph_path: str,
+    graph_version: int,
+    ready_node_ids: tuple[str, ...],
+    dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
+    roadmap_status_report: str,
+    roadmap_markdown: str,
+    canonical_graph_json: str,
+) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    ready_frontier_json = json.dumps(list(ready_node_ids), separators=(",", ":"))
+    dependency_artifacts_json = _roadmap_dependency_artifacts_json(dependency_artifacts)
+    return f"""
+You are the roadmap-adjustment agent for repository {repo_full_name}.
+
+Task:
+- Evaluate whether roadmap issue #{issue.number} should proceed with its ready frontier or pause for a same-roadmap revision.
+- Base branch is: {default_branch}
+{coding_guidelines_lines}
+
+Decision rules:
+- Return `action = "proceed"` when the current roadmap still looks sound for the ready frontier.
+- Return `action = "revise"` when the roadmap should change before issuing more child work.
+- Return `action = "abandon"` only when continuing the roadmap is no longer viable.
+- Prefer `proceed` unless the current roadmap is materially wrong.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Required output fields:
+- `action`: one of `proceed`, `revise`, `abandon`
+- `summary`: short rationale
+- `details`: full rationale, referencing the ready frontier and the current roadmap state
+- `updated_roadmap_markdown`: string or null
+- `updated_graph_json`: object or null
+
+Payload rules:
+- When `action = "revise"`, set both `updated_roadmap_markdown` and `updated_graph_json`.
+- When `action` is `proceed` or `abandon`, set both `updated_roadmap_markdown` and `updated_graph_json` to null.
+- `updated_roadmap_markdown` must be the full revised markdown body for `{roadmap_doc_path}`.
+- `updated_graph_json` must be a valid revised roadmap graph object for issue #{issue.number}.
+- The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
+- Keep the revised graph internally consistent with the revised markdown narrative.
+
+Current roadmap metadata:
+- roadmap markdown path: {roadmap_doc_path}
+- roadmap graph path: {graph_path}
+- roadmap graph version: {graph_version}
+- ready frontier node_ids: {ready_frontier_json}
+- dependency artifacts JSON: {dependency_artifacts_json}
+
+Roadmap issue title:
+{issue.title}
+
+Roadmap issue URL:
+{issue.html_url}
+
+Roadmap issue body:
+{issue.body}
+
+Current roadmap markdown ({roadmap_doc_path}):
+{roadmap_markdown}
+
+Current canonical roadmap graph JSON ({graph_path}):
+{canonical_graph_json}
+
+Current roadmap status report:
+{roadmap_status_report}
+
+Dependency artifacts for the ready frontier:
+{dependency_artifacts_json}
+""".strip()
+
+
+def build_requested_roadmap_revision_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    coding_guidelines_path: str | None,
+    roadmap_doc_path: str,
+    graph_path: str,
+    graph_version: int,
+    request_reason: str,
+    roadmap_status_report: str,
+    roadmap_markdown: str,
+    canonical_graph_json: str,
+) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    return f"""
+You are the roadmap-revision agent for repository {repo_full_name}.
+
+Task:
+- A same-roadmap revision has been explicitly requested for roadmap issue #{issue.number}.
+- Base branch is: {default_branch}
+{coding_guidelines_lines}
+
+Decision rules:
+- Return `action = "revise"` when you can author a revised roadmap safely.
+- Return `action = "abandon"` only when the roadmap should be abandoned instead of revised.
+- Do not return `action = "proceed"` for this task.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Required output fields:
+- `action`: one of `proceed`, `revise`, `abandon`
+- `summary`: short rationale
+- `details`: full rationale for the requested revision
+- `updated_roadmap_markdown`: string or null
+- `updated_graph_json`: object or null
+
+Payload rules:
+- When `action = "revise"`, set both `updated_roadmap_markdown` and `updated_graph_json`.
+- When `action = "abandon"`, set both `updated_roadmap_markdown` and `updated_graph_json` to null.
+- `updated_roadmap_markdown` must be the full revised markdown body for `{roadmap_doc_path}`.
+- `updated_graph_json` must be a valid revised roadmap graph object for issue #{issue.number}.
+- The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
+- Keep the revised graph internally consistent with the revised markdown narrative.
+
+Revision request reason:
+{request_reason}
+
+Current roadmap metadata:
+- roadmap markdown path: {roadmap_doc_path}
+- roadmap graph path: {graph_path}
+- roadmap graph version: {graph_version}
+
+Roadmap issue title:
+{issue.title}
+
+Roadmap issue URL:
+{issue.html_url}
+
+Roadmap issue body:
+{issue.body}
+
+Current roadmap markdown ({roadmap_doc_path}):
+{roadmap_markdown}
+
+Current canonical roadmap graph JSON ({graph_path}):
+{canonical_graph_json}
+
+Current roadmap status report:
+{roadmap_status_report}
 """.strip()
 
 

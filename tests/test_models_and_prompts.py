@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from mergexo.agent_adapter import FeedbackTurn
+from mergexo.agent_adapter import (
+    FeedbackTurn,
+    RoadmapDependencyArtifact,
+    RoadmapDependencyReference,
+)
 from mergexo import __version__
 from mergexo.models import (
     FlakyTestReport,
@@ -25,6 +29,8 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_requested_roadmap_revision_prompt,
+    build_roadmap_adjustment_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
 )
@@ -239,6 +245,112 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "under 32000 characters" in prompt
     assert "If flaky_test_report is non-null, commit_message MUST be null." in prompt
     assert '"escalation"' in prompt
+
+
+def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
+    issue = Issue(
+        number=22,
+        title="Roadmap",
+        body="Continue implementing the roadmap.",
+        html_url="https://example/issue/22",
+        labels=("agent:roadmap",),
+    )
+
+    prompt = build_roadmap_adjustment_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        roadmap_doc_path="docs/roadmap/22-roadmap.md",
+        graph_path="docs/roadmap/22-roadmap.graph.json",
+        graph_version=3,
+        ready_node_ids=("n2", "n3"),
+        dependency_artifacts=(
+            RoadmapDependencyArtifact(
+                dependency_node_id="n1",
+                dependency_kind="small_job",
+                dependency_title="Dependency",
+                frontier_references=(
+                    RoadmapDependencyReference(ready_node_id="n2", requires="implemented"),
+                    RoadmapDependencyReference(ready_node_id="n3", requires="planned"),
+                ),
+                child_issue_number=201,
+                child_issue_url="https://example/issues/201",
+                child_issue_title="Dependency issue",
+                child_issue_body="Dependency issue body " + ("x" * 1300),
+                issue_run_status="merged",
+                issue_run_branch="agent/impl/201-dependency",
+                issue_run_error="Needs follow-up " + ("e" * 700),
+                resolution_markers=("issue_run_status=merged",),
+                pr_number=301,
+                pr_url="https://example/pr/301",
+                pr_title="Dependency PR",
+                pr_body="PR body " + ("p" * 1700),
+                pr_state="closed",
+                pr_merged=True,
+                changed_files=("src/dep.py",),
+                review_summaries=(),
+                issue_comments=(
+                    PullRequestIssueComment(
+                        comment_id=1,
+                        body="This changed the interface. " + ("c" * 700),
+                        user_login="reviewer",
+                        html_url="https://example/comment/1",
+                        created_at="t1",
+                        updated_at="t2",
+                    ),
+                ),
+            ),
+        ),
+        roadmap_status_report="status report",
+        roadmap_markdown="# Roadmap",
+        canonical_graph_json='{"roadmap_issue_number":22}',
+    )
+
+    assert "roadmap-adjustment agent" in prompt
+    assert '`action = "proceed"`' in prompt
+    assert '`action = "revise"`' in prompt
+    assert '`action = "abandon"`' in prompt
+    assert "`updated_roadmap_markdown`" in prompt
+    assert "`updated_graph_json`" in prompt
+    assert "bump the graph `version` from 3 to 4" in prompt
+    assert "ready frontier node_ids" in prompt
+    assert '["n2","n3"]' in prompt
+    assert '"dependency_node_id":"n1"' in prompt
+    assert '"pr_title":"Dependency PR"' in prompt
+    assert "... [truncated]" in prompt
+    assert "docs/roadmap/22-roadmap.graph.json" in prompt
+    assert "status report" in prompt
+
+
+def test_build_requested_roadmap_revision_prompt_contains_request_contract() -> None:
+    issue = Issue(
+        number=23,
+        title="Revise roadmap",
+        body="Please revise the roadmap.",
+        html_url="https://example/issue/23",
+        labels=("agent:roadmap", "agent:roadmap-revise"),
+    )
+
+    prompt = build_requested_roadmap_revision_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        roadmap_doc_path="docs/roadmap/23-roadmap.md",
+        graph_path="docs/roadmap/23-roadmap.graph.json",
+        graph_version=5,
+        request_reason="operator requested roadmap revision",
+        roadmap_status_report="status report",
+        roadmap_markdown="# Roadmap",
+        canonical_graph_json='{"roadmap_issue_number":23}',
+    )
+
+    assert "roadmap-revision agent" in prompt
+    assert 'Do not return `action = "proceed"`' in prompt
+    assert "operator requested roadmap revision" in prompt
+    assert "docs/roadmap/23-roadmap.md" in prompt
+    assert "bump the graph `version` from 5 to 6" in prompt
 
 
 def test_build_bugfix_prompt_requires_regression_tests() -> None:

@@ -15,6 +15,9 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapAdjustmentAction,
+    RoadmapDependencyArtifact,
+    RoadmapAdjustmentResult,
     RoadmapStartResult,
     ReviewReply,
 )
@@ -32,6 +35,8 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_requested_roadmap_revision_prompt,
+    build_roadmap_adjustment_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
 )
@@ -91,6 +96,28 @@ _ROADMAP_OUTPUT_SCHEMA: dict[str, object] = {
         "summary": {"type": "string", "minLength": 1},
         "roadmap_markdown": {"type": "string", "minLength": 1},
         "graph_json": {"type": "object"},
+    },
+}
+
+_ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "action",
+        "summary",
+        "details",
+        "updated_roadmap_markdown",
+        "updated_graph_json",
+    ],
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["proceed", "revise", "abandon"],
+        },
+        "summary": {"type": "string", "minLength": 1},
+        "details": {"type": "string", "minLength": 1},
+        "updated_roadmap_markdown": {"type": ["string", "null"]},
+        "updated_graph_json": {"type": ["object", "null"]},
     },
 }
 
@@ -329,6 +356,83 @@ class CodexAdapter(AgentAdapter):
             prompt=prompt,
             cwd=cwd,
         )
+
+    def evaluate_roadmap_adjustment(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        ready_node_ids: tuple[str, ...],
+        dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        prompt = build_roadmap_adjustment_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+            roadmap_doc_path=roadmap_doc_path,
+            graph_path=graph_path,
+            graph_version=graph_version,
+            ready_node_ids=ready_node_ids,
+            dependency_artifacts=dependency_artifacts,
+            roadmap_status_report=roadmap_status_report,
+            roadmap_markdown=roadmap_markdown,
+            canonical_graph_json=canonical_graph_json,
+        )
+        return self._run_roadmap_adjustment_turn(
+            prompt=prompt,
+            cwd=cwd,
+            expected_issue_number=issue.number,
+            current_graph_version=graph_version,
+        )
+
+    def author_requested_roadmap_revision(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        request_reason: str,
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        prompt = build_requested_roadmap_revision_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+            roadmap_doc_path=roadmap_doc_path,
+            graph_path=graph_path,
+            graph_version=graph_version,
+            request_reason=request_reason,
+            roadmap_status_report=roadmap_status_report,
+            roadmap_markdown=roadmap_markdown,
+            canonical_graph_json=canonical_graph_json,
+        )
+        result = self._run_roadmap_adjustment_turn(
+            prompt=prompt,
+            cwd=cwd,
+            expected_issue_number=issue.number,
+            current_graph_version=graph_version,
+        )
+        if result.action == "proceed":
+            raise RuntimeError("requested roadmap revision authoring must not return proceed")
+        return result
 
     def start_implementation_from_design(
         self,
@@ -719,6 +823,78 @@ class CodexAdapter(AgentAdapter):
                 escalation=escalation,
             ),
             _extract_thread_id(raw_events),
+        )
+
+    def _run_roadmap_adjustment_turn(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+        expected_issue_number: int,
+        current_graph_version: int,
+    ) -> RoadmapAdjustmentResult:
+        if not self._config.enabled:
+            raise RuntimeError("Codex is disabled in config")
+
+        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "schema.json"
+            output_path = tmp_path / "last_message.txt"
+            schema_path.write_text(
+                json.dumps(_ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA),
+                encoding="utf-8",
+            )
+
+            cmd = [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            self._append_common_options(cmd)
+            run(cmd, cwd=cwd, input_text=prompt)
+
+            raw = output_path.read_text(encoding="utf-8").strip()
+            payload = _parse_json_payload(raw)
+
+        action = _require_str(payload, "action")
+        if action not in {"proceed", "revise", "abandon"}:
+            raise RuntimeError("action must be one of: proceed, revise, abandon")
+        updated_roadmap_markdown = _optional_output_text(payload.get("updated_roadmap_markdown"))
+        updated_graph_json_payload = payload.get("updated_graph_json")
+        updated_canonical_graph_json: str | None = None
+        if action == "revise":
+            if updated_roadmap_markdown is None:
+                raise RuntimeError("revise action requires non-null updated_roadmap_markdown")
+            updated_graph_json = _as_object_dict(updated_graph_json_payload)
+            if updated_graph_json is None:
+                raise RuntimeError("revise action requires non-null updated_graph_json object")
+            parsed_graph = parse_roadmap_graph_object(
+                updated_graph_json, expected_issue_number=expected_issue_number
+            )
+            expected_version = current_graph_version + 1
+            if parsed_graph.graph.version != expected_version:
+                raise RuntimeError(
+                    "revise action must bump roadmap graph version by exactly 1: "
+                    f"expected {expected_version}, got {parsed_graph.graph.version}"
+                )
+            updated_canonical_graph_json = parsed_graph.canonical_json
+        else:
+            if updated_roadmap_markdown is not None or updated_graph_json_payload is not None:
+                raise RuntimeError(
+                    "proceed and abandon actions must set updated roadmap payload fields to null"
+                )
+        return RoadmapAdjustmentResult(
+            action=cast(RoadmapAdjustmentAction, action),
+            summary=_require_str(payload, "summary"),
+            details=_require_str(payload, "details"),
+            updated_roadmap_markdown=updated_roadmap_markdown,
+            updated_canonical_graph_json=updated_canonical_graph_json,
         )
 
     def _append_common_options(self, cmd: list[str]) -> None:

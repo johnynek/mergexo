@@ -125,6 +125,23 @@ def compute_roadmap_revision_escalation_token(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def compute_roadmap_adjustment_decision_token(
+    *,
+    roadmap_issue_number: int,
+    graph_version: int,
+    ready_node_ids: tuple[str, ...],
+    action: str,
+    summary: str,
+) -> str:
+    """Return an idempotency token for roadmap adjustment decision comments."""
+    frontier = ",".join(ready_node_ids)
+    payload = (
+        f"roadmap_adjustment_decision:{roadmap_issue_number}:{graph_version}:{frontier}:"
+        f"{action}:{summary}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def compute_roadmap_graph_drift_token(*, roadmap_issue_number: int, graph_checksum: str) -> str:
     """Return an idempotency token for roadmap graph drift/mismatch notifications."""
     payload = f"roadmap_graph_drift:{roadmap_issue_number}:{graph_checksum}"

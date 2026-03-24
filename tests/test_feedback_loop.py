@@ -9,6 +9,7 @@ from mergexo.feedback_loop import (
     compute_history_rewrite_token,
     compute_operator_command_token,
     compute_pre_pr_checkpoint_token,
+    compute_roadmap_adjustment_decision_token,
     compute_roadmap_graph_drift_token,
     compute_roadmap_node_issue_token,
     compute_roadmap_revision_escalation_token,
@@ -160,6 +161,30 @@ def test_roadmap_tokens_are_stable_and_specific() -> None:
     )
     assert escalation_a == escalation_b
     assert escalation_a != escalation_c
+
+    adjustment_a = compute_roadmap_adjustment_decision_token(
+        roadmap_issue_number=44,
+        graph_version=3,
+        ready_node_ids=("n2", "n3"),
+        action="revise",
+        summary="Need revision",
+    )
+    adjustment_b = compute_roadmap_adjustment_decision_token(
+        roadmap_issue_number=44,
+        graph_version=3,
+        ready_node_ids=("n2", "n3"),
+        action="revise",
+        summary="Need revision",
+    )
+    adjustment_c = compute_roadmap_adjustment_decision_token(
+        roadmap_issue_number=44,
+        graph_version=3,
+        ready_node_ids=("n2",),
+        action="revise",
+        summary="Need revision",
+    )
+    assert adjustment_a == adjustment_b
+    assert adjustment_a != adjustment_c
 
     drift_a = compute_roadmap_graph_drift_token(roadmap_issue_number=44, graph_checksum="abc")
     drift_b = compute_roadmap_graph_drift_token(roadmap_issue_number=44, graph_checksum="abc")

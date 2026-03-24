@@ -13,6 +13,8 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    RoadmapDependencyRequirement,
+    RoadmapNodeKind,
     RoadmapRevisionEscalation,
 )
 
@@ -52,11 +54,52 @@ class ReviewReply:
 
 
 GitOpName = Literal["fetch_origin", "merge_origin_default_branch"]
+RoadmapAdjustmentAction = Literal["proceed", "revise", "abandon"]
 
 
 @dataclass(frozen=True)
 class GitOpRequest:
     op: GitOpName
+
+
+@dataclass(frozen=True)
+class RoadmapDependencyReference:
+    ready_node_id: str
+    requires: RoadmapDependencyRequirement
+
+
+@dataclass(frozen=True)
+class RoadmapDependencyArtifact:
+    dependency_node_id: str
+    dependency_kind: RoadmapNodeKind
+    dependency_title: str
+    frontier_references: tuple[RoadmapDependencyReference, ...]
+    child_issue_number: int | None
+    child_issue_url: str | None
+    child_issue_title: str | None
+    child_issue_body: str | None
+    issue_run_status: str | None
+    issue_run_branch: str | None
+    issue_run_error: str | None
+    resolution_markers: tuple[str, ...]
+    pr_number: int | None
+    pr_url: str | None
+    pr_title: str | None
+    pr_body: str | None
+    pr_state: str | None
+    pr_merged: bool | None
+    changed_files: tuple[str, ...]
+    review_summaries: tuple[PullRequestIssueComment, ...]
+    issue_comments: tuple[PullRequestIssueComment, ...]
+
+
+@dataclass(frozen=True)
+class RoadmapAdjustmentResult:
+    action: RoadmapAdjustmentAction
+    summary: str
+    details: str
+    updated_roadmap_markdown: str | None = None
+    updated_canonical_graph_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +148,45 @@ class AgentAdapter(ABC):
         cwd: Path,
     ) -> RoadmapStartResult:
         """Start a roadmap PR lifecycle from an issue and produce roadmap artifacts."""
+
+    @abstractmethod
+    def evaluate_roadmap_adjustment(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        ready_node_ids: tuple[str, ...],
+        dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        """Decide whether a ready roadmap frontier should proceed, revise, or abandon."""
+
+    @abstractmethod
+    def author_requested_roadmap_revision(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        request_reason: str,
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        """Author a same-roadmap revision requested by an operator or escalation."""
 
     @abstractmethod
     def start_bugfix_from_issue(
