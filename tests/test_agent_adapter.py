@@ -143,6 +143,47 @@ class DummyAdapter(AgentAdapter):
             details="The roadmap frontier can proceed.",
         )
 
+    def author_requested_roadmap_revision(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        request_reason: str,
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        _ = (
+            issue,
+            repo_full_name,
+            default_branch,
+            coding_guidelines_path,
+            roadmap_doc_path,
+            graph_path,
+            graph_version,
+            request_reason,
+            roadmap_status_report,
+            roadmap_markdown,
+            canonical_graph_json,
+            cwd,
+        )
+        return RoadmapAdjustmentResult(
+            action="revise",
+            summary="Revise",
+            details="Author the requested revision.",
+            updated_roadmap_markdown="# Revised roadmap",
+            updated_canonical_graph_json=(
+                '{"nodes":[{"body_markdown":"Do it","depends_on":[],"kind":"small_job",'
+                '"node_id":"n1","title":"Ship"}],"roadmap_issue_number":1,"version":2}'
+            ),
+        )
+
     def start_bugfix_from_issue(
         self,
         *,

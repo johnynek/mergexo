@@ -1189,6 +1189,9 @@ class Phase1Orchestrator:
                     )
                 if refreshed.status != "active":
                     continue
+                if refreshed.adjustment_state == "awaiting_revision_merge":
+                    blocked_roadmaps_by_adjustment.add(refreshed.roadmap_issue_number)
+                    continue
                 if not self._verify_roadmap_graph_checksum(
                     roadmap=refreshed, checkout_path=lease.path
                 ):
@@ -1707,6 +1710,11 @@ class Phase1Orchestrator:
             return roadmap
         if roadmap.adjustment_state != "awaiting_revision_merge":
             return roadmap
+        if roadmap.pending_revision_pr_number is None:
+            return self._maybe_author_requested_roadmap_revision(
+                roadmap=roadmap,
+                checkout_path=checkout_path,
+            )
         graph_path = checkout_path / roadmap.graph_path
         if not graph_path.exists():
             self._state.set_roadmap_last_error(
@@ -1935,6 +1943,113 @@ class Phase1Orchestrator:
         )
         return updated
 
+    def _maybe_author_requested_roadmap_revision(
+        self, *, roadmap: RoadmapStateRecord, checkout_path: Path
+    ) -> RoadmapStateRecord:
+        request_reason = roadmap.last_error or "same-roadmap revision requested"
+        if not self._verify_roadmap_graph_checksum(roadmap=roadmap, checkout_path=checkout_path):
+            refreshed = self._state.get_roadmap_state(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return refreshed or roadmap
+        try:
+            context = self._build_roadmap_adjustment_context(
+                roadmap=roadmap,
+                ready_node_ids=(),
+                checkout_path=checkout_path,
+            )
+            decision = self._agent.author_requested_roadmap_revision(
+                issue=context.issue,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                coding_guidelines_path=self._coding_guidelines_path_for_checkout(
+                    checkout_path=checkout_path
+                ),
+                roadmap_doc_path=roadmap.roadmap_doc_path,
+                graph_path=roadmap.graph_path,
+                graph_version=roadmap.graph_version,
+                request_reason=request_reason,
+                roadmap_status_report=context.status_report,
+                roadmap_markdown=context.roadmap_markdown,
+                canonical_graph_json=context.canonical_graph_json,
+                cwd=checkout_path,
+            )
+            if decision.action == "abandon":
+                self._abandon_roadmap(
+                    roadmap=roadmap,
+                    reason=f"{decision.summary}\n\n{decision.details}".strip(),
+                )
+                refreshed = self._state.get_roadmap_state(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                return refreshed or roadmap
+            if decision.action != "revise":
+                raise RuntimeError(
+                    "manual roadmap revision authoring must return revise or abandon"
+                )
+            revision_pr = self._open_or_update_roadmap_revision_pr(
+                roadmap=roadmap,
+                decision=decision,
+                checkout_path=checkout_path,
+            )
+            if not self._state.set_roadmap_adjustment_request_version(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                request_version=revision_pr.graph_version,
+                repo_full_name=self._state_repo_full_name(),
+            ):
+                raise RuntimeError("failed to persist requested roadmap revision version")
+            if not self._state.set_roadmap_pending_revision_pr(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                pr_number=revision_pr.pull_request.number,
+                pr_url=revision_pr.pull_request.html_url,
+                head_sha=revision_pr.head_sha,
+                repo_full_name=self._state_repo_full_name(),
+            ):
+                raise RuntimeError("failed to persist requested roadmap revision pull request")
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=decision.summary,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_adjustment_decision_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_version=roadmap.graph_version,
+                ready_node_ids=(),
+                action=decision.action,
+                summary=decision.summary,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO auto-authored a same-roadmap revision PR from a manual revision "
+                    "request.\n"
+                    f"- request reason: {request_reason}\n"
+                    f"- revision PR: {revision_pr.pull_request.html_url}\n"
+                    f"- revision branch: `{revision_pr.branch}`\n"
+                    f"- target graph version: `{revision_pr.graph_version}`\n"
+                    f"- summary: {decision.summary}\n\n"
+                    f"{decision.details}"
+                ),
+                source="roadmap_manual_revision_pr_opened",
+                repo_full_name=self._state_repo_full_name(),
+            )
+        except Exception as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"roadmap revision authoring failed: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        refreshed = self._state.get_roadmap_state(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return refreshed or roadmap
+
     def _verify_roadmap_graph_checksum(
         self, *, roadmap: RoadmapStateRecord, checkout_path: Path
     ) -> bool:
@@ -1961,7 +2076,32 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
             )
             return False
-        graph_raw = graph_path.read_text(encoding="utf-8")
+        try:
+            graph_raw = graph_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"unreadable graph file: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="unreadable",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO blocked roadmap fan-out because the canonical graph file is "
+                    "unreadable.\n"
+                    f"- path: `{roadmap.graph_path}`\n"
+                    f"- read error: {exc}"
+                ),
+                source="roadmap_graph_drift_unreadable",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
         try:
             parsed = parse_roadmap_graph_json(
                 graph_raw,

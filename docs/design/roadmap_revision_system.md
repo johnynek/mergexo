@@ -42,9 +42,12 @@ The current branch already contains the enabling foundation:
    interruption.
 9. `/roadmap status` now includes pending revision PR details, the latest known
    roadmap note, and recent applied roadmap versions.
+10. Manual revision requests from labels or escalations now auto-author a
+    same-roadmap revision PR through a dedicated revision-authoring turn, while
+    invalid canonical graph inputs fail explicitly instead of opening a broken
+    PR.
 
-This is enough to support manual same-roadmap revision, but it is not yet the
-full continuous-adjustment system.
+This branch now implements the full checkpoint plan described in this document.
 
 ## Complete Steps
 
@@ -96,6 +99,13 @@ full continuous-adjustment system.
   note, and recent applied roadmap versions; the state layer exposes recent
   revision history directly, and the richer report is also threaded through the
   adjustment context.
+- Checkpoint 9 completed: manual revision requests now close the loop instead
+  of pausing indefinitely. A dedicated revision-authoring turn asks the agent
+  to produce a concrete same-roadmap revision payload, the orchestrator opens
+  the corresponding revision branch and PR when the canonical graph is valid,
+  and explicit failure handling now covers invalid authoring decisions,
+  persistence failures, unreadable tracked graph files, and preflight graph
+  validation errors without regressing `./scripts/test.sh`.
 
 ## Current Job
 
@@ -103,9 +113,8 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 
 ## Remaining Work
 
-- Manual revision requests from labels or escalations still do not auto-author
-  a roadmap update PR, because those paths do not yet produce a concrete
-  revised roadmap payload.
+No remaining implementation gaps are currently recorded in this checkpoint
+plan.
 
 ## Target End State
 

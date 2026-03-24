@@ -35,6 +35,7 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_requested_roadmap_revision_prompt,
     build_roadmap_adjustment_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
@@ -393,6 +394,45 @@ class CodexAdapter(AgentAdapter):
             expected_issue_number=issue.number,
             current_graph_version=graph_version,
         )
+
+    def author_requested_roadmap_revision(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        request_reason: str,
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        prompt = build_requested_roadmap_revision_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            coding_guidelines_path=coding_guidelines_path,
+            roadmap_doc_path=roadmap_doc_path,
+            graph_path=graph_path,
+            graph_version=graph_version,
+            request_reason=request_reason,
+            roadmap_status_report=roadmap_status_report,
+            roadmap_markdown=roadmap_markdown,
+            canonical_graph_json=canonical_graph_json,
+        )
+        result = self._run_roadmap_adjustment_turn(
+            prompt=prompt,
+            cwd=cwd,
+            expected_issue_number=issue.number,
+            current_graph_version=graph_version,
+        )
+        if result.action == "proceed":
+            raise RuntimeError("requested roadmap revision authoring must not return proceed")
+        return result
 
     def start_implementation_from_design(
         self,

@@ -29,6 +29,7 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_requested_roadmap_revision_prompt,
     build_roadmap_adjustment_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
@@ -320,6 +321,36 @@ def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
     assert "... [truncated]" in prompt
     assert "docs/roadmap/22-roadmap.graph.json" in prompt
     assert "status report" in prompt
+
+
+def test_build_requested_roadmap_revision_prompt_contains_request_contract() -> None:
+    issue = Issue(
+        number=23,
+        title="Revise roadmap",
+        body="Please revise the roadmap.",
+        html_url="https://example/issue/23",
+        labels=("agent:roadmap", "agent:roadmap-revise"),
+    )
+
+    prompt = build_requested_roadmap_revision_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        coding_guidelines_path="docs/python_style.md",
+        roadmap_doc_path="docs/roadmap/23-roadmap.md",
+        graph_path="docs/roadmap/23-roadmap.graph.json",
+        graph_version=5,
+        request_reason="operator requested roadmap revision",
+        roadmap_status_report="status report",
+        roadmap_markdown="# Roadmap",
+        canonical_graph_json='{"roadmap_issue_number":23}',
+    )
+
+    assert "roadmap-revision agent" in prompt
+    assert 'Do not return `action = "proceed"`' in prompt
+    assert "operator requested roadmap revision" in prompt
+    assert "docs/roadmap/23-roadmap.md" in prompt
+    assert "bump the graph `version` from 5 to 6" in prompt
 
 
 def test_build_bugfix_prompt_requires_regression_tests() -> None:

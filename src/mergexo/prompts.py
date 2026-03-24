@@ -436,6 +436,84 @@ Dependency artifacts for the ready frontier:
 """.strip()
 
 
+def build_requested_roadmap_revision_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    coding_guidelines_path: str | None,
+    roadmap_doc_path: str,
+    graph_path: str,
+    graph_version: int,
+    request_reason: str,
+    roadmap_status_report: str,
+    roadmap_markdown: str,
+    canonical_graph_json: str,
+) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    return f"""
+You are the roadmap-revision agent for repository {repo_full_name}.
+
+Task:
+- A same-roadmap revision has been explicitly requested for roadmap issue #{issue.number}.
+- Base branch is: {default_branch}
+{coding_guidelines_lines}
+
+Decision rules:
+- Return `action = "revise"` when you can author a revised roadmap safely.
+- Return `action = "abandon"` only when the roadmap should be abandoned instead of revised.
+- Do not return `action = "proceed"` for this task.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+Required output fields:
+- `action`: one of `proceed`, `revise`, `abandon`
+- `summary`: short rationale
+- `details`: full rationale for the requested revision
+- `updated_roadmap_markdown`: string or null
+- `updated_graph_json`: object or null
+
+Payload rules:
+- When `action = "revise"`, set both `updated_roadmap_markdown` and `updated_graph_json`.
+- When `action = "abandon"`, set both `updated_roadmap_markdown` and `updated_graph_json` to null.
+- `updated_roadmap_markdown` must be the full revised markdown body for `{roadmap_doc_path}`.
+- `updated_graph_json` must be a valid revised roadmap graph object for issue #{issue.number}.
+- The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
+- Keep the revised graph internally consistent with the revised markdown narrative.
+
+Revision request reason:
+{request_reason}
+
+Current roadmap metadata:
+- roadmap markdown path: {roadmap_doc_path}
+- roadmap graph path: {graph_path}
+- roadmap graph version: {graph_version}
+
+Roadmap issue title:
+{issue.title}
+
+Roadmap issue URL:
+{issue.html_url}
+
+Roadmap issue body:
+{issue.body}
+
+Current roadmap markdown ({roadmap_doc_path}):
+{roadmap_markdown}
+
+Current canonical roadmap graph JSON ({graph_path}):
+{canonical_graph_json}
+
+Current roadmap status report:
+{roadmap_status_report}
+""".strip()
+
+
 def build_feedback_prompt(*, turn: FeedbackTurn) -> str:
     review_comments = [
         {

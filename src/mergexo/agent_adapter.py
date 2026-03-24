@@ -170,6 +170,25 @@ class AgentAdapter(ABC):
         """Decide whether a ready roadmap frontier should proceed, revise, or abandon."""
 
     @abstractmethod
+    def author_requested_roadmap_revision(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        coding_guidelines_path: str | None,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_version: int,
+        request_reason: str,
+        roadmap_status_report: str,
+        roadmap_markdown: str,
+        canonical_graph_json: str,
+        cwd: Path,
+    ) -> RoadmapAdjustmentResult:
+        """Author a same-roadmap revision requested by an operator or escalation."""
+
+    @abstractmethod
     def start_bugfix_from_issue(
         self,
         *,
