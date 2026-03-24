@@ -229,6 +229,49 @@ def test_create_issue_rejects_non_object_payload(monkeypatch: pytest.MonkeyPatch
         gateway.create_issue(title="x", body="y")
 
 
+def test_close_issue_updates_state_via_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self
+        calls.append((method, path, payload))
+        return {"number": 7, "state": "closed"}
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    gateway.close_issue(7)
+
+    assert calls == [("PATCH", "/repos/o/r/issues/7", {"state": "closed"})]
+
+
+def test_close_issue_rejects_non_positive_issue_number() -> None:
+    gateway = GitHubGateway("o", "r")
+    with pytest.raises(ValueError, match="issue_number must be >= 1"):
+        gateway.close_issue(0)
+
+
+def test_close_issue_raises_when_patch_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = GitHubGateway("o", "r")
+
+    def fake_api(
+        self: GitHubGateway,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+    ) -> object:
+        _ = self, method, path, payload
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+    with pytest.raises(RuntimeError, match="boom"):
+        gateway.close_issue(7)
+
+
 def test_rerun_workflow_run_failed_jobs_uses_rerun_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -5,6 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import logging
@@ -22,6 +23,10 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapDependencyArtifact,
+    RoadmapDependencyReference,
+    RoadmapAdjustmentResult,
+    RoadmapStartResult,
 )
 from mergexo.codex_adapter import CodexAdapter, CodexInvocationHooks
 from mergexo.config import AppConfig, RepoConfig
@@ -35,6 +40,11 @@ from mergexo.feedback_loop import (
     compute_history_rewrite_token,
     compute_operator_command_token,
     compute_pre_pr_checkpoint_token,
+    compute_roadmap_adjustment_decision_token,
+    compute_roadmap_graph_drift_token,
+    compute_roadmap_node_issue_token,
+    compute_roadmap_revision_escalation_token,
+    compute_roadmap_status_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
     compute_turn_key,
@@ -56,6 +66,7 @@ from mergexo.github_gateway import (
 from mergexo.models import (
     FlakyTestReport,
     GeneratedDesign,
+    GeneratedRoadmap,
     Issue,
     IssueFlow,
     OperatorCommandRecord,
@@ -69,6 +80,7 @@ from mergexo.models import (
     PullRequestReviewComment,
     WorkflowJobSnapshot,
     WorkflowRunSnapshot,
+    RoadmapRevisionEscalation,
     WorkResult,
 )
 from mergexo.observability import log_event, logging_repo_context
@@ -77,8 +89,14 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_roadmap_prompt,
     build_small_job_prompt,
 )
+from mergexo.roadmap_parser import (
+    RoadmapGraphValidationError,
+    parse_roadmap_graph_json,
+)
+from mergexo.roadmap_transition_validator import RoadmapGraphTransitionError
 from mergexo.shell import (
     CommandError,
     CommandTimeoutError,
@@ -97,9 +115,19 @@ from mergexo.state import (
     GitHubCommentSurface,
     GitHubCommentPollCursorState,
     ImplementationCandidateState,
+    IssueRunRecord,
     PendingFeedbackEvent,
     PollCursorUpdate,
     PrePrFollowupState,
+    RoadmapDependencyState,
+    RoadmapNodeGraphInput,
+    RoadmapNodeRecord,
+    RoadmapRevisionDraftRecord,
+    RoadmapRevisionRecord,
+    RoadmapStateRecord,
+    RoadmapStatusSnapshotRow,
+    RoadmapBlockerRow,
+    ReadyRoadmapNodeClaim,
     StateStore,
     TrackedPullRequestState,
 )
@@ -127,7 +155,9 @@ _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "required pre-push tests did not pass after automated repair attempts",
     "new_issue_comments_pending",
 )
-_PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(r"(bugfix|small-job|implementation) flow blocked:")
+_PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(
+    r"(bugfix|small-job|roadmap|implementation) flow blocked:"
+)
 _COMMENT_CURSOR_EPOCH = "1970-01-01T00:00:00Z"
 _SURFACE_PR_REVIEW_COMMENTS: GitHubCommentSurface = "pr_review_comments"
 _SURFACE_PR_REVIEW_SUMMARIES: GitHubCommentSurface = "pr_review_summaries"
@@ -159,7 +189,7 @@ _FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS = 4
 _FEEDBACK_TRANSIENT_GIT_INITIAL_DELAY_SECONDS = 5
 _FEEDBACK_TRANSIENT_GIT_MAX_DELAY_SECONDS = 60
 
-PrePrFlow = Literal["design_doc", "bugfix", "small_job", "implementation"]
+PrePrFlow = Literal["design_doc", "bugfix", "small_job", "roadmap", "implementation"]
 
 
 @dataclass(frozen=True)
@@ -215,6 +245,42 @@ class _CreatePullRequestOutboxPayload:
     head: str
     base: str
     body: str
+
+
+@dataclass(frozen=True)
+class _CreateIssueOutboxPayload:
+    roadmap_issue_number: int
+    node_id: str
+    title: str
+    body: str
+    labels: tuple[str, ...]
+    marker: str
+
+
+@dataclass(frozen=True)
+class _PostIssueCommentOutboxPayload:
+    issue_number: int
+    token: str
+    body: str
+    source: str
+
+
+@dataclass(frozen=True)
+class _RoadmapRevisionPullRequest:
+    branch: str
+    graph_version: int
+    head_sha: str
+    pull_request: PullRequest
+
+
+@dataclass(frozen=True)
+class _RoadmapAdjustmentContext:
+    issue: Issue
+    roadmap_markdown: str
+    canonical_graph_json: str
+    dependency_artifacts: tuple[RoadmapDependencyArtifact, ...]
+    status_report: str
+    basis_digest: str
 
 
 class DirectFlowError(RuntimeError):
@@ -466,6 +532,22 @@ class Phase1Orchestrator:
                     fn=lambda: self._enqueue_implementation_work(pool),
                 ):
                     poll_had_github_errors = True
+                if self._config.runtime.enable_roadmaps:
+                    if not self._run_poll_step(
+                        step_name="activate_merged_roadmaps",
+                        fn=self._activate_merged_roadmaps,
+                    ):
+                        poll_had_github_errors = True
+                    if not self._run_poll_step(
+                        step_name="advance_roadmap_nodes",
+                        fn=self._advance_roadmap_nodes,
+                    ):
+                        poll_had_github_errors = True
+                    if not self._run_poll_step(
+                        step_name="publish_roadmap_status_reports",
+                        fn=self._publish_roadmap_status_reports,
+                    ):
+                        poll_had_github_errors = True
                 if self._config.runtime.enable_issue_comment_routing:
                     if not self._run_poll_step(
                         step_name="enqueue_pre_pr_followup_work",
@@ -530,14 +612,32 @@ class Phase1Orchestrator:
         self._git.ensure_layout()
         self._cleanup_persisted_codex_processes()
         replayed_create_pr_call_count = 0
+        replayed_create_issue_call_count = 0
+        replayed_post_issue_comment_call_count = 0
 
         def replay_create_pr_calls() -> None:
             nonlocal replayed_create_pr_call_count
             replayed_create_pr_call_count = self._replay_pending_create_pr_calls()
 
+        def replay_create_issue_calls() -> None:
+            nonlocal replayed_create_issue_call_count
+            replayed_create_issue_call_count = self._replay_pending_create_issue_calls()
+
+        def replay_post_issue_comment_calls() -> None:
+            nonlocal replayed_post_issue_comment_call_count
+            replayed_post_issue_comment_call_count = self._replay_pending_post_issue_comment_calls()
+
         self._run_poll_step(
             step_name="replay_pending_create_pr_calls",
             fn=replay_create_pr_calls,
+        )
+        self._run_poll_step(
+            step_name="replay_pending_create_issue_calls",
+            fn=replay_create_issue_calls,
+        )
+        self._run_poll_step(
+            step_name="replay_pending_post_issue_comment_calls",
+            fn=replay_post_issue_comment_calls,
         )
         if replayed_create_pr_call_count > 0:
             log_event(
@@ -545,6 +645,20 @@ class Phase1Orchestrator:
                 "pending_create_pr_calls_replayed",
                 repo_full_name=self._state_repo_full_name(),
                 replayed_count=replayed_create_pr_call_count,
+            )
+        if replayed_create_issue_call_count > 0:
+            log_event(
+                LOGGER,
+                "pending_create_issue_calls_replayed",
+                repo_full_name=self._state_repo_full_name(),
+                replayed_count=replayed_create_issue_call_count,
+            )
+        if replayed_post_issue_comment_call_count > 0:
+            log_event(
+                LOGGER,
+                "pending_post_issue_comment_calls_replayed",
+                repo_full_name=self._state_repo_full_name(),
+                replayed_count=replayed_post_issue_comment_call_count,
             )
         reconciled_count = self._state.reconcile_unfinished_agent_runs(
             repo_full_name=self._state_repo_full_name()
@@ -826,7 +940,7 @@ class Phase1Orchestrator:
         )
 
     def _enqueue_new_work(self, pool: ThreadPoolExecutor) -> None:
-        labels = _trigger_labels(self._repo)
+        labels = _trigger_labels(self._repo, enable_roadmaps=self._config.runtime.enable_roadmaps)
         issues = self._github.list_open_issues_with_any_labels(labels)
         log_event(LOGGER, "issues_fetched", issue_count=len(issues), label_count=len(labels))
         for issue in issues:
@@ -855,9 +969,11 @@ class Phase1Orchestrator:
             flow = _resolve_issue_flow(
                 issue=issue,
                 design_label=self._repo.trigger_label,
+                roadmap_label=self._repo.roadmap_label,
                 bugfix_label=self._repo.bugfix_label,
                 small_job_label=self._repo.small_job_label,
                 ignore_label=self._repo.ignore_label,
+                enable_roadmaps=self._config.runtime.enable_roadmaps,
             )
             if flow is None:
                 log_event(
@@ -1046,6 +1162,1582 @@ class Phase1Orchestrator:
             finally:
                 if capacity_reserved:
                     self._work_limiter.release()
+
+    def _activate_merged_roadmaps(self) -> None:
+        candidates = self._state.list_roadmap_activation_candidates(
+            repo_full_name=self._state_repo_full_name()
+        )
+        if not candidates:
+            return
+        lease = self._slot_pool.acquire()
+        try:
+            self._git.prepare_checkout(lease.path)
+            for candidate in candidates:
+                issue = self._issue_snapshot_for_poll(issue_number=candidate.roadmap_issue_number)
+                slug = _slugify(issue.title)
+                base_name = f"{candidate.roadmap_issue_number}-{slug}"
+                graph_relpath = f"{self._repo.roadmap_docs_dir}/{base_name}.graph.json"
+                roadmap_relpath = f"{self._repo.roadmap_docs_dir}/{base_name}.md"
+                graph_abspath = lease.path / graph_relpath
+                if not graph_abspath.exists():
+                    token = compute_roadmap_graph_drift_token(
+                        roadmap_issue_number=candidate.roadmap_issue_number,
+                        graph_checksum="missing",
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=candidate.roadmap_issue_number,
+                        token=token,
+                        body=(
+                            "MergeXO roadmap activation is blocked: missing canonical graph file.\n"
+                            f"- expected path: `{graph_relpath}`\n"
+                            "- merge a correction PR with the missing `.graph.json` file."
+                        ),
+                        source="roadmap_activation_missing_graph",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
+                try:
+                    graph_raw = graph_abspath.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    token = compute_roadmap_graph_drift_token(
+                        roadmap_issue_number=candidate.roadmap_issue_number,
+                        graph_checksum="unreadable",
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=candidate.roadmap_issue_number,
+                        token=token,
+                        body=(
+                            "MergeXO roadmap activation is blocked: canonical graph file is unreadable.\n"
+                            f"- graph path: `{graph_relpath}`\n"
+                            f"- read error: {exc}\n\n"
+                            "Merge a correction PR that fixes the `.graph.json` file contents/encoding."
+                        ),
+                        source="roadmap_activation_unreadable_graph",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
+                try:
+                    parsed = parse_roadmap_graph_json(
+                        graph_raw,
+                        expected_issue_number=candidate.roadmap_issue_number,
+                    )
+                except RoadmapGraphValidationError as exc:
+                    token = compute_roadmap_graph_drift_token(
+                        roadmap_issue_number=candidate.roadmap_issue_number,
+                        graph_checksum="invalid",
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=candidate.roadmap_issue_number,
+                        token=token,
+                        body=(
+                            "MergeXO roadmap activation is blocked: invalid canonical graph.\n"
+                            f"- graph path: `{graph_relpath}`\n"
+                            f"- validation error: {exc}\n\n"
+                            "Merge a roadmap-revision PR that corrects the `.graph.json` file."
+                        ),
+                        source="roadmap_activation_invalid_graph",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
+                node_inputs = tuple(
+                    RoadmapNodeGraphInput(
+                        node_id=node.node_id,
+                        kind=node.kind,
+                        title=node.title,
+                        body_markdown=node.body_markdown,
+                        dependencies=tuple(
+                            RoadmapDependencyState(node_id=dep.node_id, requires=dep.requires)
+                            for dep in node.depends_on
+                        ),
+                    )
+                    for node in parsed.graph.nodes
+                )
+                parent_roadmap_issue_number = _parse_superseding_roadmap_parent(issue.body)
+                activated = self._state.upsert_roadmap_graph(
+                    roadmap_issue_number=candidate.roadmap_issue_number,
+                    roadmap_pr_number=candidate.roadmap_pr_number,
+                    roadmap_doc_path=roadmap_relpath,
+                    graph_path=graph_relpath,
+                    graph_checksum=parsed.checksum,
+                    graph_version=parsed.graph.version,
+                    nodes=node_inputs,
+                    parent_roadmap_issue_number=parent_roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                self._reconcile_roadmap_parent_supersede(roadmap=activated)
+                if len(parsed.graph.nodes) > self._repo.roadmap_recommended_node_count:
+                    token = compute_roadmap_graph_drift_token(
+                        roadmap_issue_number=candidate.roadmap_issue_number,
+                        graph_checksum=parsed.checksum,
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=candidate.roadmap_issue_number,
+                        token=token,
+                        body=(
+                            "MergeXO roadmap sizing recommendation:\n"
+                            f"- detected nodes: {len(parsed.graph.nodes)}\n"
+                            f"- recommended max: {self._repo.roadmap_recommended_node_count}\n"
+                            "This is non-blocking; consider splitting into a roadmap-of-roadmaps."
+                        ),
+                        source="roadmap_node_count_recommendation",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+        finally:
+            self._cleanup_and_release_slot(lease)
+
+    def _advance_roadmap_nodes(self) -> None:
+        roadmaps = self._state.list_active_roadmaps(repo_full_name=self._state_repo_full_name())
+        if not roadmaps:
+            return
+        lease = self._slot_pool.acquire()
+        blocked_roadmaps_by_drift: set[int] = set()
+        blocked_roadmaps_by_adjustment: set[int] = set()
+        try:
+            self._git.prepare_checkout(lease.path)
+            for roadmap in roadmaps:
+                self._handle_roadmap_control_labels(roadmap=roadmap)
+                refreshed = self._state.get_roadmap_state(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if refreshed is None:
+                    continue
+                self._reconcile_roadmap_parent_supersede(roadmap=refreshed)
+                self._sync_roadmap_node_progress(roadmap=refreshed)
+                if refreshed.adjustment_state == "awaiting_revision_merge":
+                    refreshed = self._maybe_apply_pending_roadmap_revision(
+                        roadmap=refreshed,
+                        checkout_path=lease.path,
+                    )
+                if refreshed.status != "active":
+                    continue
+                if refreshed.adjustment_state == "awaiting_revision_merge":
+                    blocked_roadmaps_by_adjustment.add(refreshed.roadmap_issue_number)
+                    continue
+                if not self._verify_roadmap_graph_checksum(
+                    roadmap=refreshed, checkout_path=lease.path
+                ):
+                    blocked_roadmaps_by_drift.add(refreshed.roadmap_issue_number)
+                    continue
+                nodes = self._state.list_roadmap_nodes(
+                    roadmap_issue_number=refreshed.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if nodes and all(node.status in {"completed", "abandoned"} for node in nodes):
+                    token = compute_roadmap_status_token(
+                        roadmap_issue_number=refreshed.roadmap_issue_number,
+                        request_comment_id=0,
+                    )
+                    self._ensure_tokenized_issue_comment(
+                        github=self._github,
+                        issue_number=refreshed.roadmap_issue_number,
+                        token=token,
+                        body="MergeXO roadmap completed: all roadmap nodes reached terminal outcomes.",
+                        source="roadmap_completed",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    self._github.close_issue(refreshed.roadmap_issue_number)
+                    # Persist completion only after side effects so retries can recover from
+                    # crashes between commenting/closing and state finalization.
+                    self._state.mark_roadmap_completed(
+                        roadmap_issue_number=refreshed.roadmap_issue_number,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
+                if not self._run_roadmap_adjustment_gate(
+                    roadmap=refreshed,
+                    checkout_path=lease.path,
+                ):
+                    blocked_roadmaps_by_adjustment.add(refreshed.roadmap_issue_number)
+            claims = self._state.claim_ready_roadmap_nodes(
+                repo_full_name=self._state_repo_full_name()
+            )
+            for claim in claims:
+                if claim.roadmap_issue_number in blocked_roadmaps_by_drift.union(
+                    blocked_roadmaps_by_adjustment
+                ):
+                    self._state.release_roadmap_node_claim(
+                        roadmap_issue_number=claim.roadmap_issue_number,
+                        node_id=claim.node_id,
+                        claim_token=claim.claim_token,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
+                roadmap_state = self._state.get_roadmap_state(
+                    roadmap_issue_number=claim.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if roadmap_state is None or roadmap_state.status != "active":
+                    self._state.release_roadmap_node_claim(
+                        roadmap_issue_number=claim.roadmap_issue_number,
+                        node_id=claim.node_id,
+                        claim_token=claim.claim_token,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
+                label = _roadmap_child_label_for_kind(kind=claim.kind, repo=self._repo)
+                token = compute_roadmap_node_issue_token(
+                    roadmap_issue_number=claim.roadmap_issue_number,
+                    node_id=claim.node_id,
+                )
+                marker = f"<!-- mergexo-action:{token} -->"
+                try:
+                    created = self._create_roadmap_child_issue_with_outbox(
+                        claim=claim,
+                        issue_body=append_action_token(
+                            body=_render_roadmap_child_issue_body(
+                                roadmap_issue_number=claim.roadmap_issue_number,
+                                node_id=claim.node_id,
+                                dependencies_json=claim.dependencies_json,
+                                body_markdown=claim.body_markdown,
+                            ),
+                            token=token,
+                        ),
+                        marker=marker,
+                        labels=(label,),
+                    )
+                except Exception:
+                    self._state.release_roadmap_node_claim(
+                        roadmap_issue_number=claim.roadmap_issue_number,
+                        node_id=claim.node_id,
+                        claim_token=claim.claim_token,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    continue
+                if claim.kind == "small_job":
+                    self._state.record_roadmap_node_milestone(
+                        roadmap_issue_number=claim.roadmap_issue_number,
+                        node_id=claim.node_id,
+                        milestone="planned",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+        finally:
+            self._cleanup_and_release_slot(lease)
+
+    def _run_roadmap_adjustment_gate(
+        self, *, roadmap: RoadmapStateRecord, checkout_path: Path
+    ) -> bool:
+        claim_token = self._state.claim_roadmap_adjustment(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if claim_token is None:
+            return False
+
+        release_claim = True
+        release_basis_digest: str | None = None
+        try:
+            claimed_roadmap = self._state.get_roadmap_state(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if claimed_roadmap is None:
+                return False
+            ready_node_ids = self._state.list_ready_roadmap_frontier(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if not ready_node_ids:
+                return True
+            context = self._build_roadmap_adjustment_context(
+                roadmap=claimed_roadmap,
+                ready_node_ids=ready_node_ids,
+                checkout_path=checkout_path,
+            )
+            if context.basis_digest == claimed_roadmap.last_adjustment_basis_digest:
+                self._state.set_roadmap_last_error(
+                    roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
+                    error=None,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                release_basis_digest = context.basis_digest
+                return True
+            decision = self._agent.evaluate_roadmap_adjustment(
+                issue=context.issue,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                coding_guidelines_path=self._coding_guidelines_path_for_checkout(
+                    checkout_path=checkout_path
+                ),
+                roadmap_doc_path=claimed_roadmap.roadmap_doc_path,
+                graph_path=claimed_roadmap.graph_path,
+                graph_version=claimed_roadmap.graph_version,
+                ready_node_ids=ready_node_ids,
+                dependency_artifacts=context.dependency_artifacts,
+                roadmap_status_report=context.status_report,
+                roadmap_markdown=context.roadmap_markdown,
+                canonical_graph_json=context.canonical_graph_json,
+                cwd=checkout_path,
+            )
+            if decision.action == "proceed":
+                self._state.set_roadmap_last_error(
+                    roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
+                    error=None,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                release_basis_digest = context.basis_digest
+                return True
+            if decision.action == "revise":
+                draft = self._roadmap_revision_draft_from_decision(
+                    roadmap=claimed_roadmap,
+                    decision=decision,
+                    source_kind="adjustment",
+                    ready_node_ids=ready_node_ids,
+                    request_reason=None,
+                )
+                marked = self._state.prepare_roadmap_revision_draft_from_adjustment(
+                    roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
+                    claim_token=claim_token,
+                    request_version=draft.request_version,
+                    summary=draft.summary,
+                    details=draft.details,
+                    updated_roadmap_markdown=draft.updated_roadmap_markdown,
+                    updated_canonical_graph_json=draft.updated_canonical_graph_json,
+                    ready_node_ids_json=draft.ready_node_ids_json,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if marked:
+                    release_claim = False
+                    refreshed = self._state.get_roadmap_state(
+                        roadmap_issue_number=claimed_roadmap.roadmap_issue_number,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    if refreshed is None:
+                        raise RuntimeError("roadmap disappeared after revision draft prepare")
+                    self._materialize_roadmap_revision_draft(
+                        roadmap=refreshed,
+                        draft=draft,
+                        checkout_path=checkout_path,
+                    )
+                else:
+                    raise RuntimeError("failed to persist same-roadmap revision draft")
+                return False
+            self._abandon_roadmap(
+                roadmap=claimed_roadmap,
+                reason=f"{decision.summary}\n\n{decision.details}".strip(),
+            )
+            release_claim = False
+            return False
+        except Exception as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"roadmap adjustment evaluation failed: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
+        finally:
+            if release_claim:
+                self._state.release_roadmap_adjustment(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    claim_token=claim_token,
+                    basis_digest=release_basis_digest,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+
+    def _roadmap_revision_draft_from_decision(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        decision: RoadmapAdjustmentResult,
+        source_kind: str,
+        ready_node_ids: tuple[str, ...],
+        request_reason: str | None,
+    ) -> RoadmapRevisionDraftRecord:
+        if decision.updated_roadmap_markdown is None:
+            raise RuntimeError("revise decision missing updated roadmap markdown")
+        if decision.updated_canonical_graph_json is None:
+            raise RuntimeError("revise decision missing updated roadmap graph")
+
+        parsed = parse_roadmap_graph_json(
+            decision.updated_canonical_graph_json,
+            expected_issue_number=roadmap.roadmap_issue_number,
+        )
+        if parsed.graph.version != roadmap.graph_version + 1:
+            raise RuntimeError("revise decision must bump roadmap graph version by exactly 1")
+        return RoadmapRevisionDraftRecord(
+            repo_full_name=self._state_repo_full_name(),
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            request_version=parsed.graph.version,
+            summary=decision.summary,
+            details=decision.details,
+            updated_roadmap_markdown=decision.updated_roadmap_markdown,
+            updated_canonical_graph_json=parsed.canonical_json,
+            source_kind=source_kind,
+            ready_node_ids_json=(
+                json.dumps(list(ready_node_ids), sort_keys=True) if ready_node_ids else None
+            ),
+            request_reason=request_reason,
+            created_at="",
+            updated_at="",
+        )
+
+    def _open_or_update_roadmap_revision_pr(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        decision: RoadmapAdjustmentResult,
+        checkout_path: Path,
+    ) -> _RoadmapRevisionPullRequest:
+        draft = self._roadmap_revision_draft_from_decision(
+            roadmap=roadmap,
+            decision=decision,
+            source_kind="adjustment",
+            ready_node_ids=(),
+            request_reason=None,
+        )
+        return self._open_or_update_roadmap_revision_pr_from_draft(
+            roadmap=roadmap,
+            draft=draft,
+            checkout_path=checkout_path,
+        )
+
+    def _open_or_update_roadmap_revision_pr_from_draft(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        draft: RoadmapRevisionDraftRecord,
+        checkout_path: Path,
+    ) -> _RoadmapRevisionPullRequest:
+        parsed = parse_roadmap_graph_json(
+            draft.updated_canonical_graph_json,
+            expected_issue_number=roadmap.roadmap_issue_number,
+        )
+        if parsed.graph.version != draft.request_version:
+            raise RuntimeError("stored roadmap revision draft version does not match graph version")
+        branch = _roadmap_revision_branch(
+            issue_number=roadmap.roadmap_issue_number,
+            graph_version=draft.request_version,
+        )
+        issue = self._github.get_issue(roadmap.roadmap_issue_number)
+        self._git.create_or_reset_branch(checkout_path, branch)
+
+        roadmap_abs_path = checkout_path / roadmap.roadmap_doc_path
+        graph_abs_path = checkout_path / roadmap.graph_path
+        roadmap_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        graph_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        roadmap_abs_path.write_text(draft.updated_roadmap_markdown, encoding="utf-8")
+        graph_payload = json.loads(parsed.canonical_json)
+        graph_abs_path.write_text(
+            json.dumps(graph_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        if self._git.list_staged_files(checkout_path):
+            self._git.commit_all(
+                checkout_path,
+                f"docs: revise roadmap for issue #{roadmap.roadmap_issue_number}",
+            )
+            required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+            if required_tests_error is not None:
+                required_tests_command = self._repo.required_tests or "<unset>"
+                error_summary = _summarize_git_error(required_tests_error)
+                failure_body = (
+                    "MergeXO could not push the same-roadmap revision branch because the "
+                    f"required pre-push test `{required_tests_command}` failed.\n"
+                    f"Failure summary: {error_summary}"
+                )
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=roadmap.roadmap_issue_number,
+                    token=compute_general_comment_token(
+                        turn_key=(
+                            f"roadmap_revision_required_tests:"
+                            f"{roadmap.roadmap_issue_number}:{draft.request_version}"
+                        ),
+                        body=failure_body,
+                    ),
+                    body=(failure_body),
+                    source="roadmap_revision_required_tests_failed",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                raise DirectFlowValidationError(
+                    "required pre-push tests failed before pushing roadmap revision branch"
+                )
+            self._push_pre_pr_branch(
+                issue=issue,
+                flow_label="roadmap revision",
+                checkout_path=checkout_path,
+                branch=branch,
+            )
+
+        pr = self._create_pull_request_with_outbox(
+            issue_number=roadmap.roadmap_issue_number,
+            run_id=None,
+            title=f"Roadmap revision for #{roadmap.roadmap_issue_number} (v{draft.request_version})",
+            head=branch,
+            base=self._repo.default_branch,
+            body=(
+                "Automated same-roadmap revision.\n\n"
+                f"- target graph version: `{draft.request_version}`\n"
+                f"- roadmap doc path: `{roadmap.roadmap_doc_path}`\n"
+                f"- graph path: `{roadmap.graph_path}`\n"
+                f"- summary: {draft.summary}\n\n"
+                f"{draft.details}\n\n"
+                f"Refs #{roadmap.roadmap_issue_number}"
+            ),
+        )
+        return _RoadmapRevisionPullRequest(
+            branch=branch,
+            graph_version=draft.request_version,
+            head_sha=self._git.current_head_sha(checkout_path),
+            pull_request=pr,
+        )
+
+    def _materialize_roadmap_revision_draft(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        draft: RoadmapRevisionDraftRecord,
+        checkout_path: Path,
+    ) -> RoadmapStateRecord:
+        revision_pr = self._open_or_update_roadmap_revision_pr_from_draft(
+            roadmap=roadmap,
+            draft=draft,
+            checkout_path=checkout_path,
+        )
+        if not self._state.mark_roadmap_revision_materialized(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            request_version=revision_pr.graph_version,
+            pr_number=revision_pr.pull_request.number,
+            pr_url=revision_pr.pull_request.html_url,
+            head_sha=revision_pr.head_sha,
+            repo_full_name=self._state_repo_full_name(),
+        ):
+            raise RuntimeError("failed to persist materialized roadmap revision pull request")
+        self._state.mark_create_pr_call_state_applied(
+            issue_number=roadmap.roadmap_issue_number,
+            branch=revision_pr.branch,
+            pr_number=revision_pr.pull_request.number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if draft.source_kind == "adjustment":
+            ready_node_ids = _parse_ready_node_ids_json(draft.ready_node_ids_json)
+            frontier = ", ".join(ready_node_ids) if ready_node_ids else "<none>"
+            token = compute_roadmap_adjustment_decision_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_version=roadmap.graph_version,
+                ready_node_ids=ready_node_ids,
+                action="revise",
+                summary=draft.summary,
+            )
+            body = (
+                "MergeXO adjustment gate opened a same-roadmap revision PR before issuing "
+                "the next frontier.\n"
+                f"- ready frontier: {frontier}\n"
+                f"- revision PR: {revision_pr.pull_request.html_url}\n"
+                f"- revision branch: `{revision_pr.branch}`\n"
+                f"- target graph version: `{revision_pr.graph_version}`\n"
+                f"- summary: {draft.summary}\n\n"
+                f"{draft.details}"
+            )
+            source = "roadmap_adjustment_revision_pr_opened"
+        else:
+            token = compute_roadmap_adjustment_decision_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_version=roadmap.graph_version,
+                ready_node_ids=(),
+                action="revise",
+                summary=draft.summary,
+            )
+            body = (
+                "MergeXO auto-authored a same-roadmap revision PR from a manual revision "
+                "request.\n"
+                f"- request reason: {draft.request_reason or 'manual roadmap revision requested'}\n"
+                f"- revision PR: {revision_pr.pull_request.html_url}\n"
+                f"- revision branch: `{revision_pr.branch}`\n"
+                f"- target graph version: `{revision_pr.graph_version}`\n"
+                f"- summary: {draft.summary}\n\n"
+                f"{draft.details}"
+            )
+            source = "roadmap_manual_revision_pr_opened"
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=roadmap.roadmap_issue_number,
+            token=token,
+            body=body,
+            source=source,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        refreshed = self._state.get_roadmap_state(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return refreshed or roadmap
+
+    def _build_roadmap_adjustment_context(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        ready_node_ids: tuple[str, ...],
+        checkout_path: Path,
+    ) -> _RoadmapAdjustmentContext:
+        graph_raw = (checkout_path / roadmap.graph_path).read_text(encoding="utf-8")
+        roadmap_doc_path = checkout_path / roadmap.roadmap_doc_path
+        try:
+            roadmap_markdown = roadmap_doc_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            roadmap_markdown = f"(roadmap markdown unavailable at {roadmap.roadmap_doc_path})"
+        issue = self._issue_snapshot_for_poll(issue_number=roadmap.roadmap_issue_number)
+        snapshot = self._state.list_roadmap_status_snapshot(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        blockers = self._state.list_roadmap_blockers_oldest_first(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        revisions = self._state.list_roadmap_revisions(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        dependency_artifacts = self._collect_roadmap_dependency_artifacts(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            ready_node_ids=ready_node_ids,
+        )
+        status_report = _render_roadmap_status_report(
+            roadmap_status=roadmap.status,
+            graph_version=roadmap.graph_version,
+            adjustment_state=roadmap.adjustment_state,
+            pending_revision_pr_number=roadmap.pending_revision_pr_number,
+            pending_revision_pr_url=roadmap.pending_revision_pr_url,
+            adjustment_request_version=roadmap.adjustment_request_version,
+            latest_note=roadmap.last_error,
+            revision_requested_at=roadmap.revision_requested_at,
+            revisions=revisions,
+            rows=snapshot,
+            blockers=blockers,
+            request_comment_id=0,
+        )
+        return _RoadmapAdjustmentContext(
+            issue=issue,
+            roadmap_markdown=roadmap_markdown,
+            canonical_graph_json=graph_raw,
+            dependency_artifacts=dependency_artifacts,
+            status_report=status_report,
+            basis_digest=_roadmap_adjustment_basis_digest(
+                issue=issue,
+                graph_version=roadmap.graph_version,
+                ready_node_ids=ready_node_ids,
+                dependency_artifacts=dependency_artifacts,
+                roadmap_status_report=status_report,
+                roadmap_markdown=roadmap_markdown,
+                canonical_graph_json=graph_raw,
+            ),
+        )
+
+    def _evaluate_roadmap_frontier_adjustment(
+        self,
+        *,
+        roadmap: RoadmapStateRecord,
+        ready_node_ids: tuple[str, ...],
+        checkout_path: Path,
+    ) -> RoadmapAdjustmentResult:
+        context = self._build_roadmap_adjustment_context(
+            roadmap=roadmap,
+            ready_node_ids=ready_node_ids,
+            checkout_path=checkout_path,
+        )
+        return self._agent.evaluate_roadmap_adjustment(
+            issue=context.issue,
+            repo_full_name=self._state_repo_full_name(),
+            default_branch=self._repo.default_branch,
+            coding_guidelines_path=self._coding_guidelines_path_for_checkout(
+                checkout_path=checkout_path
+            ),
+            roadmap_doc_path=roadmap.roadmap_doc_path,
+            graph_path=roadmap.graph_path,
+            graph_version=roadmap.graph_version,
+            ready_node_ids=ready_node_ids,
+            dependency_artifacts=context.dependency_artifacts,
+            roadmap_status_report=context.status_report,
+            roadmap_markdown=context.roadmap_markdown,
+            canonical_graph_json=context.canonical_graph_json,
+            cwd=checkout_path,
+        )
+
+    def _collect_roadmap_dependency_artifacts(
+        self,
+        *,
+        roadmap_issue_number: int,
+        ready_node_ids: tuple[str, ...],
+    ) -> tuple[RoadmapDependencyArtifact, ...]:
+        nodes = self._state.list_roadmap_nodes(
+            roadmap_issue_number=roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        nodes_by_id = {node.node_id: node for node in nodes}
+        dependency_refs = _ready_frontier_dependency_references(
+            nodes_by_id=nodes_by_id,
+            ready_node_ids=ready_node_ids,
+        )
+        artifacts: list[RoadmapDependencyArtifact] = []
+        for dependency_node_id in sorted(dependency_refs):
+            dependency_node = nodes_by_id.get(dependency_node_id)
+            if dependency_node is None:
+                continue
+            child_issue = None
+            issue_comments: tuple[PullRequestIssueComment, ...] = ()
+            issue_run = None
+            if dependency_node.child_issue_number is not None:
+                child_issue = self._issue_snapshot_for_poll(
+                    issue_number=dependency_node.child_issue_number
+                )
+                issue_comments = _key_roadmap_dependency_comments(
+                    tuple(self._github.list_issue_comments(dependency_node.child_issue_number))
+                )
+                issue_run = self._state.get_issue_run_record(
+                    dependency_node.child_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            pr_number = issue_run.pr_number if issue_run is not None else None
+            pr_url = issue_run.pr_url if issue_run is not None else None
+            pr_snapshot = (
+                self._github.get_pull_request(pr_number) if pr_number is not None else None
+            )
+            changed_files = (
+                _roadmap_dependency_changed_files(self._github.list_pull_request_files(pr_number))
+                if pr_number is not None
+                else ()
+            )
+            review_summaries = (
+                _key_roadmap_dependency_comments(
+                    tuple(self._github.list_pull_request_review_summaries(pr_number))
+                )
+                if pr_number is not None
+                else ()
+            )
+            artifacts.append(
+                RoadmapDependencyArtifact(
+                    dependency_node_id=dependency_node.node_id,
+                    dependency_kind=dependency_node.kind,
+                    dependency_title=dependency_node.title,
+                    frontier_references=dependency_refs[dependency_node_id],
+                    child_issue_number=dependency_node.child_issue_number,
+                    child_issue_url=dependency_node.child_issue_url,
+                    child_issue_title=child_issue.title if child_issue is not None else None,
+                    child_issue_body=child_issue.body if child_issue is not None else None,
+                    issue_run_status=issue_run.status if issue_run is not None else None,
+                    issue_run_branch=issue_run.branch if issue_run is not None else None,
+                    issue_run_error=issue_run.error if issue_run is not None else None,
+                    resolution_markers=_roadmap_dependency_resolution_markers(
+                        node=dependency_node,
+                        issue_run=issue_run,
+                    ),
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    pr_title=pr_snapshot.title if pr_snapshot is not None else None,
+                    pr_body=pr_snapshot.body if pr_snapshot is not None else None,
+                    pr_state=pr_snapshot.state if pr_snapshot is not None else None,
+                    pr_merged=pr_snapshot.merged if pr_snapshot is not None else None,
+                    changed_files=changed_files,
+                    review_summaries=review_summaries,
+                    issue_comments=issue_comments,
+                )
+            )
+        return tuple(artifacts)
+
+    def _maybe_apply_pending_roadmap_revision(
+        self, *, roadmap: RoadmapStateRecord, checkout_path: Path
+    ) -> RoadmapStateRecord:
+        if roadmap.status != "active":
+            return roadmap
+        if roadmap.adjustment_state != "awaiting_revision_merge":
+            return roadmap
+        if roadmap.pending_revision_pr_number is None:
+            draft = self._state.get_roadmap_revision_draft(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if draft is not None:
+                try:
+                    return self._materialize_roadmap_revision_draft(
+                        roadmap=roadmap,
+                        draft=draft,
+                        checkout_path=checkout_path,
+                    )
+                except Exception as exc:
+                    self._state.set_roadmap_last_error(
+                        roadmap_issue_number=roadmap.roadmap_issue_number,
+                        error=f"roadmap revision materialization failed: {exc}",
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    refreshed = self._state.get_roadmap_state(
+                        roadmap_issue_number=roadmap.roadmap_issue_number,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    return refreshed or roadmap
+            return self._maybe_author_requested_roadmap_revision(
+                roadmap=roadmap,
+                checkout_path=checkout_path,
+            )
+        graph_path = checkout_path / roadmap.graph_path
+        if not graph_path.exists():
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"awaiting roadmap revision merge: missing graph file {roadmap.graph_path}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="awaiting-revision-missing",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for a same-roadmap revision merge, but the canonical graph "
+                    "file is missing.\n"
+                    f"- expected path: `{roadmap.graph_path}`"
+                ),
+                source="roadmap_revision_waiting_missing_graph",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        try:
+            graph_raw = graph_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"awaiting roadmap revision merge: unreadable graph file: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="awaiting-revision-unreadable",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for a same-roadmap revision merge, but the canonical graph "
+                    "file is unreadable.\n"
+                    f"- path: `{roadmap.graph_path}`\n"
+                    f"- read error: {exc}"
+                ),
+                source="roadmap_revision_waiting_unreadable_graph",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        try:
+            parsed = parse_roadmap_graph_json(
+                graph_raw,
+                expected_issue_number=roadmap.roadmap_issue_number,
+            )
+        except RoadmapGraphValidationError as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=str(exc),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="awaiting-revision-invalid",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for a valid same-roadmap revision merge.\n"
+                    f"- path: `{roadmap.graph_path}`\n"
+                    f"- validation error: {exc}"
+                ),
+                source="roadmap_revision_waiting_invalid_graph",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        pending_pr = None
+        if roadmap.pending_revision_pr_number is not None:
+            pending_pr = self._github.get_pull_request(roadmap.pending_revision_pr_number)
+        graph_unchanged = (
+            parsed.graph.version == roadmap.graph_version
+            and parsed.checksum == roadmap.graph_checksum
+        )
+        if pending_pr is not None and not pending_pr.merged:
+            if graph_unchanged:
+                return roadmap
+            pending_pr_ref = f"#{roadmap.pending_revision_pr_number}"
+            if roadmap.pending_revision_pr_url is not None:
+                pending_pr_ref = f"{pending_pr_ref} ({roadmap.pending_revision_pr_url})"
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=(
+                    "tracked same-roadmap revision PR is not merged, but canonical graph changed: "
+                    f"current_version={roadmap.graph_version} repo_version={parsed.graph.version}"
+                ),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"awaiting-revision-open:{parsed.checksum}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for the tracked same-roadmap revision PR to merge "
+                    "before applying graph changes.\n"
+                    f"- pending revision PR: {pending_pr_ref}\n"
+                    f"- current version: `{roadmap.graph_version}`\n"
+                    f"- repo version: `{parsed.graph.version}`"
+                ),
+                source="roadmap_revision_waiting_pending_pr_merge",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        if graph_unchanged:
+            return roadmap
+        if (
+            pending_pr is not None
+            and roadmap.adjustment_request_version is not None
+            and parsed.graph.version != roadmap.adjustment_request_version
+        ):
+            pending_pr_ref = f"#{roadmap.pending_revision_pr_number}"
+            if roadmap.pending_revision_pr_url is not None:
+                pending_pr_ref = f"{pending_pr_ref} ({roadmap.pending_revision_pr_url})"
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=(
+                    "merged same-roadmap revision does not match requested version: "
+                    f"requested={roadmap.adjustment_request_version} repo={parsed.graph.version}"
+                ),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"awaiting-revision-version:{parsed.checksum}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO detected a merged same-roadmap revision PR, but the canonical graph "
+                    "version does not match the requested revision.\n"
+                    f"- pending revision PR: {pending_pr_ref}\n"
+                    f"- requested version: `{roadmap.adjustment_request_version}`\n"
+                    f"- repo version: `{parsed.graph.version}`"
+                ),
+                source="roadmap_revision_version_mismatch",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        node_inputs = tuple(
+            RoadmapNodeGraphInput(
+                node_id=node.node_id,
+                kind=node.kind,
+                title=node.title,
+                body_markdown=node.body_markdown,
+                dependencies=tuple(
+                    RoadmapDependencyState(node_id=dep.node_id, requires=dep.requires)
+                    for dep in node.depends_on
+                ),
+            )
+            for node in parsed.graph.nodes
+        )
+        try:
+            updated = self._state.upsert_roadmap_graph(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                roadmap_pr_number=roadmap.roadmap_pr_number,
+                roadmap_doc_path=roadmap.roadmap_doc_path,
+                graph_path=roadmap.graph_path,
+                graph_checksum=parsed.checksum,
+                graph_version=parsed.graph.version,
+                nodes=node_inputs,
+                parent_roadmap_issue_number=roadmap.parent_roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+        except RoadmapGraphTransitionError as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=str(exc),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=parsed.checksum,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO rejected the merged same-roadmap revision.\n"
+                    f"- current version: `{roadmap.graph_version}`\n"
+                    f"- proposed version: `{parsed.graph.version}`\n"
+                    f"- validation error: {exc}\n\n"
+                    "Update the roadmap graph with a valid transition and merge a corrected PR."
+                ),
+                source="roadmap_revision_invalid_transition",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        self._state.set_roadmap_last_error(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            error=None,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        token = compute_roadmap_graph_drift_token(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            graph_checksum=parsed.checksum,
+        )
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=roadmap.roadmap_issue_number,
+            token=token,
+            body=(
+                "MergeXO applied a same-roadmap revision.\n"
+                f"- version: `{roadmap.graph_version}` -> `{updated.graph_version}`\n"
+                f"- graph path: `{roadmap.graph_path}`"
+            ),
+            source="roadmap_revision_applied",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return updated
+
+    def _maybe_author_requested_roadmap_revision(
+        self, *, roadmap: RoadmapStateRecord, checkout_path: Path
+    ) -> RoadmapStateRecord:
+        request_reason = roadmap.last_error or "same-roadmap revision requested"
+        if not self._verify_roadmap_graph_checksum(roadmap=roadmap, checkout_path=checkout_path):
+            refreshed = self._state.get_roadmap_state(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return refreshed or roadmap
+        try:
+            context = self._build_roadmap_adjustment_context(
+                roadmap=roadmap,
+                ready_node_ids=(),
+                checkout_path=checkout_path,
+            )
+            decision = self._agent.author_requested_roadmap_revision(
+                issue=context.issue,
+                repo_full_name=self._state_repo_full_name(),
+                default_branch=self._repo.default_branch,
+                coding_guidelines_path=self._coding_guidelines_path_for_checkout(
+                    checkout_path=checkout_path
+                ),
+                roadmap_doc_path=roadmap.roadmap_doc_path,
+                graph_path=roadmap.graph_path,
+                graph_version=roadmap.graph_version,
+                request_reason=request_reason,
+                roadmap_status_report=context.status_report,
+                roadmap_markdown=context.roadmap_markdown,
+                canonical_graph_json=context.canonical_graph_json,
+                cwd=checkout_path,
+            )
+            if decision.action == "abandon":
+                self._abandon_roadmap(
+                    roadmap=roadmap,
+                    reason=f"{decision.summary}\n\n{decision.details}".strip(),
+                )
+                refreshed = self._state.get_roadmap_state(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                return refreshed or roadmap
+            if decision.action != "revise":
+                raise RuntimeError(
+                    "manual roadmap revision authoring must return revise or abandon"
+                )
+            draft = self._roadmap_revision_draft_from_decision(
+                roadmap=roadmap,
+                decision=decision,
+                source_kind="manual",
+                ready_node_ids=(),
+                request_reason=request_reason,
+            )
+            if not self._state.prepare_requested_roadmap_revision_draft(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                request_version=draft.request_version,
+                summary=draft.summary,
+                details=draft.details,
+                updated_roadmap_markdown=draft.updated_roadmap_markdown,
+                updated_canonical_graph_json=draft.updated_canonical_graph_json,
+                request_reason=request_reason,
+                repo_full_name=self._state_repo_full_name(),
+            ):
+                raise RuntimeError("failed to persist requested roadmap revision draft")
+            refreshed = self._state.get_roadmap_state(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if refreshed is None:
+                raise RuntimeError("roadmap disappeared after requested revision draft prepare")
+            return self._materialize_roadmap_revision_draft(
+                roadmap=refreshed,
+                draft=draft,
+                checkout_path=checkout_path,
+            )
+        except Exception as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"roadmap revision authoring failed: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        refreshed = self._state.get_roadmap_state(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return refreshed or roadmap
+
+    def _verify_roadmap_graph_checksum(
+        self, *, roadmap: RoadmapStateRecord, checkout_path: Path
+    ) -> bool:
+        graph_path = checkout_path / roadmap.graph_path
+        if not graph_path.exists():
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"missing graph file: {roadmap.graph_path}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="missing",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO blocked roadmap fan-out because the canonical graph file is missing.\n"
+                    f"- expected path: `{roadmap.graph_path}`"
+                ),
+                source="roadmap_graph_drift_missing",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
+        try:
+            graph_raw = graph_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=f"unreadable graph file: {exc}",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="unreadable",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO blocked roadmap fan-out because the canonical graph file is "
+                    "unreadable.\n"
+                    f"- path: `{roadmap.graph_path}`\n"
+                    f"- read error: {exc}"
+                ),
+                source="roadmap_graph_drift_unreadable",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
+        try:
+            parsed = parse_roadmap_graph_json(
+                graph_raw,
+                expected_issue_number=roadmap.roadmap_issue_number,
+            )
+        except RoadmapGraphValidationError as exc:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=str(exc),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum="invalid",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO blocked roadmap fan-out because the canonical graph is invalid.\n"
+                    f"- path: `{roadmap.graph_path}`\n"
+                    f"- validation error: {exc}"
+                ),
+                source="roadmap_graph_drift_invalid",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
+        if parsed.checksum != roadmap.graph_checksum:
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=(
+                    "graph checksum mismatch: "
+                    f"sqlite={roadmap.graph_checksum} repo={parsed.checksum}"
+                ),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=parsed.checksum,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO blocked roadmap fan-out because sqlite and repository graph checksums "
+                    "diverged.\n"
+                    f"- sqlite checksum: `{roadmap.graph_checksum}`\n"
+                    f"- repo checksum: `{parsed.checksum}`\n"
+                    "Merge a deterministic roadmap revision that re-aligns the canonical graph."
+                ),
+                source="roadmap_graph_drift_checksum",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return False
+        self._state.set_roadmap_last_error(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            error=None,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return True
+
+    def _sync_roadmap_node_progress(self, *, roadmap: RoadmapStateRecord) -> None:
+        nodes = self._state.list_roadmap_nodes(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        for node in nodes:
+            if node.child_issue_number is None:
+                continue
+            planned, implemented, blocked = self._roadmap_node_milestones(node=node)
+            if planned:
+                self._state.record_roadmap_node_milestone(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    node_id=node.node_id,
+                    milestone="planned",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            if implemented:
+                self._state.record_roadmap_node_milestone(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    node_id=node.node_id,
+                    milestone="implemented",
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                continue
+            if blocked:
+                self._state.mark_roadmap_node_blocked(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    node_id=node.node_id,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            else:
+                self._state.mark_roadmap_node_unblocked(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    node_id=node.node_id,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+
+    def _roadmap_node_milestones(self, *, node: RoadmapNodeRecord) -> tuple[bool, bool, bool]:
+        if node.child_issue_number is None:
+            return False, False, False
+        issue_state = self._state.get_issue_run_state(
+            node.child_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if node.kind == "small_job":
+            implemented = (
+                issue_state is not None
+                and issue_state[0] == "merged"
+                and (issue_state[1] or "").startswith("agent/small/")
+            )
+            blocked = issue_state is not None and issue_state[0] in {
+                "failed",
+                "blocked",
+                "awaiting_issue_followup",
+            }
+            return True, implemented, blocked
+        if node.kind == "design_doc":
+            planned = (
+                issue_state is not None
+                and issue_state[0] == "merged"
+                and (
+                    (issue_state[1] or "").startswith("agent/design/")
+                    or (issue_state[1] or "").startswith("agent/impl/")
+                )
+            )
+            implemented = (
+                issue_state is not None
+                and issue_state[0] == "merged"
+                and (issue_state[1] or "").startswith("agent/impl/")
+            )
+            blocked = issue_state is not None and issue_state[0] in {
+                "failed",
+                "blocked",
+                "awaiting_issue_followup",
+            }
+            return planned, implemented, blocked
+        child_roadmap = self._state.get_roadmap_state(
+            roadmap_issue_number=node.child_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if child_roadmap is None:
+            blocked = issue_state is not None and issue_state[0] in {
+                "failed",
+                "blocked",
+                "awaiting_issue_followup",
+            }
+            return False, False, blocked
+        planned = child_roadmap.status in {
+            "active",
+            "superseded",
+            "abandoned",
+            "completed",
+        }
+        implemented = child_roadmap.status == "completed"
+        blocked = child_roadmap.adjustment_state == "awaiting_revision_merge"
+        return planned, implemented, blocked
+
+    def _find_existing_roadmap_child_issue(self, *, label: str, marker: str) -> Issue | None:
+        issues = self._github.list_open_issues_with_label(label)
+        for issue in issues:
+            if marker in issue.body:
+                return issue
+        return None
+
+    def _handle_roadmap_control_labels(self, *, roadmap: RoadmapStateRecord) -> None:
+        issue = self._issue_snapshot_for_poll(issue_number=roadmap.roadmap_issue_number)
+        labels = set(issue.labels)
+        if self._repo.roadmap_abandon_label in labels:
+            self._abandon_roadmap(roadmap=roadmap, reason="abandon label set on roadmap issue")
+            return
+        if self._repo.roadmap_revision_label not in labels:
+            if roadmap.adjustment_request_version is not None:
+                self._state.set_roadmap_adjustment_request_version(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    request_version=None,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            return
+        if self._repo.roadmap_revision_label in labels:
+            if roadmap.adjustment_state == "awaiting_revision_merge":
+                return
+            if roadmap.adjustment_request_version == roadmap.graph_version:
+                return
+            self._state.mark_roadmap_revision_requested(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                last_error="roadmap revision label applied",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"revision-request:{roadmap.graph_version}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO paused roadmap fan-out pending a same-roadmap revision.\n"
+                    f"- current graph version: `{roadmap.graph_version}`\n"
+                    f"- graph path: `{roadmap.graph_path}`\n"
+                    f"- roadmap doc path: `{roadmap.roadmap_doc_path}`\n\n"
+                    "Merge a PR that updates the existing roadmap markdown and `.graph.json` for "
+                    "this issue with a valid graph version bump."
+                ),
+                source="roadmap_revision_requested",
+                repo_full_name=self._state_repo_full_name(),
+            )
+
+    def _open_superseding_roadmap_issue(self, *, roadmap: RoadmapStateRecord, issue: Issue) -> None:
+        created = self._find_existing_superseding_roadmap_issue(
+            roadmap_issue_number=roadmap.roadmap_issue_number
+        )
+        if created is None:
+            created = self._github.create_issue(
+                title=f"Roadmap revision for #{roadmap.roadmap_issue_number}: {issue.title}",
+                body=(
+                    f"Supersedes roadmap #{roadmap.roadmap_issue_number}.\n\n"
+                    "Please propose a revised roadmap graph and markdown narrative.\n"
+                    "This issue was generated automatically after revision was requested."
+                ),
+                labels=(self._repo.roadmap_label,),
+            )
+        token = compute_roadmap_status_token(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            request_comment_id=created.number,
+        )
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=roadmap.roadmap_issue_number,
+            token=token,
+            body=(
+                "MergeXO opened a superseding roadmap issue.\n"
+                f"- superseding issue: #{created.number} ({created.html_url})"
+            ),
+            source="roadmap_superseding_issue_created",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        # Persist linkage only after comment side effect so retries can recover from
+        # crashes/failures between issue creation/comment and sqlite finalization.
+        self._state.set_roadmap_superseding_issue(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            superseding_roadmap_issue_number=created.number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+
+    def _find_existing_superseding_roadmap_issue(
+        self, *, roadmap_issue_number: int
+    ) -> Issue | None:
+        roadmap_issues = self._github.list_open_issues_with_label(self._repo.roadmap_label)
+        for roadmap_issue in roadmap_issues:
+            if roadmap_issue.number == roadmap_issue_number:
+                continue
+            if _parse_superseding_roadmap_parent(roadmap_issue.body) != roadmap_issue_number:
+                continue
+            return roadmap_issue
+        return None
+
+    def _abandon_roadmap(self, *, roadmap: RoadmapStateRecord, reason: str) -> None:
+        refreshed = self._state.get_roadmap_state(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if refreshed is None or refreshed.status != "active":
+            return
+        nodes = self._state.list_roadmap_nodes(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        for node in nodes:
+            if (
+                node.child_issue_number is None
+                or node.status == "completed"
+                or node.implemented_at is not None
+            ):
+                continue
+            token = compute_roadmap_node_issue_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                node_id=node.node_id,
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=node.child_issue_number,
+                token=token,
+                body=(
+                    f"MergeXO abandoned parent roadmap #{roadmap.roadmap_issue_number}; "
+                    "closing this child issue."
+                ),
+                source="roadmap_abandon_child_close",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            self._github.close_issue(node.child_issue_number)
+        parent_token = compute_roadmap_status_token(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            request_comment_id=-1,
+        )
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=roadmap.roadmap_issue_number,
+            token=parent_token,
+            body=f"MergeXO abandoned this roadmap. Reason: {reason}",
+            source="roadmap_abandon_parent_close",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        self._github.close_issue(roadmap.roadmap_issue_number)
+        # Persist abandon status only after side effects so retries can recover from
+        # crashes between issue close/comment operations and sqlite finalization.
+        self._state.mark_roadmap_abandoned(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            last_error=reason,
+            repo_full_name=self._state_repo_full_name(),
+        )
+
+    def _reconcile_roadmap_parent_supersede(self, *, roadmap: RoadmapStateRecord) -> None:
+        parent_roadmap_issue_number = roadmap.parent_roadmap_issue_number
+        if parent_roadmap_issue_number is None:
+            return
+        parent_state = self._state.get_roadmap_state(
+            roadmap_issue_number=parent_roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if parent_state is None:
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"missing_parent:{parent_roadmap_issue_number}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO roadmap supersede linkage warning:\n"
+                    f"- `Supersedes` references roadmap #{parent_roadmap_issue_number}, "
+                    "but it was not found in roadmap state.\n"
+                    "- skipping parent supersede transition."
+                ),
+                source="roadmap_activation_missing_parent",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return
+        self._state.mark_roadmap_superseded(
+            roadmap_issue_number=parent_roadmap_issue_number,
+            superseding_roadmap_issue_number=roadmap.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+
+    def _publish_roadmap_status_reports(self) -> None:
+        roadmaps = self._state.list_active_roadmaps(repo_full_name=self._state_repo_full_name())
+        if not roadmaps:
+            return
+        for roadmap in roadmaps:
+            comments = self._github.list_issue_comments(roadmap.roadmap_issue_number)
+            for comment in comments:
+                if is_bot_login(comment.user_login):
+                    continue
+                if comment.body.strip().lower() != "/roadmap status":
+                    continue
+                token = compute_roadmap_status_token(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    request_comment_id=comment.comment_id,
+                )
+                snapshot = self._state.list_roadmap_status_snapshot(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                blockers = self._state.list_roadmap_blockers_oldest_first(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                revisions = self._state.list_roadmap_revisions(
+                    roadmap_issue_number=roadmap.roadmap_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                self._ensure_tokenized_issue_comment(
+                    github=self._github,
+                    issue_number=roadmap.roadmap_issue_number,
+                    token=token,
+                    body=_render_roadmap_status_report(
+                        roadmap_status=roadmap.status,
+                        graph_version=roadmap.graph_version,
+                        adjustment_state=roadmap.adjustment_state,
+                        pending_revision_pr_number=roadmap.pending_revision_pr_number,
+                        pending_revision_pr_url=roadmap.pending_revision_pr_url,
+                        adjustment_request_version=roadmap.adjustment_request_version,
+                        latest_note=roadmap.last_error,
+                        revision_requested_at=roadmap.revision_requested_at,
+                        revisions=revisions,
+                        rows=snapshot,
+                        blockers=blockers,
+                        request_comment_id=comment.comment_id,
+                    ),
+                    source="roadmap_status_report",
+                    repo_full_name=self._state_repo_full_name(),
+                )
 
     def _enqueue_feedback_work(self, pool: ThreadPoolExecutor) -> None:
         tracked_prs = self._state.list_tracked_pull_requests(
@@ -1683,6 +3375,7 @@ class Phase1Orchestrator:
                 issue=issue,
                 error=legacy.error or "",
                 design_label=self._repo.trigger_label,
+                roadmap_label=self._repo.roadmap_label,
                 bugfix_label=self._repo.bugfix_label,
                 small_job_label=self._repo.small_job_label,
                 ignore_label=self._repo.ignore_label,
@@ -2026,6 +3719,377 @@ class Phase1Orchestrator:
                     call_id=entry.call_id,
                     error_type=type(exc).__name__,
                 )
+        return replayed_count
+
+    def _create_roadmap_issue_dedupe_key(self, *, roadmap_issue_number: int, node_id: str) -> str:
+        return f"create_issue:roadmap_node:{roadmap_issue_number}:{node_id}"
+
+    def _parse_create_issue_outbox_payload(self, payload_json: str) -> _CreateIssueOutboxPayload:
+        payload_obj = json.loads(payload_json)
+        if not isinstance(payload_obj, dict):
+            raise RuntimeError("Invalid create_issue outbox payload")
+        roadmap_issue_number = payload_obj.get("roadmap_issue_number")
+        node_id = payload_obj.get("node_id")
+        title = payload_obj.get("title")
+        body = payload_obj.get("body")
+        labels_obj = payload_obj.get("labels")
+        marker = payload_obj.get("marker")
+        if not isinstance(roadmap_issue_number, int):
+            raise RuntimeError("create_issue outbox payload is missing roadmap_issue_number")
+        if not isinstance(node_id, str):
+            raise RuntimeError("create_issue outbox payload is missing node_id")
+        if not isinstance(title, str):
+            raise RuntimeError("create_issue outbox payload is missing title")
+        if not isinstance(body, str):
+            raise RuntimeError("create_issue outbox payload is missing body")
+        if (
+            not isinstance(labels_obj, list)
+            or not labels_obj
+            or not all(isinstance(label, str) for label in labels_obj)
+        ):
+            raise RuntimeError("create_issue outbox payload is missing labels")
+        if not isinstance(marker, str):
+            raise RuntimeError("create_issue outbox payload is missing marker")
+        return _CreateIssueOutboxPayload(
+            roadmap_issue_number=roadmap_issue_number,
+            node_id=node_id,
+            title=title,
+            body=body,
+            labels=tuple(cast(str, label) for label in labels_obj),
+            marker=marker,
+        )
+
+    def _issue_from_outbox_result(self, result_json: str | None) -> Issue | None:
+        if result_json is None:
+            return None
+        result_obj = json.loads(result_json)
+        if not isinstance(result_obj, dict):
+            return None
+        issue_number = result_obj.get("issue_number")
+        issue_url = result_obj.get("issue_url")
+        if not isinstance(issue_number, int):
+            return None
+        if not isinstance(issue_url, str):
+            return None
+        return Issue(
+            number=issue_number,
+            title="",
+            body="",
+            html_url=issue_url,
+            labels=(),
+            author_login="",
+        )
+
+    def _execute_create_issue_outbox_call(self, entry: GitHubCallOutboxState) -> Issue:
+        payload = self._parse_create_issue_outbox_payload(entry.payload_json)
+        if entry.status == "succeeded":
+            completed = self._issue_from_outbox_result(entry.result_json)
+            if completed is not None:
+                return completed
+            self._state.mark_github_call_pending_retry(
+                call_id=entry.call_id,
+                error="create_issue outbox row was succeeded without result payload",
+                repo_full_name=entry.repo_full_name,
+            )
+
+        self._state.mark_github_call_in_progress(
+            call_id=entry.call_id,
+            repo_full_name=entry.repo_full_name,
+        )
+        try:
+            existing = self._find_existing_roadmap_child_issue(
+                label=payload.labels[0],
+                marker=payload.marker,
+            )
+            if existing is None:
+                try:
+                    existing = self._github.create_issue(
+                        title=payload.title,
+                        body=payload.body,
+                        labels=payload.labels,
+                    )
+                except Exception:
+                    recovered = self._find_existing_roadmap_child_issue(
+                        label=payload.labels[0],
+                        marker=payload.marker,
+                    )
+                    if recovered is None:
+                        raise
+                    existing = recovered
+            self._state.mark_github_call_succeeded(
+                call_id=entry.call_id,
+                result_json=json.dumps(
+                    {"issue_number": existing.number, "issue_url": existing.html_url},
+                    sort_keys=True,
+                ),
+                repo_full_name=entry.repo_full_name,
+            )
+            return existing
+        except Exception as exc:  # noqa: BLE001
+            self._state.mark_github_call_pending_retry(
+                call_id=entry.call_id,
+                error=str(exc),
+                repo_full_name=entry.repo_full_name,
+            )
+            raise
+
+    def _create_roadmap_child_issue_with_outbox(
+        self,
+        *,
+        claim: ReadyRoadmapNodeClaim,
+        issue_body: str,
+        marker: str,
+        labels: tuple[str, ...],
+    ) -> Issue:
+        entry = self._state.upsert_github_call_intent(
+            call_kind="create_issue",
+            dedupe_key=self._create_roadmap_issue_dedupe_key(
+                roadmap_issue_number=claim.roadmap_issue_number,
+                node_id=claim.node_id,
+            ),
+            payload_json=json.dumps(
+                {
+                    "roadmap_issue_number": claim.roadmap_issue_number,
+                    "node_id": claim.node_id,
+                    "title": claim.title,
+                    "body": issue_body,
+                    "labels": list(labels),
+                    "marker": marker,
+                },
+                sort_keys=True,
+            ),
+            issue_number=claim.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if entry.state_applied:
+            existing = self._issue_from_outbox_result(entry.result_json)
+            if existing is None:
+                raise RuntimeError("create_issue outbox row is applied without result payload")
+            return existing
+        issue = self._execute_create_issue_outbox_call(entry)
+        if not self._state.apply_succeeded_create_issue_call(
+            call_id=entry.call_id,
+            roadmap_issue_number=claim.roadmap_issue_number,
+            node_id=claim.node_id,
+            child_issue_number=issue.number,
+            child_issue_url=issue.html_url,
+            repo_full_name=self._state_repo_full_name(),
+        ):
+            refreshed = self._state.upsert_github_call_intent(
+                call_kind="create_issue",
+                dedupe_key=self._create_roadmap_issue_dedupe_key(
+                    roadmap_issue_number=claim.roadmap_issue_number,
+                    node_id=claim.node_id,
+                ),
+                payload_json=entry.payload_json,
+                issue_number=claim.roadmap_issue_number,
+                repo_full_name=self._state_repo_full_name(),
+            )
+            if not refreshed.state_applied:
+                raise RuntimeError("failed to apply succeeded roadmap child issue outbox call")
+        return issue
+
+    def _replay_pending_create_issue_calls(self) -> int:
+        replayed_count = 0
+        entries = self._state.list_replayable_github_calls(
+            call_kind="create_issue",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        for entry in entries:
+            try:
+                payload = self._parse_create_issue_outbox_payload(entry.payload_json)
+                issue = self._execute_create_issue_outbox_call(entry)
+                applied = self._state.apply_succeeded_create_issue_call(
+                    call_id=entry.call_id,
+                    roadmap_issue_number=payload.roadmap_issue_number,
+                    node_id=payload.node_id,
+                    child_issue_number=issue.number,
+                    child_issue_url=issue.html_url,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if applied:
+                    replayed_count += 1
+            except GitHubPollingError:
+                raise
+            except Exception:
+                continue
+        return replayed_count
+
+    def _create_post_issue_comment_dedupe_key(self, *, issue_number: int, token: str) -> str:
+        return f"post_issue_comment:{issue_number}:{token}"
+
+    def _parse_post_issue_comment_outbox_payload(
+        self, payload_json: str
+    ) -> _PostIssueCommentOutboxPayload:
+        payload_obj = json.loads(payload_json)
+        if not isinstance(payload_obj, dict):
+            raise RuntimeError("Invalid post_issue_comment outbox payload")
+        issue_number = payload_obj.get("issue_number")
+        token = payload_obj.get("token")
+        body = payload_obj.get("body")
+        source = payload_obj.get("source")
+        if not isinstance(issue_number, int):
+            raise RuntimeError("post_issue_comment outbox payload is missing issue_number")
+        if not isinstance(token, str):
+            raise RuntimeError("post_issue_comment outbox payload is missing token")
+        if not isinstance(body, str):
+            raise RuntimeError("post_issue_comment outbox payload is missing body")
+        if not isinstance(source, str):
+            raise RuntimeError("post_issue_comment outbox payload is missing source")
+        return _PostIssueCommentOutboxPayload(
+            issue_number=issue_number,
+            token=token,
+            body=body,
+            source=source,
+        )
+
+    def _execute_post_issue_comment_outbox_call(self, entry: GitHubCallOutboxState) -> bool:
+        payload = self._parse_post_issue_comment_outbox_payload(entry.payload_json)
+        if entry.status == "succeeded":
+            result_obj = json.loads(entry.result_json) if entry.result_json is not None else None
+            if isinstance(result_obj, dict) and isinstance(result_obj.get("posted"), bool):
+                return cast(bool, result_obj["posted"])
+            self._state.mark_github_call_pending_retry(
+                call_id=entry.call_id,
+                error="post_issue_comment outbox row was succeeded without result payload",
+                repo_full_name=entry.repo_full_name,
+            )
+
+        planned = self._state.record_action_token_planned(
+            token=payload.token,
+            scope_kind="issue",
+            scope_number=payload.issue_number,
+            source=payload.source,
+            repo_full_name=entry.repo_full_name,
+        )
+        if self._is_action_token_observed(token_state=planned, github=self._github):
+            self._state.mark_github_call_succeeded(
+                call_id=entry.call_id,
+                result_json=json.dumps(
+                    {"issue_number": payload.issue_number, "posted": False},
+                    sort_keys=True,
+                ),
+                repo_full_name=entry.repo_full_name,
+            )
+            return False
+
+        self._state.mark_github_call_in_progress(
+            call_id=entry.call_id,
+            repo_full_name=entry.repo_full_name,
+        )
+        try:
+            self._github.post_issue_comment(
+                issue_number=payload.issue_number,
+                body=append_action_token(body=payload.body, token=payload.token),
+            )
+            self._state.mark_github_call_succeeded(
+                call_id=entry.call_id,
+                result_json=json.dumps(
+                    {"issue_number": payload.issue_number, "posted": True},
+                    sort_keys=True,
+                ),
+                repo_full_name=entry.repo_full_name,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            planned = self._state.record_action_token_planned(
+                token=payload.token,
+                scope_kind="issue",
+                scope_number=payload.issue_number,
+                source=payload.source,
+                repo_full_name=entry.repo_full_name,
+            )
+            if self._is_action_token_observed(token_state=planned, github=self._github):
+                self._state.mark_github_call_succeeded(
+                    call_id=entry.call_id,
+                    result_json=json.dumps(
+                        {"issue_number": payload.issue_number, "posted": False},
+                        sort_keys=True,
+                    ),
+                    repo_full_name=entry.repo_full_name,
+                )
+                return False
+            self._state.mark_github_call_pending_retry(
+                call_id=entry.call_id,
+                error=str(exc),
+                repo_full_name=entry.repo_full_name,
+            )
+            raise
+
+    def _post_issue_comment_with_outbox(
+        self,
+        *,
+        issue_number: int,
+        token: str,
+        body: str,
+        source: str,
+        repo_full_name: str,
+    ) -> bool:
+        entry = self._state.upsert_github_call_intent(
+            call_kind="post_issue_comment",
+            dedupe_key=self._create_post_issue_comment_dedupe_key(
+                issue_number=issue_number,
+                token=token,
+            ),
+            payload_json=json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "token": token,
+                    "body": body,
+                    "source": source,
+                },
+                sort_keys=True,
+            ),
+            issue_number=issue_number,
+            repo_full_name=repo_full_name,
+        )
+        if entry.state_applied:
+            return False
+        posted = self._execute_post_issue_comment_outbox_call(entry)
+        if not self._state.apply_succeeded_post_issue_comment_call(
+            call_id=entry.call_id,
+            issue_number=issue_number,
+            token=token,
+            source=source,
+            repo_full_name=repo_full_name,
+        ):
+            refreshed = self._state.upsert_github_call_intent(
+                call_kind="post_issue_comment",
+                dedupe_key=self._create_post_issue_comment_dedupe_key(
+                    issue_number=issue_number,
+                    token=token,
+                ),
+                payload_json=entry.payload_json,
+                issue_number=issue_number,
+                repo_full_name=repo_full_name,
+            )
+            if not refreshed.state_applied:
+                raise RuntimeError("failed to apply succeeded post_issue_comment outbox call")
+        return posted
+
+    def _replay_pending_post_issue_comment_calls(self) -> int:
+        replayed_count = 0
+        entries = self._state.list_replayable_github_calls(
+            call_kind="post_issue_comment",
+            repo_full_name=self._state_repo_full_name(),
+        )
+        for entry in entries:
+            try:
+                payload = self._parse_post_issue_comment_outbox_payload(entry.payload_json)
+                self._execute_post_issue_comment_outbox_call(entry)
+                applied = self._state.apply_succeeded_post_issue_comment_call(
+                    call_id=entry.call_id,
+                    issue_number=payload.issue_number,
+                    token=payload.token,
+                    source=payload.source,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+                if applied:
+                    replayed_count += 1
+            except GitHubPollingError:
+                raise
+            except Exception:
+                continue
         return replayed_count
 
     def _has_capacity_locked(self) -> bool:
@@ -3177,18 +5241,13 @@ class Phase1Orchestrator:
         )
         if self._is_action_token_observed(token_state=planned, github=github):
             return False
-        github.post_issue_comment(
+        return self._post_issue_comment_with_outbox(
             issue_number=issue_number,
-            body=append_action_token(body=body, token=token),
-        )
-        self._state.record_action_token_posted(
             token=token,
-            scope_kind="issue",
-            scope_number=issue_number,
+            body=body,
             source=source,
             repo_full_name=repo_full_name,
         )
-        return True
 
     def _ensure_tokenized_review_reply(
         self,
@@ -3222,6 +5281,57 @@ class Phase1Orchestrator:
             repo_full_name=repo_full_name,
         )
         return True
+
+    def _handle_roadmap_revision_escalation(
+        self,
+        *,
+        source_issue: Issue,
+        escalation: RoadmapRevisionEscalation,
+        source_url: str,
+    ) -> None:
+        lookup = self._state.find_roadmap_by_child_issue(
+            child_issue_number=source_issue.number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if lookup is None:
+            return
+        self._state.mark_roadmap_revision_requested(
+            roadmap_issue_number=lookup.roadmap_issue_number,
+            last_error=escalation.summary,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        blockers = self._state.list_roadmap_blockers_oldest_first(
+            roadmap_issue_number=lookup.roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        blocker_lines = (
+            "\n".join(
+                f"- {item.node_id}: blocked since {item.blocked_since_at}" for item in blockers[:5]
+            )
+            if blockers
+            else "- none"
+        )
+        token = compute_roadmap_revision_escalation_token(
+            roadmap_issue_number=lookup.roadmap_issue_number,
+            source_issue_number=source_issue.number,
+            summary=escalation.summary,
+        )
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=lookup.roadmap_issue_number,
+            token=token,
+            body=(
+                "MergeXO roadmap revision escalation received.\n"
+                f"- source issue: #{source_issue.number} ({source_url})\n"
+                f"- source node: {lookup.node_id}\n"
+                f"- summary: {escalation.summary}\n\n"
+                f"{escalation.details}\n\n"
+                "Current oldest blockers:\n"
+                f"{blocker_lines}"
+            ),
+            source="roadmap_revision_escalation",
+            repo_full_name=self._state_repo_full_name(),
+        )
 
     def _reap_finished(self) -> None:
         finished_issue_numbers: list[int] = []
@@ -3538,6 +5648,13 @@ class Phase1Orchestrator:
                     branch=branch,
                     pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
                 )
+            if flow == "roadmap":
+                return self._process_roadmap_issue(
+                    issue=issue,
+                    checkout_path=lease.path,
+                    branch=branch,
+                    pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+                )
             return self._process_direct_issue(
                 issue=issue,
                 flow=flow,
@@ -3659,7 +5776,12 @@ class Phase1Orchestrator:
             raise DirectFlowValidationError(
                 "required pre-push tests failed before pushing design branch"
             )
-        self._git.push_branch(checkout_path, branch)
+        self._push_pre_pr_branch(
+            issue=issue,
+            flow_label="design",
+            checkout_path=checkout_path,
+            branch=branch,
+        )
         self._run_pre_pr_ordering_gate(
             issue_number=issue.number,
             last_consumed_comment_id=pre_pr_last_consumed_comment_id,
@@ -3686,6 +5808,151 @@ class Phase1Orchestrator:
             pr_number=pr.number,
             branch=branch,
             flow="design_doc",
+        )
+        return WorkResult(
+            issue_number=issue.number,
+            branch=branch,
+            pr_number=pr.number,
+            pr_url=pr.html_url,
+            repo_full_name=self._state_repo_full_name(),
+        )
+
+    def _process_roadmap_issue(
+        self,
+        *,
+        issue: Issue,
+        checkout_path: Path,
+        branch: str,
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
+        self._git.create_or_reset_branch(checkout_path, branch)
+
+        slug = _slugify(issue.title)
+        base_name = f"{issue.number}-{slug}"
+        roadmap_relpath = f"{self._repo.roadmap_docs_dir}/{base_name}.md"
+        graph_relpath = f"{self._repo.roadmap_docs_dir}/{base_name}.graph.json"
+        coding_guidelines_path = self._coding_guidelines_path_for_checkout(
+            checkout_path=checkout_path
+        )
+
+        run_id = self._active_run_id_for_issue(issue.number)
+        roadmap_prompt = build_roadmap_prompt(
+            issue=issue,
+            repo_full_name=self._state_repo_full_name(),
+            default_branch=self._repo.default_branch,
+            roadmap_docs_dir=self._repo.roadmap_docs_dir,
+            recommended_node_count=self._repo.roadmap_recommended_node_count,
+            coding_guidelines_path=coding_guidelines_path,
+        )
+        durable_launch = self._durable_codex_launch(run_id)
+        self._mark_codex_invocation_started(
+            run_id=run_id,
+            mode="roadmap",
+            prompt=roadmap_prompt,
+            session_id=None,
+            durable_launch=durable_launch,
+        )
+        initial_head_sha = self._git.current_head_sha(checkout_path)
+        try:
+            with self._observe_agent_invocations(run_id=run_id, durable_launch=durable_launch):
+                start_result = self._agent.start_roadmap_from_issue(
+                    issue=issue,
+                    repo_full_name=self._state_repo_full_name(),
+                    default_branch=self._repo.default_branch,
+                    roadmap_docs_dir=self._repo.roadmap_docs_dir,
+                    recommended_node_count=self._repo.roadmap_recommended_node_count,
+                    cwd=checkout_path,
+                )
+        except Exception as exc:
+            self._mark_codex_invocation_finished(run_id=run_id)
+            self._raise_if_timeout_left_local_changes(
+                exc=exc,
+                checkout_path=checkout_path,
+                initial_head_sha=initial_head_sha,
+                blocked_message=(
+                    "roadmap flow blocked: codex invocation timed out after local changes were made"
+                ),
+            )
+            raise
+        self._mark_codex_invocation_finished(
+            run_id=run_id,
+            session_id=start_result.session.thread_id if start_result.session else None,
+        )
+        self._save_agent_session_if_present(issue_number=issue.number, session=start_result.session)
+
+        generated = start_result.roadmap
+        if generated.roadmap_issue_number != issue.number:
+            raise DirectFlowValidationError(
+                "Roadmap graph issue number did not match the source issue number"
+            )
+
+        roadmap_abs_path = checkout_path / roadmap_relpath
+        graph_abs_path = checkout_path / graph_relpath
+        roadmap_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        roadmap_abs_path.write_text(generated.roadmap_markdown, encoding="utf-8")
+        graph_payload = json.loads(generated.canonical_graph_json)
+        graph_abs_path.write_text(
+            json.dumps(graph_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        self._git.commit_all(checkout_path, f"docs: add roadmap for issue #{issue.number}")
+        required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+        if required_tests_error is not None:
+            required_tests_command = self._repo.required_tests or "<unset>"
+            error_summary = _summarize_git_error(required_tests_error)
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=(
+                    "MergeXO roadmap flow could not push because the required pre-push test "
+                    f"`{required_tests_command}` failed.\n"
+                    f"Failure summary: {error_summary}"
+                ),
+            )
+            raise DirectFlowValidationError(
+                "required pre-push tests failed before pushing roadmap branch"
+            )
+        self._push_pre_pr_branch(
+            issue=issue,
+            flow_label="roadmap",
+            checkout_path=checkout_path,
+            branch=branch,
+        )
+        self._run_pre_pr_ordering_gate(
+            issue_number=issue.number,
+            last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+        )
+
+        pr = self._create_pull_request_with_outbox(
+            issue_number=issue.number,
+            run_id=run_id,
+            title=f"Roadmap for #{issue.number}: {generated.title}",
+            head=branch,
+            base=self._repo.default_branch,
+            body=f"Roadmap plan.\n\nRefs #{issue.number}",
+        )
+        self._github.post_issue_comment(
+            issue_number=issue.number,
+            body=f"Opened roadmap PR: {pr.html_url}",
+        )
+        if len(generated.graph_nodes) > self._repo.roadmap_recommended_node_count:
+            self._github.post_issue_comment(
+                issue_number=issue.number,
+                body=(
+                    "MergeXO roadmap sizing recommendation:\n"
+                    f"- detected nodes: {len(generated.graph_nodes)}\n"
+                    f"- recommended max: {self._repo.roadmap_recommended_node_count}\n"
+                    "Suggestion: split this into a roadmap-of-roadmaps where practical."
+                ),
+            )
+
+        log_event(
+            LOGGER,
+            "issue_processing_completed",
+            issue_number=issue.number,
+            pr_number=pr.number,
+            branch=branch,
+            flow="roadmap",
         )
         return WorkResult(
             issue_number=issue.number,
@@ -4359,6 +6626,40 @@ class Phase1Orchestrator:
             repo_full_name=self._state_repo_full_name(),
         )
 
+    def _push_pre_pr_branch(
+        self,
+        *,
+        issue: Issue,
+        flow_label: str,
+        checkout_path: Path,
+        branch: str,
+    ) -> None:
+        push_recovered_remote_race = self._git.push_branch(checkout_path, branch)
+        if not push_recovered_remote_race:
+            return
+
+        # push_branch() may auto-merge origin/<branch> to recover a non-fast-forward race.
+        # Re-run required tests on that merged state before opening any PR.
+        required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
+        if required_tests_error is None:
+            return
+
+        required_tests_command = self._repo.required_tests or "<unset>"
+        error_summary = _summarize_git_error(required_tests_error)
+        self._github.post_issue_comment(
+            issue_number=issue.number,
+            body=(
+                f"MergeXO {flow_label} flow pushed `{branch}` after automatically reconciling "
+                "a remote branch update, but required pre-push tests then failed on the merged "
+                f"branch (`{required_tests_command}`).\n"
+                f"Failure summary: {error_summary}\n"
+                "No PR was opened so this can be fixed before review."
+            ),
+        )
+        raise DirectFlowValidationError(
+            "required pre-push tests failed after push reconciled remote branch updates"
+        )
+
     def _push_branch_with_merge_conflict_repair(
         self,
         *,
@@ -4372,7 +6673,12 @@ class Phase1Orchestrator:
         conflict_repair_round = 0
         while True:
             try:
-                self._git.push_branch(checkout_path, branch)
+                self._push_pre_pr_branch(
+                    issue=issue,
+                    flow_label=flow_label,
+                    checkout_path=checkout_path,
+                    branch=branch,
+                )
                 return
             except CommandError as exc:
                 detail = str(exc)
@@ -4483,6 +6789,12 @@ class Phase1Orchestrator:
 
         while True:
             self._save_agent_session_if_present(issue_number=issue.number, session=result.session)
+            if result.escalation is not None:
+                self._handle_roadmap_revision_escalation(
+                    source_issue=issue,
+                    escalation=result.escalation,
+                    source_url=issue.html_url,
+                )
             if result.blocked_reason:
                 self._github.post_issue_comment(
                     issue_number=issue.number,
@@ -5264,6 +7576,15 @@ class Phase1Orchestrator:
                     tracked=tracked, fallback="blocked"
                 )
             result, pr = feedback_outcome
+            if result.escalation is not None:
+                self._handle_roadmap_revision_escalation(
+                    source_issue=issue,
+                    escalation=result.escalation,
+                    source_url=_pull_request_url(
+                        repo_full_name=self._state_repo_full_name(),
+                        pr_number=tracked.pr_number,
+                    ),
+                )
             if self._block_invalid_feedback_review_reply_targets(
                 tracked=tracked,
                 pull_request=pr,
@@ -7398,6 +9719,7 @@ def _infer_pre_pr_flow_from_issue_and_error(
     issue: Issue,
     error: str,
     design_label: str,
+    roadmap_label: str,
     bugfix_label: str,
     small_job_label: str,
     ignore_label: str | None = None,
@@ -7405,6 +9727,7 @@ def _infer_pre_pr_flow_from_issue_and_error(
     resolved = _resolve_issue_flow(
         issue=issue,
         design_label=design_label,
+        roadmap_label=roadmap_label,
         bugfix_label=bugfix_label,
         small_job_label=small_job_label,
         ignore_label=ignore_label,
@@ -7492,11 +9815,300 @@ def _render_pre_pr_checkpoint_failure_comment(
     )
 
 
+def _parse_superseding_roadmap_parent(body: str) -> int | None:
+    match = re.search(r"(?im)^\s*supersedes(?:\s+roadmap)?\s+#(\d+)\b", body)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _roadmap_child_label_for_kind(*, kind: str, repo: RepoConfig) -> str:
+    if kind == "design_doc":
+        return repo.trigger_label
+    if kind == "small_job":
+        return repo.small_job_label
+    if kind == "roadmap":
+        return repo.roadmap_label
+    raise RuntimeError(f"Unsupported roadmap node kind: {kind}")
+
+
+def _render_roadmap_child_issue_body(
+    *,
+    roadmap_issue_number: int,
+    node_id: str,
+    dependencies_json: str,
+    body_markdown: str,
+) -> str:
+    dependencies: list[str] = []
+    try:
+        payload = json.loads(dependencies_json)
+    except json.JSONDecodeError:
+        payload = []
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            dep_node_id = item.get("node_id")
+            requires = item.get("requires", "implemented")
+            if isinstance(dep_node_id, str) and isinstance(requires, str):
+                dependencies.append(f"- {dep_node_id} ({requires})")
+    dependency_lines = "\n".join(dependencies) if dependencies else "- none"
+    return (
+        f"Parent roadmap: #{roadmap_issue_number}\n"
+        f"Roadmap node: {node_id}\n\n"
+        "Dependency context:\n"
+        f"{dependency_lines}\n\n"
+        f"{body_markdown}"
+    )
+
+
+def _ready_frontier_dependency_references(
+    *,
+    nodes_by_id: dict[str, RoadmapNodeRecord],
+    ready_node_ids: tuple[str, ...],
+) -> dict[str, tuple[RoadmapDependencyReference, ...]]:
+    refs: dict[str, list[RoadmapDependencyReference]] = {}
+    for ready_node_id in ready_node_ids:
+        ready_node = nodes_by_id.get(ready_node_id)
+        if ready_node is None:
+            continue
+        try:
+            payload = json.loads(ready_node.dependencies_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, list):
+            continue
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            dependency_node_id = item.get("node_id")
+            requires = item.get("requires")
+            if not isinstance(dependency_node_id, str) or not isinstance(requires, str):
+                continue
+            if requires not in {"planned", "implemented"}:
+                continue
+            refs.setdefault(dependency_node_id, []).append(
+                RoadmapDependencyReference(
+                    ready_node_id=ready_node_id,
+                    requires=cast(Literal["planned", "implemented"], requires),
+                )
+            )
+    return {
+        dependency_node_id: tuple(
+            sorted(
+                dependency_refs,
+                key=lambda reference: (reference.ready_node_id, reference.requires),
+            )
+        )
+        for dependency_node_id, dependency_refs in refs.items()
+    }
+
+
+def _roadmap_dependency_changed_files(changed_files: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(changed_files[:25])
+
+
+def _key_roadmap_dependency_comments(
+    comments: tuple[PullRequestIssueComment, ...],
+) -> tuple[PullRequestIssueComment, ...]:
+    user_comments = tuple(comment for comment in comments if not is_bot_login(comment.user_login))
+    if len(user_comments) <= 3:
+        return user_comments
+    return user_comments[-3:]
+
+
+def _roadmap_dependency_resolution_markers(
+    *,
+    node: RoadmapNodeRecord,
+    issue_run: IssueRunRecord | None,
+) -> tuple[str, ...]:
+    markers = [
+        f"node_status={node.status}",
+        f"planned_at={'set' if node.planned_at is not None else 'unset'}",
+        f"implemented_at={'set' if node.implemented_at is not None else 'unset'}",
+        f"blocked_since_at={'set' if node.blocked_since_at is not None else 'unset'}",
+        f"child_issue={'set' if node.child_issue_number is not None else 'unset'}",
+    ]
+    if issue_run is None:
+        markers.append("issue_run=missing")
+    else:
+        markers.append(f"issue_run_status={issue_run.status}")
+        markers.append(f"issue_run_pr={'set' if issue_run.pr_number is not None else 'unset'}")
+        if issue_run.error is not None:
+            markers.append(f"issue_run_error={issue_run.error}")
+    return tuple(markers)
+
+
+def _roadmap_adjustment_basis_digest(
+    *,
+    issue: Issue,
+    graph_version: int,
+    ready_node_ids: tuple[str, ...],
+    dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
+    roadmap_status_report: str,
+    roadmap_markdown: str,
+    canonical_graph_json: str,
+) -> str:
+    payload = {
+        "issue": {
+            "number": issue.number,
+            "title": issue.title,
+            "body": issue.body,
+            "html_url": issue.html_url,
+            "labels": list(issue.labels),
+            "author_login": issue.author_login,
+        },
+        "graph_version": graph_version,
+        "ready_node_ids": list(ready_node_ids),
+        "dependency_artifacts": [
+            _serialize_roadmap_dependency_artifact(artifact) for artifact in dependency_artifacts
+        ],
+        "roadmap_status_report": roadmap_status_report,
+        "roadmap_markdown": roadmap_markdown,
+        "canonical_graph_json": canonical_graph_json,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _serialize_roadmap_dependency_artifact(
+    artifact: RoadmapDependencyArtifact,
+) -> dict[str, object]:
+    return {
+        "dependency_node_id": artifact.dependency_node_id,
+        "dependency_kind": artifact.dependency_kind,
+        "dependency_title": artifact.dependency_title,
+        "frontier_references": [
+            {
+                "ready_node_id": reference.ready_node_id,
+                "requires": reference.requires,
+            }
+            for reference in artifact.frontier_references
+        ],
+        "child_issue_number": artifact.child_issue_number,
+        "child_issue_url": artifact.child_issue_url,
+        "child_issue_title": artifact.child_issue_title,
+        "child_issue_body": artifact.child_issue_body,
+        "issue_run_status": artifact.issue_run_status,
+        "issue_run_branch": artifact.issue_run_branch,
+        "issue_run_error": artifact.issue_run_error,
+        "resolution_markers": list(artifact.resolution_markers),
+        "pr_number": artifact.pr_number,
+        "pr_url": artifact.pr_url,
+        "pr_title": artifact.pr_title,
+        "pr_body": artifact.pr_body,
+        "pr_state": artifact.pr_state,
+        "pr_merged": artifact.pr_merged,
+        "changed_files": list(artifact.changed_files),
+        "review_summaries": [
+            _serialize_pull_request_issue_comment(comment) for comment in artifact.review_summaries
+        ],
+        "issue_comments": [
+            _serialize_pull_request_issue_comment(comment) for comment in artifact.issue_comments
+        ],
+    }
+
+
+def _serialize_pull_request_issue_comment(comment: PullRequestIssueComment) -> dict[str, object]:
+    return {
+        "comment_id": comment.comment_id,
+        "body": comment.body,
+        "user_login": comment.user_login,
+        "html_url": comment.html_url,
+        "created_at": comment.created_at,
+        "updated_at": comment.updated_at,
+    }
+
+
+def _render_roadmap_status_report(
+    *,
+    roadmap_status: str,
+    graph_version: int,
+    adjustment_state: str,
+    pending_revision_pr_number: int | None,
+    pending_revision_pr_url: str | None,
+    adjustment_request_version: int | None,
+    latest_note: str | None,
+    revision_requested_at: str | None,
+    revisions: tuple[RoadmapRevisionRecord, ...],
+    rows: tuple[RoadmapStatusSnapshotRow, ...],
+    blockers: tuple[RoadmapBlockerRow, ...],
+    request_comment_id: int,
+) -> str:
+    node_lines = [
+        (
+            f"- {row.node_id} [{row.kind}] status={row.status} deps={row.dependency_summary} "
+            f"child_issue=#{row.child_issue_number if row.child_issue_number is not None else '-'} "
+            f"last_progress={row.last_progress_at or '-'}"
+        )
+        for row in rows
+    ]
+    if not node_lines:
+        node_lines = ["- (no roadmap nodes found)"]
+    blocker_lines = [
+        (
+            f"- {blocker.node_id}: blocked_since={blocker.blocked_since_at} "
+            f"child_issue=#{blocker.child_issue_number if blocker.child_issue_number is not None else '-'}"
+        )
+        for blocker in blockers
+    ]
+    if not blocker_lines:
+        blocker_lines = ["- none"]
+    if pending_revision_pr_number is None:
+        pending_revision_line = "- pending_revision_pr: none"
+    elif pending_revision_pr_url is None:
+        pending_revision_line = f"- pending_revision_pr: #{pending_revision_pr_number}"
+    else:
+        pending_revision_line = (
+            f"- pending_revision_pr: #{pending_revision_pr_number} ({pending_revision_pr_url})"
+        )
+    requested_version_line = (
+        f"- requested_revision_version: {adjustment_request_version}"
+        if adjustment_request_version is not None
+        else "- requested_revision_version: none"
+    )
+    latest_note_line = f"- latest_note: {latest_note}" if latest_note else "- latest_note: none"
+    revision_requested_line = (
+        f"- revision_requested_at: {revision_requested_at}"
+        if revision_requested_at is not None
+        else "- revision_requested_at: none"
+    )
+    revision_lines = [
+        (
+            f"- v{revision.version}: applied_at={revision.applied_at} "
+            f"checksum={revision.graph_checksum}"
+        )
+        for revision in revisions
+    ]
+    if not revision_lines:
+        revision_lines = ["- none recorded"]
+    return (
+        "MergeXO roadmap status report:\n"
+        f"- request_comment_id: {request_comment_id}\n"
+        f"- roadmap_status: {roadmap_status}\n\n"
+        f"- graph_version: {graph_version}\n"
+        f"- adjustment_state: {adjustment_state}\n"
+        f"{pending_revision_line}\n"
+        f"{requested_version_line}\n"
+        f"{latest_note_line}\n"
+        f"{revision_requested_line}\n\n"
+        "Nodes:\n"
+        + "\n".join(node_lines)
+        + "\n\nBlockers (oldest first):\n"
+        + "\n".join(blocker_lines)
+        + "\n\nRecent revisions:\n"
+        + "\n".join(revision_lines)
+    )
+
+
 def _pre_pr_flow_label(flow: PrePrFlow) -> str:
     if flow == "design_doc":
         return "design"
     if flow == "small_job":
         return "small-job"
+    if flow == "roadmap":
+        return "roadmap"
     return flow
 
 
@@ -7515,11 +10127,15 @@ def _design_branch_slug(branch: str) -> str | None:
     return slug
 
 
-def _trigger_labels(repo: RepoConfig) -> tuple[str, ...]:
+def _trigger_labels(repo: RepoConfig, *, enable_roadmaps: bool = True) -> tuple[str, ...]:
     # Operators may intentionally configure overlapping labels across flows; dedupe avoids
     # repeated GitHub queries while preserving first-occurrence precedence semantics.
     labels: list[str] = []
-    for label in (repo.trigger_label, repo.bugfix_label, repo.small_job_label):
+    label_order: list[str] = []
+    if enable_roadmaps:
+        label_order.append(repo.roadmap_label)
+    label_order.extend((repo.bugfix_label, repo.small_job_label, repo.trigger_label))
+    for label in label_order:
         if label not in labels:
             labels.append(label)
     return tuple(labels)
@@ -7571,13 +10187,17 @@ def _resolve_issue_flow(
     *,
     issue: Issue,
     design_label: str,
+    roadmap_label: str,
     bugfix_label: str,
     small_job_label: str,
     ignore_label: str | None = None,
+    enable_roadmaps: bool = True,
 ) -> IssueFlow | None:
     issue_labels = set(issue.labels)
     if ignore_label and ignore_label in issue_labels:
         return None
+    if enable_roadmaps and roadmap_label in issue_labels:
+        return "roadmap"
     if bugfix_label in issue_labels:
         return "bugfix"
     if small_job_label in issue_labels:
@@ -7590,6 +10210,8 @@ def _resolve_issue_flow(
 def _flow_trigger_label(*, flow: IssueFlow, repo: RepoConfig) -> str:
     if flow == "design_doc":
         return repo.trigger_label
+    if flow == "roadmap":
+        return repo.roadmap_label
     if flow == "bugfix":
         return repo.bugfix_label
     return repo.small_job_label
@@ -7598,9 +10220,24 @@ def _flow_trigger_label(*, flow: IssueFlow, repo: RepoConfig) -> str:
 def _issue_branch(*, flow: IssueFlow, issue_number: int, slug: str) -> str:
     if flow == "design_doc":
         return f"agent/design/{issue_number}-{slug}"
+    if flow == "roadmap":
+        return f"agent/roadmap/{issue_number}-{slug}"
     if flow == "bugfix":
         return f"agent/bugfix/{issue_number}-{slug}"
     return f"agent/small/{issue_number}-{slug}"
+
+
+def _roadmap_revision_branch(*, issue_number: int, graph_version: int) -> str:
+    return f"agent/roadmap/{issue_number}-revision-v{graph_version}"
+
+
+def _parse_ready_node_ids_json(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    parsed = json.loads(value)
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise RuntimeError("Invalid ready_node_ids_json stored in roadmap revision draft")
+    return tuple(cast(str, item) for item in parsed)
 
 
 def _default_commit_message(*, flow: IssueFlow, issue_number: int) -> str:
@@ -7614,6 +10251,8 @@ def _render_issue_start_comment(
 ) -> str:
     if flow == "design_doc":
         action = "design work"
+    elif flow == "roadmap":
+        action = "roadmap planning work"
     elif flow == "bugfix":
         action = "bugfix PR work"
     elif flow == "small_job":
@@ -7663,6 +10302,12 @@ def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, s
             (f"Recovered design PR from a previously pushed branch.\n\nRefs #{issue.number}"),
             flow,
         )
+    if flow == "roadmap":
+        return (
+            f"Roadmap for #{issue.number}: {issue.title}",
+            (f"Recovered roadmap PR from a previously pushed branch.\n\nRefs #{issue.number}"),
+            flow,
+        )
     if flow == "implementation":
         return (
             f"Implementation for #{issue.number}: {issue.title}",
@@ -7688,6 +10333,8 @@ def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, s
 def _flow_label_from_branch(branch: str) -> str:
     if branch.startswith("agent/design/"):
         return "design"
+    if branch.startswith("agent/roadmap/"):
+        return "roadmap"
     if branch.startswith("agent/bugfix/"):
         return "bugfix"
     if branch.startswith("agent/impl/"):

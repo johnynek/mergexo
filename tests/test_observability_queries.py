@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
@@ -8,7 +10,7 @@ import pytest
 
 from mergexo.feedback_loop import FeedbackEventRecord
 from mergexo import observability_queries as oq
-from mergexo.state import StateStore
+from mergexo.state import RoadmapDependencyState, RoadmapNodeGraphInput, StateStore
 
 
 def _iso(dt: datetime) -> str:
@@ -168,6 +170,108 @@ def _seed_state(store: StateStore) -> None:
         repo_full_name="o/repo-b",
     )
 
+    roadmap_nodes = (
+        RoadmapNodeGraphInput(
+            node_id="n1",
+            kind="small_job",
+            title="Ship",
+            body_markdown="Do it",
+            dependencies=(),
+        ),
+    )
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=200,
+        roadmap_pr_number=2200,
+        roadmap_doc_path="docs/roadmap/200.md",
+        graph_path="docs/roadmap/200.graph.json",
+        graph_checksum="sum200",
+        nodes=roadmap_nodes,
+        repo_full_name="o/repo-a",
+    )
+    claim = store.claim_ready_roadmap_nodes(repo_full_name="o/repo-a")[0]
+    store.mark_roadmap_node_issue_created(
+        roadmap_issue_number=200,
+        node_id="n1",
+        claim_token=claim.claim_token,
+        child_issue_number=2001,
+        child_issue_url="https://example/issues/2001",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_roadmap_node_blocked(
+        roadmap_issue_number=200,
+        node_id="n1",
+        repo_full_name="o/repo-a",
+    )
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=201,
+        roadmap_pr_number=2201,
+        roadmap_doc_path="docs/roadmap/201.md",
+        graph_path="docs/roadmap/201.graph.json",
+        graph_checksum="sum201",
+        nodes=roadmap_nodes,
+        repo_full_name="o/repo-a",
+    )
+    store.mark_roadmap_revision_requested(
+        roadmap_issue_number=201,
+        repo_full_name="o/repo-a",
+    )
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=202,
+        roadmap_pr_number=2202,
+        roadmap_doc_path="docs/roadmap/202.md",
+        graph_path="docs/roadmap/202.graph.json",
+        graph_checksum="sum202",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="n1",
+                kind="roadmap",
+                title="Nested",
+                body_markdown="Nested",
+                dependencies=(RoadmapDependencyState(node_id="n1", requires="planned"),),
+            ),
+        ),
+        repo_full_name="o/repo-a",
+    )
+    store.mark_roadmap_revision_requested(
+        roadmap_issue_number=202,
+        repo_full_name="o/repo-a",
+    )
+    store.mark_roadmap_superseded(
+        roadmap_issue_number=202,
+        superseding_roadmap_issue_number=303,
+        repo_full_name="o/repo-a",
+    )
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=203,
+        roadmap_pr_number=2203,
+        roadmap_doc_path="docs/roadmap/203.md",
+        graph_path="docs/roadmap/203.graph.json",
+        graph_checksum="sum203",
+        nodes=roadmap_nodes,
+        repo_full_name="o/repo-b",
+    )
+    store.mark_roadmap_abandoned(
+        roadmap_issue_number=203,
+        repo_full_name="o/repo-b",
+    )
+
+    store.upsert_roadmap_graph(
+        roadmap_issue_number=204,
+        roadmap_pr_number=2204,
+        roadmap_doc_path="docs/roadmap/204.md",
+        graph_path="docs/roadmap/204.graph.json",
+        graph_checksum="sum204",
+        nodes=roadmap_nodes,
+        repo_full_name="o/repo-b",
+    )
+    store.mark_roadmap_completed(
+        roadmap_issue_number=204,
+        repo_full_name="o/repo-b",
+    )
+
 
 def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
@@ -248,6 +352,33 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert oq.load_metrics(db_path, window="1h").overall.terminal_count == 2
     assert oq.load_metrics(db_path, window="30d").overall.terminal_count == 3
 
+    lifecycle_counts = oq.load_roadmap_lifecycle_counts(db_path)
+    assert lifecycle_counts.active == 1
+    assert lifecycle_counts.revision_requested == 1
+    assert lifecycle_counts.superseded == 1
+    assert lifecycle_counts.abandoned == 1
+    assert lifecycle_counts.completed == 1
+
+    repo_a_counts = oq.load_roadmap_lifecycle_counts(db_path, repo_filter="o/repo-a")
+    assert repo_a_counts.active == 1
+    assert repo_a_counts.revision_requested == 1
+    assert repo_a_counts.superseded == 1
+    assert repo_a_counts.abandoned == 0
+    assert repo_a_counts.completed == 0
+
+    blockers = oq.load_roadmap_blocker_ages(
+        db_path,
+        limit=10,
+        now=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    assert len(blockers) == 1
+    assert blockers[0].repo_full_name == "o/repo-a"
+    assert blockers[0].roadmap_issue_number == 200
+    assert blockers[0].node_id == "n1"
+    assert blockers[0].child_issue_number == 2001
+    assert blockers[0].age_seconds >= 0.0
+    assert oq.load_roadmap_blocker_ages(db_path, repo_filter="o/repo-b", limit=10) == ()
+
 
 def test_observability_queries_show_takeover_tracked_pr_as_blocked(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
@@ -313,6 +444,8 @@ def test_observability_query_validation_paths(tmp_path: Path) -> None:
         oq.load_terminal_issue_outcomes(db_path, None, limit=0)
     with pytest.raises(ValueError, match="offset"):
         oq.load_terminal_issue_outcomes(db_path, None, limit=1, offset=-1)
+    with pytest.raises(ValueError, match="limit"):
+        oq.load_roadmap_blocker_ages(db_path, limit=0)
 
     assert oq._window_modifier("1h") == "-1 hours"
     assert oq._window_modifier("24h") == "-24 hours"
@@ -411,13 +544,30 @@ def test_observability_query_internal_error_paths() -> None:
     with pytest.raises(RuntimeError, match="count query"):
         oq._fetch_int(EmptyCountConn(), "SELECT 1", ())
 
+    class EmptyRoadmapConn:
+        def execute(self, sql: str, params: tuple[object, ...]) -> FakeCursor:
+            _ = sql, params
+            return FakeCursor(None)
+
+    @contextmanager
+    def fake_connect(_db_path: Path) -> Iterator[EmptyRoadmapConn]:
+        yield EmptyRoadmapConn()
+
+    original_connect = oq._connect
+    oq._connect = fake_connect
+    try:
+        with pytest.raises(RuntimeError, match="roadmap lifecycle query"):
+            oq.load_roadmap_lifecycle_counts(Path("unused.db"))
+    finally:
+        oq._connect = original_connect
+
 
 def test_load_tracked_and_blocked_sorted_by_updated_desc(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
     _seed_state(store)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE pr_feedback_state
@@ -439,6 +589,7 @@ def test_load_tracked_and_blocked_sorted_by_updated_desc(tmp_path: Path) -> None
             WHERE repo_full_name = 'o/repo-b' AND pr_number = 1111
             """
         )
+        conn.commit()
 
     rows = oq.load_tracked_and_blocked(db_path, limit=20)
     assert [row.updated_at for row in rows] == [

@@ -24,6 +24,7 @@ base_dir = "~/tmp/mergexo"
 worker_count = 2
 poll_interval_seconds = 60
 enable_github_operations = true
+enable_roadmaps = true
 enable_issue_comment_routing = true
 enable_pr_actions_monitoring = true
 enable_incremental_comment_fetch = true
@@ -50,6 +51,11 @@ pr_actions_feedback_policy = "first_fail"
 local_clone_source = "/tmp/local.git"
 operations_issue_number = 99
 operator_logins = ["Alice", "bob"]
+roadmap_label = "agent:rmap"
+roadmap_docs_dir = "docs/my-roadmaps"
+roadmap_revision_label = "agent:rmap-revise"
+roadmap_abandon_label = "agent:rmap-abandon"
+roadmap_recommended_node_count = 9
 
 [auth]
 allowed_users = [" Alice ", "BOB", "alice"]
@@ -74,6 +80,7 @@ extra_args = ["--repo-mode"]
     assert loaded.runtime.worker_count == 2
     assert loaded.runtime.base_dir.as_posix().endswith("/tmp/mergexo")
     assert loaded.runtime.enable_github_operations is True
+    assert loaded.runtime.enable_roadmaps is True
     assert loaded.runtime.enable_issue_comment_routing is True
     assert loaded.runtime.enable_pr_actions_monitoring is True
     assert loaded.runtime.enable_incremental_comment_fetch is True
@@ -97,6 +104,11 @@ extra_args = ["--repo-mode"]
     assert loaded.repo.bugfix_label == "agent:bugfix"
     assert loaded.repo.small_job_label == "agent:small-job"
     assert loaded.repo.ignore_label == "agent:pause"
+    assert loaded.repo.roadmap_label == "agent:rmap"
+    assert loaded.repo.roadmap_docs_dir == "docs/my-roadmaps"
+    assert loaded.repo.roadmap_revision_label == "agent:rmap-revise"
+    assert loaded.repo.roadmap_abandon_label == "agent:rmap-abandon"
+    assert loaded.repo.roadmap_recommended_node_count == 9
     assert loaded.repo.design_docs_dir == "docs/design"
     assert loaded.repo.effective_remote_url == "git@github.com:johnynek/repo.git"
     assert loaded.repo.coding_guidelines_path == "docs/guidelines.md"
@@ -144,6 +156,7 @@ coding_guidelines_path = "docs/python_style.md"
     loaded = config.load_config(cfg_path)
     assert len(loaded.repos) == 2
     assert loaded.runtime.enable_issue_comment_routing is False
+    assert loaded.runtime.enable_roadmaps is False
     assert loaded.runtime.enable_pr_actions_monitoring is False
     assert loaded.runtime.enable_incremental_comment_fetch is False
     assert loaded.runtime.comment_fetch_overlap_seconds == 5
@@ -160,6 +173,11 @@ coding_guidelines_path = "docs/python_style.md"
     assert by_id["mergexo"].allowed_users == frozenset({"alice", "bob"})
     assert by_id["mergexo"].pr_actions_feedback_policy == "never"
     assert by_id["mergexo"].ignore_label == "agent:ignore"
+    assert by_id["mergexo"].roadmap_label == "agent:roadmap"
+    assert by_id["mergexo"].roadmap_docs_dir == "docs/roadmap"
+    assert by_id["mergexo"].roadmap_revision_label == "agent:roadmap-revise"
+    assert by_id["mergexo"].roadmap_abandon_label == "agent:roadmap-abandon"
+    assert by_id["mergexo"].roadmap_recommended_node_count == 7
 
     assert by_id["bosatsu"].name == "bosatsu"
     assert by_id["bosatsu"].full_name == "johnynek/bosatsu"
@@ -380,6 +398,26 @@ enabled = false
 """.strip(),
     )
     with pytest.raises(ConfigError, match="Unknown repo id"):
+        config.load_config(cfg_path)
+
+
+def test_load_config_rejects_invalid_roadmap_recommended_node_count(tmp_path: Path) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        """
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "o"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+roadmap_recommended_node_count = 0
+""".strip(),
+    )
+    with pytest.raises(ConfigError, match="roadmap_recommended_node_count"):
         config.load_config(cfg_path)
 
 

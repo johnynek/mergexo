@@ -9,6 +9,11 @@ from mergexo.feedback_loop import (
     compute_history_rewrite_token,
     compute_operator_command_token,
     compute_pre_pr_checkpoint_token,
+    compute_roadmap_adjustment_decision_token,
+    compute_roadmap_graph_drift_token,
+    compute_roadmap_node_issue_token,
+    compute_roadmap_revision_escalation_token,
+    compute_roadmap_status_token,
     compute_review_reply_token,
     compute_source_issue_redirect_token,
     compute_turn_key,
@@ -130,6 +135,68 @@ def test_pre_pr_checkpoint_token_is_stable() -> None:
     token_c = compute_pre_pr_checkpoint_token(issue_number=44, checkpoint_sha="def456")
     assert token_a == token_b
     assert token_a != token_c
+
+
+def test_roadmap_tokens_are_stable_and_specific() -> None:
+    status_a = compute_roadmap_status_token(roadmap_issue_number=44, request_comment_id=7)
+    status_b = compute_roadmap_status_token(roadmap_issue_number=44, request_comment_id=7)
+    status_c = compute_roadmap_status_token(roadmap_issue_number=44, request_comment_id=8)
+    assert status_a == status_b
+    assert status_a != status_c
+
+    escalation_a = compute_roadmap_revision_escalation_token(
+        roadmap_issue_number=44,
+        source_issue_number=101,
+        summary="Need revision",
+    )
+    escalation_b = compute_roadmap_revision_escalation_token(
+        roadmap_issue_number=44,
+        source_issue_number=101,
+        summary="Need revision",
+    )
+    escalation_c = compute_roadmap_revision_escalation_token(
+        roadmap_issue_number=44,
+        source_issue_number=101,
+        summary="Different summary",
+    )
+    assert escalation_a == escalation_b
+    assert escalation_a != escalation_c
+
+    adjustment_a = compute_roadmap_adjustment_decision_token(
+        roadmap_issue_number=44,
+        graph_version=3,
+        ready_node_ids=("n2", "n3"),
+        action="revise",
+        summary="Need revision",
+    )
+    adjustment_b = compute_roadmap_adjustment_decision_token(
+        roadmap_issue_number=44,
+        graph_version=3,
+        ready_node_ids=("n2", "n3"),
+        action="revise",
+        summary="Need revision",
+    )
+    adjustment_c = compute_roadmap_adjustment_decision_token(
+        roadmap_issue_number=44,
+        graph_version=3,
+        ready_node_ids=("n2",),
+        action="revise",
+        summary="Need revision",
+    )
+    assert adjustment_a == adjustment_b
+    assert adjustment_a != adjustment_c
+
+    drift_a = compute_roadmap_graph_drift_token(roadmap_issue_number=44, graph_checksum="abc")
+    drift_b = compute_roadmap_graph_drift_token(roadmap_issue_number=44, graph_checksum="abc")
+    drift_c = compute_roadmap_graph_drift_token(roadmap_issue_number=44, graph_checksum="def")
+    assert drift_a == drift_b
+    assert drift_a != drift_c
+
+    node_a = compute_roadmap_node_issue_token(roadmap_issue_number=44, node_id="n1")
+    node_b = compute_roadmap_node_issue_token(roadmap_issue_number=44, node_id="n1")
+    node_c = compute_roadmap_node_issue_token(roadmap_issue_number=44, node_id="n2")
+    assert node_a == node_b
+    assert node_a != node_c
 
 
 def test_parse_operator_command_valid_variants() -> None:
