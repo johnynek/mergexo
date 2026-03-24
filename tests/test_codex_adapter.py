@@ -5,7 +5,12 @@ import json
 
 import pytest
 
-from mergexo.agent_adapter import AgentSession, FeedbackTurn
+from mergexo.agent_adapter import (
+    AgentSession,
+    FeedbackTurn,
+    RoadmapDependencyArtifact,
+    RoadmapDependencyReference,
+)
 from mergexo.codex_adapter import (
     CodexAdapter,
     _as_object_dict,
@@ -333,6 +338,33 @@ def test_evaluate_roadmap_adjustment_happy_path(
         graph_path="docs/roadmap/1-issue.graph.json",
         graph_version=2,
         ready_node_ids=("n2", "n3"),
+        dependency_artifacts=(
+            RoadmapDependencyArtifact(
+                dependency_node_id="n1",
+                dependency_kind="small_job",
+                dependency_title="Dependency",
+                frontier_references=(
+                    RoadmapDependencyReference(ready_node_id="n2", requires="implemented"),
+                ),
+                child_issue_number=10,
+                child_issue_url="https://example/issues/10",
+                child_issue_title="Dependency issue",
+                child_issue_body="Issue body",
+                issue_run_status="merged",
+                issue_run_branch="agent/impl/10-dependency",
+                issue_run_error=None,
+                resolution_markers=("issue_run_status=merged",),
+                pr_number=11,
+                pr_url="https://example/pr/11",
+                pr_title="Dependency PR",
+                pr_body="PR body",
+                pr_state="closed",
+                pr_merged=True,
+                changed_files=("src/a.py",),
+                review_summaries=(),
+                issue_comments=(),
+            ),
+        ),
         roadmap_status_report="status report",
         roadmap_markdown="# Roadmap",
         canonical_graph_json='{"roadmap_issue_number":1}',
@@ -381,6 +413,7 @@ def test_evaluate_roadmap_adjustment_rejects_invalid_action(
             graph_path="docs/roadmap/1-issue.graph.json",
             graph_version=2,
             ready_node_ids=("n2",),
+            dependency_artifacts=(),
             roadmap_status_report="status report",
             roadmap_markdown="# Roadmap",
             canonical_graph_json='{"roadmap_issue_number":1}',
@@ -408,6 +441,7 @@ def test_evaluate_roadmap_adjustment_requires_enabled_config(tmp_path: Path) -> 
             graph_path="docs/roadmap/1-issue.graph.json",
             graph_version=2,
             ready_node_ids=("n2",),
+            dependency_artifacts=(),
             roadmap_status_report="status report",
             roadmap_markdown="# Roadmap",
             canonical_graph_json='{"roadmap_issue_number":1}',

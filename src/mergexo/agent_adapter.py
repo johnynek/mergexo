@@ -13,6 +13,8 @@ from mergexo.models import (
     PullRequestIssueComment,
     PullRequestReviewComment,
     PullRequestSnapshot,
+    RoadmapDependencyRequirement,
+    RoadmapNodeKind,
     RoadmapRevisionEscalation,
 )
 
@@ -58,6 +60,37 @@ RoadmapAdjustmentAction = Literal["proceed", "request_revision", "abandon"]
 @dataclass(frozen=True)
 class GitOpRequest:
     op: GitOpName
+
+
+@dataclass(frozen=True)
+class RoadmapDependencyReference:
+    ready_node_id: str
+    requires: RoadmapDependencyRequirement
+
+
+@dataclass(frozen=True)
+class RoadmapDependencyArtifact:
+    dependency_node_id: str
+    dependency_kind: RoadmapNodeKind
+    dependency_title: str
+    frontier_references: tuple[RoadmapDependencyReference, ...]
+    child_issue_number: int | None
+    child_issue_url: str | None
+    child_issue_title: str | None
+    child_issue_body: str | None
+    issue_run_status: str | None
+    issue_run_branch: str | None
+    issue_run_error: str | None
+    resolution_markers: tuple[str, ...]
+    pr_number: int | None
+    pr_url: str | None
+    pr_title: str | None
+    pr_body: str | None
+    pr_state: str | None
+    pr_merged: bool | None
+    changed_files: tuple[str, ...]
+    review_summaries: tuple[PullRequestIssueComment, ...]
+    issue_comments: tuple[PullRequestIssueComment, ...]
 
 
 @dataclass(frozen=True)
@@ -126,6 +159,7 @@ class AgentAdapter(ABC):
         graph_path: str,
         graph_version: int,
         ready_node_ids: tuple[str, ...],
+        dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
         roadmap_status_report: str,
         roadmap_markdown: str,
         canonical_graph_json: str,

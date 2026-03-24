@@ -213,6 +213,17 @@ class RoadmapRevisionRecord:
 
 
 @dataclass(frozen=True)
+class IssueRunRecord:
+    repo_full_name: str
+    issue_number: int
+    status: str
+    branch: str | None
+    pr_number: int | None
+    pr_url: str | None
+    error: str | None
+
+
+@dataclass(frozen=True)
 class TrackedPullRequestState:
     pr_number: int
     issue_number: int
@@ -4765,6 +4776,42 @@ class StateStore:
         if branch is not None and not isinstance(branch, str):
             raise RuntimeError("Invalid branch value stored in issue_runs")
         return status, branch
+
+    def get_issue_run_record(
+        self, issue_number: int, *, repo_full_name: str | None = None
+    ) -> IssueRunRecord | None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT status, branch, pr_number, pr_url, error
+                FROM issue_runs
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (repo_key, issue_number),
+            ).fetchone()
+        if row is None:
+            return None
+        status, branch, pr_number, pr_url, error = row
+        if not isinstance(status, str):
+            raise RuntimeError("Invalid status value stored in issue_runs")
+        if branch is not None and not isinstance(branch, str):
+            raise RuntimeError("Invalid branch value stored in issue_runs")
+        if pr_number is not None and not isinstance(pr_number, int):
+            raise RuntimeError("Invalid pr_number value stored in issue_runs")
+        if pr_url is not None and not isinstance(pr_url, str):
+            raise RuntimeError("Invalid pr_url value stored in issue_runs")
+        if error is not None and not isinstance(error, str):
+            raise RuntimeError("Invalid error value stored in issue_runs")
+        return IssueRunRecord(
+            repo_full_name=repo_key,
+            issue_number=issue_number,
+            status=status,
+            branch=branch,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            error=error,
+        )
 
     def get_roadmap_state(
         self, *, roadmap_issue_number: int, repo_full_name: str | None = None

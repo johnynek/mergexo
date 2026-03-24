@@ -22,6 +22,7 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapDependencyArtifact,
     RoadmapAdjustmentResult,
     RoadmapStartResult,
     ReviewReply,
@@ -103,6 +104,10 @@ from mergexo.orchestrator import (
     _render_design_doc,
     _render_operator_command_result,
     _render_roadmap_child_issue_body,
+    _ready_frontier_dependency_references,
+    _key_roadmap_dependency_comments,
+    _roadmap_dependency_changed_files,
+    _roadmap_dependency_resolution_markers,
     _render_roadmap_status_report,
     _render_regex_patterns,
     _recovery_pr_payload_for_issue,
@@ -130,8 +135,11 @@ from mergexo.state import (
     PrFlakeStatus,
     PrePrFollowupState,
     RoadmapBlockerRow,
+    RoadmapDependencyState,
     RoadmapNodeGraphInput,
+    RoadmapNodeRecord,
     RoadmapStatusSnapshotRow,
+    IssueRunRecord,
     StateStore,
     TrackedPullRequestState,
 )
@@ -362,29 +370,28 @@ class FakeGitHub:
         )
 
     def get_pull_request(self, pr_number: int) -> PullRequestSnapshot:
-        assert pr_number == self.pr_snapshot.number
-        return self.pr_snapshot
+        if pr_number == self.pr_snapshot.number:
+            return self.pr_snapshot
+        return replace(self.pr_snapshot, number=pr_number)
 
     def list_pull_request_files(self, pr_number: int) -> tuple[str, ...]:
-        assert pr_number == self.pr_snapshot.number
+        _ = pr_number
         return self.changed_files
 
     def list_pull_request_review_comments(
         self, pr_number: int, *, since: str | None = None
     ) -> list[PullRequestReviewComment]:
-        _ = since
-        assert pr_number == self.pr_snapshot.number
+        _ = pr_number, since
         return list(self.review_comments)
 
     def list_pull_request_review_summaries(self, pr_number: int) -> list[PullRequestIssueComment]:
-        assert pr_number == self.pr_snapshot.number
+        _ = pr_number
         return list(self.review_summaries)
 
     def list_pull_request_issue_comments(
         self, pr_number: int, *, since: str | None = None
     ) -> list[PullRequestIssueComment]:
-        _ = since
-        assert pr_number == self.pr_snapshot.number
+        _ = pr_number, since
         return list(self.issue_comments)
 
     def list_issue_comments(
@@ -448,7 +455,9 @@ class FakeAgent:
         self.fail = fail
         self.calls: list[tuple[Issue, Path]] = []
         self.roadmap_calls: list[tuple[Issue, Path]] = []
-        self.roadmap_adjustment_calls: list[tuple[Issue, tuple[str, ...], Path]] = []
+        self.roadmap_adjustment_calls: list[
+            tuple[Issue, tuple[str, ...], tuple[RoadmapDependencyArtifact, ...], Path]
+        ] = []
         self.bugfix_calls: list[tuple[Issue, Path]] = []
         self.small_job_calls: list[tuple[Issue, Path]] = []
         self.implementation_calls: list[tuple[Issue, Path, str]] = []
@@ -590,6 +599,7 @@ class FakeAgent:
         graph_path: str,
         graph_version: int,
         ready_node_ids: tuple[str, ...],
+        dependency_artifacts: tuple[RoadmapDependencyArtifact, ...],
         roadmap_status_report: str,
         roadmap_markdown: str,
         canonical_graph_json: str,
@@ -602,11 +612,12 @@ class FakeAgent:
             roadmap_doc_path,
             graph_path,
             graph_version,
+            dependency_artifacts,
             roadmap_status_report,
             roadmap_markdown,
             canonical_graph_json,
         )
-        self.roadmap_adjustment_calls.append((issue, ready_node_ids, cwd))
+        self.roadmap_adjustment_calls.append((issue, ready_node_ids, dependency_artifacts, cwd))
         return self.roadmap_adjustment_result
 
     def start_bugfix_from_issue(
@@ -2713,6 +2724,288 @@ def test_flow_helpers() -> None:
     assert "Blockers (oldest first):\n- none" in empty_status_body
     assert "graph_version: 1" in empty_status_body
     assert "adjustment_state: idle" in empty_status_body
+    dependency_refs = _ready_frontier_dependency_references(
+        nodes_by_id={
+            "n2": RoadmapNodeRecord(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="n2",
+                kind="small_job",
+                title="Ready",
+                body_markdown="Ready",
+                dependencies_json='[{"node_id":"n1","requires":"implemented"},1]',
+                introduced_in_version=1,
+                retired_in_version=None,
+                is_active=True,
+                child_issue_number=None,
+                child_issue_url=None,
+                status="pending",
+                planned_at=None,
+                implemented_at=None,
+                status_changed_at=None,
+                last_progress_at=None,
+                blocked_since_at=None,
+                claim_token=None,
+                updated_at="t",
+            ),
+            "n3": RoadmapNodeRecord(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="n3",
+                kind="small_job",
+                title="Also ready",
+                body_markdown="Also ready",
+                dependencies_json='[{"node_id":"n1","requires":"planned"}]',
+                introduced_in_version=1,
+                retired_in_version=None,
+                is_active=True,
+                child_issue_number=None,
+                child_issue_url=None,
+                status="pending",
+                planned_at=None,
+                implemented_at=None,
+                status_changed_at=None,
+                last_progress_at=None,
+                blocked_since_at=None,
+                claim_token=None,
+                updated_at="t",
+            ),
+            "bad": RoadmapNodeRecord(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="bad",
+                kind="small_job",
+                title="Bad",
+                body_markdown="Bad",
+                dependencies_json="{",
+                introduced_in_version=1,
+                retired_in_version=None,
+                is_active=True,
+                child_issue_number=None,
+                child_issue_url=None,
+                status="pending",
+                planned_at=None,
+                implemented_at=None,
+                status_changed_at=None,
+                last_progress_at=None,
+                blocked_since_at=None,
+                claim_token=None,
+                updated_at="t",
+            ),
+            "bad-shape": RoadmapNodeRecord(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="bad-shape",
+                kind="small_job",
+                title="Bad shape",
+                body_markdown="Bad shape",
+                dependencies_json='"not-a-list"',
+                introduced_in_version=1,
+                retired_in_version=None,
+                is_active=True,
+                child_issue_number=None,
+                child_issue_url=None,
+                status="pending",
+                planned_at=None,
+                implemented_at=None,
+                status_changed_at=None,
+                last_progress_at=None,
+                blocked_since_at=None,
+                claim_token=None,
+                updated_at="t",
+            ),
+            "bad-fields": RoadmapNodeRecord(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="bad-fields",
+                kind="small_job",
+                title="Bad fields",
+                body_markdown="Bad fields",
+                dependencies_json='[{"node_id":1,"requires":"implemented"},{"node_id":"n1"}]',
+                introduced_in_version=1,
+                retired_in_version=None,
+                is_active=True,
+                child_issue_number=None,
+                child_issue_url=None,
+                status="pending",
+                planned_at=None,
+                implemented_at=None,
+                status_changed_at=None,
+                last_progress_at=None,
+                blocked_since_at=None,
+                claim_token=None,
+                updated_at="t",
+            ),
+            "bad-requires": RoadmapNodeRecord(
+                repo_full_name="o/r",
+                roadmap_issue_number=7,
+                node_id="bad-requires",
+                kind="small_job",
+                title="Bad requires",
+                body_markdown="Bad requires",
+                dependencies_json='[{"node_id":"n1","requires":"reviewed"}]',
+                introduced_in_version=1,
+                retired_in_version=None,
+                is_active=True,
+                child_issue_number=None,
+                child_issue_url=None,
+                status="pending",
+                planned_at=None,
+                implemented_at=None,
+                status_changed_at=None,
+                last_progress_at=None,
+                blocked_since_at=None,
+                claim_token=None,
+                updated_at="t",
+            ),
+        },
+        ready_node_ids=("n2", "n3", "missing", "bad", "bad-shape", "bad-fields", "bad-requires"),
+    )
+    assert tuple(reference.ready_node_id for reference in dependency_refs["n1"]) == ("n2", "n3")
+    assert _roadmap_dependency_changed_files(tuple(f"src/file_{i}.py" for i in range(30))) == tuple(
+        f"src/file_{i}.py" for i in range(25)
+    )
+    key_comments = _key_roadmap_dependency_comments(
+        (
+            PullRequestIssueComment(
+                comment_id=1,
+                body="bot",
+                user_login="mergexo[bot]",
+                html_url="https://example/comment/1",
+                created_at="t1",
+                updated_at="t1",
+            ),
+            PullRequestIssueComment(
+                comment_id=2,
+                body="keep-1",
+                user_login="alice",
+                html_url="https://example/comment/2",
+                created_at="t2",
+                updated_at="t2",
+            ),
+            PullRequestIssueComment(
+                comment_id=3,
+                body="keep-2",
+                user_login="bob",
+                html_url="https://example/comment/3",
+                created_at="t3",
+                updated_at="t3",
+            ),
+            PullRequestIssueComment(
+                comment_id=4,
+                body="keep-3",
+                user_login="carol",
+                html_url="https://example/comment/4",
+                created_at="t4",
+                updated_at="t4",
+            ),
+            PullRequestIssueComment(
+                comment_id=5,
+                body="keep-4",
+                user_login="dave",
+                html_url="https://example/comment/5",
+                created_at="t5",
+                updated_at="t5",
+            ),
+        )
+    )
+    assert tuple(comment.body for comment in key_comments) == ("keep-2", "keep-3", "keep-4")
+    resolution_markers = _roadmap_dependency_resolution_markers(
+        node=RoadmapNodeRecord(
+            repo_full_name="o/r",
+            roadmap_issue_number=7,
+            node_id="n1",
+            kind="small_job",
+            title="Dependency",
+            body_markdown="Dependency",
+            dependencies_json="[]",
+            introduced_in_version=1,
+            retired_in_version=None,
+            is_active=True,
+            child_issue_number=10,
+            child_issue_url="https://example/issues/10",
+            status="completed",
+            planned_at="t1",
+            implemented_at="t2",
+            status_changed_at="t2",
+            last_progress_at="t2",
+            blocked_since_at=None,
+            claim_token=None,
+            updated_at="t2",
+        ),
+        issue_run=IssueRunRecord(
+            repo_full_name="o/r",
+            issue_number=10,
+            status="merged",
+            branch="agent/impl/10-dependency",
+            pr_number=101,
+            pr_url="https://example/pr/101",
+            error=None,
+        ),
+    )
+    assert "issue_run_status=merged" in resolution_markers
+    assert "planned_at=set" in resolution_markers
+    assert "issue_run_pr=set" in resolution_markers
+    error_markers = _roadmap_dependency_resolution_markers(
+        node=RoadmapNodeRecord(
+            repo_full_name="o/r",
+            roadmap_issue_number=7,
+            node_id="n5",
+            kind="small_job",
+            title="Errored issue run",
+            body_markdown="Errored issue run",
+            dependencies_json="[]",
+            introduced_in_version=1,
+            retired_in_version=None,
+            is_active=True,
+            child_issue_number=12,
+            child_issue_url="https://example/issues/12",
+            status="blocked",
+            planned_at=None,
+            implemented_at=None,
+            status_changed_at=None,
+            last_progress_at=None,
+            blocked_since_at="t",
+            claim_token=None,
+            updated_at="t",
+        ),
+        issue_run=IssueRunRecord(
+            repo_full_name="o/r",
+            issue_number=12,
+            status="blocked",
+            branch=None,
+            pr_number=None,
+            pr_url=None,
+            error="boom",
+        ),
+    )
+    assert "issue_run_error=boom" in error_markers
+    missing_issue_run_markers = _roadmap_dependency_resolution_markers(
+        node=RoadmapNodeRecord(
+            repo_full_name="o/r",
+            roadmap_issue_number=7,
+            node_id="n4",
+            kind="small_job",
+            title="No issue run",
+            body_markdown="No issue run",
+            dependencies_json="[]",
+            introduced_in_version=1,
+            retired_in_version=None,
+            is_active=True,
+            child_issue_number=None,
+            child_issue_url=None,
+            status="pending",
+            planned_at=None,
+            implemented_at=None,
+            status_changed_at=None,
+            last_progress_at=None,
+            blocked_since_at=None,
+            claim_token=None,
+            updated_at="t",
+        ),
+        issue_run=None,
+    )
+    assert "issue_run=missing" in missing_issue_run_markers
     assert _pre_pr_flow_label("roadmap") == "roadmap"
     assert _flow_trigger_label(flow="roadmap", repo=cfg) == cfg.roadmap_label
     roadmap_recovery = _recovery_pr_payload_for_issue(
@@ -14809,6 +15102,223 @@ def test_run_roadmap_adjustment_gate_request_revision_and_abandon_paths(tmp_path
     assert abandoned is not None
     assert abandoned.status == "abandoned"
     assert 1004 in abandon_github.closed_issue_numbers
+
+
+def test_evaluate_roadmap_frontier_adjustment_collects_dependency_artifacts(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=1008,
+        roadmap_pr_number=10080,
+        roadmap_doc_path="docs/roadmap/1008.md",
+        graph_path="docs/roadmap/1008.graph.json",
+        graph_checksum="sum1008",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="dep",
+                kind="small_job",
+                title="Dependency",
+                body_markdown="Dependency body",
+                dependencies=(),
+            ),
+            RoadmapNodeGraphInput(
+                node_id="ready",
+                kind="small_job",
+                title="Ready",
+                body_markdown="Ready body",
+                dependencies=(RoadmapDependencyState(node_id="dep", requires="implemented"),),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    dependency_claim = next(
+        claim
+        for claim in state.claim_ready_roadmap_nodes(repo_full_name=repo)
+        if claim.node_id == "dep"
+    )
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=1008,
+        node_id="dep",
+        claim_token=dependency_claim.claim_token,
+        child_issue_number=10081,
+        child_issue_url="https://example/issues/10081",
+        repo_full_name=repo,
+    )
+    state.record_roadmap_node_milestone(
+        roadmap_issue_number=1008,
+        node_id="dep",
+        milestone="implemented",
+        repo_full_name=repo,
+    )
+    state.mark_completed(
+        10081,
+        "agent/impl/10081-dependency",
+        20081,
+        "https://example/pr/20081",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(
+        pr_number=20081,
+        issue_number=10081,
+        status="merged",
+        repo_full_name=repo,
+    )
+
+    git = FakeGitManager(tmp_path / "checkouts")
+    checkout = git.ensure_checkout(0)
+    roadmap_graph = parse_roadmap_graph_json(
+        json.dumps(
+            {
+                "roadmap_issue_number": 1008,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "dep",
+                        "kind": "small_job",
+                        "title": "Dependency",
+                        "body_markdown": "Dependency body",
+                        "depends_on": [],
+                    },
+                    {
+                        "node_id": "ready",
+                        "kind": "small_job",
+                        "title": "Ready",
+                        "body_markdown": "Ready body",
+                        "depends_on": [{"node_id": "dep", "requires": "implemented"}],
+                    },
+                ],
+            }
+        ),
+        expected_issue_number=1008,
+    )
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/1008.graph.json",
+        content=roadmap_graph.canonical_json,
+        slot=0,
+    )
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/1008.md",
+        content="# Roadmap\n\nDependency and ready node.",
+        slot=0,
+    )
+    github = FakeGitHub(
+        [
+            _issue(1008, "Plan", labels=(cfg.repo.roadmap_label,)),
+            _issue(10081, "Dependency child", labels=(cfg.repo.small_job_label,)),
+        ]
+    )
+    github.pr_snapshot = PullRequestSnapshot(
+        number=20081,
+        title="Dependency PR",
+        body="Merged dependency work.",
+        head_sha="head-20081",
+        base_sha="base-20081",
+        draft=False,
+        state="closed",
+        merged=True,
+    )
+    github.changed_files = ("src/dependency.py", "tests/test_dependency.py")
+    github.review_summaries = [
+        PullRequestIssueComment(
+            comment_id=1,
+            body="Looks good after the interface change.",
+            user_login="reviewer",
+            html_url="https://example/review-summary/1",
+            created_at="t1",
+            updated_at="t1",
+        )
+    ]
+    github.issue_comments = [
+        PullRequestIssueComment(
+            comment_id=2,
+            body="Please account for the new dependency shape.",
+            user_login="engineer",
+            html_url="https://example/comment/2",
+            created_at="t2",
+            updated_at="t2",
+        ),
+        PullRequestIssueComment(
+            comment_id=3,
+            body="bot noise",
+            user_login="mergexo[bot]",
+            html_url="https://example/comment/3",
+            created_at="t3",
+            updated_at="t3",
+        ),
+    ]
+    agent = FakeAgent()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    roadmap = state.get_roadmap_state(roadmap_issue_number=1008, repo_full_name=repo)
+    assert roadmap is not None
+
+    result = orch._evaluate_roadmap_frontier_adjustment(
+        roadmap=roadmap,
+        ready_node_ids=("ready",),
+        checkout_path=checkout,
+    )
+
+    assert result.action == "proceed"
+    artifacts = agent.roadmap_adjustment_calls[0][2]
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact.dependency_node_id == "dep"
+    assert artifact.frontier_references[0].ready_node_id == "ready"
+    assert artifact.child_issue_number == 10081
+    assert artifact.issue_run_status == "merged"
+    assert artifact.pr_number == 20081
+    assert artifact.pr_title == "Dependency PR"
+    assert artifact.changed_files == ("src/dependency.py", "tests/test_dependency.py")
+    assert tuple(comment.body for comment in artifact.review_summaries) == (
+        "Looks good after the interface change.",
+    )
+    assert tuple(comment.body for comment in artifact.issue_comments) == (
+        "Please account for the new dependency shape.",
+    )
+    assert "issue_run_status=merged" in artifact.resolution_markers
+
+
+def test_collect_roadmap_dependency_artifacts_skips_missing_dependency_nodes(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=1009,
+        roadmap_pr_number=10090,
+        roadmap_doc_path="docs/roadmap/1009.md",
+        graph_path="docs/roadmap/1009.graph.json",
+        graph_checksum="sum1009",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="ready",
+                kind="small_job",
+                title="Ready",
+                body_markdown="Ready body",
+                dependencies=(RoadmapDependencyState(node_id="missing", requires="implemented"),),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(1009, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    artifacts = orch._collect_roadmap_dependency_artifacts(
+        roadmap_issue_number=1009,
+        ready_node_ids=("ready",),
+    )
+
+    assert artifacts == ()
 
 
 def test_run_roadmap_adjustment_gate_no_frontier_no_claim_and_error_paths(

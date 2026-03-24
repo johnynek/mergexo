@@ -44,6 +44,12 @@ full continuous-adjustment system.
   migrated forward during state initialization, and orchestration plus
   observability now key off coordination state instead of a synthetic lifecycle
   status.
+- Checkpoint 2 completed: roadmap adjustment now receives concrete dependency
+  frontier artifacts instead of only a status snapshot. The orchestrator
+  collects dependency child issue context, issue run state, merged PR metadata,
+  changed files, review summaries, issue comments, and resolution markers for
+  the ready frontier dependencies, then passes that typed payload through the
+  adapter stack into the adjustment prompt.
 
 ## Current Job
 
@@ -54,9 +60,6 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 - Automatic same-roadmap revision PR creation is still missing. A
   `request_revision` decision pauses the roadmap and comments on the roadmap
   issue, but it does not create or update the roadmap revision PR.
-- The adjustment agent does not yet consume dependency PR artifacts. It sees
-  the roadmap markdown, graph, ready frontier, and a status snapshot, but not
-  merged PR bodies, changed files, review threads, or upstream issue comments.
 - The adjustment decision does not yet produce a concrete revision payload. It
   returns a coarse decision plus rationale, not a PR-ready roadmap markdown
   and graph update.
@@ -69,8 +72,6 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 - Transition validation still enforces the minimal safety rules, not the full
   lineage policy. In particular, we do not yet strictly enforce semantic
   `node_id` stability versus replacement across all revision cases.
-- The effective adjustment input is still weaker than the intended
-  `(roadmap, ready_frontier, dependency_artifacts)` interface.
 - We do not yet have the full recomputation loop around an auto-generated
   revision PR: create PR, wait for merge, apply revision, recompute frontier,
   then resume issuing work.

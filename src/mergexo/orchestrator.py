@@ -20,6 +20,8 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapDependencyArtifact,
+    RoadmapDependencyReference,
     RoadmapAdjustmentResult,
     RoadmapStartResult,
 )
@@ -100,6 +102,7 @@ from mergexo.state import (
     GitHubCommentSurface,
     GitHubCommentPollCursorState,
     ImplementationCandidateState,
+    IssueRunRecord,
     PendingFeedbackEvent,
     PollCursorUpdate,
     PrePrFollowupState,
@@ -1392,6 +1395,10 @@ class Phase1Orchestrator:
             roadmap_issue_number=roadmap.roadmap_issue_number,
             repo_full_name=self._state_repo_full_name(),
         )
+        dependency_artifacts = self._collect_roadmap_dependency_artifacts(
+            roadmap_issue_number=roadmap.roadmap_issue_number,
+            ready_node_ids=ready_node_ids,
+        )
         coding_guidelines_path = self._coding_guidelines_path_for_checkout(
             checkout_path=checkout_path
         )
@@ -1412,11 +1419,93 @@ class Phase1Orchestrator:
             graph_path=roadmap.graph_path,
             graph_version=roadmap.graph_version,
             ready_node_ids=ready_node_ids,
+            dependency_artifacts=dependency_artifacts,
             roadmap_status_report=status_report,
             roadmap_markdown=roadmap_markdown,
             canonical_graph_json=graph_raw,
             cwd=checkout_path,
         )
+
+    def _collect_roadmap_dependency_artifacts(
+        self,
+        *,
+        roadmap_issue_number: int,
+        ready_node_ids: tuple[str, ...],
+    ) -> tuple[RoadmapDependencyArtifact, ...]:
+        nodes = self._state.list_roadmap_nodes(
+            roadmap_issue_number=roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        nodes_by_id = {node.node_id: node for node in nodes}
+        dependency_refs = _ready_frontier_dependency_references(
+            nodes_by_id=nodes_by_id,
+            ready_node_ids=ready_node_ids,
+        )
+        artifacts: list[RoadmapDependencyArtifact] = []
+        for dependency_node_id in sorted(dependency_refs):
+            dependency_node = nodes_by_id.get(dependency_node_id)
+            if dependency_node is None:
+                continue
+            child_issue = None
+            issue_comments: tuple[PullRequestIssueComment, ...] = ()
+            issue_run = None
+            if dependency_node.child_issue_number is not None:
+                child_issue = self._issue_snapshot_for_poll(
+                    issue_number=dependency_node.child_issue_number
+                )
+                issue_comments = _key_roadmap_dependency_comments(
+                    tuple(self._github.list_issue_comments(dependency_node.child_issue_number))
+                )
+                issue_run = self._state.get_issue_run_record(
+                    dependency_node.child_issue_number,
+                    repo_full_name=self._state_repo_full_name(),
+                )
+            pr_number = issue_run.pr_number if issue_run is not None else None
+            pr_url = issue_run.pr_url if issue_run is not None else None
+            pr_snapshot = (
+                self._github.get_pull_request(pr_number) if pr_number is not None else None
+            )
+            changed_files = (
+                _roadmap_dependency_changed_files(self._github.list_pull_request_files(pr_number))
+                if pr_number is not None
+                else ()
+            )
+            review_summaries = (
+                _key_roadmap_dependency_comments(
+                    tuple(self._github.list_pull_request_review_summaries(pr_number))
+                )
+                if pr_number is not None
+                else ()
+            )
+            artifacts.append(
+                RoadmapDependencyArtifact(
+                    dependency_node_id=dependency_node.node_id,
+                    dependency_kind=dependency_node.kind,
+                    dependency_title=dependency_node.title,
+                    frontier_references=dependency_refs[dependency_node_id],
+                    child_issue_number=dependency_node.child_issue_number,
+                    child_issue_url=dependency_node.child_issue_url,
+                    child_issue_title=child_issue.title if child_issue is not None else None,
+                    child_issue_body=child_issue.body if child_issue is not None else None,
+                    issue_run_status=issue_run.status if issue_run is not None else None,
+                    issue_run_branch=issue_run.branch if issue_run is not None else None,
+                    issue_run_error=issue_run.error if issue_run is not None else None,
+                    resolution_markers=_roadmap_dependency_resolution_markers(
+                        node=dependency_node,
+                        issue_run=issue_run,
+                    ),
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    pr_title=pr_snapshot.title if pr_snapshot is not None else None,
+                    pr_body=pr_snapshot.body if pr_snapshot is not None else None,
+                    pr_state=pr_snapshot.state if pr_snapshot is not None else None,
+                    pr_merged=pr_snapshot.merged if pr_snapshot is not None else None,
+                    changed_files=changed_files,
+                    review_summaries=review_summaries,
+                    issue_comments=issue_comments,
+                )
+            )
+        return tuple(artifacts)
 
     def _maybe_apply_pending_roadmap_revision(
         self, *, roadmap: RoadmapStateRecord, checkout_path: Path
@@ -8485,6 +8574,83 @@ def _render_roadmap_child_issue_body(
         f"{dependency_lines}\n\n"
         f"{body_markdown}"
     )
+
+
+def _ready_frontier_dependency_references(
+    *,
+    nodes_by_id: dict[str, RoadmapNodeRecord],
+    ready_node_ids: tuple[str, ...],
+) -> dict[str, tuple[RoadmapDependencyReference, ...]]:
+    refs: dict[str, list[RoadmapDependencyReference]] = {}
+    for ready_node_id in ready_node_ids:
+        ready_node = nodes_by_id.get(ready_node_id)
+        if ready_node is None:
+            continue
+        try:
+            payload = json.loads(ready_node.dependencies_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, list):
+            continue
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            dependency_node_id = item.get("node_id")
+            requires = item.get("requires")
+            if not isinstance(dependency_node_id, str) or not isinstance(requires, str):
+                continue
+            if requires not in {"planned", "implemented"}:
+                continue
+            refs.setdefault(dependency_node_id, []).append(
+                RoadmapDependencyReference(
+                    ready_node_id=ready_node_id,
+                    requires=cast(Literal["planned", "implemented"], requires),
+                )
+            )
+    return {
+        dependency_node_id: tuple(
+            sorted(
+                dependency_refs,
+                key=lambda reference: (reference.ready_node_id, reference.requires),
+            )
+        )
+        for dependency_node_id, dependency_refs in refs.items()
+    }
+
+
+def _roadmap_dependency_changed_files(changed_files: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(changed_files[:25])
+
+
+def _key_roadmap_dependency_comments(
+    comments: tuple[PullRequestIssueComment, ...],
+) -> tuple[PullRequestIssueComment, ...]:
+    user_comments = tuple(comment for comment in comments if not is_bot_login(comment.user_login))
+    if len(user_comments) <= 3:
+        return user_comments
+    return user_comments[-3:]
+
+
+def _roadmap_dependency_resolution_markers(
+    *,
+    node: RoadmapNodeRecord,
+    issue_run: IssueRunRecord | None,
+) -> tuple[str, ...]:
+    markers = [
+        f"node_status={node.status}",
+        f"planned_at={'set' if node.planned_at is not None else 'unset'}",
+        f"implemented_at={'set' if node.implemented_at is not None else 'unset'}",
+        f"blocked_since_at={'set' if node.blocked_since_at is not None else 'unset'}",
+        f"child_issue={'set' if node.child_issue_number is not None else 'unset'}",
+    ]
+    if issue_run is None:
+        markers.append("issue_run=missing")
+    else:
+        markers.append(f"issue_run_status={issue_run.status}")
+        markers.append(f"issue_run_pr={'set' if issue_run.pr_number is not None else 'unset'}")
+        if issue_run.error is not None:
+            markers.append(f"issue_run_error={issue_run.error}")
+    return tuple(markers)
 
 
 def _render_roadmap_status_report(

@@ -197,6 +197,14 @@ def test_state_store_transitions_and_feedback_tracking(tmp_path: Path) -> None:
     assert tracked[0].pr_number == 9
     assert tracked[0].issue_number == 42
     assert tracked[0].branch == "feature"
+    run_record = store.get_issue_run_record(42)
+    assert run_record is not None
+    assert run_record.status == "awaiting_feedback"
+    assert run_record.branch == "feature"
+    assert run_record.pr_number == 9
+    assert run_record.pr_url == "https://example/pr/9"
+    assert run_record.error is None
+    assert store.get_issue_run_record(999) is None
 
     store.save_agent_session(issue_number=42, adapter="codex", thread_id="thread-1")
     assert store.get_agent_session(42) == ("codex", "thread-1")
@@ -4803,6 +4811,8 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
         conn.commit()
     with pytest.raises(RuntimeError, match="Invalid status value"):
         store.get_issue_run_state(1, repo_full_name=repo)
+    with pytest.raises(RuntimeError, match="Invalid status value"):
+        store.get_issue_run_record(1, repo_full_name=repo)
 
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -4816,6 +4826,47 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
         conn.commit()
     with pytest.raises(RuntimeError, match="Invalid branch value"):
         store.get_issue_run_state(1, repo_full_name=repo)
+    with pytest.raises(RuntimeError, match="Invalid branch value"):
+        store.get_issue_run_record(1, repo_full_name=repo)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET status = 'running', branch = NULL, pr_number = ?
+            WHERE repo_full_name = ? AND issue_number = ?
+            """,
+            (sqlite3.Binary(b"\x03"), repo, 1),
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="Invalid pr_number value"):
+        store.get_issue_run_record(1, repo_full_name=repo)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET pr_number = NULL, pr_url = ?
+            WHERE repo_full_name = ? AND issue_number = ?
+            """,
+            (sqlite3.Binary(b"\x04"), repo, 1),
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="Invalid pr_url value"):
+        store.get_issue_run_record(1, repo_full_name=repo)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET pr_url = NULL, error = ?
+            WHERE repo_full_name = ? AND issue_number = ?
+            """,
+            (sqlite3.Binary(b"\x05"), repo, 1),
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="Invalid error value"):
+        store.get_issue_run_record(1, repo_full_name=repo)
 
 
 def test_parse_poll_cursor_row_validations() -> None:
