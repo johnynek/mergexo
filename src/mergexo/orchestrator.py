@@ -1701,10 +1701,82 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
             )
             return roadmap
-        if (
+        pending_pr = None
+        if roadmap.pending_revision_pr_number is not None:
+            pending_pr = self._github.get_pull_request(roadmap.pending_revision_pr_number)
+        graph_unchanged = (
             parsed.graph.version == roadmap.graph_version
             and parsed.checksum == roadmap.graph_checksum
+        )
+        if pending_pr is not None and not pending_pr.merged:
+            if graph_unchanged:
+                return roadmap
+            pending_pr_ref = f"#{roadmap.pending_revision_pr_number}"
+            if roadmap.pending_revision_pr_url is not None:
+                pending_pr_ref = f"{pending_pr_ref} ({roadmap.pending_revision_pr_url})"
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=(
+                    "tracked same-roadmap revision PR is not merged, but canonical graph changed: "
+                    f"current_version={roadmap.graph_version} repo_version={parsed.graph.version}"
+                ),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"awaiting-revision-open:{parsed.checksum}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO is waiting for the tracked same-roadmap revision PR to merge "
+                    "before applying graph changes.\n"
+                    f"- pending revision PR: {pending_pr_ref}\n"
+                    f"- current version: `{roadmap.graph_version}`\n"
+                    f"- repo version: `{parsed.graph.version}`"
+                ),
+                source="roadmap_revision_waiting_pending_pr_merge",
+                repo_full_name=self._state_repo_full_name(),
+            )
+            return roadmap
+        if graph_unchanged:
+            return roadmap
+        if (
+            pending_pr is not None
+            and roadmap.adjustment_request_version is not None
+            and parsed.graph.version != roadmap.adjustment_request_version
         ):
+            pending_pr_ref = f"#{roadmap.pending_revision_pr_number}"
+            if roadmap.pending_revision_pr_url is not None:
+                pending_pr_ref = f"{pending_pr_ref} ({roadmap.pending_revision_pr_url})"
+            self._state.set_roadmap_last_error(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                error=(
+                    "merged same-roadmap revision does not match requested version: "
+                    f"requested={roadmap.adjustment_request_version} repo={parsed.graph.version}"
+                ),
+                repo_full_name=self._state_repo_full_name(),
+            )
+            token = compute_roadmap_graph_drift_token(
+                roadmap_issue_number=roadmap.roadmap_issue_number,
+                graph_checksum=f"awaiting-revision-version:{parsed.checksum}",
+            )
+            self._ensure_tokenized_issue_comment(
+                github=self._github,
+                issue_number=roadmap.roadmap_issue_number,
+                token=token,
+                body=(
+                    "MergeXO detected a merged same-roadmap revision PR, but the canonical graph "
+                    "version does not match the requested revision.\n"
+                    f"- pending revision PR: {pending_pr_ref}\n"
+                    f"- requested version: `{roadmap.adjustment_request_version}`\n"
+                    f"- repo version: `{parsed.graph.version}`"
+                ),
+                source="roadmap_revision_version_mismatch",
+                repo_full_name=self._state_repo_full_name(),
+            )
             return roadmap
         node_inputs = tuple(
             RoadmapNodeGraphInput(

@@ -32,6 +32,9 @@ The current branch already contains the enabling foundation:
    `revise(updated_markdown, updated_graph, rationale)`, or `abandon`.
 6. A `revise(...)` decision now auto-creates or reuses a same-roadmap revision
    branch and PR, then records the pending PR metadata in roadmap state.
+7. A tracked pending same-roadmap revision PR is now applied only after merge,
+   and roadmap advancement resumes on the updated graph in the same scheduler
+   pass.
 
 This is enough to support manual same-roadmap revision, but it is not yet the
 full continuous-adjustment system.
@@ -64,6 +67,11 @@ full continuous-adjustment system.
   pushes a deterministic revision branch when needed, opens or reuses the
   corresponding PR through the GitHub outbox path, and persists the pending PR
   number, URL, and head SHA while the roadmap waits for that PR to merge.
+- Checkpoint 5 completed: tracked pending same-roadmap revision PRs are now
+  the normal apply path. While a pending revision PR is still open, unrelated
+  graph changes remain blocked as drift; once the tracked PR is merged and the
+  merged graph matches the requested version, the revision is applied and the
+  roadmap can resume child issuance in the same `advance_roadmap_nodes` pass.
 
 ## Current Job
 
@@ -74,18 +82,12 @@ No active checkpoint is recorded here after the latest checkpoint commit.
 - Manual revision requests from labels or escalations still do not auto-author
   a roadmap update PR, because those paths do not yet produce a concrete
   revised roadmap payload.
-- Active roadmaps still treat unsolicited merged graph changes as drift. A
-  graph update is only accepted when the roadmap has already entered the
-  revision flow.
 - The adjustment lock is only partially realized operationally. We have claim
   APIs and adjustment state, but not the full "worker owns the adjustment until
   the revision PR is resolved" lifecycle with pending PR metadata.
 - Transition validation still enforces the minimal safety rules, not the full
   lineage policy. In particular, we do not yet strictly enforce semantic
   `node_id` stability versus replacement across all revision cases.
-- We do not yet have the full recomputation loop around an auto-generated
-  revision PR: create PR, wait for merge, apply revision, recompute frontier,
-  then resume issuing work.
 - Status and observability are still thin. The current status output shows
   roadmap version and adjustment state, but not pending revision PR details,
   adjustment rationale history, or revision history.
