@@ -31,7 +31,7 @@ from mergexo.prompts import (
     build_implementation_prompt,
     build_small_job_prompt,
 )
-from mergexo.shell import CommandError, RunningCommand, run
+from mergexo.shell import CommandError, DurableLaunch, RunningCommand, run
 
 
 _DESIGN_OUTPUT_SCHEMA: dict[str, object] = {
@@ -116,6 +116,7 @@ LOGGER = logging.getLogger("mergexo.codex_adapter")
 class CodexInvocationHooks:
     on_start: Callable[[RunningCommand], None] | None = None
     on_progress: Callable[[], None] | None = None
+    durable_launch: DurableLaunch | None = None
 
 
 class CodexAdapter(AgentAdapter):
@@ -647,6 +648,7 @@ class CodexAdapter(AgentAdapter):
             graceful_shutdown_seconds=self._config.graceful_shutdown_seconds,
             on_start=_on_start if hooks is not None else None,
             on_output=_on_output if hooks is not None else None,
+            durable_launch=hooks.durable_launch if hooks is not None else None,
         )
 
     def _timeout_seconds_for_mode(self, invocation_mode: str) -> float | None:

@@ -12,6 +12,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from typing import Callable, Literal, Sequence, cast
 
 from mergexo.agent_adapter import (
@@ -81,8 +82,11 @@ from mergexo.prompts import (
 from mergexo.shell import (
     CommandError,
     CommandTimeoutError,
+    DurableLaunch,
     RunningCommand,
+    ResolvedLaunch,
     run,
+    resolve_durable_launch,
     terminate_process_tree,
 )
 from mergexo.state import (
@@ -143,6 +147,8 @@ _DEFAULT_RUN_META_JSON = json.dumps(
         "codex_timeout_seconds": None,
         "codex_idle_timeout_seconds": None,
         "codex_kill_requested_at": None,
+        "codex_launch_token": None,
+        "codex_launch_metadata_path": None,
         "last_progress_at": None,
         "last_prompt": None,
         "run_phase": None,
@@ -198,6 +204,8 @@ class _PersistedRunMeta:
     codex_active: bool
     codex_pid: int | None
     codex_pgid: int | None
+    codex_launch_token: str | None
+    codex_launch_metadata_path: str | None
 
 
 @dataclass(frozen=True)
@@ -580,11 +588,12 @@ class Phase1Orchestrator:
             meta = _run_meta_from_json(run.meta_json)
             if meta.codex_active is not True:
                 continue
-            if meta.codex_pid is None:
+            resolved = self._resolve_persisted_codex_launch(meta)
+            if resolved is None:
                 continue
             terminate_process_tree(
-                pid=meta.codex_pid,
-                pgid=meta.codex_pgid,
+                pid=resolved.pid,
+                pgid=resolved.pgid,
                 graceful_shutdown_seconds=float(graceful_shutdown_seconds),
             )
             log_event(
@@ -594,9 +603,21 @@ class Phase1Orchestrator:
                 run_id=run.run_id,
                 issue_number=run.issue_number,
                 pr_number=run.pr_number if run.pr_number is not None else "",
-                pid=meta.codex_pid,
-                pgid=meta.codex_pgid if meta.codex_pgid is not None else "",
+                pid=resolved.pid,
+                pgid=resolved.pgid if resolved.pgid is not None else "",
             )
+
+    def _resolve_persisted_codex_launch(self, meta: _PersistedRunMeta) -> ResolvedLaunch | None:
+        if meta.codex_pid is not None:
+            return ResolvedLaunch(pid=meta.codex_pid, pgid=meta.codex_pgid)
+        if meta.codex_launch_token is None or meta.codex_launch_metadata_path is None:
+            return None
+        return resolve_durable_launch(
+            DurableLaunch(
+                token=meta.codex_launch_token,
+                metadata_path=Path(meta.codex_launch_metadata_path),
+            )
+        )
 
     def _is_restart_pending(self) -> bool:
         operation = self._state.get_runtime_operation(_RESTART_OPERATION_NAME)
@@ -3574,15 +3595,17 @@ class Phase1Orchestrator:
             design_doc_path=design_relpath,
             default_branch=self._repo.default_branch,
         )
+        durable_launch = self._durable_codex_launch(run_id)
         self._mark_codex_invocation_started(
             run_id=run_id,
             mode="writing_doc",
             prompt=design_prompt,
             session_id=None,
+            durable_launch=durable_launch,
         )
         initial_head_sha = self._git.current_head_sha(checkout_path)
         try:
-            with self._observe_agent_invocations(run_id=run_id):
+            with self._observe_agent_invocations(run_id=run_id, durable_launch=durable_launch):
                 start_result = self._agent.start_design_from_issue(
                     issue=issue,
                     repo_full_name=self._state_repo_full_name(),
@@ -3700,15 +3723,19 @@ class Phase1Orchestrator:
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                 )
+                durable_launch = self._durable_codex_launch(run_id)
                 self._mark_codex_invocation_started(
                     run_id=run_id,
                     mode="bugfix",
                     prompt=prompt,
                     session_id=None,
+                    durable_launch=durable_launch,
                 )
                 initial_head_sha = self._git.current_head_sha(checkout_path)
                 try:
-                    with self._observe_agent_invocations(run_id=run_id):
+                    with self._observe_agent_invocations(
+                        run_id=run_id, durable_launch=durable_launch
+                    ):
                         result = self._agent.start_bugfix_from_issue(
                             issue=agent_issue,
                             repo_full_name=repo_full_name,
@@ -3742,15 +3769,19 @@ class Phase1Orchestrator:
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                 )
+                durable_launch = self._durable_codex_launch(run_id)
                 self._mark_codex_invocation_started(
                     run_id=run_id,
                     mode="small-job",
                     prompt=prompt,
                     session_id=None,
+                    durable_launch=durable_launch,
                 )
                 initial_head_sha = self._git.current_head_sha(checkout_path)
                 try:
-                    with self._observe_agent_invocations(run_id=run_id):
+                    with self._observe_agent_invocations(
+                        run_id=run_id, durable_launch=durable_launch
+                    ):
                         result = self._agent.start_small_job_from_issue(
                             issue=agent_issue,
                             repo_full_name=repo_full_name,
@@ -3908,15 +3939,19 @@ class Phase1Orchestrator:
                     design_pr_number=candidate.design_pr_number,
                     design_pr_url=candidate.design_pr_url,
                 )
+                durable_launch = self._durable_codex_launch(run_id)
                 self._mark_codex_invocation_started(
                     run_id=run_id,
                     mode="implementation",
                     prompt=prompt,
                     session_id=None,
+                    durable_launch=durable_launch,
                 )
                 initial_head_sha = self._git.current_head_sha(lease.path)
                 try:
-                    with self._observe_agent_invocations(run_id=run_id):
+                    with self._observe_agent_invocations(
+                        run_id=run_id, durable_launch=durable_launch
+                    ):
                         result = self._agent.start_implementation_from_design(
                             issue=agent_issue,
                             repo_full_name=repo_full_name,
@@ -4111,7 +4146,22 @@ class Phase1Orchestrator:
                 return None
             return feedback.run_id
 
-    def _observe_agent_invocations(self, *, run_id: str | None):
+    def _durable_codex_launch(self, run_id: str | None) -> DurableLaunch | None:
+        if run_id is None or not isinstance(self._agent, CodexAdapter):
+            return None
+        launch_token = f"mergexo-codex-{run_id}-{uuid.uuid4().hex}"
+        metadata_path = (
+            self._config.runtime.base_dir
+            / "codex-launches"
+            / self._repo.owner
+            / self._repo.name
+            / f"{run_id}.json"
+        )
+        return DurableLaunch(token=launch_token, metadata_path=metadata_path)
+
+    def _observe_agent_invocations(
+        self, *, run_id: str | None, durable_launch: DurableLaunch | None = None
+    ):
         if run_id is None or not isinstance(self._agent, CodexAdapter):
             return nullcontext()
 
@@ -4140,7 +4190,11 @@ class Phase1Orchestrator:
             )
 
         return self._agent.observe_invocations(
-            CodexInvocationHooks(on_start=on_start, on_progress=on_progress)
+            CodexInvocationHooks(
+                on_start=on_start,
+                on_progress=on_progress,
+                durable_launch=durable_launch,
+            )
         )
 
     def _initialize_run_meta_cache(self, run_id: str) -> None:
@@ -4174,6 +4228,7 @@ class Phase1Orchestrator:
         mode: str,
         prompt: str,
         session_id: str | None,
+        durable_launch: DurableLaunch | None = None,
     ) -> None:
         self._update_run_meta(
             run_id,
@@ -4186,6 +4241,10 @@ class Phase1Orchestrator:
             last_prompt=prompt,
             last_progress_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             codex_kill_requested_at=None,
+            codex_launch_token=durable_launch.token if durable_launch is not None else None,
+            codex_launch_metadata_path=(
+                str(durable_launch.metadata_path) if durable_launch is not None else None
+            ),
             run_phase="codex_launching",
         )
 
@@ -4204,6 +4263,8 @@ class Phase1Orchestrator:
             "codex_timeout_seconds": None,
             "codex_idle_timeout_seconds": None,
             "codex_kill_requested_at": None,
+            "codex_launch_token": None,
+            "codex_launch_metadata_path": None,
             "run_phase": "postprocess",
         }
         if session_id is not None:
@@ -6565,15 +6626,17 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 turn_key=current_turn.turn_key,
             )
+            durable_launch = self._durable_codex_launch(run_id)
             self._mark_codex_invocation_started(
                 run_id=run_id,
                 mode="respond_to_review",
                 prompt=prompt,
                 session_id=current_session.thread_id,
+                durable_launch=durable_launch,
             )
             initial_head_sha = self._git.current_head_sha(checkout_path)
             try:
-                with self._observe_agent_invocations(run_id=run_id):
+                with self._observe_agent_invocations(run_id=run_id, durable_launch=durable_launch):
                     result = self._agent.respond_to_feedback(
                         session=current_session,
                         turn=current_turn,
@@ -7187,6 +7250,16 @@ def _run_meta_from_json(meta_json: str) -> _PersistedRunMeta:
         codex_active=payload.get("codex_active") is True,
         codex_pid=pid if isinstance(pid, int) and pid > 0 else None,
         codex_pgid=pgid if isinstance(pgid, int) and pgid > 0 else None,
+        codex_launch_token=(
+            payload.get("codex_launch_token")
+            if isinstance(payload.get("codex_launch_token"), str)
+            else None
+        ),
+        codex_launch_metadata_path=(
+            payload.get("codex_launch_metadata_path")
+            if isinstance(payload.get("codex_launch_metadata_path"), str)
+            else None
+        ),
     )
 
 

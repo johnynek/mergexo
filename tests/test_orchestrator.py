@@ -106,7 +106,13 @@ from mergexo.orchestrator import (
     _truncate_feedback_text,
 )
 from mergexo.observability import configure_logging
-from mergexo.shell import CommandError, CommandTimeoutError, RunningCommand
+from mergexo.shell import (
+    CommandError,
+    CommandTimeoutError,
+    DurableLaunch,
+    ResolvedLaunch,
+    RunningCommand,
+)
 from mergexo.state import (
     ActionTokenScopeKind,
     ActionTokenState,
@@ -4748,6 +4754,53 @@ def test_cleanup_persisted_codex_processes_skips_runs_without_pid(
     assert killed == []
 
 
+def test_cleanup_persisted_codex_processes_resolves_launch_without_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    launch_path = tmp_path / "launch.json"
+    state.list_unfinished_agent_runs = lambda **kwargs: (  # type: ignore[method-assign]
+        type(
+            "Run",
+            (),
+            {
+                "run_id": "run-1",
+                "issue_number": 7,
+                "pr_number": None,
+                "meta_json": json.dumps(
+                    {
+                        "codex_active": True,
+                        "codex_launch_token": "launch-token",
+                        "codex_launch_metadata_path": str(launch_path),
+                    }
+                ),
+            },
+        )(),
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    killed: list[tuple[int, int | None, float]] = []
+
+    def fake_terminate_process_tree(
+        *, pid: int, pgid: int | None = None, graceful_shutdown_seconds: float = 5.0
+    ) -> None:
+        killed.append((pid, pgid, graceful_shutdown_seconds))
+
+    monkeypatch.setattr(
+        "mergexo.orchestrator.resolve_durable_launch",
+        lambda launch: ResolvedLaunch(pid=321, pgid=654),
+    )
+    monkeypatch.setattr("mergexo.orchestrator.terminate_process_tree", fake_terminate_process_tree)
+
+    orch._cleanup_persisted_codex_processes()
+
+    assert killed == [(321, 654, 5.0)]
+
+
 def test_observe_agent_invocations_updates_run_meta_and_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4770,10 +4823,15 @@ def test_observe_agent_invocations_updates_run_meta_and_progress(
         orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
     )
 
-    with orch._observe_agent_invocations(run_id="run-1"):
+    durable_launch = DurableLaunch(
+        token="launch-token",
+        metadata_path=tmp_path / "launch.json",
+    )
+    with orch._observe_agent_invocations(run_id="run-1", durable_launch=durable_launch):
         hooks = cast(CodexInvocationHooks, getattr(agent._local, "invocation_hooks"))
         assert hooks.on_start is not None
         assert hooks.on_progress is not None
+        assert hooks.durable_launch == durable_launch
         hooks.on_start(
             RunningCommand(
                 argv=("codex", "exec"),
@@ -4793,6 +4851,63 @@ def test_observe_agent_invocations_updates_run_meta_and_progress(
     assert recorded_meta[0]["run_phase"] == "codex_running"
     assert recorded_meta[0]["last_progress_at"] is not None
     assert recorded_meta[1]["last_progress_at"] is not None
+
+
+def test_mark_codex_invocation_started_persists_durable_launch_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._initialize_run_meta_cache("run-1")
+
+    recorded_meta: list[dict[str, object]] = []
+
+    def fake_update_agent_run_meta(*, run_id: str, meta_json: str) -> bool:
+        assert run_id == "run-1"
+        recorded_meta.append(cast(dict[str, object], json.loads(meta_json)))
+        return True
+
+    monkeypatch.setattr(
+        orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
+    )
+    durable_launch = DurableLaunch(
+        token="launch-token",
+        metadata_path=tmp_path / "launch.json",
+    )
+
+    orch._mark_codex_invocation_started(
+        run_id="run-1",
+        mode="writing_doc",
+        prompt="prompt",
+        session_id=None,
+        durable_launch=durable_launch,
+    )
+
+    assert recorded_meta[-1]["codex_active"] is True
+    assert recorded_meta[-1]["codex_launch_token"] == "launch-token"
+    assert recorded_meta[-1]["codex_launch_metadata_path"] == str(tmp_path / "launch.json")
+
+
+def test_durable_codex_launch_uses_repo_scoped_launch_path(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=CodexAdapter(cfg.codex),
+    )
+
+    durable_launch = orch._durable_codex_launch("run-1")
+
+    assert durable_launch is not None
+    assert durable_launch.token.startswith("mergexo-codex-run-1-")
+    assert durable_launch.metadata_path == (
+        tmp_path / "state" / "codex-launches" / "johnynek" / "mergexo" / "run-1.json"
+    )
 
 
 def test_raise_if_timeout_left_local_changes_returns_when_checkout_is_clean(
