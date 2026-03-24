@@ -16214,7 +16214,8 @@ def test_run_roadmap_adjustment_gate_revise_and_abandon_paths(tmp_path: Path) ->
     assert revised is not None
     assert revised.status == "active"
     assert revised.adjustment_state == "awaiting_revision_merge"
-    assert revised.adjustment_claim_token is not None
+    assert revised.adjustment_claim_token is None
+    assert revised.adjustment_started_at is None
     assert revised.adjustment_request_version == 2
     assert revised.pending_revision_pr_number == 101
     assert revised.pending_revision_pr_url == "https://example/pr/101"

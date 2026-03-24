@@ -4686,7 +4686,7 @@ def test_list_ready_roadmap_frontier_and_adjustment_request_version_paths(tmp_pa
         )
 
 
-def test_mark_roadmap_revision_pending_preserves_claim_and_tracks_pr(tmp_path: Path) -> None:
+def test_mark_roadmap_revision_pending_clears_claim_and_tracks_pr(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
     repo = "o/repo"
     store.upsert_roadmap_graph(
@@ -4726,7 +4726,8 @@ def test_mark_roadmap_revision_pending_preserves_claim_and_tracks_pr(tmp_path: P
     refreshed = store.get_roadmap_state(roadmap_issue_number=213, repo_full_name=repo)
     assert refreshed is not None
     assert refreshed.adjustment_state == "awaiting_revision_merge"
-    assert refreshed.adjustment_claim_token == claim
+    assert refreshed.adjustment_claim_token is None
+    assert refreshed.adjustment_started_at is None
     assert refreshed.adjustment_request_version == 2
     assert refreshed.pending_revision_pr_number == 2139
     assert refreshed.pending_revision_pr_url == "https://example/pr/2139"

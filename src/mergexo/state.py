@@ -6058,6 +6058,8 @@ class StateStore:
                 UPDATE roadmap_state
                 SET
                     adjustment_state = 'awaiting_revision_merge',
+                    adjustment_claim_token = NULL,
+                    adjustment_started_at = NULL,
                     adjustment_request_version = ?,
                     pending_revision_pr_number = ?,
                     pending_revision_pr_url = ?,
