@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -12,6 +13,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from typing import Callable, Literal, Sequence, cast
 
 from mergexo.agent_adapter import (
@@ -26,6 +28,7 @@ from mergexo.agent_adapter import (
     RoadmapAdjustmentResult,
     RoadmapStartResult,
 )
+from mergexo.codex_adapter import CodexAdapter, CodexInvocationHooks
 from mergexo.config import AppConfig, RepoConfig
 from mergexo.feedback_loop import (
     FeedbackEventRecord,
@@ -94,7 +97,16 @@ from mergexo.roadmap_parser import (
     parse_roadmap_graph_json,
 )
 from mergexo.roadmap_transition_validator import RoadmapGraphTransitionError
-from mergexo.shell import CommandError, run
+from mergexo.shell import (
+    CommandError,
+    CommandTimeoutError,
+    DurableLaunch,
+    RunningCommand,
+    ResolvedLaunch,
+    run,
+    resolve_durable_launch,
+    terminate_process_tree,
+)
 from mergexo.state import (
     AgentRunFailureClass,
     ActionTokenObservation,
@@ -159,7 +171,17 @@ _DEFAULT_RUN_META_JSON = json.dumps(
         "codex_invocation_started_at": None,
         "codex_mode": None,
         "codex_session_id": None,
+        "codex_pid": None,
+        "codex_pgid": None,
+        "codex_timeout_at": None,
+        "codex_timeout_seconds": None,
+        "codex_idle_timeout_seconds": None,
+        "codex_kill_requested_at": None,
+        "codex_launch_token": None,
+        "codex_launch_metadata_path": None,
+        "last_progress_at": None,
         "last_prompt": None,
+        "run_phase": None,
     },
     sort_keys=True,
 )
@@ -205,6 +227,15 @@ class _IncrementalCommentScan:
     fetched: tuple[PullRequestIssueComment | PullRequestReviewComment, ...]
     new: tuple[PullRequestIssueComment | PullRequestReviewComment, ...]
     cursor_update: PollCursorUpdate
+
+
+@dataclass(frozen=True)
+class _PersistedRunMeta:
+    codex_active: bool
+    codex_pid: int | None
+    codex_pgid: int | None
+    codex_launch_token: str | None
+    codex_launch_metadata_path: str | None
 
 
 @dataclass(frozen=True)
@@ -448,6 +479,7 @@ class Phase1Orchestrator:
                 allow_enqueue=allow_enqueue,
             )
             self._reap_finished()
+            self._sweep_stalled_active_codex_runs()
 
             poll_had_github_errors = False
             restart_pending = self._is_restart_pending()
@@ -578,6 +610,7 @@ class Phase1Orchestrator:
         if self._poll_setup_done:
             return
         self._git.ensure_layout()
+        self._cleanup_persisted_codex_processes()
         replayed_create_pr_call_count = 0
         replayed_create_issue_call_count = 0
         replayed_post_issue_comment_call_count = 0
@@ -657,6 +690,48 @@ class Phase1Orchestrator:
                 fn=self._adopt_legacy_failed_pre_pr_runs,
             )
         self._poll_setup_done = True
+
+    def _cleanup_persisted_codex_processes(self) -> None:
+        unfinished_runs = self._state.list_unfinished_agent_runs(
+            repo_full_name=self._state_repo_full_name()
+        )
+        graceful_shutdown_seconds = self._config.codex_for_repo(
+            self._repo
+        ).graceful_shutdown_seconds
+        for run in unfinished_runs:
+            meta = _run_meta_from_json(run.meta_json)
+            if meta.codex_active is not True:
+                continue
+            resolved = self._resolve_persisted_codex_launch(meta)
+            if resolved is None:
+                continue
+            terminate_process_tree(
+                pid=resolved.pid,
+                pgid=resolved.pgid,
+                graceful_shutdown_seconds=float(graceful_shutdown_seconds),
+            )
+            log_event(
+                LOGGER,
+                "codex_startup_cleanup_kill",
+                repo_full_name=self._state_repo_full_name(),
+                run_id=run.run_id,
+                issue_number=run.issue_number,
+                pr_number=run.pr_number if run.pr_number is not None else "",
+                pid=resolved.pid,
+                pgid=resolved.pgid if resolved.pgid is not None else "",
+            )
+
+    def _resolve_persisted_codex_launch(self, meta: _PersistedRunMeta) -> ResolvedLaunch | None:
+        if meta.codex_pid is not None:
+            return ResolvedLaunch(pid=meta.codex_pid, pgid=meta.codex_pgid)
+        if meta.codex_launch_token is None or meta.codex_launch_metadata_path is None:
+            return None
+        return resolve_durable_launch(
+            DurableLaunch(
+                token=meta.codex_launch_token,
+                metadata_path=Path(meta.codex_launch_metadata_path),
+            )
+        )
 
     def _is_restart_pending(self) -> bool:
         operation = self._state.get_runtime_operation(_RESTART_OPERATION_NAME)
@@ -5439,6 +5514,33 @@ class Phase1Orchestrator:
                         )
                         continue
 
+                    failure_class = _failure_class_for_exception(exc)
+                    if failure_class in {"github_error", "timeout", "unknown"}:
+                        self._state.mark_pr_status(
+                            pr_number=pr_number,
+                            issue_number=handle.issue_number,
+                            status="awaiting_feedback",
+                            error=None,
+                            reason="feedback_transient_retry",
+                            detail=str(exc),
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_retry",
+                            issue_number=handle.issue_number,
+                            pr_number=pr_number,
+                            reason="transient_feedback_failure",
+                            failure_class=failure_class,
+                        )
+                        self._state.finish_agent_run(
+                            run_id=handle.run_id,
+                            terminal_status="failed",
+                            failure_class=failure_class,
+                            error=str(exc),
+                        )
+                        continue
+
                     error = str(exc)
                     self._mark_feedback_blocked(
                         pr_number=pr_number,
@@ -5457,7 +5559,7 @@ class Phase1Orchestrator:
                     self._state.finish_agent_run(
                         run_id=handle.run_id,
                         terminal_status="failed",
-                        failure_class=_failure_class_for_exception(exc),
+                        failure_class=failure_class,
                         error=error,
                     )
                 finally:
@@ -5610,22 +5712,32 @@ class Phase1Orchestrator:
             design_doc_path=design_relpath,
             default_branch=self._repo.default_branch,
         )
+        durable_launch = self._durable_codex_launch(run_id)
         self._mark_codex_invocation_started(
             run_id=run_id,
             mode="writing_doc",
             prompt=design_prompt,
             session_id=None,
+            durable_launch=durable_launch,
         )
+        initial_head_sha = self._git.current_head_sha(checkout_path)
         try:
-            start_result = self._agent.start_design_from_issue(
-                issue=issue,
-                repo_full_name=self._state_repo_full_name(),
-                design_doc_path=design_relpath,
-                default_branch=self._repo.default_branch,
-                cwd=checkout_path,
-            )
-        except Exception:
+            with self._observe_agent_invocations(run_id=run_id, durable_launch=durable_launch):
+                start_result = self._agent.start_design_from_issue(
+                    issue=issue,
+                    repo_full_name=self._state_repo_full_name(),
+                    design_doc_path=design_relpath,
+                    default_branch=self._repo.default_branch,
+                    cwd=checkout_path,
+                )
+        except Exception as exc:
             self._mark_codex_invocation_finished(run_id=run_id)
+            self._raise_if_timeout_left_local_changes(
+                exc=exc,
+                checkout_path=checkout_path,
+                initial_head_sha=initial_head_sha,
+                blocked_message="design_doc flow blocked: codex invocation timed out after local changes were made",
+            )
             raise
         self._mark_codex_invocation_finished(
             run_id=run_id,
@@ -5732,23 +5844,35 @@ class Phase1Orchestrator:
             recommended_node_count=self._repo.roadmap_recommended_node_count,
             coding_guidelines_path=coding_guidelines_path,
         )
+        durable_launch = self._durable_codex_launch(run_id)
         self._mark_codex_invocation_started(
             run_id=run_id,
             mode="roadmap",
             prompt=roadmap_prompt,
             session_id=None,
+            durable_launch=durable_launch,
         )
+        initial_head_sha = self._git.current_head_sha(checkout_path)
         try:
-            start_result = self._agent.start_roadmap_from_issue(
-                issue=issue,
-                repo_full_name=self._state_repo_full_name(),
-                default_branch=self._repo.default_branch,
-                roadmap_docs_dir=self._repo.roadmap_docs_dir,
-                recommended_node_count=self._repo.roadmap_recommended_node_count,
-                cwd=checkout_path,
-            )
-        except Exception:
+            with self._observe_agent_invocations(run_id=run_id, durable_launch=durable_launch):
+                start_result = self._agent.start_roadmap_from_issue(
+                    issue=issue,
+                    repo_full_name=self._state_repo_full_name(),
+                    default_branch=self._repo.default_branch,
+                    roadmap_docs_dir=self._repo.roadmap_docs_dir,
+                    recommended_node_count=self._repo.roadmap_recommended_node_count,
+                    cwd=checkout_path,
+                )
+        except Exception as exc:
             self._mark_codex_invocation_finished(run_id=run_id)
+            self._raise_if_timeout_left_local_changes(
+                exc=exc,
+                checkout_path=checkout_path,
+                initial_head_sha=initial_head_sha,
+                blocked_message=(
+                    "roadmap flow blocked: codex invocation timed out after local changes were made"
+                ),
+            )
             raise
         self._mark_codex_invocation_finished(
             run_id=run_id,
@@ -5866,22 +5990,34 @@ class Phase1Orchestrator:
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                 )
+                durable_launch = self._durable_codex_launch(run_id)
                 self._mark_codex_invocation_started(
                     run_id=run_id,
                     mode="bugfix",
                     prompt=prompt,
                     session_id=None,
+                    durable_launch=durable_launch,
                 )
+                initial_head_sha = self._git.current_head_sha(checkout_path)
                 try:
-                    result = self._agent.start_bugfix_from_issue(
-                        issue=agent_issue,
-                        repo_full_name=repo_full_name,
-                        default_branch=self._repo.default_branch,
-                        coding_guidelines_path=coding_guidelines_path,
-                        cwd=checkout_path,
-                    )
-                except Exception:
+                    with self._observe_agent_invocations(
+                        run_id=run_id, durable_launch=durable_launch
+                    ):
+                        result = self._agent.start_bugfix_from_issue(
+                            issue=agent_issue,
+                            repo_full_name=repo_full_name,
+                            default_branch=self._repo.default_branch,
+                            coding_guidelines_path=coding_guidelines_path,
+                            cwd=checkout_path,
+                        )
+                except Exception as exc:
                     self._mark_codex_invocation_finished(run_id=run_id)
+                    self._raise_if_timeout_left_local_changes(
+                        exc=exc,
+                        checkout_path=checkout_path,
+                        initial_head_sha=initial_head_sha,
+                        blocked_message="bugfix flow blocked: codex invocation timed out after local changes were made",
+                    )
                     raise
                 self._mark_codex_invocation_finished(
                     run_id=run_id,
@@ -5900,22 +6036,34 @@ class Phase1Orchestrator:
                     default_branch=self._repo.default_branch,
                     coding_guidelines_path=coding_guidelines_path,
                 )
+                durable_launch = self._durable_codex_launch(run_id)
                 self._mark_codex_invocation_started(
                     run_id=run_id,
                     mode="small-job",
                     prompt=prompt,
                     session_id=None,
+                    durable_launch=durable_launch,
                 )
+                initial_head_sha = self._git.current_head_sha(checkout_path)
                 try:
-                    result = self._agent.start_small_job_from_issue(
-                        issue=agent_issue,
-                        repo_full_name=repo_full_name,
-                        default_branch=self._repo.default_branch,
-                        coding_guidelines_path=coding_guidelines_path,
-                        cwd=checkout_path,
-                    )
-                except Exception:
+                    with self._observe_agent_invocations(
+                        run_id=run_id, durable_launch=durable_launch
+                    ):
+                        result = self._agent.start_small_job_from_issue(
+                            issue=agent_issue,
+                            repo_full_name=repo_full_name,
+                            default_branch=self._repo.default_branch,
+                            coding_guidelines_path=coding_guidelines_path,
+                            cwd=checkout_path,
+                        )
+                except Exception as exc:
                     self._mark_codex_invocation_finished(run_id=run_id)
+                    self._raise_if_timeout_left_local_changes(
+                        exc=exc,
+                        checkout_path=checkout_path,
+                        initial_head_sha=initial_head_sha,
+                        blocked_message="small-job flow blocked: codex invocation timed out after local changes were made",
+                    )
                     raise
                 self._mark_codex_invocation_finished(
                     run_id=run_id,
@@ -6058,26 +6206,38 @@ class Phase1Orchestrator:
                     design_pr_number=candidate.design_pr_number,
                     design_pr_url=candidate.design_pr_url,
                 )
+                durable_launch = self._durable_codex_launch(run_id)
                 self._mark_codex_invocation_started(
                     run_id=run_id,
                     mode="implementation",
                     prompt=prompt,
                     session_id=None,
+                    durable_launch=durable_launch,
                 )
+                initial_head_sha = self._git.current_head_sha(lease.path)
                 try:
-                    result = self._agent.start_implementation_from_design(
-                        issue=agent_issue,
-                        repo_full_name=repo_full_name,
-                        default_branch=self._repo.default_branch,
-                        coding_guidelines_path=coding_guidelines_path,
-                        design_doc_path=design_relpath,
-                        design_doc_markdown=design_doc_markdown,
-                        design_pr_number=candidate.design_pr_number,
-                        design_pr_url=candidate.design_pr_url,
-                        cwd=lease.path,
-                    )
-                except Exception:
+                    with self._observe_agent_invocations(
+                        run_id=run_id, durable_launch=durable_launch
+                    ):
+                        result = self._agent.start_implementation_from_design(
+                            issue=agent_issue,
+                            repo_full_name=repo_full_name,
+                            default_branch=self._repo.default_branch,
+                            coding_guidelines_path=coding_guidelines_path,
+                            design_doc_path=design_relpath,
+                            design_doc_markdown=design_doc_markdown,
+                            design_pr_number=candidate.design_pr_number,
+                            design_pr_url=candidate.design_pr_url,
+                            cwd=lease.path,
+                        )
+                except Exception as exc:
                     self._mark_codex_invocation_finished(run_id=run_id)
+                    self._raise_if_timeout_left_local_changes(
+                        exc=exc,
+                        checkout_path=lease.path,
+                        initial_head_sha=initial_head_sha,
+                        blocked_message="implementation flow blocked: codex invocation timed out after local changes were made",
+                    )
                     raise
                 self._mark_codex_invocation_finished(
                     run_id=run_id,
@@ -6253,6 +6413,57 @@ class Phase1Orchestrator:
                 return None
             return feedback.run_id
 
+    def _durable_codex_launch(self, run_id: str | None) -> DurableLaunch | None:
+        if run_id is None or not isinstance(self._agent, CodexAdapter):
+            return None
+        launch_token = f"mergexo-codex-{run_id}-{uuid.uuid4().hex}"
+        metadata_path = (
+            self._config.runtime.base_dir
+            / "codex-launches"
+            / self._repo.owner
+            / self._repo.name
+            / f"{run_id}.json"
+        )
+        return DurableLaunch(token=launch_token, metadata_path=metadata_path)
+
+    def _observe_agent_invocations(
+        self, *, run_id: str | None, durable_launch: DurableLaunch | None = None
+    ):
+        if run_id is None or not isinstance(self._agent, CodexAdapter):
+            return nullcontext()
+
+        def on_start(command: RunningCommand) -> None:
+            now = datetime.now(timezone.utc)
+            timeout_at: str | None = None
+            if command.timeout_seconds is not None:
+                timeout_at = (now + timedelta(seconds=command.timeout_seconds)).strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                )
+            self._update_run_meta(
+                run_id,
+                codex_pid=command.pid,
+                codex_pgid=command.pgid,
+                codex_timeout_at=timeout_at,
+                codex_timeout_seconds=command.timeout_seconds,
+                codex_idle_timeout_seconds=command.idle_timeout_seconds,
+                last_progress_at=now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                run_phase="codex_running",
+            )
+
+        def on_progress() -> None:
+            self._update_run_meta(
+                run_id,
+                last_progress_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            )
+
+        return self._agent.observe_invocations(
+            CodexInvocationHooks(
+                on_start=on_start,
+                on_progress=on_progress,
+                durable_launch=durable_launch,
+            )
+        )
+
     def _initialize_run_meta_cache(self, run_id: str) -> None:
         self._run_meta_cache[run_id] = json.loads(_DEFAULT_RUN_META_JSON)
 
@@ -6284,6 +6495,7 @@ class Phase1Orchestrator:
         mode: str,
         prompt: str,
         session_id: str | None,
+        durable_launch: DurableLaunch | None = None,
     ) -> None:
         self._update_run_meta(
             run_id,
@@ -6294,6 +6506,13 @@ class Phase1Orchestrator:
             codex_mode=mode,
             codex_session_id=session_id,
             last_prompt=prompt,
+            last_progress_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            codex_kill_requested_at=None,
+            codex_launch_token=durable_launch.token if durable_launch is not None else None,
+            codex_launch_metadata_path=(
+                str(durable_launch.metadata_path) if durable_launch is not None else None
+            ),
+            run_phase="codex_launching",
         )
 
     def _mark_codex_invocation_finished(
@@ -6305,10 +6524,95 @@ class Phase1Orchestrator:
         updates: dict[str, object] = {
             "codex_active": False,
             "codex_invocation_started_at": None,
+            "codex_pid": None,
+            "codex_pgid": None,
+            "codex_timeout_at": None,
+            "codex_timeout_seconds": None,
+            "codex_idle_timeout_seconds": None,
+            "codex_kill_requested_at": None,
+            "codex_launch_token": None,
+            "codex_launch_metadata_path": None,
+            "run_phase": "postprocess",
         }
         if session_id is not None:
             updates["codex_session_id"] = session_id
         self._update_run_meta(run_id, **updates)
+
+    def _raise_if_timeout_left_local_changes(
+        self,
+        *,
+        exc: Exception,
+        checkout_path: Path,
+        initial_head_sha: str,
+        blocked_message: str,
+    ) -> None:
+        if not isinstance(exc, CommandTimeoutError):
+            return
+        current_head_sha = self._git.current_head_sha(checkout_path)
+        has_worktree_changes = self._git.has_working_tree_changes(checkout_path)
+        if not has_worktree_changes and current_head_sha == initial_head_sha:
+            return
+        detail_parts: list[str] = []
+        if has_worktree_changes:
+            detail_parts.append("working tree has local changes")
+        if current_head_sha != initial_head_sha:
+            detail_parts.append("HEAD moved during the timed out turn")
+        detail = "; ".join(detail_parts) if detail_parts else "local state changed"
+        raise DirectFlowBlockedError(f"{blocked_message}: {detail}") from exc
+
+    def _sweep_stalled_active_codex_runs(self) -> None:
+        now = datetime.now(timezone.utc)
+        for run_id, meta in tuple(self._run_meta_cache.items()):
+            if meta.get("codex_active") is not True:
+                continue
+            if meta.get("codex_kill_requested_at") is not None:
+                continue
+            pid = meta.get("codex_pid")
+            if not isinstance(pid, int) or pid < 1:
+                continue
+            wall_clock_timed_out = False
+            timeout_at_value = meta.get("codex_timeout_at")
+            if isinstance(timeout_at_value, str):
+                timeout_at = _parse_utc_timestamp(timeout_at_value)
+                wall_clock_timed_out = timeout_at is not None and timeout_at <= now
+
+            idle_timed_out = False
+            last_progress_value = meta.get("last_progress_at")
+            idle_timeout_value = meta.get("codex_idle_timeout_seconds")
+            if isinstance(last_progress_value, str) and isinstance(
+                idle_timeout_value, (int, float)
+            ):
+                last_progress_at = _parse_utc_timestamp(last_progress_value)
+                idle_timeout_seconds = float(idle_timeout_value)
+                if last_progress_at is not None and idle_timeout_seconds > 0:
+                    idle_timed_out = now >= last_progress_at + timedelta(
+                        seconds=idle_timeout_seconds
+                    )
+
+            if not wall_clock_timed_out and not idle_timed_out:
+                continue
+            pgid_value = meta.get("codex_pgid")
+            pgid = pgid_value if isinstance(pgid_value, int) else None
+            graceful_shutdown_seconds = self._config.codex_for_repo(
+                self._repo
+            ).graceful_shutdown_seconds
+            self._update_run_meta(
+                run_id,
+                codex_kill_requested_at=now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            )
+            terminate_process_tree(
+                pid=pid,
+                pgid=pgid,
+                graceful_shutdown_seconds=float(graceful_shutdown_seconds),
+            )
+            log_event(
+                LOGGER,
+                "codex_watchdog_timeout",
+                repo_full_name=self._state_repo_full_name(),
+                run_id=run_id,
+                pid=pid,
+                pgid=pgid if pgid is not None else "",
+            )
 
     def _save_agent_session_if_present(
         self, *, issue_number: int, session: AgentSession | None
@@ -8643,22 +8947,32 @@ class Phase1Orchestrator:
                 pr_number=tracked.pr_number,
                 turn_key=current_turn.turn_key,
             )
+            durable_launch = self._durable_codex_launch(run_id)
             self._mark_codex_invocation_started(
                 run_id=run_id,
                 mode="respond_to_review",
                 prompt=prompt,
                 session_id=current_session.thread_id,
+                durable_launch=durable_launch,
             )
+            initial_head_sha = self._git.current_head_sha(checkout_path)
             try:
-                result = self._agent.respond_to_feedback(
-                    session=current_session,
-                    turn=current_turn,
-                    cwd=checkout_path,
-                )
-            except Exception:
+                with self._observe_agent_invocations(run_id=run_id, durable_launch=durable_launch):
+                    result = self._agent.respond_to_feedback(
+                        session=current_session,
+                        turn=current_turn,
+                        cwd=checkout_path,
+                    )
+            except Exception as exc:
                 self._mark_codex_invocation_finished(
                     run_id=run_id,
                     session_id=current_session.thread_id,
+                )
+                self._raise_if_timeout_left_local_changes(
+                    exc=exc,
+                    checkout_path=checkout_path,
+                    initial_head_sha=initial_head_sha,
+                    blocked_message="feedback flow blocked: codex invocation timed out after local changes were made",
                 )
                 raise
             self._mark_codex_invocation_finished(
@@ -9244,6 +9558,32 @@ def _parse_utc_timestamp(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _run_meta_from_json(meta_json: str) -> _PersistedRunMeta:
+    try:
+        payload = json.loads(meta_json)
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    pid = payload.get("codex_pid")
+    pgid = payload.get("codex_pgid")
+    return _PersistedRunMeta(
+        codex_active=payload.get("codex_active") is True,
+        codex_pid=pid if isinstance(pid, int) and pid > 0 else None,
+        codex_pgid=pgid if isinstance(pgid, int) and pgid > 0 else None,
+        codex_launch_token=(
+            payload.get("codex_launch_token")
+            if isinstance(payload.get("codex_launch_token"), str)
+            else None
+        ),
+        codex_launch_metadata_path=(
+            payload.get("codex_launch_metadata_path")
+            if isinstance(payload.get("codex_launch_metadata_path"), str)
+            else None
+        ),
+    )
+
+
 def _format_utc_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -9826,6 +10166,8 @@ def _failure_class_for_exception(exc: Exception) -> AgentRunFailureClass:
         or "missing saved agent session" in normalized
     ):
         return "policy_block"
+    if isinstance(exc, CommandTimeoutError) or "timed out" in normalized:
+        return "timeout"
     if "required pre-push test" in normalized or "required tests" in normalized:
         return "tests_failed"
     if "github" in normalized:
@@ -9838,7 +10180,7 @@ def _failure_class_for_exception(exc: Exception) -> AgentRunFailureClass:
 
 
 def _is_transient_issue_failure_class(failure_class: AgentRunFailureClass) -> bool:
-    return failure_class in {"github_error", "unknown"}
+    return failure_class in {"github_error", "timeout", "unknown"}
 
 
 def _resolve_issue_flow(

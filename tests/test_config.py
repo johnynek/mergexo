@@ -306,6 +306,41 @@ extra_args = ["--beta-only"]
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("design_turn_timeout_seconds", "0", "codex.design_turn_timeout_seconds"),
+        ("direct_turn_timeout_seconds", "0", "codex.direct_turn_timeout_seconds"),
+        ("feedback_turn_timeout_seconds", "0", "codex.feedback_turn_timeout_seconds"),
+        ("idle_timeout_seconds", "0", "codex.idle_timeout_seconds"),
+        ("graceful_shutdown_seconds", "0", "codex.graceful_shutdown_seconds"),
+    ],
+)
+def test_load_config_rejects_invalid_codex_timeout_settings(
+    tmp_path: Path, field: str, value: str, error: str
+) -> None:
+    cfg_path = _write(
+        tmp_path / "bad.toml",
+        f"""
+[runtime]
+base_dir = "/tmp/x"
+worker_count = 1
+poll_interval_seconds = 5
+
+[repo]
+owner = "owner"
+name = "repo"
+coding_guidelines_path = "docs/python_style.md"
+
+[codex]
+{field} = {value}
+""".strip(),
+    )
+
+    with pytest.raises(ConfigError, match=error):
+        config.load_config(cfg_path)
+
+
+@pytest.mark.parametrize(
     "runtime_lines,error",
     [
         ("comment_fetch_overlap_seconds = -1", "runtime.comment_fetch_overlap_seconds"),

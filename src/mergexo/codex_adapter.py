@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 import json
 import logging
 import tempfile
+import threading
 import time
 from typing import cast
 
@@ -41,7 +45,7 @@ from mergexo.prompts import (
     build_small_job_prompt,
 )
 from mergexo.roadmap_parser import parse_roadmap_graph_object
-from mergexo.shell import CommandError, run
+from mergexo.shell import CommandError, DurableLaunch, RunningCommand, run
 
 
 _DESIGN_OUTPUT_SCHEMA: dict[str, object] = {
@@ -186,9 +190,30 @@ _FEEDBACK_OUTPUT_SCHEMA: dict[str, object] = {
 LOGGER = logging.getLogger("mergexo.codex_adapter")
 
 
+@dataclass(frozen=True)
+class CodexInvocationHooks:
+    on_start: Callable[[RunningCommand], None] | None = None
+    on_progress: Callable[[], None] | None = None
+    durable_launch: DurableLaunch | None = None
+
+
 class CodexAdapter(AgentAdapter):
     def __init__(self, config: CodexConfig) -> None:
         self._config = config
+        self._local = threading.local()
+
+    @contextmanager
+    def observe_invocations(self, hooks: CodexInvocationHooks) -> Iterator[None]:
+        previous = getattr(self._local, "invocation_hooks", None)
+        self._local.invocation_hooks = hooks
+        try:
+            yield
+        finally:
+            if previous is None:
+                if hasattr(self._local, "invocation_hooks"):
+                    delattr(self._local, "invocation_hooks")
+            else:
+                self._local.invocation_hooks = previous
 
     def start_design_from_issue(
         self,
@@ -587,7 +612,12 @@ class CodexAdapter(AgentAdapter):
         self._append_resume_options(cmd)
         cmd.extend([session.thread_id, "-"])
 
-        raw_events = run(cmd, cwd=cwd, input_text=prompt)
+        raw_events = self._run_codex_command(
+            cmd=cmd,
+            cwd=cwd,
+            prompt=prompt,
+            invocation_mode="respond_to_review",
+        )
         message = _extract_final_agent_message(raw_events)
         payload = _parse_json_payload(message)
         return payload, _extract_thread_id(raw_events) or session.thread_id
@@ -613,11 +643,16 @@ class CodexAdapter(AgentAdapter):
                 str(schema_path),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
             self._append_common_options(cmd)
+            cmd.append("-")
 
-            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+            raw_events = self._run_codex_command(
+                cmd=cmd,
+                cwd=cwd,
+                prompt=prompt,
+                invocation_mode="respond_to_review",
+            )
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
 
@@ -646,7 +681,12 @@ class CodexAdapter(AgentAdapter):
             self._append_common_options(cmd)
             cmd.append("-")
 
-            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+            raw_events = self._run_codex_command(
+                cmd=cmd,
+                cwd=cwd,
+                prompt=prompt,
+                invocation_mode="writing_doc",
+            )
 
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
@@ -687,10 +727,15 @@ class CodexAdapter(AgentAdapter):
                 str(schema_path),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
             self._append_common_options(cmd)
-            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+            cmd.append("-")
+            raw_events = self._run_codex_command(
+                cmd=cmd,
+                cwd=cwd,
+                prompt=prompt,
+                invocation_mode="roadmap",
+            )
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
 
@@ -741,7 +786,11 @@ class CodexAdapter(AgentAdapter):
             flow=flow_name,
         )
         try:
-            result, thread_id = self._run_direct_turn(prompt=prompt, cwd=cwd)
+            result, thread_id = self._run_direct_turn(
+                prompt=prompt,
+                cwd=cwd,
+                invocation_mode=invocation_mode,
+            )
         except Exception as exc:  # noqa: BLE001
             log_event(
                 LOGGER,
@@ -779,7 +828,13 @@ class CodexAdapter(AgentAdapter):
             session=AgentSession(adapter="codex", thread_id=thread_id),
         )
 
-    def _run_direct_turn(self, *, prompt: str, cwd: Path) -> tuple[DirectStartResult, str | None]:
+    def _run_direct_turn(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+        invocation_mode: str,
+    ) -> tuple[DirectStartResult, str | None]:
         if not self._config.enabled:
             raise RuntimeError("Codex is disabled in config")
 
@@ -798,11 +853,16 @@ class CodexAdapter(AgentAdapter):
                 str(schema_path),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
             self._append_common_options(cmd)
+            cmd.append("-")
 
-            raw_events = run(cmd, cwd=cwd, input_text=prompt)
+            raw_events = self._run_codex_command(
+                cmd=cmd,
+                cwd=cwd,
+                prompt=prompt,
+                invocation_mode=invocation_mode,
+            )
 
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
@@ -854,10 +914,15 @@ class CodexAdapter(AgentAdapter):
                 str(schema_path),
                 "--output-last-message",
                 str(output_path),
-                "-",
             ]
             self._append_common_options(cmd)
-            run(cmd, cwd=cwd, input_text=prompt)
+            cmd.append("-")
+            self._run_codex_command(
+                cmd=cmd,
+                cwd=cwd,
+                prompt=prompt,
+                invocation_mode="roadmap",
+            )
 
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
@@ -896,6 +961,51 @@ class CodexAdapter(AgentAdapter):
             updated_roadmap_markdown=updated_roadmap_markdown,
             updated_canonical_graph_json=updated_canonical_graph_json,
         )
+
+    def _current_invocation_hooks(self) -> CodexInvocationHooks | None:
+        hooks = getattr(self._local, "invocation_hooks", None)
+        if isinstance(hooks, CodexInvocationHooks):
+            return hooks
+        return None
+
+    def _run_codex_command(
+        self,
+        *,
+        cmd: list[str],
+        cwd: Path,
+        prompt: str,
+        invocation_mode: str,
+    ) -> str:
+        hooks = self._current_invocation_hooks()
+
+        def _on_start(command: RunningCommand) -> None:
+            if hooks is None or hooks.on_start is None:
+                return
+            hooks.on_start(command)
+
+        def _on_output(_stream_name: str, _chunk: str) -> None:
+            if hooks is None or hooks.on_progress is None:
+                return
+            hooks.on_progress()
+
+        return run(
+            cmd,
+            cwd=cwd,
+            input_text=prompt,
+            timeout_seconds=self._timeout_seconds_for_mode(invocation_mode),
+            idle_timeout_seconds=self._config.idle_timeout_seconds,
+            graceful_shutdown_seconds=self._config.graceful_shutdown_seconds,
+            on_start=_on_start if hooks is not None else None,
+            on_output=_on_output if hooks is not None else None,
+            durable_launch=hooks.durable_launch if hooks is not None else None,
+        )
+
+    def _timeout_seconds_for_mode(self, invocation_mode: str) -> float | None:
+        if invocation_mode == "writing_doc":
+            return float(self._config.design_turn_timeout_seconds)
+        if invocation_mode == "respond_to_review":
+            return float(self._config.feedback_turn_timeout_seconds)
+        return float(self._config.direct_turn_timeout_seconds)
 
     def _append_common_options(self, cmd: list[str]) -> None:
         if self._config.model:

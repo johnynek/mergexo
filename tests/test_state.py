@@ -422,6 +422,48 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
     assert _get_active_run_id(db_path, 99) is None
 
 
+def test_state_store_lists_unfinished_agent_runs_across_repos(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.record_agent_run_start(
+        run_kind="issue_flow",
+        issue_number=1,
+        pr_number=None,
+        flow="design_doc",
+        branch="agent/design/1-a",
+        run_id="run-a",
+        started_at="2026-02-24T00:00:00.000Z",
+        repo_full_name="o/repo-a",
+    )
+    store.record_agent_run_start(
+        run_kind="feedback_turn",
+        issue_number=2,
+        pr_number=101,
+        flow=None,
+        branch="agent/design/2-b",
+        run_id="run-b",
+        started_at="2026-02-24T00:00:01.000Z",
+        repo_full_name="o/repo-b",
+    )
+    store.record_agent_run_start(
+        run_kind="issue_flow",
+        issue_number=3,
+        pr_number=None,
+        flow="design_doc",
+        branch="agent/design/3-c",
+        run_id="run-c",
+        started_at="2026-02-24T00:00:02.000Z",
+        repo_full_name="o/repo-c",
+    )
+    assert store.finish_agent_run(run_id="run-c", terminal_status="completed")
+
+    unfinished = store.list_unfinished_agent_runs()
+
+    assert [run.run_id for run in unfinished] == ["run-a", "run-b"]
+    assert [run.repo_full_name for run in unfinished] == ["o/repo-a", "o/repo-b"]
+
+
 def test_state_store_claim_new_issue_run_start_retries_transient_failed_rows(
     tmp_path: Path,
 ) -> None:

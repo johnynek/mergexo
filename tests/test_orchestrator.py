@@ -27,6 +27,7 @@ from mergexo.agent_adapter import (
     RoadmapStartResult,
     ReviewReply,
 )
+from mergexo.codex_adapter import CodexAdapter, CodexInvocationHooks
 from mergexo.config import AppConfig, CodexConfig, RepoConfig, RuntimeConfig
 from mergexo.feedback_loop import (
     FeedbackEventRecord,
@@ -116,6 +117,7 @@ from mergexo.orchestrator import (
     _roadmap_revision_branch,
     _parse_superseding_roadmap_parent,
     _resolve_issue_flow,
+    _run_meta_from_json,
     _summarize_git_error,
     _slugify,
     _trigger_labels,
@@ -123,7 +125,13 @@ from mergexo.orchestrator import (
 )
 from mergexo.observability import configure_logging
 from mergexo.roadmap_parser import parse_roadmap_graph_json
-from mergexo.shell import CommandError
+from mergexo.shell import (
+    CommandError,
+    CommandTimeoutError,
+    DurableLaunch,
+    ResolvedLaunch,
+    RunningCommand,
+)
 from mergexo.state import (
     ActionTokenScopeKind,
     ActionTokenState,
@@ -1239,6 +1247,12 @@ class FakeState:
         return ()
 
     def list_legacy_running_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[object, ...]:
+        _ = repo_full_name
+        return ()
+
+    def list_unfinished_agent_runs(
         self, *, repo_full_name: str | None = None
     ) -> tuple[object, ...]:
         _ = repo_full_name
@@ -3174,6 +3188,20 @@ def test_observability_failure_and_terminal_helpers() -> None:
     assert _failure_class_for_exception(DirectFlowBlockedError("x flow blocked: waiting")) == (
         "policy_block"
     )
+    assert (
+        _failure_class_for_exception(
+            CommandTimeoutError(
+                argv=["codex", "exec"],
+                timeout_kind="wall_clock",
+                timeout_seconds=30.0,
+                pid=1,
+                pgid=1,
+                stdout="",
+                stderr="",
+            )
+        )
+        == "timeout"
+    )
     assert _failure_class_for_exception(RuntimeError("required pre-push tests failed")) == (
         "tests_failed"
     )
@@ -4421,6 +4449,406 @@ def test_active_run_id_helpers_and_prompt_recording(
 
     orch._record_run_prompt("run-issue", "Prompt text")
     assert recorded_meta == [("run-issue", '{"last_prompt": "Prompt text"}')]
+
+
+def test_cleanup_persisted_codex_processes_terminates_active_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    state.list_unfinished_agent_runs = lambda **kwargs: (  # type: ignore[method-assign]
+        type(
+            "Run",
+            (),
+            {
+                "run_id": "run-1",
+                "issue_number": 7,
+                "pr_number": None,
+                "meta_json": json.dumps(
+                    {
+                        "codex_active": True,
+                        "codex_pid": 321,
+                        "codex_pgid": 654,
+                    }
+                ),
+            },
+        )(),
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    killed: list[tuple[int, int | None, float]] = []
+
+    def fake_terminate_process_tree(
+        *, pid: int, pgid: int | None = None, graceful_shutdown_seconds: float = 5.0
+    ) -> None:
+        killed.append((pid, pgid, graceful_shutdown_seconds))
+
+    monkeypatch.setattr("mergexo.orchestrator.terminate_process_tree", fake_terminate_process_tree)
+    orch._cleanup_persisted_codex_processes()
+
+    assert killed == [(321, 654, 5.0)]
+
+
+def test_cleanup_persisted_codex_processes_skips_runs_without_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    state.list_unfinished_agent_runs = lambda **kwargs: (  # type: ignore[method-assign]
+        type(
+            "Run",
+            (),
+            {
+                "run_id": "run-1",
+                "issue_number": 7,
+                "pr_number": None,
+                "meta_json": json.dumps(
+                    {
+                        "codex_active": True,
+                        "codex_pid": None,
+                        "codex_pgid": 654,
+                    }
+                ),
+            },
+        )(),
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    killed: list[tuple[int, int | None, float]] = []
+
+    def fake_terminate_process_tree(
+        *, pid: int, pgid: int | None = None, graceful_shutdown_seconds: float = 5.0
+    ) -> None:
+        killed.append((pid, pgid, graceful_shutdown_seconds))
+
+    monkeypatch.setattr("mergexo.orchestrator.terminate_process_tree", fake_terminate_process_tree)
+    orch._cleanup_persisted_codex_processes()
+
+    assert killed == []
+
+
+def test_cleanup_persisted_codex_processes_resolves_launch_without_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    launch_path = tmp_path / "launch.json"
+    state.list_unfinished_agent_runs = lambda **kwargs: (  # type: ignore[method-assign]
+        type(
+            "Run",
+            (),
+            {
+                "run_id": "run-1",
+                "issue_number": 7,
+                "pr_number": None,
+                "meta_json": json.dumps(
+                    {
+                        "codex_active": True,
+                        "codex_launch_token": "launch-token",
+                        "codex_launch_metadata_path": str(launch_path),
+                    }
+                ),
+            },
+        )(),
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    killed: list[tuple[int, int | None, float]] = []
+
+    def fake_terminate_process_tree(
+        *, pid: int, pgid: int | None = None, graceful_shutdown_seconds: float = 5.0
+    ) -> None:
+        killed.append((pid, pgid, graceful_shutdown_seconds))
+
+    monkeypatch.setattr(
+        "mergexo.orchestrator.resolve_durable_launch",
+        lambda launch: ResolvedLaunch(pid=321, pgid=654),
+    )
+    monkeypatch.setattr("mergexo.orchestrator.terminate_process_tree", fake_terminate_process_tree)
+
+    orch._cleanup_persisted_codex_processes()
+
+    assert killed == [(321, 654, 5.0)]
+
+
+def test_observe_agent_invocations_updates_run_meta_and_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = CodexAdapter(cfg.codex)
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._initialize_run_meta_cache("run-1")
+
+    recorded_meta: list[dict[str, object]] = []
+
+    def fake_update_agent_run_meta(*, run_id: str, meta_json: str) -> bool:
+        assert run_id == "run-1"
+        recorded_meta.append(cast(dict[str, object], json.loads(meta_json)))
+        return True
+
+    monkeypatch.setattr(
+        orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
+    )
+
+    durable_launch = DurableLaunch(
+        token="launch-token",
+        metadata_path=tmp_path / "launch.json",
+    )
+    with orch._observe_agent_invocations(run_id="run-1", durable_launch=durable_launch):
+        hooks = cast(CodexInvocationHooks, getattr(agent._local, "invocation_hooks"))
+        assert hooks.on_start is not None
+        assert hooks.on_progress is not None
+        assert hooks.durable_launch == durable_launch
+        hooks.on_start(
+            RunningCommand(
+                argv=("codex", "exec"),
+                cwd=tmp_path,
+                pid=123,
+                pgid=456,
+                timeout_seconds=60.0,
+                idle_timeout_seconds=30.0,
+            )
+        )
+        hooks.on_progress()
+
+    assert recorded_meta[0]["codex_pid"] == 123
+    assert recorded_meta[0]["codex_pgid"] == 456
+    assert recorded_meta[0]["codex_timeout_seconds"] == 60.0
+    assert recorded_meta[0]["codex_idle_timeout_seconds"] == 30.0
+    assert recorded_meta[0]["run_phase"] == "codex_running"
+    assert recorded_meta[0]["last_progress_at"] is not None
+    assert recorded_meta[1]["last_progress_at"] is not None
+
+
+def test_mark_codex_invocation_started_persists_durable_launch_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
+    orch._initialize_run_meta_cache("run-1")
+
+    recorded_meta: list[dict[str, object]] = []
+
+    def fake_update_agent_run_meta(*, run_id: str, meta_json: str) -> bool:
+        assert run_id == "run-1"
+        recorded_meta.append(cast(dict[str, object], json.loads(meta_json)))
+        return True
+
+    monkeypatch.setattr(
+        orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
+    )
+    durable_launch = DurableLaunch(
+        token="launch-token",
+        metadata_path=tmp_path / "launch.json",
+    )
+
+    orch._mark_codex_invocation_started(
+        run_id="run-1",
+        mode="writing_doc",
+        prompt="prompt",
+        session_id=None,
+        durable_launch=durable_launch,
+    )
+
+    assert recorded_meta[-1]["codex_active"] is True
+    assert recorded_meta[-1]["codex_launch_token"] == "launch-token"
+    assert recorded_meta[-1]["codex_launch_metadata_path"] == str(tmp_path / "launch.json")
+
+
+def test_durable_codex_launch_uses_repo_scoped_launch_path(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=CodexAdapter(cfg.codex),
+    )
+
+    durable_launch = orch._durable_codex_launch("run-1")
+
+    assert durable_launch is not None
+    assert durable_launch.token.startswith("mergexo-codex-run-1-")
+    assert durable_launch.metadata_path == (
+        tmp_path / "state" / "codex-launches" / "johnynek" / "mergexo" / "run-1.json"
+    )
+
+
+def test_raise_if_timeout_left_local_changes_returns_when_checkout_is_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    monkeypatch.setattr(git, "current_head_sha", lambda _path: "head-a", raising=False)
+    monkeypatch.setattr(git, "has_working_tree_changes", lambda _path: False, raising=False)
+
+    orch._raise_if_timeout_left_local_changes(
+        exc=CommandTimeoutError(
+            argv=["codex", "exec"],
+            timeout_kind="wall_clock",
+            timeout_seconds=30.0,
+            pid=1,
+            pgid=1,
+            stdout="",
+            stderr="",
+        ),
+        checkout_path=tmp_path,
+        initial_head_sha="head-a",
+        blocked_message="timed out",
+    )
+
+
+def test_raise_if_timeout_left_local_changes_blocks_when_checkout_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    monkeypatch.setattr(git, "current_head_sha", lambda _path: "head-b", raising=False)
+    monkeypatch.setattr(git, "has_working_tree_changes", lambda _path: True, raising=False)
+
+    with pytest.raises(
+        DirectFlowBlockedError,
+        match=("timed out: working tree has local changes; HEAD moved during the timed out turn"),
+    ):
+        orch._raise_if_timeout_left_local_changes(
+            exc=CommandTimeoutError(
+                argv=["codex", "exec"],
+                timeout_kind="wall_clock",
+                timeout_seconds=30.0,
+                pid=1,
+                pgid=1,
+                stdout="",
+                stderr="",
+            ),
+            checkout_path=tmp_path,
+            initial_head_sha="head-a",
+            blocked_message="timed out",
+        )
+
+
+def test_sweep_stalled_active_codex_runs_terminates_idle_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    now = datetime.now(timezone.utc)
+    orch._run_meta_cache["run-1"] = {
+        "codex_active": True,
+        "codex_pid": 123,
+        "codex_pgid": 456,
+        "codex_timeout_at": (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "codex_idle_timeout_seconds": 30,
+        "last_progress_at": (now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    }
+
+    recorded_meta: list[dict[str, object]] = []
+    killed: list[tuple[int, int | None, float]] = []
+
+    def fake_update_agent_run_meta(*, run_id: str, meta_json: str) -> bool:
+        assert run_id == "run-1"
+        recorded_meta.append(cast(dict[str, object], json.loads(meta_json)))
+        return True
+
+    def fake_terminate_process_tree(
+        *, pid: int, pgid: int | None = None, graceful_shutdown_seconds: float = 5.0
+    ) -> None:
+        killed.append((pid, pgid, graceful_shutdown_seconds))
+
+    monkeypatch.setattr(
+        orch._state, "update_agent_run_meta", fake_update_agent_run_meta, raising=False
+    )
+    monkeypatch.setattr("mergexo.orchestrator.terminate_process_tree", fake_terminate_process_tree)
+
+    orch._sweep_stalled_active_codex_runs()
+
+    assert killed == [(123, 456, 5.0)]
+    assert recorded_meta[-1]["codex_kill_requested_at"] is not None
+
+
+def test_sweep_stalled_active_codex_runs_skips_non_stale_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    now = datetime.now(timezone.utc)
+    orch._run_meta_cache = {
+        "inactive": {"codex_active": False},
+        "kill-requested": {
+            "codex_active": True,
+            "codex_kill_requested_at": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "codex_pid": 11,
+        },
+        "bad-pid": {
+            "codex_active": True,
+            "codex_kill_requested_at": None,
+            "codex_pid": 0,
+        },
+        "not-stale": {
+            "codex_active": True,
+            "codex_kill_requested_at": None,
+            "codex_pid": 12,
+            "codex_timeout_at": (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "codex_idle_timeout_seconds": 30,
+            "last_progress_at": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        },
+    }
+
+    killed: list[tuple[int, int | None, float]] = []
+    monkeypatch.setattr(
+        "mergexo.orchestrator.terminate_process_tree",
+        lambda *, pid, pgid=None, graceful_shutdown_seconds=5.0: killed.append(
+            (pid, pgid, graceful_shutdown_seconds)
+        ),
+    )
+
+    orch._sweep_stalled_active_codex_runs()
+
+    assert killed == []
+
+
+def test_run_meta_from_json_handles_invalid_payloads() -> None:
+    invalid_json = _run_meta_from_json("{")
+    non_dict_json = _run_meta_from_json("[]")
+
+    assert invalid_json.codex_active is False
+    assert invalid_json.codex_pid is None
+    assert invalid_json.codex_pgid is None
+    assert non_dict_json.codex_active is False
+    assert non_dict_json.codex_pid is None
+    assert non_dict_json.codex_pgid is None
 
 
 def test_process_feedback_turn_worker_retries_transient_git_errors_before_succeeding(
@@ -10655,19 +11083,42 @@ def test_reap_finished_marks_feedback_failure_blocked(tmp_path: Path) -> None:
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
 
     bad_feedback: Future[str] = Future()
-    bad_feedback.set_exception(RuntimeError("feedback boom"))
+    bad_feedback.set_exception(DirectFlowBlockedError("feedback flow blocked: blocked for test"))
     orch._running_feedback = {
         101: _FeedbackFuture(issue_number=7, run_id="run-bad", future=bad_feedback)
     }
 
     orch._reap_finished()
-    assert state.status_updates == [(101, 7, "blocked", None, "feedback boom")]
+    assert state.status_updates == [
+        (101, 7, "blocked", None, "feedback flow blocked: blocked for test")
+    ]
     assert len(github.comments) == 1
-    assert "unexpected error occurred" in github.comments[0][1].lower()
+    assert "feedback loop is blocked" in github.comments[0][1].lower()
     assert state.released_feedback_claims == [(101, "run-bad")]
 
 
-def test_reap_finished_blocks_with_concise_transient_git_retry_message(tmp_path: Path) -> None:
+def test_reap_finished_retries_unknown_feedback_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    unknown_failure: Future[str] = Future()
+    unknown_failure.set_exception(RuntimeError("feedback boom"))
+    orch._running_feedback = {
+        101: _FeedbackFuture(issue_number=7, run_id="run-unknown", future=unknown_failure)
+    }
+
+    orch._reap_finished()
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
+    assert state.run_finishes == [("run-unknown", "failed", "unknown", "feedback boom")]
+    assert github.comments == []
+    assert state.released_feedback_claims == [(101, "run-unknown")]
+
+
+def test_reap_finished_retries_transient_feedback_git_failure(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub([])
@@ -10687,16 +11138,7 @@ def test_reap_finished_blocks_with_concise_transient_git_retry_message(tmp_path:
     }
 
     orch._reap_finished()
-    assert state.status_updates == [
-        (
-            101,
-            7,
-            "blocked",
-            None,
-            "Unable to reach GitHub during feedback operations after 4 attempts. "
-            "Last error: ERROR: no healthy upstream",
-        )
-    ]
+    assert state.status_updates == [(101, 7, "awaiting_feedback", None, None)]
     assert state.run_finishes == [
         (
             "run-transient",
@@ -10706,11 +11148,7 @@ def test_reap_finished_blocks_with_concise_transient_git_retry_message(tmp_path:
             "Last error: ERROR: no healthy upstream",
         )
     ]
-    assert len(github.comments) == 1
-    assert (
-        "unable to reach github during feedback operations after 4 attempts"
-        in github.comments[0][1].lower()
-    )
+    assert github.comments == []
     assert state.released_feedback_claims == [(101, "run-transient")]
 
 
