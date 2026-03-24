@@ -484,6 +484,16 @@ def test_is_process_group_alive_handles_invalid_group() -> None:
     assert shell._is_process_group_alive(0) is False
 
 
+def test_is_process_group_alive_returns_false_on_os_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        shell.os, "killpg", lambda _pgid, _sig: (_ for _ in ()).throw(OSError("gone"))
+    )
+
+    assert shell._is_process_group_alive(123) is False
+
+
 def test_terminate_process_tree_returns_when_process_is_already_dead(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
