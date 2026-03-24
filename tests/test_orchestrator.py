@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14957,7 +14958,7 @@ def test_advance_roadmap_nodes_reclaims_stale_node_claim_after_crash(tmp_path: P
     )
     crashed_claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)
     assert len(crashed_claim) == 1
-    with sqlite3.connect(tmp_path / "state.db") as conn:
+    with closing(sqlite3.connect(tmp_path / "state.db")) as conn:
         conn.execute(
             """
             UPDATE roadmap_nodes

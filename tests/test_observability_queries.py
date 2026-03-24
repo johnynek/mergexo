@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
@@ -567,7 +567,7 @@ def test_load_tracked_and_blocked_sorted_by_updated_desc(tmp_path: Path) -> None
     store = StateStore(db_path)
     _seed_state(store)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE pr_feedback_state
@@ -589,6 +589,7 @@ def test_load_tracked_and_blocked_sorted_by_updated_desc(tmp_path: Path) -> None
             WHERE repo_full_name = 'o/repo-b' AND pr_number = 1111
             """
         )
+        conn.commit()
 
     rows = oq.load_tracked_and_blocked(db_path, limit=20)
     assert [row.updated_at for row in rows] == [

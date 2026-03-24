@@ -461,6 +461,7 @@ def test_module_main_executes_wrapper_entrypoint(
         ],
     )
     monkeypatch.setattr(shell.subprocess, "Popen", lambda cmd: FakeChild())
+    monkeypatch.delitem(sys.modules, "mergexo.shell", raising=False)
 
     with pytest.raises(SystemExit) as exc_info:
         runpy.run_module("mergexo.shell", run_name="__main__")

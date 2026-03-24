@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 
@@ -215,7 +216,7 @@ def test_state_store_transitions_and_feedback_tracking(tmp_path: Path) -> None:
 
 def test_state_store_migrates_legacy_roadmap_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy.db"
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             CREATE TABLE roadmap_state (
@@ -294,7 +295,7 @@ def test_state_store_migrates_legacy_roadmap_schema(tmp_path: Path) -> None:
 
     store = StateStore(db_path)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         roadmap_state_columns = set(_table_columns(conn, "roadmap_state"))
         roadmap_node_columns = set(_table_columns(conn, "roadmap_nodes"))
     assert {
@@ -5528,7 +5529,7 @@ def test_claim_ready_roadmap_nodes_limit_and_conflict_paths(tmp_path: Path) -> N
     global_limited_claims = store.claim_ready_roadmap_nodes(limit=1, repo_full_name=repo)
     assert len(global_limited_claims) == 1
 
-    with sqlite3.connect(tmp_path / "state.db") as conn:
+    with closing(sqlite3.connect(tmp_path / "state.db")) as conn:
         conn.execute(
             """
             UPDATE roadmap_nodes
@@ -5568,7 +5569,7 @@ def test_claim_ready_roadmap_nodes_reclaims_stale_claims_and_frontier(tmp_path: 
     initial_claim = store.claim_ready_roadmap_nodes(repo_full_name=repo)
     assert len(initial_claim) == 1
 
-    with sqlite3.connect(tmp_path / "state.db") as conn:
+    with closing(sqlite3.connect(tmp_path / "state.db")) as conn:
         conn.execute(
             """
             UPDATE roadmap_nodes
@@ -5587,7 +5588,7 @@ def test_claim_ready_roadmap_nodes_reclaims_stale_claims_and_frontier(tmp_path: 
     assert reclaimed_claim[0].node_id == "a"
     assert reclaimed_claim[0].claim_token != initial_claim[0].claim_token
 
-    with sqlite3.connect(tmp_path / "state.db") as conn:
+    with closing(sqlite3.connect(tmp_path / "state.db")) as conn:
         row = conn.execute(
             """
             SELECT claim_token, claim_started_at
@@ -5609,7 +5610,7 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
     repo = "o/repo"
     store.mark_running(1, repo_full_name=repo)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE issue_runs
@@ -5624,7 +5625,7 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="Invalid status value"):
         store.get_issue_run_record(1, repo_full_name=repo)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE issue_runs
@@ -5639,7 +5640,7 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="Invalid branch value"):
         store.get_issue_run_record(1, repo_full_name=repo)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE issue_runs
@@ -5652,7 +5653,7 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="Invalid pr_number value"):
         store.get_issue_run_record(1, repo_full_name=repo)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE issue_runs
@@ -5665,7 +5666,7 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="Invalid pr_url value"):
         store.get_issue_run_record(1, repo_full_name=repo)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             UPDATE issue_runs
