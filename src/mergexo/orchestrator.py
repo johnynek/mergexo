@@ -4113,13 +4113,9 @@ class Phase1Orchestrator:
             repo_full_name=self._state_repo_full_name()
         )
         blocked_pr_issue_numbers = {
-            blocked.pr_number: blocked.issue_number
-            for blocked in blocked_pull_requests
+            blocked.pr_number: blocked.issue_number for blocked in blocked_pull_requests
         }
-        blocked_pr_by_number = {
-            blocked.pr_number: blocked
-            for blocked in blocked_pull_requests
-        }
+        blocked_pr_by_number = {blocked.pr_number: blocked for blocked in blocked_pull_requests}
         failed_issue_by_number = {
             failed.issue_number: failed
             for failed in self._state.list_failed_issue_runs_without_pr(

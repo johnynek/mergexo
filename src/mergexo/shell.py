@@ -9,6 +9,7 @@ from pathlib import Path
 import logging
 import os
 from queue import Empty, Queue
+import shlex
 import signal
 import subprocess
 import sys
@@ -170,7 +171,14 @@ def _find_launch_by_token(launch_token: str) -> ResolvedLaunch | None:
         return None
     for line in proc.stdout.splitlines():
         pid_text, _, command = line.strip().partition(" ")
-        if launch_token not in command:
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        if "--launch-token" not in argv:
+            continue
+        launch_flag_index = argv.index("--launch-token")
+        if launch_flag_index + 1 >= len(argv) or argv[launch_flag_index + 1] != launch_token:
             continue
         try:
             pid = int(pid_text)

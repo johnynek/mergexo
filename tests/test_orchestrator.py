@@ -14816,7 +14816,9 @@ def test_operator_retry_rearms_failed_issue_from_issue_thread(tmp_path: Path) ->
     assert retry_run_id == "run-151-retry"
 
 
-def test_operator_retry_incremental_bootstrap_processes_failed_issue_comments(tmp_path: Path) -> None:
+def test_operator_retry_incremental_bootstrap_processes_failed_issue_comments(
+    tmp_path: Path,
+) -> None:
     cfg = _config(
         tmp_path,
         enable_github_operations=True,
@@ -14826,7 +14828,9 @@ def test_operator_retry_incremental_bootstrap_processes_failed_issue_comments(tm
     git = FakeGitManager(tmp_path / "checkouts")
     state = StateStore(tmp_path / "state.db")
     state.mark_failed(151, "roadmap schema rejected", repo_full_name=cfg.repo.full_name)
-    failed_at = state.list_failed_issue_runs_without_pr(repo_full_name=cfg.repo.full_name)[0].updated_at
+    failed_at = state.list_failed_issue_runs_without_pr(repo_full_name=cfg.repo.full_name)[
+        0
+    ].updated_at
     comment_updated_at = (
         datetime.strptime(failed_at, "%Y-%m-%dT%H:%M:%S.%fZ") + timedelta(seconds=1)
     ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -14862,7 +14866,9 @@ def test_operator_retry_incremental_bootstrap_processes_failed_issue_comments(tm
     assert "Re-armed failed issue #151 for retry" in github.posted_comments[0][1]
 
 
-def test_operator_unblock_incremental_bootstrap_processes_blocked_pr_comments(tmp_path: Path) -> None:
+def test_operator_unblock_incremental_bootstrap_processes_blocked_pr_comments(
+    tmp_path: Path,
+) -> None:
     cfg = _config(
         tmp_path,
         enable_github_operations=True,
