@@ -1,0 +1,97 @@
+{
+  "nodes": [
+    {
+      "body_markdown": "Add the repo-level configuration and checkout-time guidance plumbing needed for automated review.\n\nScope:\n- Extend config with review enablement or policy, reviewer guidance path, and any review-loop limits chosen in the design.\n- Resolve the optional review guidance file from the checkout similarly to `coding_guidelines_path`.\n- Thread resolved values through the relevant call sites without enabling review behavior yet.\n\nAcceptance criteria:\n- Config defaults and validation are fully covered by tests.\n- Missing optional review guidance files degrade safely to null or disabled behavior with explicit coverage.\n- Repos with review disabled behave exactly as before.",
+      "depends_on": [
+        {
+          "node_id": "review_design",
+          "requires": "planned"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_config",
+      "title": "Add review config and guidance resolution"
+    },
+    {
+      "body_markdown": "Implement the dedicated reviewer-agent contract.\n\nScope:\n- Add typed models for reviewer results and findings.\n- Add a prompt builder that includes code-review instructions, repo coding guidance, and repo review guidance.\n- Add Codex adapter schema validation for the reviewer response shape.\n\nAcceptance criteria:\n- The reviewer output supports both a clean pass and actionable findings with file-aware context.\n- Invalid reviewer payloads fail deterministically in adapter tests.\n- No PR-producing flow consumes the reviewer yet.",
+      "depends_on": [
+        {
+          "node_id": "review_design",
+          "requires": "planned"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_contract",
+      "title": "Add reviewer prompt and structured findings contract"
+    },
+    {
+      "body_markdown": "Produce the design doc for optional automated code review support.\n\nScope:\n- Define when automated review runs relative to author turns, required tests, and PR creation.\n- Define repo config for opt-in, reviewer guidance, and bounded repair rounds.\n- Define the reviewer output schema, blocking semantics, and the author handoff strategy.\n- Define failure handling, stop conditions, and operator-visible status messages.\n\nAcceptance criteria:\n- A merged design doc in `docs/design` covers the control loop and rollout order.\n- Downstream implementation issues do not need to reopen the core architecture questions.",
+      "depends_on": [],
+      "kind": "design_doc",
+      "node_id": "review_design",
+      "title": "Design optional automated code review flow"
+    },
+    {
+      "body_markdown": "Integrate the automated reviewer into direct PR-producing flows.\n\nScope:\n- After author changes and local required tests succeed, run the reviewer when repo config enables it.\n- When findings are returned, rerun the author flow with reviewer handoff context and repeat up to the configured limit.\n- Open the PR only after review passes; otherwise post a clear blocking comment on the source issue.\n\nAcceptance criteria:\n- `bugfix` and `small_job` preserve current behavior when review is disabled.\n- Review-enabled direct flows cover pass, repair, and max-round blocking paths in tests.\n- Existing regression-test enforcement and required-tests repair behavior still hold.",
+      "depends_on": [
+        {
+          "node_id": "review_config",
+          "requires": "implemented"
+        },
+        {
+          "node_id": "review_contract",
+          "requires": "implemented"
+        },
+        {
+          "node_id": "review_handoff",
+          "requires": "implemented"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_direct",
+      "title": "Run automated review loops for bugfix and small-job intake"
+    },
+    {
+      "body_markdown": "Implement the author-side context builder for automated review follow-up.\n\nScope:\n- Convert reviewer findings into compact, ordered follow-up context for the next author turn.\n- Preserve file references, round metadata, and truncation rules deterministically.\n- Reuse the existing pre-PR repair style so author retry turns stay bounded and testable.\n\nAcceptance criteria:\n- The same reviewer payload always yields the same author handoff text.\n- Long finding sets are truncated in a deterministic, test-covered way.\n- Author retry turns can distinguish reviewer follow-up from other pre-PR repair contexts.",
+      "depends_on": [
+        {
+          "node_id": "review_contract",
+          "requires": "implemented"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_handoff",
+      "title": "Build deterministic author handoff from reviewer findings"
+    },
+    {
+      "body_markdown": "Extend the same review gate to implementation PRs created from merged design docs.\n\nScope:\n- Reuse the shared review loop for `_process_implementation_candidate`.\n- Preserve design-doc context alongside reviewer follow-up context.\n- Keep post-PR human feedback behavior unchanged once the PR is opened.\n\nAcceptance criteria:\n- Implementation-flow PRs can run the optional reviewer gate without regressing design-doc handoff.\n- Review reruns and blocking outcomes are covered by orchestration tests.\n- Existing post-PR feedback loop behavior remains unchanged after PR creation.",
+      "depends_on": [
+        {
+          "node_id": "review_direct",
+          "requires": "implemented"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_impl",
+      "title": "Apply automated review to implementation-from-design flow"
+    },
+    {
+      "body_markdown": "Finish the operator-facing surfaces for the new behavior.\n\nScope:\n- Add deterministic source-issue or PR messaging for review-passed, review-blocked, and review-skipped outcomes as defined by the design.\n- Update `README.md` and `mergexo.toml.example` with the new config keys and guidance-file expectations.\n- Fill any small logging or observability gaps needed to make review rounds and outcomes legible.\n\nAcceptance criteria:\n- Maintainers can tell when automated review ran and why it blocked when it fails.\n- The shipped docs match the implemented config surface and control flow.\n- Tests cover any new status-comment or metadata behavior introduced here.",
+      "depends_on": [
+        {
+          "node_id": "review_direct",
+          "requires": "implemented"
+        },
+        {
+          "node_id": "review_impl",
+          "requires": "implemented"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_visibility",
+      "title": "Document and surface automated review outcomes"
+    }
+  ],
+  "roadmap_issue_number": 151,
+  "version": 1
+}
