@@ -8748,6 +8748,8 @@ class Phase1Orchestrator:
             expected_issue_number=expected_issue_number,
         )
         roadmap_markdown = render_roadmap_markdown(parsed.graph)
+        # Keep the persisted graph human-reviewable while preserving the parser's canonical JSON
+        # for checksums and state comparisons elsewhere.
         graph_text = (
             json.dumps(
                 json.loads(parsed.canonical_json),
@@ -9053,6 +9055,8 @@ class Phase1Orchestrator:
             )
 
             if isinstance(current_turn, RoadmapFeedbackTurn):
+                # Roadmap feedback commits must contain the regenerated markdown that matches the
+                # current graph, so validate/materialize before creating the commit.
                 validation_error = self._validate_roadmap_feedback_artifacts(
                     turn=current_turn,
                     checkout_path=checkout_path,
