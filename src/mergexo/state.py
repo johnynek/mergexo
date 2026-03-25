@@ -333,6 +333,7 @@ class FailedIssueRunState:
     issue_number: int
     branch: str | None
     error: str | None
+    updated_at: str
     repo_full_name: str = ""
 
 
@@ -3351,7 +3352,8 @@ class StateStore:
                         r.repo_full_name,
                         r.issue_number,
                         r.branch,
-                        r.error
+                        r.error,
+                        r.updated_at
                     FROM issue_runs AS r
                     LEFT JOIN pre_pr_followup_state AS p
                         ON p.repo_full_name = r.repo_full_name
@@ -3369,7 +3371,8 @@ class StateStore:
                         r.repo_full_name,
                         r.issue_number,
                         r.branch,
-                        r.error
+                        r.error,
+                        r.updated_at
                     FROM issue_runs AS r
                     LEFT JOIN pre_pr_followup_state AS p
                         ON p.repo_full_name = r.repo_full_name
@@ -3388,8 +3391,9 @@ class StateStore:
                 issue_number=int(issue_number),
                 branch=str(branch) if isinstance(branch, str) else None,
                 error=str(error) if isinstance(error, str) else None,
+                updated_at=str(updated_at),
             )
-            for row_repo_full_name, issue_number, branch, error in rows
+            for row_repo_full_name, issue_number, branch, error, updated_at in rows
         )
 
     def list_legacy_failed_issue_runs_without_pr(

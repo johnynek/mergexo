@@ -14482,8 +14482,10 @@ class OperatorGitHub:
     def list_issue_comments(
         self, issue_number: int, *, since: str | None = None
     ) -> list[PullRequestIssueComment]:
-        _ = since
-        return list(self._threads.get(issue_number, []))
+        comments = list(self._threads.get(issue_number, []))
+        if since is None:
+            return comments
+        return [comment for comment in comments if comment.updated_at > since]
 
     def post_issue_comment(self, issue_number: int, body: str) -> None:
         self.posted_comments.append((issue_number, body))
@@ -14812,6 +14814,109 @@ def test_operator_retry_rearms_failed_issue_from_issue_thread(tmp_path: Path) ->
         repo_full_name=cfg.repo.full_name,
     )
     assert retry_run_id == "run-151-retry"
+
+
+def test_operator_retry_incremental_bootstrap_processes_failed_issue_comments(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        enable_incremental_comment_fetch=True,
+        operator_logins=("alice",),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_failed(151, "roadmap schema rejected", repo_full_name=cfg.repo.full_name)
+    failed_at = state.list_failed_issue_runs_without_pr(repo_full_name=cfg.repo.full_name)[0].updated_at
+    comment_updated_at = (
+        datetime.strptime(failed_at, "%Y-%m-%dT%H:%M:%S.%fZ") + timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    github = OperatorGitHub(
+        {
+            151: [
+                _operator_issue_comment(
+                    comment_id=19,
+                    body="/mergexo retry",
+                    user_login="alice",
+                    updated_at=comment_updated_at,
+                    issue_number=151,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    command = state.get_operator_command(f"151:19:{comment_updated_at}")
+    assert command is not None
+    assert command.command == "retry"
+    assert command.status == "applied"
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 151
+    assert "Re-armed failed issue #151 for retry" in github.posted_comments[0][1]
+
+
+def test_operator_unblock_incremental_bootstrap_processes_blocked_pr_comments(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        enable_incremental_comment_fetch=True,
+        operator_logins=("alice",),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        7, "agent/design/7-worker", 101, "https://example/pr/101", repo_full_name=cfg.repo.full_name
+    )
+    state.mark_pr_status(
+        pr_number=101,
+        issue_number=7,
+        status="blocked",
+        last_seen_head_sha="head-old",
+        error="blocked for test",
+        repo_full_name=cfg.repo.full_name,
+    )
+    blocked_at = state.list_blocked_pull_requests(repo_full_name=cfg.repo.full_name)[0].updated_at
+    comment_updated_at = (
+        datetime.strptime(blocked_at, "%Y-%m-%dT%H:%M:%S.%fZ") + timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    github = OperatorGitHub(
+        {
+            101: [
+                _operator_issue_comment(
+                    comment_id=22,
+                    body="/mergexo unblock",
+                    user_login="alice",
+                    updated_at=comment_updated_at,
+                    issue_number=101,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    command = state.get_operator_command(f"101:22:{comment_updated_at}")
+    assert command is not None
+    assert command.command == "unblock"
+    assert command.status == "applied"
+    assert state.list_blocked_pull_requests(repo_full_name=cfg.repo.full_name) == ()
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 101
+    assert "Reset blocked state for PR #101." in github.posted_comments[0][1]
 
 
 def test_operator_retry_requires_target_on_operations_issue(tmp_path: Path) -> None:
