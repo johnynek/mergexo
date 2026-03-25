@@ -4109,9 +4109,16 @@ class Phase1Orchestrator:
         issue_numbers = self._operator_issue_numbers_to_scan()
         if not issue_numbers:
             return
+        blocked_pull_requests = self._state.list_blocked_pull_requests(
+            repo_full_name=self._state_repo_full_name()
+        )
         blocked_pr_issue_numbers = {
-            blocked.pr_number: blocked.issue_number
-            for blocked in self._state.list_blocked_pull_requests(
+            blocked.pr_number: blocked.issue_number for blocked in blocked_pull_requests
+        }
+        blocked_pr_by_number = {blocked.pr_number: blocked for blocked in blocked_pull_requests}
+        failed_issue_by_number = {
+            failed.issue_number: failed
+            for failed in self._state.list_failed_issue_runs_without_pr(
                 repo_full_name=self._state_repo_full_name()
             )
         }
@@ -4132,10 +4139,21 @@ class Phase1Orchestrator:
                 continue
             source_pr_number = issue_number if source_issue_number is not None else None
             if self._incremental_comment_fetch_enabled():
+                blocked_pr_state = blocked_pr_by_number.get(issue_number)
+                failed_issue_state = failed_issue_by_number.get(issue_number)
+                bootstrap_mode: Literal["process_all", "seed_latest"] = "seed_latest"
+                bootstrap_since: str | None = None
+                if blocked_pr_state is not None:
+                    bootstrap_mode = "process_all"
+                    bootstrap_since = blocked_pr_state.updated_at
+                elif failed_issue_state is not None:
+                    bootstrap_mode = "process_all"
+                    bootstrap_since = failed_issue_state.updated_at
                 incremental_scan = self._scan_incremental_issue_comments(
                     issue_number=issue_number,
                     surface=_SURFACE_ISSUE_OPERATOR_COMMANDS,
-                    bootstrap_mode="seed_latest",
+                    bootstrap_mode=bootstrap_mode,
+                    bootstrap_since=bootstrap_since,
                 )
                 comments = [cast(PullRequestIssueComment, c) for c in incremental_scan.new]
                 token_observations = self._action_token_observations_from_comments(
@@ -5152,6 +5170,7 @@ class Phase1Orchestrator:
         issue_number: int,
         surface: GitHubCommentSurface,
         bootstrap_mode: Literal["process_all", "seed_latest"],
+        bootstrap_since: str | None = None,
     ) -> _IncrementalCommentScan:
         cursor = self._load_poll_cursor(surface=surface, scope_number=issue_number)
         since = (
@@ -5159,6 +5178,8 @@ class Phase1Orchestrator:
             if not cursor.bootstrap_complete
             else self._since_for_cursor(last_updated_at=cursor.last_updated_at)
         )
+        if not cursor.bootstrap_complete and bootstrap_since is not None:
+            since = self._since_for_cursor(last_updated_at=bootstrap_since)
         log_event(
             LOGGER,
             "incremental_scan_started",

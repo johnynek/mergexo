@@ -245,6 +245,45 @@ def test_resolve_durable_launch_skips_bad_process_scan_rows(
     assert resolve_durable_launch(durable_launch) is None
 
 
+def test_resolve_durable_launch_requires_exact_launch_token_argument(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    durable_launch = DurableLaunch(token="launch-token", metadata_path=tmp_path / "launch.json")
+    monkeypatch.setattr(
+        shell.subprocess,
+        "run",
+        lambda *args, **kwargs: shell.subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout=(
+                " 123 /usr/bin/python --launch-token mergexo-codex-real-token\n"
+                " 456 /usr/bin/python -m something launch-token\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    assert resolve_durable_launch(durable_launch) is None
+
+
+def test_resolve_durable_launch_skips_unparseable_process_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    durable_launch = DurableLaunch(token="launch-token", metadata_path=tmp_path / "launch.json")
+    monkeypatch.setattr(
+        shell.subprocess,
+        "run",
+        lambda *args, **kwargs: shell.subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout=' 123 /usr/bin/python --launch-token "launch-token\n',
+            stderr="",
+        ),
+    )
+
+    assert resolve_durable_launch(durable_launch) is None
+
+
 def test_resolve_durable_launch_scans_process_list_without_pgid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
