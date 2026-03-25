@@ -329,11 +329,14 @@ class IssueTakeoverState:
 
 
 @dataclass(frozen=True)
-class LegacyFailedIssueRunState:
+class FailedIssueRunState:
     issue_number: int
     branch: str | None
     error: str | None
     repo_full_name: str = ""
+
+
+LegacyFailedIssueRunState = FailedIssueRunState
 
 
 @dataclass(frozen=True)
@@ -3336,9 +3339,9 @@ class StateStore:
                 (repo_key, issue_number),
             )
 
-    def list_legacy_failed_issue_runs_without_pr(
+    def list_failed_issue_runs_without_pr(
         self, *, repo_full_name: str | None = None
-    ) -> tuple[LegacyFailedIssueRunState, ...]:
+    ) -> tuple[FailedIssueRunState, ...]:
         repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
         with self._lock, self._connect() as conn:
             if repo_key is None:
@@ -3380,7 +3383,7 @@ class StateStore:
                     (repo_key,),
                 ).fetchall()
         return tuple(
-            LegacyFailedIssueRunState(
+            FailedIssueRunState(
                 repo_full_name=str(row_repo_full_name),
                 issue_number=int(issue_number),
                 branch=str(branch) if isinstance(branch, str) else None,
@@ -3388,6 +3391,58 @@ class StateStore:
             )
             for row_repo_full_name, issue_number, branch, error in rows
         )
+
+    def list_legacy_failed_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[LegacyFailedIssueRunState, ...]:
+        return self.list_failed_issue_runs_without_pr(repo_full_name=repo_full_name)
+
+    def retry_failed_issue_runs(
+        self,
+        *,
+        issue_numbers: tuple[int, ...] | None = None,
+        repo_full_name: str | None = None,
+    ) -> int:
+        if issue_numbers is not None and len(issue_numbers) == 0:
+            return 0
+
+        repo_key = _normalize_repo_full_name(repo_full_name) if repo_full_name is not None else None
+        repo_filter_sql = "AND issue_runs.repo_full_name = ?" if repo_key is not None else ""
+        params: list[object] = []
+        if repo_key is not None:
+            params.append(repo_key)
+
+        issue_filter_sql = ""
+        if issue_numbers is not None:
+            issue_filter_sql = (
+                "AND issue_runs.issue_number IN (" + ", ".join("?" for _ in issue_numbers) + ")"
+            )
+            params.extend(issue_numbers)
+
+        with self._lock, self._connect() as conn:
+            updated = conn.execute(
+                f"""
+                UPDATE issue_runs
+                SET
+                    active_run_id = NULL,
+                    last_failure_class = 'unknown',
+                    retry_count = 1,
+                    next_retry_at = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE status = 'failed'
+                  AND pr_number IS NULL
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM pre_pr_followup_state AS p
+                        WHERE p.repo_full_name = issue_runs.repo_full_name
+                          AND p.issue_number = issue_runs.issue_number
+                    )
+                  {repo_filter_sql}
+                  {issue_filter_sql}
+                """,
+                tuple(params),
+            )
+        return int(updated.rowcount)
 
     def list_legacy_running_issue_runs_without_pr(
         self, *, repo_full_name: str | None = None
@@ -7478,7 +7533,7 @@ def _parse_runtime_operation_row(row: tuple[object, ...]) -> RuntimeOperationRec
 def _parse_operator_command_name(value: object) -> OperatorCommandName:
     if not isinstance(value, str):
         raise RuntimeError("Invalid command value stored in operator_commands")
-    if value not in {"unblock", "restart", "help", "invalid"}:
+    if value not in {"unblock", "retry", "restart", "help", "invalid"}:
         raise RuntimeError(f"Unknown command value stored in operator_commands: {value}")
     return cast(OperatorCommandName, value)
 

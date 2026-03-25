@@ -574,6 +574,97 @@ def test_state_store_claim_new_issue_run_start_skips_non_retryable_or_exhausted_
     )
 
 
+def test_retry_failed_issue_runs_rearms_failed_pre_pr_issue_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.record_issue_run_start(
+        run_kind="issue_flow",
+        issue_number=12,
+        flow="roadmap",
+        branch="agent/roadmap/12-old",
+        run_id="run-12-initial",
+    )
+    store.mark_failed(
+        12,
+        "roadmap validation failed",
+        failure_class="agent_error",
+    )
+    assert (
+        store.claim_new_issue_run_start(
+            issue_number=12,
+            flow="roadmap",
+            branch="agent/roadmap/12-retry",
+            run_id="run-12-before-retry",
+        )
+        is None
+    )
+
+    retried = store.retry_failed_issue_runs(issue_numbers=(12,))
+    assert retried == 1
+
+    status, error, last_failure_class, retry_count, next_retry_at, active_run_id = (
+        _get_issue_run_retry_state(db_path, 12)
+    )
+    assert status == "failed"
+    assert error == "roadmap validation failed"
+    assert last_failure_class == "unknown"
+    assert retry_count == 1
+    assert next_retry_at is None
+    assert active_run_id is None
+
+    retry_run_id = store.claim_new_issue_run_start(
+        issue_number=12,
+        flow="roadmap",
+        branch="agent/roadmap/12-retry",
+        run_id="run-12-retry",
+    )
+    assert retry_run_id == "run-12-retry"
+    assert store.retry_failed_issue_runs(issue_numbers=()) == 0
+
+
+def test_retry_failed_issue_runs_skips_rows_with_pr_or_followup(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_failed(21, "still failed")
+    store.mark_completed(22, "agent/design/22", 102, "https://example/pr/102")
+    store.mark_failed(22, "pr exists")
+    store.mark_failed(23, "followup exists")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO pre_pr_followup_state(
+                repo_full_name,
+                issue_number,
+                flow,
+                branch,
+                context_json,
+                waiting_reason,
+                last_checkpoint_sha
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "__single_repo__",
+                23,
+                "bugfix",
+                "agent/bugfix/23",
+                '{"flow":"bugfix"}',
+                "waiting",
+                None,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert store.retry_failed_issue_runs(issue_numbers=(21, 22, 23)) == 1
+    failed = store.list_failed_issue_runs_without_pr()
+    assert [item.issue_number for item in failed] == [21]
+
+
 def test_state_store_claim_implementation_issue_run_start_is_single_claim_and_preconditioned(
     tmp_path: Path,
 ) -> None:

@@ -123,6 +123,24 @@ class FeedbackTurn:
     changed_files: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class RoadmapFeedbackTurn:
+    turn_key: str
+    issue: Issue
+    pull_request: PullRequestSnapshot
+    review_comments: tuple[PullRequestReviewComment, ...]
+    issue_comments: tuple[PullRequestIssueComment, ...]
+    changed_files: tuple[str, ...]
+    roadmap_doc_path: str
+    graph_path: str
+    roadmap_markdown: str
+    graph_json_text: str
+    graph_version: int | None
+    roadmap_markdown_missing: bool
+    graph_missing: bool
+    graph_validation_error: str | None
+
+
 class AgentAdapter(ABC):
     @abstractmethod
     def start_design_from_issue(
@@ -237,3 +255,13 @@ class AgentAdapter(ABC):
         cwd: Path,
     ) -> FeedbackResult:
         """Produce reply actions for a review feedback turn within the same PR session."""
+
+    @abstractmethod
+    def respond_to_roadmap_feedback(
+        self,
+        *,
+        session: AgentSession,
+        turn: RoadmapFeedbackTurn,
+        cwd: Path,
+    ) -> FeedbackResult:
+        """Produce reply actions for a roadmap PR feedback turn within the same PR session."""

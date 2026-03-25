@@ -10,10 +10,16 @@ from mergexo.agent_adapter import (
     FeedbackTurn,
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
+    RoadmapFeedbackTurn,
 )
 from mergexo.codex_adapter import (
     CodexAdapter,
     CodexInvocationHooks,
+    _DESIGN_OUTPUT_SCHEMA,
+    _DIRECT_OUTPUT_SCHEMA,
+    _FEEDBACK_OUTPUT_SCHEMA,
+    _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA,
+    _ROADMAP_OUTPUT_SCHEMA,
     _as_object_dict,
     _extract_final_agent_message,
     _extract_thread_id,
@@ -28,6 +34,7 @@ from mergexo.codex_adapter import (
     _parse_review_replies,
     _require_str,
     _require_str_list,
+    _validate_strict_output_schema,
 )
 from mergexo.config import CodexConfig
 from mergexo.models import (
@@ -90,6 +97,167 @@ def _feedback_turn() -> FeedbackTurn:
         ),
         changed_files=("src/a.py",),
     )
+
+
+def _roadmap_feedback_turn() -> RoadmapFeedbackTurn:
+    return RoadmapFeedbackTurn(
+        turn_key="turn-roadmap",
+        issue=Issue(
+            number=1,
+            title="Roadmap Issue",
+            body="Body",
+            html_url="u",
+            labels=("agent:roadmap",),
+        ),
+        pull_request=PullRequestSnapshot(
+            number=8,
+            title="Roadmap PR",
+            body="desc",
+            head_sha="headsha",
+            base_sha="basesha",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=("docs/roadmap/1-issue.md", "docs/roadmap/1-issue.graph.json"),
+        roadmap_doc_path="docs/roadmap/1-issue.md",
+        graph_path="docs/roadmap/1-issue.graph.json",
+        roadmap_markdown="# Roadmap",
+        graph_json_text='{"roadmap_issue_number":1,"version":1,"nodes":[]}',
+        graph_version=1,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+
+def test_output_schemas_satisfy_strict_backend_contract() -> None:
+    schemas = {
+        "design": _DESIGN_OUTPUT_SCHEMA,
+        "direct": _DIRECT_OUTPUT_SCHEMA,
+        "roadmap": _ROADMAP_OUTPUT_SCHEMA,
+        "roadmap_adjustment": _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA,
+        "feedback": _FEEDBACK_OUTPUT_SCHEMA,
+    }
+
+    for name, schema in schemas.items():
+        _validate_strict_output_schema(schema_name=name, schema=schema)
+
+    assert _DIRECT_OUTPUT_SCHEMA["required"] == [
+        "pr_title",
+        "pr_summary",
+        "commit_message",
+        "blocked_reason",
+        "escalation",
+    ]
+    assert _FEEDBACK_OUTPUT_SCHEMA["required"] == [
+        "review_replies",
+        "general_comment",
+        "commit_message",
+        "git_ops",
+        "flaky_test_report",
+        "escalation",
+    ]
+
+
+def test_validate_strict_output_schema_rejects_missing_required_property() -> None:
+    with pytest.raises(RuntimeError, match="missing required keys: escalation"):
+        _validate_strict_output_schema(
+            schema_name="broken",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "escalation": {"type": "null"},
+                },
+            },
+        )
+
+
+def test_validate_strict_output_schema_rejects_non_object_schema() -> None:
+    with pytest.raises(RuntimeError, match="must be a JSON object"):
+        _validate_strict_output_schema(schema_name="broken", schema="not-a-schema")
+
+
+def test_validate_strict_output_schema_rejects_open_object_schema() -> None:
+    with pytest.raises(RuntimeError, match="must set additionalProperties to false"):
+        _validate_strict_output_schema(
+            schema_name="broken",
+            schema={
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                    "title": {"type": "string"},
+                },
+            },
+        )
+
+
+def test_validate_strict_output_schema_rejects_missing_properties_and_required_list() -> None:
+    with pytest.raises(RuntimeError, match="must define properties"):
+        _validate_strict_output_schema(
+            schema_name="broken",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title"],
+            },
+        )
+
+    with pytest.raises(RuntimeError, match="must define required as a string list"):
+        _validate_strict_output_schema(
+            schema_name="broken",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", 1],
+                "properties": {
+                    "title": {"type": "string"},
+                },
+            },
+        )
+
+
+def test_validate_strict_output_schema_reports_unknown_required_keys() -> None:
+    with pytest.raises(RuntimeError, match="unknown required keys: ghost"):
+        _validate_strict_output_schema(
+            schema_name="broken",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "ghost"],
+                "properties": {
+                    "title": {"type": "string"},
+                },
+            },
+        )
+
+
+def test_validate_strict_output_schema_handles_items_lists_and_rejects_invalid_combiners() -> None:
+    _validate_strict_output_schema(
+        schema_name="tuple_array",
+        schema={
+            "type": "array",
+            "items": [
+                {"type": "string", "minLength": 1},
+                {"type": "null"},
+            ],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=r"\$\.anyOf must be a list"):
+        _validate_strict_output_schema(
+            schema_name="broken",
+            schema={
+                "anyOf": {
+                    "type": "null",
+                },
+            },
+        )
 
 
 def test_start_design_from_issue_happy_path(
@@ -456,6 +624,23 @@ def test_start_roadmap_from_issue_happy_path(
         _ = cwd, check
         assert input_text is not None
         assert "roadmap agent" in input_text
+        schema_idx = cmd.index("--output-schema")
+        schema = json.loads(Path(cmd[schema_idx + 1]).read_text(encoding="utf-8"))
+        graph_schema = schema["properties"]["graph_json"]
+        assert graph_schema["additionalProperties"] is False
+        assert graph_schema["required"] == ["roadmap_issue_number", "version", "nodes"]
+        node_schema = graph_schema["properties"]["nodes"]["items"]
+        assert node_schema["additionalProperties"] is False
+        assert node_schema["required"] == [
+            "node_id",
+            "kind",
+            "title",
+            "body_markdown",
+            "depends_on",
+        ]
+        dependency_schema = node_schema["properties"]["depends_on"]["items"]
+        assert dependency_schema["additionalProperties"] is False
+        assert dependency_schema["required"] == ["node_id", "requires"]
         idx = cmd.index("--output-last-message")
         Path(cmd[idx + 1]).write_text(
             json.dumps(
@@ -666,6 +851,24 @@ def test_evaluate_roadmap_adjustment_happy_path(
         assert input_text is not None
         assert "roadmap-adjustment agent" in input_text
         assert '["n2","n3"]' in input_text
+        schema_idx = cmd.index("--output-schema")
+        schema = json.loads(Path(cmd[schema_idx + 1]).read_text(encoding="utf-8"))
+        updated_graph_schema = next(
+            item
+            for item in schema["properties"]["updated_graph_json"]["anyOf"]
+            if item.get("type") == "object"
+        )
+        assert updated_graph_schema["additionalProperties"] is False
+        assert updated_graph_schema["required"] == ["roadmap_issue_number", "version", "nodes"]
+        node_schema = updated_graph_schema["properties"]["nodes"]["items"]
+        assert node_schema["additionalProperties"] is False
+        assert node_schema["required"] == [
+            "node_id",
+            "kind",
+            "title",
+            "body_markdown",
+            "depends_on",
+        ]
         idx = cmd.index("--output-last-message")
         Path(cmd[idx + 1]).write_text(
             json.dumps(
@@ -1359,6 +1562,93 @@ def test_respond_to_feedback_happy_path(
         "event=feedback_agent_call_completed has_commit_message=true has_general_comment=true issue_number=1 pr_number=8 review_reply_count=1 thread_id=thread-resumed"
         in stderr
     )
+
+
+def test_respond_to_roadmap_feedback_happy_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, input_text, check
+        assert cmd[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+        assert input_text is not None
+        assert "roadmap-feedback agent" in input_text
+        assert "docs/roadmap/1-issue.graph.json" in input_text
+        message_payload = json.dumps(
+            {
+                "review_replies": [{"review_comment_id": 101, "body": "Updated roadmap"}],
+                "general_comment": "Updated roadmap artifacts",
+                "commit_message": "docs: refine roadmap after review",
+            }
+        )
+        return (
+            '{"type":"thread.started","thread_id":"thread-roadmap"}\n'
+            + json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": message_payload},
+                }
+            )
+            + "\n"
+        )
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    configure_logging(verbose=True)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.respond_to_roadmap_feedback(
+        session=AgentSession(adapter="codex", thread_id="thread-abc"),
+        turn=_roadmap_feedback_turn(),
+        cwd=tmp_path,
+    )
+
+    assert result.session.thread_id == "thread-roadmap"
+    assert result.review_replies[0].body == "Updated roadmap"
+    assert result.general_comment == "Updated roadmap artifacts"
+    assert result.commit_message == "docs: refine roadmap after review"
+    assert result.escalation is None
+    stderr = capsys.readouterr().err
+    assert "mode=roadmap_feedback" in stderr
+
+
+def test_respond_to_roadmap_feedback_rejects_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter = CodexAdapter(_enabled_config())
+    monkeypatch.setattr(
+        adapter,
+        "_run_feedback_turn_resume",
+        lambda **_: (
+            {
+                "review_replies": [],
+                "general_comment": "Need a bigger replan.",
+                "commit_message": None,
+                "git_ops": [],
+                "escalation": {
+                    "kind": "roadmap_revision",
+                    "summary": "Replan",
+                    "details": "This roadmap needs a larger revision.",
+                },
+            },
+            "thread-roadmap",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="roadmap feedback must not return escalation"):
+        adapter.respond_to_roadmap_feedback(
+            session=AgentSession(adapter="codex", thread_id="thread-123"),
+            turn=_roadmap_feedback_turn(),
+            cwd=tmp_path,
+        )
 
 
 def test_respond_to_feedback_falls_back_to_fresh_thread_on_context_window_exhaustion(

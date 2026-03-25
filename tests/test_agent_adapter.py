@@ -13,6 +13,7 @@ from mergexo.agent_adapter import (
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
     RoadmapAdjustmentResult,
+    RoadmapFeedbackTurn,
     RoadmapStartResult,
     ReviewReply,
 )
@@ -53,6 +54,22 @@ class DummyAdapter(AgentAdapter):
         *,
         session: AgentSession,
         turn: FeedbackTurn,
+        cwd: Path,
+    ) -> FeedbackResult:
+        _ = session, turn, cwd
+        return FeedbackResult(
+            session=AgentSession(adapter="dummy", thread_id="th"),
+            review_replies=(ReviewReply(review_comment_id=1, body="ok"),),
+            general_comment="done",
+            commit_message="commit",
+            git_ops=(GitOpRequest(op="fetch_origin"),),
+        )
+
+    def respond_to_roadmap_feedback(
+        self,
+        *,
+        session: AgentSession,
+        turn: RoadmapFeedbackTurn,
         cwd: Path,
     ) -> FeedbackResult:
         _ = session, turn, cwd

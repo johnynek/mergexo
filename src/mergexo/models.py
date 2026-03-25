@@ -7,7 +7,7 @@ from typing import Literal
 IssueFlow = Literal["design_doc", "bugfix", "small_job", "roadmap"]
 RoadmapNodeKind = Literal["design_doc", "small_job", "roadmap"]
 RoadmapDependencyRequirement = Literal["planned", "implemented"]
-OperatorCommandName = Literal["unblock", "restart", "help", "invalid"]
+OperatorCommandName = Literal["unblock", "retry", "restart", "help", "invalid"]
 OperatorCommandStatus = Literal["applied", "rejected", "failed"]
 OperatorReplyStatus = Literal["applied", "rejected", "failed", "help"]
 RestartMode = Literal["git_checkout", "pypi"]
