@@ -22,6 +22,7 @@ from mergexo.agent_adapter import (
     RoadmapAdjustmentAction,
     RoadmapDependencyArtifact,
     RoadmapAdjustmentResult,
+    RoadmapFeedbackTurn,
     RoadmapStartResult,
     ReviewReply,
 )
@@ -39,6 +40,7 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_roadmap_feedback_prompt,
     build_requested_roadmap_revision_prompt,
     build_roadmap_adjustment_prompt,
     build_roadmap_prompt,
@@ -64,29 +66,85 @@ _DESIGN_OUTPUT_SCHEMA: dict[str, object] = {
     },
 }
 
+_NONEMPTY_NULLABLE_STRING_SCHEMA: dict[str, object] = {
+    "anyOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1},
+    ]
+}
+
+_ROADMAP_REVISION_ESCALATION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["kind", "summary", "details"],
+    "properties": {
+        "kind": {"type": "string", "enum": ["roadmap_revision"]},
+        "summary": {"type": "string", "minLength": 1},
+        "details": {"type": "string", "minLength": 1},
+    },
+}
+
 _DIRECT_OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["pr_title", "pr_summary", "commit_message", "blocked_reason"],
+    "required": [
+        "pr_title",
+        "pr_summary",
+        "commit_message",
+        "blocked_reason",
+        "escalation",
+    ],
     "properties": {
         "pr_title": {"type": "string", "minLength": 1},
         "pr_summary": {"type": "string", "minLength": 1},
-        "commit_message": {"type": ["string", "null"]},
-        "blocked_reason": {"type": ["string", "null"]},
+        "commit_message": _NONEMPTY_NULLABLE_STRING_SCHEMA,
+        "blocked_reason": _NONEMPTY_NULLABLE_STRING_SCHEMA,
         "escalation": {
             "anyOf": [
                 {"type": "null"},
-                {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["kind", "summary", "details"],
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["roadmap_revision"]},
-                        "summary": {"type": "string", "minLength": 1},
-                        "details": {"type": "string", "minLength": 1},
-                    },
-                },
+                _ROADMAP_REVISION_ESCALATION_SCHEMA,
             ],
+        },
+    },
+}
+
+_ROADMAP_DEPENDENCY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["node_id", "requires"],
+    "properties": {
+        "node_id": {"type": "string", "minLength": 1},
+        "requires": {"type": "string", "enum": ["planned", "implemented"]},
+    },
+}
+
+_ROADMAP_NODE_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["node_id", "kind", "title", "body_markdown", "depends_on"],
+    "properties": {
+        "node_id": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "enum": ["design_doc", "small_job", "roadmap"]},
+        "title": {"type": "string", "minLength": 1},
+        "body_markdown": {"type": "string", "minLength": 1},
+        "depends_on": {
+            "type": "array",
+            "items": _ROADMAP_DEPENDENCY_SCHEMA,
+        },
+    },
+}
+
+_ROADMAP_GRAPH_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["roadmap_issue_number", "version", "nodes"],
+    "properties": {
+        "roadmap_issue_number": {"type": "integer", "minimum": 1},
+        "version": {"type": "integer", "minimum": 1},
+        "nodes": {
+            "type": "array",
+            "minItems": 1,
+            "items": _ROADMAP_NODE_SCHEMA,
         },
     },
 }
@@ -99,7 +157,7 @@ _ROADMAP_OUTPUT_SCHEMA: dict[str, object] = {
         "title": {"type": "string", "minLength": 1},
         "summary": {"type": "string", "minLength": 1},
         "roadmap_markdown": {"type": "string", "minLength": 1},
-        "graph_json": {"type": "object"},
+        "graph_json": _ROADMAP_GRAPH_SCHEMA,
     },
 }
 
@@ -120,71 +178,172 @@ _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA: dict[str, object] = {
         },
         "summary": {"type": "string", "minLength": 1},
         "details": {"type": "string", "minLength": 1},
-        "updated_roadmap_markdown": {"type": ["string", "null"]},
-        "updated_graph_json": {"type": ["object", "null"]},
+        "updated_roadmap_markdown": _NONEMPTY_NULLABLE_STRING_SCHEMA,
+        "updated_graph_json": {
+            "anyOf": [
+                {"type": "null"},
+                _ROADMAP_GRAPH_SCHEMA,
+            ]
+        },
+    },
+}
+
+_REVIEW_REPLY_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["review_comment_id", "body"],
+    "properties": {
+        "review_comment_id": {"type": "integer"},
+        "body": {"type": "string", "minLength": 1},
+    },
+}
+
+_GIT_OP_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["op"],
+    "properties": {
+        "op": {
+            "type": "string",
+            "enum": ["fetch_origin", "merge_origin_default_branch"],
+        }
+    },
+}
+
+_FLAKY_TEST_REPORT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["run_id", "title", "summary", "relevant_log_excerpt"],
+    "properties": {
+        "run_id": {"type": "integer", "minimum": 1},
+        "title": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "minLength": 1},
+        "relevant_log_excerpt": {"type": "string", "minLength": 1},
     },
 }
 
 _FEEDBACK_OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
+    "required": [
+        "review_replies",
+        "general_comment",
+        "commit_message",
+        "git_ops",
+        "flaky_test_report",
+        "escalation",
+    ],
     "properties": {
         "review_replies": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["review_comment_id", "body"],
-                "properties": {
-                    "review_comment_id": {"type": "integer"},
-                    "body": {"type": "string", "minLength": 1},
-                },
-            },
+            "items": _REVIEW_REPLY_SCHEMA,
         },
-        "general_comment": {"type": ["string", "null"]},
-        "commit_message": {"type": ["string", "null"]},
+        "general_comment": _NONEMPTY_NULLABLE_STRING_SCHEMA,
+        "commit_message": _NONEMPTY_NULLABLE_STRING_SCHEMA,
         "git_ops": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["op"],
-                "properties": {
-                    "op": {
-                        "type": "string",
-                        "enum": ["fetch_origin", "merge_origin_default_branch"],
-                    }
-                },
-            },
+            "items": _GIT_OP_SCHEMA,
         },
         "flaky_test_report": {
-            "type": ["object", "null"],
-            "additionalProperties": False,
-            "required": ["run_id", "title", "summary", "relevant_log_excerpt"],
-            "properties": {
-                "run_id": {"type": "integer", "minimum": 1},
-                "title": {"type": "string", "minLength": 1},
-                "summary": {"type": "string", "minLength": 1},
-                "relevant_log_excerpt": {"type": "string", "minLength": 1},
-            },
+            "anyOf": [
+                {"type": "null"},
+                _FLAKY_TEST_REPORT_SCHEMA,
+            ]
         },
         "escalation": {
             "anyOf": [
                 {"type": "null"},
-                {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["kind", "summary", "details"],
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["roadmap_revision"]},
-                        "summary": {"type": "string", "minLength": 1},
-                        "details": {"type": "string", "minLength": 1},
-                    },
-                },
+                _ROADMAP_REVISION_ESCALATION_SCHEMA,
             ],
         },
     },
 }
+
+
+def _validate_strict_output_schema(*, schema_name: str, schema: object, path: str = "$") -> None:
+    if not isinstance(schema, dict):
+        raise RuntimeError(f"{schema_name} schema at {path} must be a JSON object")
+    schema_obj = cast(dict[str, object], schema)
+
+    schema_type = schema_obj.get("type")
+    if schema_type == "object":
+        properties = schema_obj.get("properties")
+        required = schema_obj.get("required")
+        if schema_obj.get("additionalProperties") is not False:
+            raise RuntimeError(
+                f"{schema_name} schema at {path} must set additionalProperties to false"
+            )
+        if not isinstance(properties, dict):
+            raise RuntimeError(f"{schema_name} schema at {path} must define properties")
+        if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+            raise RuntimeError(
+                f"{schema_name} schema at {path} must define required as a string list"
+            )
+        typed_properties = cast(dict[str, object], properties)
+        typed_required = cast(list[str], required)
+        property_keys = list(typed_properties.keys())
+        required_keys = list(typed_required)
+        if len(required_keys) != len(property_keys) or set(required_keys) != set(property_keys):
+            missing = [key for key in property_keys if key not in required_keys]
+            extras = [key for key in required_keys if key not in property_keys]
+            details: list[str] = []
+            if missing:
+                details.append(f"missing required keys: {', '.join(missing)}")
+            if extras:
+                details.append(f"unknown required keys: {', '.join(extras)}")
+            raise RuntimeError(
+                f"{schema_name} schema at {path} must require every property exactly once"
+                + (f" ({'; '.join(details)})" if details else "")
+            )
+
+    properties = schema_obj.get("properties")
+    if isinstance(properties, dict):
+        for key, child in cast(dict[str, object], properties).items():
+            _validate_strict_output_schema(
+                schema_name=schema_name,
+                schema=child,
+                path=f"{path}.properties.{key}",
+            )
+
+    items = schema_obj.get("items")
+    if isinstance(items, dict):
+        _validate_strict_output_schema(
+            schema_name=schema_name,
+            schema=items,
+            path=f"{path}.items",
+        )
+    elif isinstance(items, list):
+        for idx, child in enumerate(items):
+            _validate_strict_output_schema(
+                schema_name=schema_name,
+                schema=child,
+                path=f"{path}.items[{idx}]",
+            )
+
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        options = schema_obj.get(keyword)
+        if options is None:
+            continue
+        if not isinstance(options, list):
+            raise RuntimeError(f"{schema_name} schema at {path}.{keyword} must be a list")
+        for idx, child in enumerate(options):
+            _validate_strict_output_schema(
+                schema_name=schema_name,
+                schema=child,
+                path=f"{path}.{keyword}[{idx}]",
+            )
+
+
+for _schema_name, _schema in (
+    ("design", _DESIGN_OUTPUT_SCHEMA),
+    ("direct", _DIRECT_OUTPUT_SCHEMA),
+    ("roadmap", _ROADMAP_OUTPUT_SCHEMA),
+    ("roadmap_adjustment", _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA),
+    ("feedback", _FEEDBACK_OUTPUT_SCHEMA),
+):
+    _validate_strict_output_schema(schema_name=_schema_name, schema=_schema)
+del _schema_name
+del _schema
 
 
 LOGGER = logging.getLogger("mergexo.codex_adapter")
@@ -497,6 +656,50 @@ class CodexAdapter(AgentAdapter):
         turn: FeedbackTurn,
         cwd: Path,
     ) -> FeedbackResult:
+        prompt = build_feedback_prompt(turn=turn)
+        return self._respond_to_review_turn(
+            session=session,
+            prompt=prompt,
+            cwd=cwd,
+            issue_number=turn.issue.number,
+            pr_number=turn.pull_request.number,
+            turn_key=turn.turn_key,
+            invocation_mode="respond_to_review",
+            allow_escalation=True,
+        )
+
+    def respond_to_roadmap_feedback(
+        self,
+        *,
+        session: AgentSession,
+        turn: RoadmapFeedbackTurn,
+        cwd: Path,
+    ) -> FeedbackResult:
+        prompt = build_roadmap_feedback_prompt(turn=turn)
+        result = self._respond_to_review_turn(
+            session=session,
+            prompt=prompt,
+            cwd=cwd,
+            issue_number=turn.issue.number,
+            pr_number=turn.pull_request.number,
+            turn_key=turn.turn_key,
+            invocation_mode="roadmap_feedback",
+            allow_escalation=False,
+        )
+        return result
+
+    def _respond_to_review_turn(
+        self,
+        *,
+        session: AgentSession,
+        prompt: str,
+        cwd: Path,
+        issue_number: int,
+        pr_number: int,
+        turn_key: str,
+        invocation_mode: str,
+        allow_escalation: bool,
+    ) -> FeedbackResult:
         if session.thread_id is None:
             raise RuntimeError("Cannot resume Codex feedback turn without a thread_id")
 
@@ -504,25 +707,25 @@ class CodexAdapter(AgentAdapter):
         log_event(
             LOGGER,
             "codex_invocation_started",
-            mode="respond_to_review",
-            issue_number=turn.issue.number,
-            pr_number=turn.pull_request.number,
+            mode=invocation_mode,
+            issue_number=issue_number,
+            pr_number=pr_number,
         )
         log_event(
             LOGGER,
             "feedback_agent_call_started",
-            issue_number=turn.issue.number,
-            pr_number=turn.pull_request.number,
+            issue_number=issue_number,
+            pr_number=pr_number,
             thread_id=session.thread_id,
-            turn_key=turn.turn_key,
+            turn_key=turn_key,
         )
         try:
-            prompt = build_feedback_prompt(turn=turn)
             try:
                 payload, resumed_thread_id = self._run_feedback_turn_resume(
                     session=session,
                     prompt=prompt,
                     cwd=cwd,
+                    invocation_mode=invocation_mode,
                 )
             except CommandError as exc:
                 if not _is_context_window_exhaustion_error(exc):
@@ -530,13 +733,14 @@ class CodexAdapter(AgentAdapter):
                 log_event(
                     LOGGER,
                     "feedback_agent_call_restart_fresh_thread",
-                    issue_number=turn.issue.number,
-                    pr_number=turn.pull_request.number,
+                    issue_number=issue_number,
+                    pr_number=pr_number,
                     thread_id=session.thread_id,
                 )
                 payload, resumed_thread_id = self._run_feedback_turn_fresh(
                     prompt=prompt,
                     cwd=cwd,
+                    invocation_mode=invocation_mode,
                 )
                 resumed_thread_id = resumed_thread_id or session.thread_id
 
@@ -550,13 +754,15 @@ class CodexAdapter(AgentAdapter):
                 raise RuntimeError(
                     "Codex response cannot set commit_message when flaky_test_report is present"
                 )
+            if not allow_escalation and escalation is not None:
+                raise RuntimeError("roadmap feedback must not return escalation")
         except Exception as exc:  # noqa: BLE001
             log_event(
                 LOGGER,
                 "codex_invocation_finished",
-                mode="respond_to_review",
-                issue_number=turn.issue.number,
-                pr_number=turn.pull_request.number,
+                mode=invocation_mode,
+                issue_number=issue_number,
+                pr_number=pr_number,
                 status="fault",
                 duration_seconds=_elapsed_seconds(started_at),
                 error_type=type(exc).__name__,
@@ -566,8 +772,8 @@ class CodexAdapter(AgentAdapter):
         log_event(
             LOGGER,
             "feedback_agent_call_completed",
-            issue_number=turn.issue.number,
-            pr_number=turn.pull_request.number,
+            issue_number=issue_number,
+            pr_number=pr_number,
             thread_id=resumed_thread_id,
             review_reply_count=len(replies),
             has_general_comment=general_comment is not None,
@@ -576,9 +782,9 @@ class CodexAdapter(AgentAdapter):
         log_event(
             LOGGER,
             "codex_invocation_finished",
-            mode="respond_to_review",
-            issue_number=turn.issue.number,
-            pr_number=turn.pull_request.number,
+            mode=invocation_mode,
+            issue_number=issue_number,
+            pr_number=pr_number,
             status="success",
             duration_seconds=_elapsed_seconds(started_at),
         )
@@ -598,6 +804,7 @@ class CodexAdapter(AgentAdapter):
         session: AgentSession,
         prompt: str,
         cwd: Path,
+        invocation_mode: str = "respond_to_review",
     ) -> tuple[dict[str, object], str | None]:
         if session.thread_id is None:
             raise RuntimeError("Cannot resume Codex feedback turn without a thread_id")
@@ -616,7 +823,7 @@ class CodexAdapter(AgentAdapter):
             cmd=cmd,
             cwd=cwd,
             prompt=prompt,
-            invocation_mode="respond_to_review",
+            invocation_mode=invocation_mode,
         )
         message = _extract_final_agent_message(raw_events)
         payload = _parse_json_payload(message)
@@ -627,6 +834,7 @@ class CodexAdapter(AgentAdapter):
         *,
         prompt: str,
         cwd: Path,
+        invocation_mode: str = "respond_to_review",
     ) -> tuple[dict[str, object], str | None]:
         with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
             tmp_path = Path(tmp)
@@ -651,7 +859,7 @@ class CodexAdapter(AgentAdapter):
                 cmd=cmd,
                 cwd=cwd,
                 prompt=prompt,
-                invocation_mode="respond_to_review",
+                invocation_mode=invocation_mode,
             )
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
@@ -1003,7 +1211,7 @@ class CodexAdapter(AgentAdapter):
     def _timeout_seconds_for_mode(self, invocation_mode: str) -> float | None:
         if invocation_mode == "writing_doc":
             return float(self._config.design_turn_timeout_seconds)
-        if invocation_mode == "respond_to_review":
+        if invocation_mode in {"respond_to_review", "roadmap_feedback"}:
             return float(self._config.feedback_turn_timeout_seconds)
         return float(self._config.direct_turn_timeout_seconds)
 

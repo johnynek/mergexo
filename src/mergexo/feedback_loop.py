@@ -10,7 +10,7 @@ ACTION_TOKEN_PATTERN = re.compile(r"<!--\s*mergexo-action:([0-9a-f]{64})\s*-->")
 _OPERATOR_COMMAND_PATTERN = re.compile(r"(?mi)^\s*/mergexo(?:\s+(.+))?\s*$")
 _HEAD_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{7,64}")
 FeedbackKind = Literal["review", "issue", "review_summary", "actions"]
-OperatorCommandName = Literal["unblock", "restart", "help", "invalid"]
+OperatorCommandName = Literal["unblock", "retry", "restart", "help", "invalid"]
 
 
 @dataclass(frozen=True)
@@ -259,6 +259,37 @@ def parse_operator_command(text: str) -> ParsedOperatorCommand | None:
             parse_error=None,
         )
 
+    if command_token == "retry":
+        allowed_keys = {"issue"}
+        unknown_keys = sorted(key for key in parsed_args if key not in allowed_keys)
+        if unknown_keys:
+            unknown = ", ".join(unknown_keys)
+            return ParsedOperatorCommand(
+                command="invalid",
+                normalized_command=f"/mergexo retry {' '.join(arg_tokens)}".strip(),
+                args=tuple(sorted(parsed_args.items())),
+                parse_error=f"Unknown retry arguments: {unknown}.",
+            )
+        if "issue" in parsed_args:
+            issue_raw = parsed_args["issue"]
+            if not issue_raw.isdigit() or int(issue_raw) < 1:
+                return ParsedOperatorCommand(
+                    command="invalid",
+                    normalized_command=f"/mergexo retry issue={issue_raw}",
+                    args=tuple(sorted(parsed_args.items())),
+                    parse_error="issue must be a positive integer.",
+                )
+            parsed_args["issue"] = str(int(issue_raw))
+        normalized = "/mergexo retry"
+        if "issue" in parsed_args:
+            normalized += f" issue={parsed_args['issue']}"
+        return ParsedOperatorCommand(
+            command="retry",
+            normalized_command=normalized,
+            args=tuple((key, parsed_args[key]) for key in ("issue",) if key in parsed_args),
+            parse_error=None,
+        )
+
     if command_token == "unblock":
         allowed_keys = {"pr", "head_sha"}
         unknown_keys = sorted(key for key in parsed_args if key not in allowed_keys)
@@ -319,6 +350,8 @@ def operator_commands_help(readme_anchor: str = "README.md#github-operator-comma
         "- `/mergexo unblock`\n"
         "- `/mergexo unblock head_sha=<sha>`\n"
         "- `/mergexo unblock pr=<number> [head_sha=<sha>]`\n"
+        "- `/mergexo retry`\n"
+        "- `/mergexo retry issue=<number>`\n"
         "- `/mergexo restart`\n"
         "- `/mergexo restart mode=git_checkout|pypi`\n"
         "- `/mergexo help`\n\n"

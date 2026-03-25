@@ -26,6 +26,7 @@ from mergexo.agent_adapter import (
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
     RoadmapAdjustmentResult,
+    RoadmapFeedbackTurn,
     RoadmapStartResult,
 )
 from mergexo.codex_adapter import CodexAdapter, CodexInvocationHooks
@@ -89,6 +90,7 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_roadmap_feedback_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
 )
@@ -136,6 +138,7 @@ from mergexo.state import (
 LOGGER = logging.getLogger("mergexo.orchestrator")
 _MAX_FEEDBACK_GIT_OP_ROUNDS = 3
 _MAX_FEEDBACK_GIT_OPS_PER_ROUND = 4
+_MAX_ROADMAP_FEEDBACK_REPAIR_ROUNDS = 3
 _MAX_REQUIRED_TEST_REPAIR_ROUNDS = 3
 _MAX_PUSH_MERGE_CONFLICT_REPAIR_ROUNDS = 3
 _MAX_PUSH_REMOTE_RACE_REPAIR_ROUNDS = 3
@@ -4312,6 +4315,46 @@ class Phase1Orchestrator:
                     )
                     continue
 
+                if parsed.command == "retry":
+                    retry_status, retry_detail, target_issue_number = (
+                        self._apply_retry_issue_command(
+                            source_issue_number=issue_number,
+                            source_pr_number=source_pr_number,
+                            parsed=parsed,
+                        )
+                    )
+                    record = self._state.record_operator_command(
+                        command_key=command_key,
+                        issue_number=issue_number,
+                        pr_number=None,
+                        comment_id=comment.comment_id,
+                        author_login=comment.user_login,
+                        command="retry",
+                        args_json=args_json,
+                        status=retry_status,
+                        result=retry_detail,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+                    reply_status = cast(OperatorReplyStatus, retry_status)
+                    self._post_operator_command_result(
+                        record,
+                        reply_status=reply_status,
+                        detail=retry_detail,
+                        issue_number_override=target_issue_number,
+                    )
+                    log_event(
+                        LOGGER,
+                        "operator_command_applied"
+                        if retry_status == "applied"
+                        else "operator_command_failed",
+                        command_key=command_key,
+                        actor=comment.user_login,
+                        issue_number=issue_number,
+                        command="retry",
+                        target_issue_number=target_issue_number,
+                    )
+                    continue
+
                 if parsed.command == "restart":
                     requested_mode = cast(
                         RestartMode,
@@ -4463,6 +4506,12 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name()
             )
         }
+        issue_numbers.update(
+            failed.issue_number
+            for failed in self._state.list_failed_issue_runs_without_pr(
+                repo_full_name=self._state_repo_full_name()
+            )
+        )
         if self._repo.operations_issue_number is not None:
             issue_numbers.add(self._repo.operations_issue_number)
         return tuple(sorted(issue_numbers))
@@ -4615,6 +4664,45 @@ class Phase1Orchestrator:
         if head_sha is not None:
             detail += f" Set last_seen_head_sha override to `{head_sha}`."
         return "applied", detail, target_pr_number
+
+    def _apply_retry_issue_command(
+        self,
+        *,
+        source_issue_number: int,
+        source_pr_number: int | None,
+        parsed: ParsedOperatorCommand,
+    ) -> tuple[OperatorCommandStatus, str, int | None]:
+        issue_arg = parsed.get_arg("issue")
+        if issue_arg is not None:
+            target_issue_number = int(issue_arg)
+        elif source_pr_number is None and self._repo.operations_issue_number != source_issue_number:
+            target_issue_number = source_issue_number
+        else:
+            detail = (
+                "No target issue was provided. On the operations issue or a PR thread, use "
+                "`/mergexo retry issue=<number>`."
+            )
+            return "failed", detail, None
+
+        retried = self._state.retry_failed_issue_runs(
+            issue_numbers=(target_issue_number,),
+            repo_full_name=self._state_repo_full_name(),
+        )
+        if retried == 0:
+            return (
+                "failed",
+                f"Issue #{target_issue_number} is not currently a failed pre-PR issue run.",
+                target_issue_number,
+            )
+
+        return (
+            "applied",
+            (
+                f"Re-armed failed issue #{target_issue_number} for retry. "
+                "MergeXO will pick it up on the next poll."
+            ),
+            target_issue_number,
+        )
 
     def _encode_operator_command_args(
         self,
@@ -5445,6 +5533,21 @@ class Phase1Orchestrator:
                         continue
 
                     failure_class = _failure_class_for_exception(exc)
+                    if metadata is not None:
+                        try:
+                            self._report_issue_processing_failure(
+                                issue_number=issue_number,
+                                flow=metadata.flow,
+                                exc=exc,
+                            )
+                        except Exception as comment_exc:  # noqa: BLE001
+                            log_event(
+                                LOGGER,
+                                "issue_processing_failure_comment_failed",
+                                issue_number=issue_number,
+                                flow=metadata.flow,
+                                error_type=type(comment_exc).__name__,
+                            )
                     self._state.mark_failed(
                         issue_number=issue_number,
                         error=str(exc),
@@ -5609,6 +5712,34 @@ class Phase1Orchestrator:
                 pre_pr_last_consumed_comment_id=consumed_comment_id_max,
             )
 
+    def _report_issue_processing_failure(
+        self,
+        *,
+        issue_number: int,
+        flow: PrePrFlow,
+        exc: Exception,
+    ) -> None:
+        detail = str(exc).strip()
+        summarized_detail = _summarize_git_error(detail) if detail else "unexpected failure"
+        flow_label = _pre_pr_flow_label(flow)
+        body = (
+            f"MergeXO {flow_label} flow failed while processing this issue.\n\n"
+            f"- error type: `{type(exc).__name__}`\n"
+            f"- detail: `{summarized_detail}`\n\n"
+            "Action: inspect logs, resolve the underlying issue, then restart or retrigger the issue."
+        )
+        self._ensure_tokenized_issue_comment(
+            github=self._github,
+            issue_number=issue_number,
+            token=compute_general_comment_token(
+                turn_key=(f"issue_processing_failure:{issue_number}:{flow}:{type(exc).__name__}"),
+                body=body,
+            ),
+            body=body,
+            source="issue_processing_failed",
+            repo_full_name=self._state_repo_full_name(),
+        )
+
     def _process_issue(
         self,
         issue: Issue,
@@ -5617,18 +5748,19 @@ class Phase1Orchestrator:
         branch_override: str | None = None,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
-        if not self._is_issue_author_allowed(
-            issue_number=issue.number,
-            author_login=issue.author_login,
-            reason="unauthorized_issue_author_defensive",
-        ):
-            raise DirectFlowValidationError(
-                f"Issue #{issue.number} author is not allowed by repo.allowed_users"
-            )
-
         branch = branch_override or _branch_for_issue_flow(flow=flow, issue=issue)
-        lease = self._slot_pool.acquire()
+        lease: _SlotLease | None = None
         try:
+            if not self._is_issue_author_allowed(
+                issue_number=issue.number,
+                author_login=issue.author_login,
+                reason="unauthorized_issue_author_defensive",
+            ):
+                raise DirectFlowValidationError(
+                    f"Issue #{issue.number} author is not allowed by repo.allowed_users"
+                )
+
+            lease = self._slot_pool.acquire()
             log_event(
                 LOGGER,
                 "issue_processing_started",
@@ -5665,6 +5797,7 @@ class Phase1Orchestrator:
         except Exception as exc:  # noqa: BLE001
             if (
                 self._config.runtime.enable_issue_comment_routing
+                and lease is not None
                 and _is_recoverable_pre_pr_exception(exc)
             ):
                 raise self._checkpoint_recoverable_pre_pr_blocked(
@@ -5674,6 +5807,20 @@ class Phase1Orchestrator:
                     branch=branch,
                     blocked_error=exc,
                 ) from exc
+            try:
+                self._report_issue_processing_failure(
+                    issue_number=issue.number,
+                    flow=flow,
+                    exc=exc,
+                )
+            except Exception as comment_exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    "issue_processing_failure_comment_failed",
+                    issue_number=issue.number,
+                    flow=flow,
+                    error_type=type(comment_exc).__name__,
+                )
             log_event(
                 LOGGER,
                 "issue_processing_failed",
@@ -5685,7 +5832,8 @@ class Phase1Orchestrator:
             # the issue as failed in state without crashing the orchestrator loop.
             raise
         finally:
-            self._cleanup_and_release_slot(lease)
+            if lease is not None:
+                self._cleanup_and_release_slot(lease)
 
     def _process_design_issue(
         self,
@@ -6135,17 +6283,19 @@ class Phase1Orchestrator:
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
         issue = issue_override or self._github.get_issue(candidate.issue_number)
-        if not self._is_issue_author_allowed(
-            issue_number=issue.number,
-            author_login=issue.author_login,
-            reason="unauthorized_issue_author_defensive",
-        ):
-            raise DirectFlowValidationError(
-                f"Issue #{issue.number} author is not allowed by repo.allowed_users"
-            )
-
-        lease = self._slot_pool.acquire()
+        checkpoint_branch = branch_override or _branch_for_implementation_candidate(candidate)
+        lease: _SlotLease | None = None
         try:
+            if not self._is_issue_author_allowed(
+                issue_number=issue.number,
+                author_login=issue.author_login,
+                reason="unauthorized_issue_author_defensive",
+            ):
+                raise DirectFlowValidationError(
+                    f"Issue #{issue.number} author is not allowed by repo.allowed_users"
+                )
+
+            lease = self._slot_pool.acquire()
             log_event(
                 LOGGER,
                 "issue_processing_started",
@@ -6315,13 +6465,9 @@ class Phase1Orchestrator:
         except Exception as exc:  # noqa: BLE001
             if (
                 self._config.runtime.enable_issue_comment_routing
+                and lease is not None
                 and _is_recoverable_pre_pr_exception(exc)
             ):
-                checkpoint_branch = (
-                    branch_override
-                    if branch_override is not None
-                    else _branch_for_implementation_candidate(candidate)
-                )
                 raise self._checkpoint_recoverable_pre_pr_blocked(
                     issue=issue,
                     flow="implementation",
@@ -6329,6 +6475,20 @@ class Phase1Orchestrator:
                     branch=checkpoint_branch,
                     blocked_error=exc,
                 ) from exc
+            try:
+                self._report_issue_processing_failure(
+                    issue_number=issue.number,
+                    flow="implementation",
+                    exc=exc,
+                )
+            except Exception as comment_exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    "issue_processing_failure_comment_failed",
+                    issue_number=issue.number,
+                    flow="implementation",
+                    error_type=type(comment_exc).__name__,
+                )
             log_event(
                 LOGGER,
                 "issue_processing_failed",
@@ -6338,7 +6498,8 @@ class Phase1Orchestrator:
             )
             raise
         finally:
-            self._cleanup_and_release_slot(lease)
+            if lease is not None:
+                self._cleanup_and_release_slot(lease)
 
     def _process_implementation_candidate_worker(
         self,
@@ -6942,6 +7103,8 @@ class Phase1Orchestrator:
             return False
         if not self._repo.allows(comment.user_login):
             return False
+        if parse_operator_command(comment.body) is not None:
+            return False
         if _is_mergexo_status_comment(comment.body):
             return False
         if has_action_token(comment.body):
@@ -6973,7 +7136,12 @@ class Phase1Orchestrator:
         issue: Issue,
         comments: Sequence[PullRequestIssueComment],
     ) -> Issue:
-        if not comments:
+        qualifying_comments = [
+            comment
+            for comment in sorted(comments, key=lambda item: item.comment_id)
+            if self._is_qualifying_source_issue_comment(comment)
+        ]
+        if not qualifying_comments:
             return issue
 
         comment_lines = [
@@ -6981,7 +7149,7 @@ class Phase1Orchestrator:
                 f"- @{comment.user_login} ({comment.created_at}) [{comment.html_url}]"
                 f"\n{comment.body.strip() or '<empty>'}"
             )
-            for comment in sorted(comments, key=lambda item: item.comment_id)
+            for comment in qualifying_comments
         ]
         comment_section = "\n\n".join(comment_lines)
         context = "Ordered issue comments at first invocation:\n" + comment_section
@@ -7544,14 +7712,25 @@ class Phase1Orchestrator:
                 head_sha=turn_head_sha,
                 pending_event_keys=pending_event_keys,
             )
-            turn = FeedbackTurn(
-                turn_key=turn_key,
-                issue=issue,
-                pull_request=pr,
-                review_comments=pending_review_comments,
-                issue_comments=turn_issue_comments,
-                changed_files=changed_files,
-            )
+            if self._is_roadmap_feedback_issue(issue=issue):
+                turn: FeedbackTurn | RoadmapFeedbackTurn = self._build_roadmap_feedback_turn(
+                    turn_key=turn_key,
+                    issue=issue,
+                    pull_request=pr,
+                    review_comments=pending_review_comments,
+                    issue_comments=turn_issue_comments,
+                    changed_files=changed_files,
+                    checkout_path=lease.path,
+                )
+            else:
+                turn = FeedbackTurn(
+                    turn_key=turn_key,
+                    issue=issue,
+                    pull_request=pr,
+                    review_comments=pending_review_comments,
+                    issue_comments=turn_issue_comments,
+                    changed_files=changed_files,
+                )
             actions_only_turn = (
                 bool(actionable_actions_events)
                 and not pending_review_events
@@ -8339,14 +8518,302 @@ class Phase1Orchestrator:
         )
         return issue_comments + (reminder_comment,)
 
+    def _is_roadmap_feedback_issue(self, *, issue: Issue) -> bool:
+        return self._repo.roadmap_label in issue.labels
+
+    def _maybe_lookup_roadmap_state_for_feedback(
+        self, *, issue_number: int
+    ) -> RoadmapStateRecord | None:
+        getter = getattr(self._state, "get_roadmap_state", None)
+        if not callable(getter):
+            return None
+        value = getter(
+            roadmap_issue_number=issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        return cast(RoadmapStateRecord | None, value)
+
+    def _resolve_roadmap_feedback_paths(
+        self,
+        *,
+        issue: Issue,
+        changed_files: tuple[str, ...],
+        checkout_path: Path,
+    ) -> tuple[str, str]:
+        roadmap = self._maybe_lookup_roadmap_state_for_feedback(issue_number=issue.number)
+        if roadmap is not None:
+            return roadmap.roadmap_doc_path, roadmap.graph_path
+
+        prefix = f"{self._repo.roadmap_docs_dir}/"
+        expected_base = f"{prefix}{issue.number}-{_slugify(issue.title)}"
+        expected_doc_path = f"{expected_base}.md"
+        expected_graph_path = f"{expected_base}.graph.json"
+
+        graph_candidates = tuple(
+            sorted(
+                path
+                for path in changed_files
+                if path.startswith(prefix) and path.endswith(".graph.json")
+            )
+        )
+        for graph_path in graph_candidates:
+            if graph_path.startswith(f"{prefix}{issue.number}-"):
+                return graph_path[: -len(".graph.json")] + ".md", graph_path
+
+        md_candidates = tuple(
+            sorted(
+                path
+                for path in changed_files
+                if path.startswith(prefix)
+                and path.endswith(".md")
+                and not path.endswith(".graph.json")
+            )
+        )
+        for md_path in md_candidates:
+            if md_path.startswith(f"{prefix}{issue.number}-"):
+                return md_path, md_path[: -len(".md")] + ".graph.json"
+
+        if (
+            expected_doc_path in changed_files
+            or expected_graph_path in changed_files
+            or (checkout_path / expected_doc_path).exists()
+            or (checkout_path / expected_graph_path).exists()
+        ):
+            return expected_doc_path, expected_graph_path
+
+        for md_path in md_candidates:
+            graph_path = md_path[: -len(".md")] + ".graph.json"
+            if graph_path in graph_candidates:
+                return md_path, graph_path
+
+        return expected_doc_path, expected_graph_path
+
+    def _refresh_roadmap_feedback_turn(
+        self,
+        *,
+        turn_key: str,
+        issue: Issue,
+        pull_request: PullRequestSnapshot,
+        review_comments: tuple[PullRequestReviewComment, ...],
+        issue_comments: tuple[PullRequestIssueComment, ...],
+        changed_files: tuple[str, ...],
+        roadmap_doc_path: str,
+        graph_path: str,
+        checkout_path: Path,
+    ) -> RoadmapFeedbackTurn:
+        roadmap_abs_path = checkout_path / roadmap_doc_path
+        roadmap_markdown_missing = not roadmap_abs_path.exists()
+        if roadmap_markdown_missing:
+            roadmap_markdown = f"(roadmap markdown missing at {roadmap_doc_path})"
+        else:
+            try:
+                roadmap_markdown = roadmap_abs_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                roadmap_markdown = f"(roadmap markdown unreadable at {roadmap_doc_path}: {exc})"
+
+        graph_abs_path = checkout_path / graph_path
+        graph_missing = not graph_abs_path.exists()
+        graph_validation_error: str | None = None
+        graph_version: int | None = None
+        if graph_missing:
+            graph_json_text = f"(roadmap graph missing at {graph_path})"
+            graph_validation_error = "graph file is missing"
+        else:
+            try:
+                graph_json_text = graph_abs_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                graph_json_text = f"(roadmap graph unreadable at {graph_path}: {exc})"
+                graph_validation_error = f"graph file is unreadable: {exc}"
+            else:
+                try:
+                    parsed = parse_roadmap_graph_json(
+                        graph_json_text,
+                        expected_issue_number=issue.number,
+                    )
+                except RoadmapGraphValidationError as exc:
+                    graph_validation_error = str(exc)
+                else:
+                    graph_version = parsed.graph.version
+
+        return RoadmapFeedbackTurn(
+            turn_key=turn_key,
+            issue=issue,
+            pull_request=pull_request,
+            review_comments=review_comments,
+            issue_comments=issue_comments,
+            changed_files=changed_files,
+            roadmap_doc_path=roadmap_doc_path,
+            graph_path=graph_path,
+            roadmap_markdown=roadmap_markdown,
+            graph_json_text=graph_json_text,
+            graph_version=graph_version,
+            roadmap_markdown_missing=roadmap_markdown_missing,
+            graph_missing=graph_missing,
+            graph_validation_error=graph_validation_error,
+        )
+
+    def _build_roadmap_feedback_turn(
+        self,
+        *,
+        turn_key: str,
+        issue: Issue,
+        pull_request: PullRequestSnapshot,
+        review_comments: tuple[PullRequestReviewComment, ...],
+        issue_comments: tuple[PullRequestIssueComment, ...],
+        changed_files: tuple[str, ...],
+        checkout_path: Path,
+    ) -> RoadmapFeedbackTurn:
+        roadmap_doc_path, graph_path = self._resolve_roadmap_feedback_paths(
+            issue=issue,
+            changed_files=changed_files,
+            checkout_path=checkout_path,
+        )
+        return self._refresh_roadmap_feedback_turn(
+            turn_key=turn_key,
+            issue=issue,
+            pull_request=pull_request,
+            review_comments=review_comments,
+            issue_comments=issue_comments,
+            changed_files=changed_files,
+            roadmap_doc_path=roadmap_doc_path,
+            graph_path=graph_path,
+            checkout_path=checkout_path,
+        )
+
+    def _with_feedback_issue_comment(
+        self,
+        *,
+        turn: FeedbackTurn | RoadmapFeedbackTurn,
+        pull_request: PullRequestSnapshot,
+        comment: PullRequestIssueComment,
+        checkout_path: Path | None = None,
+    ) -> FeedbackTurn | RoadmapFeedbackTurn:
+        changed_files = self._github.list_pull_request_files(pull_request.number)
+        if isinstance(turn, RoadmapFeedbackTurn):
+            if checkout_path is None:
+                raise RuntimeError("roadmap feedback turn refresh requires checkout_path")
+            return self._refresh_roadmap_feedback_turn(
+                turn_key=turn.turn_key,
+                issue=turn.issue,
+                pull_request=pull_request,
+                review_comments=turn.review_comments,
+                issue_comments=turn.issue_comments + (comment,),
+                changed_files=changed_files,
+                roadmap_doc_path=turn.roadmap_doc_path,
+                graph_path=turn.graph_path,
+                checkout_path=checkout_path,
+            )
+        return FeedbackTurn(
+            turn_key=turn.turn_key,
+            issue=turn.issue,
+            pull_request=pull_request,
+            review_comments=turn.review_comments,
+            issue_comments=turn.issue_comments + (comment,),
+            changed_files=changed_files,
+        )
+
+    def _validate_roadmap_feedback_artifacts(
+        self,
+        *,
+        turn: RoadmapFeedbackTurn,
+        checkout_path: Path,
+    ) -> str | None:
+        roadmap_abs_path = checkout_path / turn.roadmap_doc_path
+        if not roadmap_abs_path.exists():
+            return f"missing roadmap markdown file: {turn.roadmap_doc_path}"
+        try:
+            roadmap_markdown = roadmap_abs_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"roadmap markdown is unreadable at {turn.roadmap_doc_path}: {exc}"
+        if not roadmap_markdown.strip():
+            return f"roadmap markdown is empty at {turn.roadmap_doc_path}"
+
+        graph_abs_path = checkout_path / turn.graph_path
+        if not graph_abs_path.exists():
+            return f"missing roadmap graph file: {turn.graph_path}"
+        try:
+            graph_raw = graph_abs_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"roadmap graph is unreadable at {turn.graph_path}: {exc}"
+
+        try:
+            parsed = parse_roadmap_graph_json(graph_raw, expected_issue_number=turn.issue.number)
+        except RoadmapGraphValidationError as exc:
+            return f"invalid roadmap graph: {exc}"
+
+        roadmap_state = self._maybe_lookup_roadmap_state_for_feedback(
+            issue_number=turn.issue.number
+        )
+        if roadmap_state is None:
+            if parsed.graph.version != 1:
+                return (
+                    "initial roadmap PR must keep graph version 1 until the roadmap is merged: "
+                    f"got {parsed.graph.version}"
+                )
+        else:
+            expected_version = roadmap_state.adjustment_request_version
+            if expected_version is not None and parsed.graph.version != expected_version:
+                return (
+                    "same-roadmap revision PR must keep the requested graph version unchanged: "
+                    f"expected {expected_version}, got {parsed.graph.version}"
+                )
+        return None
+
+    def _roadmap_feedback_turn_with_validation_failure(
+        self,
+        *,
+        turn: RoadmapFeedbackTurn,
+        pull_request: PullRequestSnapshot,
+        repair_round: int,
+        failure_detail: str,
+        checkout_path: Path,
+    ) -> RoadmapFeedbackTurn:
+        trimmed_output = failure_detail.strip()
+        if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
+            trimmed_output = (
+                trimmed_output[:_REQUIRED_TEST_FAILURE_OUTPUT_LIMIT]
+                + "\n... [truncated by MergeXO]"
+            )
+        if not trimmed_output:
+            trimmed_output = "<empty>"
+
+        failure_comment = PullRequestIssueComment(
+            comment_id=-(9200 + repair_round),
+            body=(
+                "MergeXO roadmap feedback validation failed.\n"
+                f"- roadmap markdown path: `{turn.roadmap_doc_path}`\n"
+                f"- roadmap graph path: `{turn.graph_path}`\n"
+                f"- repair_round: {repair_round}\n"
+                "- Keep the roadmap markdown and graph in sync.\n"
+                "- Repair the roadmap artifacts so the graph is valid and the PR can be pushed.\n"
+                "- If impossible, set commit_message to null and explain why in general_comment.\n\n"
+                "Validation error:\n"
+                f"{trimmed_output}"
+            ),
+            user_login="mergexo-system",
+            html_url="",
+            created_at="now",
+            updated_at="now",
+        )
+        refreshed = self._with_feedback_issue_comment(
+            turn=turn,
+            pull_request=pull_request,
+            comment=failure_comment,
+            checkout_path=checkout_path,
+        )
+        if not isinstance(refreshed, RoadmapFeedbackTurn):
+            raise RuntimeError("roadmap feedback validation repair must preserve roadmap turn type")
+        return refreshed
+
     def _feedback_turn_with_required_tests_failure(
         self,
         *,
-        turn: FeedbackTurn,
+        turn: FeedbackTurn | RoadmapFeedbackTurn,
         pull_request: PullRequestSnapshot,
         repair_round: int,
         failure_output: str,
-    ) -> FeedbackTurn:
+        checkout_path: Path | None = None,
+    ) -> FeedbackTurn | RoadmapFeedbackTurn:
         required_tests_command = self._repo.required_tests or "<unset>"
         trimmed_output = failure_output.strip()
         if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
@@ -8375,24 +8842,23 @@ class Phase1Orchestrator:
             created_at="now",
             updated_at="now",
         )
-        return FeedbackTurn(
-            turn_key=turn.turn_key,
-            issue=turn.issue,
+        return self._with_feedback_issue_comment(
+            turn=turn,
             pull_request=pull_request,
-            review_comments=turn.review_comments,
-            issue_comments=turn.issue_comments + (failure_comment,),
-            changed_files=self._github.list_pull_request_files(pull_request.number),
+            comment=failure_comment,
+            checkout_path=checkout_path,
         )
 
     def _feedback_turn_with_push_merge_conflict(
         self,
         *,
-        turn: FeedbackTurn,
+        turn: FeedbackTurn | RoadmapFeedbackTurn,
         pull_request: PullRequestSnapshot,
         branch: str,
         repair_round: int,
         failure_output: str,
-    ) -> FeedbackTurn:
+        checkout_path: Path | None = None,
+    ) -> FeedbackTurn | RoadmapFeedbackTurn:
         trimmed_output = failure_output.strip()
         if len(trimmed_output) > _REQUIRED_TEST_FAILURE_OUTPUT_LIMIT:
             trimmed_output = (
@@ -8421,25 +8887,24 @@ class Phase1Orchestrator:
             created_at="now",
             updated_at="now",
         )
-        return FeedbackTurn(
-            turn_key=turn.turn_key,
-            issue=turn.issue,
+        return self._with_feedback_issue_comment(
+            turn=turn,
             pull_request=pull_request,
-            review_comments=turn.review_comments,
-            issue_comments=turn.issue_comments + (failure_comment,),
-            changed_files=self._github.list_pull_request_files(pull_request.number),
+            comment=failure_comment,
+            checkout_path=checkout_path,
         )
 
     def _feedback_turn_with_remote_push_race(
         self,
         *,
-        turn: FeedbackTurn,
+        turn: FeedbackTurn | RoadmapFeedbackTurn,
         pull_request: PullRequestSnapshot,
         branch: str,
         repair_round: int,
         turn_start_head: str,
         local_head_sha: str,
-    ) -> FeedbackTurn:
+        checkout_path: Path | None = None,
+    ) -> FeedbackTurn | RoadmapFeedbackTurn:
         race_comment = PullRequestIssueComment(
             comment_id=-(9400 + repair_round),
             body=(
@@ -8460,13 +8925,11 @@ class Phase1Orchestrator:
             created_at="now",
             updated_at="now",
         )
-        return FeedbackTurn(
-            turn_key=turn.turn_key,
-            issue=turn.issue,
+        return self._with_feedback_issue_comment(
+            turn=turn,
             pull_request=pull_request,
-            review_comments=turn.review_comments,
-            issue_comments=turn.issue_comments + (race_comment,),
-            changed_files=self._github.list_pull_request_files(pull_request.number),
+            comment=race_comment,
+            checkout_path=checkout_path,
         )
 
     def _commit_push_feedback_with_required_tests(
@@ -8474,7 +8937,7 @@ class Phase1Orchestrator:
         *,
         tracked: TrackedPullRequestState,
         checkout_path: Path,
-        turn: FeedbackTurn,
+        turn: FeedbackTurn | RoadmapFeedbackTurn,
         result: FeedbackResult,
         pull_request: PullRequestSnapshot,
         turn_start_head: str,
@@ -8482,6 +8945,7 @@ class Phase1Orchestrator:
         current_result = result
         current_turn = turn
         current_pr = pull_request
+        roadmap_validation_repair_round = 0
         repair_round = 0
         push_merge_conflict_round = 0
         push_remote_race_repair_round = 0
@@ -8575,6 +9039,94 @@ class Phase1Orchestrator:
                     local_head_sha=local_head_sha,
                 )
 
+            if isinstance(current_turn, RoadmapFeedbackTurn):
+                validation_error = self._validate_roadmap_feedback_artifacts(
+                    turn=current_turn,
+                    checkout_path=checkout_path,
+                )
+                if validation_error is not None:
+                    roadmap_validation_repair_round += 1
+                    if roadmap_validation_repair_round > _MAX_ROADMAP_FEEDBACK_REPAIR_ROUNDS:
+                        error = (
+                            "roadmap feedback validation failed after automated repair attempts; "
+                            f"last failure: {validation_error}"
+                        )
+                        self._github.post_issue_comment(
+                            issue_number=tracked.pr_number,
+                            body=(
+                                "MergeXO roadmap feedback automation is blocked because the "
+                                "roadmap markdown/graph pair stayed invalid after "
+                                f"{_MAX_ROADMAP_FEEDBACK_REPAIR_ROUNDS} repair attempts.\n\n"
+                                f"{error}"
+                            ),
+                        )
+                        self._state.mark_pr_status(
+                            pr_number=tracked.pr_number,
+                            issue_number=tracked.issue_number,
+                            status="blocked",
+                            last_seen_head_sha=current_pr.head_sha,
+                            error=error,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_blocked",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            reason="roadmap_feedback_validation_repair_limit_exceeded",
+                        )
+                        return None
+
+                    current_turn = self._roadmap_feedback_turn_with_validation_failure(
+                        turn=current_turn,
+                        pull_request=current_pr,
+                        repair_round=roadmap_validation_repair_round,
+                        failure_detail=validation_error,
+                        checkout_path=checkout_path,
+                    )
+                    repair_outcome = self._run_feedback_agent_with_git_ops(
+                        tracked=tracked,
+                        session=current_result.session,
+                        turn=current_turn,
+                        checkout_path=checkout_path,
+                        pull_request=current_pr,
+                    )
+                    if repair_outcome is None:
+                        return None
+
+                    current_result, current_pr = repair_outcome
+                    if current_result.commit_message is None and not _has_local_commits_to_push():
+                        detail = (
+                            current_result.general_comment.strip()
+                            if current_result.general_comment
+                            and current_result.general_comment.strip()
+                            else "agent could not repair the roadmap markdown/graph pair"
+                        )
+                        self._github.post_issue_comment(
+                            issue_number=tracked.pr_number,
+                            body=(
+                                "MergeXO roadmap feedback automation is blocked because the "
+                                f"roadmap artifacts could not be repaired:\n\n{detail}"
+                            ),
+                        )
+                        self._state.mark_pr_status(
+                            pr_number=tracked.pr_number,
+                            issue_number=tracked.issue_number,
+                            status="blocked",
+                            last_seen_head_sha=current_pr.head_sha,
+                            error=detail,
+                            repo_full_name=self._state_repo_full_name(),
+                        )
+                        log_event(
+                            LOGGER,
+                            "feedback_turn_blocked",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            reason="roadmap_feedback_validation_reported_impossible",
+                        )
+                        return None
+                    continue
+
             required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
             if required_tests_error is not None:
                 repair_round += 1
@@ -8613,6 +9165,7 @@ class Phase1Orchestrator:
                     pull_request=current_pr,
                     repair_round=repair_round,
                     failure_output=required_tests_error,
+                    checkout_path=checkout_path,
                 )
                 repair_outcome = self._run_feedback_agent_with_git_ops(
                     tracked=tracked,
@@ -8744,6 +9297,7 @@ class Phase1Orchestrator:
                     branch=tracked.branch,
                     repair_round=push_merge_conflict_round,
                     failure_output=detail,
+                    checkout_path=checkout_path,
                 )
                 repair_outcome = self._run_feedback_agent_with_git_ops(
                     tracked=tracked,
@@ -8873,6 +9427,7 @@ class Phase1Orchestrator:
                     repair_round=push_remote_race_repair_round,
                     turn_start_head=turn_start_head,
                     local_head_sha=self._git.current_head_sha(checkout_path),
+                    checkout_path=checkout_path,
                 )
                 repair_outcome = self._run_feedback_agent_with_git_ops(
                     tracked=tracked,
@@ -8928,7 +9483,7 @@ class Phase1Orchestrator:
         *,
         tracked: TrackedPullRequestState,
         session: AgentSession,
-        turn: FeedbackTurn,
+        turn: FeedbackTurn | RoadmapFeedbackTurn,
         checkout_path: Path,
         pull_request: PullRequestSnapshot,
     ) -> tuple[FeedbackResult, PullRequestSnapshot] | None:
@@ -8939,7 +9494,12 @@ class Phase1Orchestrator:
 
         while True:
             run_id = self._active_run_id_for_pr_now(tracked.pr_number)
-            prompt = build_feedback_prompt(turn=current_turn)
+            if isinstance(current_turn, RoadmapFeedbackTurn):
+                prompt = build_roadmap_feedback_prompt(turn=current_turn)
+                invocation_mode = "roadmap_feedback"
+            else:
+                prompt = build_feedback_prompt(turn=current_turn)
+                invocation_mode = "respond_to_review"
             log_event(
                 LOGGER,
                 "feedback_agent_call_started",
@@ -8950,7 +9510,7 @@ class Phase1Orchestrator:
             durable_launch = self._durable_codex_launch(run_id)
             self._mark_codex_invocation_started(
                 run_id=run_id,
-                mode="respond_to_review",
+                mode=invocation_mode,
                 prompt=prompt,
                 session_id=current_session.thread_id,
                 durable_launch=durable_launch,
@@ -8958,11 +9518,18 @@ class Phase1Orchestrator:
             initial_head_sha = self._git.current_head_sha(checkout_path)
             try:
                 with self._observe_agent_invocations(run_id=run_id, durable_launch=durable_launch):
-                    result = self._agent.respond_to_feedback(
-                        session=current_session,
-                        turn=current_turn,
-                        cwd=checkout_path,
-                    )
+                    if isinstance(current_turn, RoadmapFeedbackTurn):
+                        result = self._agent.respond_to_roadmap_feedback(
+                            session=current_session,
+                            turn=current_turn,
+                            cwd=checkout_path,
+                        )
+                    else:
+                        result = self._agent.respond_to_feedback(
+                            session=current_session,
+                            turn=current_turn,
+                            cwd=checkout_path,
+                        )
             except Exception as exc:
                 self._mark_codex_invocation_finished(
                     run_id=run_id,
@@ -9076,25 +9643,20 @@ class Phase1Orchestrator:
                 )
                 return None
 
-            current_turn = FeedbackTurn(
-                turn_key=current_turn.turn_key,
-                issue=current_turn.issue,
+            current_turn = self._with_feedback_issue_comment(
+                turn=current_turn,
                 pull_request=current_pr,
-                review_comments=current_turn.review_comments,
-                issue_comments=current_turn.issue_comments
-                + (
-                    PullRequestIssueComment(
-                        comment_id=-(1000 + round_number),
-                        body=_render_git_op_result_comment(
-                            outcomes=outcomes, round_number=round_number
-                        ),
-                        user_login="mergexo-system",
-                        html_url="",
-                        created_at="now",
-                        updated_at="now",
+                comment=PullRequestIssueComment(
+                    comment_id=-(1000 + round_number),
+                    body=_render_git_op_result_comment(
+                        outcomes=outcomes, round_number=round_number
                     ),
+                    user_login="mergexo-system",
+                    html_url="",
+                    created_at="now",
+                    updated_at="now",
                 ),
-                changed_files=self._github.list_pull_request_files(tracked.pr_number),
+                checkout_path=checkout_path,
             )
 
     def _execute_feedback_git_ops(
@@ -9380,7 +9942,7 @@ class Phase1Orchestrator:
         *,
         tracked: TrackedPullRequestState,
         pull_request: PullRequestSnapshot,
-        turn: FeedbackTurn,
+        turn: FeedbackTurn | RoadmapFeedbackTurn,
         result: FeedbackResult,
     ) -> bool:
         if not result.review_replies:
@@ -10480,6 +11042,14 @@ def _operator_source_comment_url(*, command: OperatorCommandRecord, repo_full_na
 def _operator_reply_issue_number(command: OperatorCommandRecord) -> int:
     if command.command == "unblock" and command.pr_number is not None:
         return command.pr_number
+    if command.command == "retry":
+        payload = _operator_args_payload(command)
+        args = payload.get("args")
+        if isinstance(args, dict) and all(isinstance(key, str) for key in args.keys()):
+            parsed_args = cast(dict[str, object], args)
+            target_issue = parsed_args.get("issue")
+            if isinstance(target_issue, str) and target_issue.isdigit() and int(target_issue) > 0:
+                return int(target_issue)
     return command.issue_number
 
 

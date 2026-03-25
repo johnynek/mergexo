@@ -4,6 +4,7 @@ from mergexo.agent_adapter import (
     FeedbackTurn,
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
+    RoadmapFeedbackTurn,
 )
 from mergexo import __version__
 from mergexo.models import (
@@ -31,6 +32,7 @@ from mergexo.prompts import (
     build_implementation_prompt,
     build_requested_roadmap_revision_prompt,
     build_roadmap_adjustment_prompt,
+    build_roadmap_feedback_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
 )
@@ -179,6 +181,8 @@ def test_build_design_prompt_contains_required_contract() -> None:
     assert "`design_doc_markdown` must contain only the body" in prompt
     assert "Do NOT include YAML frontmatter" in prompt
     assert "Return JSON only." in prompt
+    assert "Always include `title`, `summary`, `touch_paths`, and `design_doc_markdown`." in prompt
+    assert "Do not omit keys." in prompt
     assert "issue #12" in prompt.lower()
     assert "docs/design/12-improve-scheduler.md" in prompt
 
@@ -245,6 +249,99 @@ def test_build_feedback_prompt_contains_structured_sections() -> None:
     assert "under 32000 characters" in prompt
     assert "If flaky_test_report is non-null, commit_message MUST be null." in prompt
     assert '"escalation"' in prompt
+    assert (
+        "Always include `git_ops`, `review_replies`, `general_comment`, `commit_message`, `flaky_test_report`, and `escalation`."
+        in prompt
+    )
+    assert "Do not omit nullable fields. Use null when a field does not apply." in prompt
+
+
+def test_build_roadmap_feedback_prompt_contains_graph_contract() -> None:
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key-2",
+        issue=Issue(
+            number=22, title="Roadmap issue", body="Body", html_url="u", labels=("agent:roadmap",)
+        ),
+        pull_request=PullRequestSnapshot(
+            number=12,
+            title="Roadmap PR",
+            body="desc",
+            head_sha="head",
+            base_sha="base",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=("docs/roadmap/22-roadmap.md", "docs/roadmap/22-roadmap.graph.json"),
+        roadmap_doc_path="docs/roadmap/22-roadmap.md",
+        graph_path="docs/roadmap/22-roadmap.graph.json",
+        roadmap_markdown="# Overview\n\n- n1",
+        graph_json_text='{"roadmap_issue_number":22,"version":1,"nodes":[]}',
+        graph_version=1,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+    prompt = build_roadmap_feedback_prompt(turn=turn)
+
+    assert "roadmap-feedback agent" in prompt
+    assert "docs/roadmap/22-roadmap.md" in prompt
+    assert "docs/roadmap/22-roadmap.graph.json" in prompt
+    assert "Keep them in sync" in prompt
+    assert "Do not return `escalation` for this task" in prompt
+    assert (
+        "Always include `git_ops`, `review_replies`, `general_comment`, `commit_message`, and `flaky_test_report`."
+        in prompt
+    )
+    assert "`roadmap_issue_number` must be the integer issue number `22`" in prompt
+    assert (
+        "Preserve that version unless a review comment explicitly requires correcting it" in prompt
+    )
+    assert "`nodes` must be a non-empty array of node objects" in prompt
+    assert "Each node object must contain exactly" in prompt
+    assert "`kind`: one of `design_doc`, `small_job`, `roadmap`." in prompt
+    assert "Each dependency object in `depends_on` must contain exactly" in prompt
+    assert "`requires`: one of `planned`, `implemented`." in prompt
+    assert "Do not add extra keys outside this schema." in prompt
+    assert '"flaky_test_report"' in prompt
+
+
+def test_build_roadmap_feedback_prompt_reports_invalid_graph_status() -> None:
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key-3",
+        issue=Issue(
+            number=22, title="Roadmap issue", body="Body", html_url="u", labels=("agent:roadmap",)
+        ),
+        pull_request=PullRequestSnapshot(
+            number=12,
+            title="Roadmap PR",
+            body="desc",
+            head_sha="head",
+            base_sha="base",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=("docs/roadmap/22-roadmap.md", "docs/roadmap/22-roadmap.graph.json"),
+        roadmap_doc_path="docs/roadmap/22-roadmap.md",
+        graph_path="docs/roadmap/22-roadmap.graph.json",
+        roadmap_markdown="# Overview\n\n- n1",
+        graph_json_text="{not valid json",
+        graph_version=None,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error="unexpected token at line 1",
+    )
+
+    prompt = build_roadmap_feedback_prompt(turn=turn)
+
+    assert "- roadmap graph status: invalid: unexpected token at line 1" in prompt
+    assert "current graph version in this pr could not be validated" in prompt.lower()
 
 
 def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
@@ -313,10 +410,20 @@ def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
     assert '`action = "abandon"`' in prompt
     assert "`updated_roadmap_markdown`" in prompt
     assert "`updated_graph_json`" in prompt
+    assert "Always include all five top-level keys." in prompt
+    assert "`updated_graph_json` must be a JSON object, not a string, with exactly" in prompt
+    assert "`roadmap_issue_number`: integer. Keep this set to 22." in prompt
+    assert "`version`: integer. Bump the graph version from 3 to 4." in prompt
+    assert "Each item in `updated_graph_json.nodes` must be an object with exactly" in prompt
     assert "bump the graph `version` from 3 to 4" in prompt
+    assert "Treat retained `node_id`s as stable work identities" in prompt
+    assert "preserve its `kind`, `title`, `body_markdown`, and `depends_on` exactly" in prompt
+    assert "Do not remove any node whose work has already started" in prompt
+    assert "Do not churn `node_id`s for unchanged work" in prompt
     assert "ready frontier node_ids" in prompt
     assert '["n2","n3"]' in prompt
     assert '"dependency_node_id":"n1"' in prompt
+    assert prompt.count('"dependency_node_id":"n1"') == 1
     assert '"pr_title":"Dependency PR"' in prompt
     assert "... [truncated]" in prompt
     assert "docs/roadmap/22-roadmap.graph.json" in prompt
@@ -348,6 +455,15 @@ def test_build_requested_roadmap_revision_prompt_contains_request_contract() -> 
 
     assert "roadmap-revision agent" in prompt
     assert 'Do not return `action = "proceed"`' in prompt
+    assert "`action`: one of `revise`, `abandon`" in prompt
+    assert "`action`: one of `proceed`, `revise`, `abandon`" not in prompt
+    assert "Always include all five top-level keys." in prompt
+    assert "`updated_graph_json` must be a JSON object, not a string, with exactly" in prompt
+    assert "`roadmap_issue_number`: integer. Keep this set to 23." in prompt
+    assert "`version`: integer. Bump the graph version from 5 to 6." in prompt
+    assert "Treat retained `node_id`s as stable work identities" in prompt
+    assert "Do not remove any node whose work has already started" in prompt
+    assert "Do not churn `node_id`s for unchanged work" in prompt
     assert "operator requested roadmap revision" in prompt
     assert "docs/roadmap/23-roadmap.md" in prompt
     assert "bump the graph `version` from 5 to 6" in prompt
@@ -372,6 +488,11 @@ def test_build_bugfix_prompt_requires_regression_tests() -> None:
     assert "regression tests that fail before the fix and pass after the fix" in prompt
     assert "docs/python_style.md" in prompt
     assert "blocked_reason" in prompt
+    assert (
+        "Always include `pr_title`, `pr_summary`, `commit_message`, `blocked_reason`, and `escalation`."
+        in prompt
+    )
+    assert "Do not omit nullable keys. Use null when a field does not apply." in prompt
     assert "issue #21" in prompt.lower()
 
 
@@ -416,6 +537,10 @@ def test_build_small_job_prompt_is_scoped() -> None:
     assert "docs/python_style.md" in prompt
     assert "blocked_reason" in prompt
     assert "Keep scope tight" in prompt
+    assert (
+        "Always include `pr_title`, `pr_summary`, `commit_message`, `blocked_reason`, and `escalation`."
+        in prompt
+    )
 
 
 def test_build_roadmap_prompt_requires_graph_contract() -> None:
@@ -442,7 +567,31 @@ def test_build_roadmap_prompt_requires_graph_contract() -> None:
     assert "design_doc" in prompt
     assert "small_job" in prompt
     assert "roadmap" in prompt
+    assert "This turn is for roadmap authoring, not repository code implementation" in prompt
+    assert "Produce a practical execution plan" in prompt
+    assert "`roadmap_markdown` and `graph_json` must describe the same plan" in prompt
+    assert "Always include `title`, `summary`, `roadmap_markdown`, and `graph_json`." in prompt
+    assert (
+        "`roadmap_markdown`: non-empty string containing the full roadmap markdown body" in prompt
+    )
+    assert "design_doc.planned" in prompt
+    assert "small_job.implemented" in prompt
+    assert "roadmap.planned" in prompt
+    assert "Use `planned` only when downstream work can safely begin" in prompt
+    assert "Choose short, unique, stable `node_id` values" in prompt
+    assert "node-by-node breakdown keyed by `node_id`" in prompt
     assert "Recommended node count is around 7" in prompt
+    assert "`graph_json` as a JSON object, not a string, with exactly" in prompt
+    assert "`roadmap_issue_number`: integer. Set this to 42." in prompt
+    assert "`version`: integer. For the initial roadmap, set this to `1`." in prompt
+    assert "`nodes`: non-empty array of node objects." in prompt
+    assert "Each item in `graph_json.nodes` must be an object with exactly" in prompt
+    assert "`title`: non-empty string for the child issue title." in prompt
+    assert "`body_markdown`: non-empty string for the child issue body." in prompt
+    assert "Each item in `depends_on` must be an object with exactly" in prompt
+    assert "`node_id`: string referencing another node in this same graph." in prompt
+    assert "`requires`: one of `planned`, `implemented`." in prompt
+    assert "Do not add extra keys outside this schema." in prompt
 
 
 def test_build_implementation_prompt_links_design_context() -> None:
@@ -470,6 +619,10 @@ def test_build_implementation_prompt_links_design_context() -> None:
     assert "docs/design/23-ship-worker-pool.md" in prompt
     assert "Source design PR: #144 (https://example/pr/144)" in prompt
     assert "blocked_reason" in prompt
+    assert (
+        "Always include `pr_title`, `pr_summary`, `commit_message`, `blocked_reason`, and `escalation`."
+        in prompt
+    )
     assert "Merged design doc markdown" in prompt
     assert "Re-read the full diff against main." in prompt
     assert "Add concise comments around subtle logic" in prompt

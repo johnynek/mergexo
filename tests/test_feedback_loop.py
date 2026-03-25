@@ -224,6 +224,12 @@ def test_parse_operator_command_valid_variants() -> None:
     assert parsed_restart.get_arg("mode") == "pypi"
     assert parsed_restart.normalized_command == "/mergexo restart mode=pypi"
 
+    parsed_retry = parse_operator_command("/mergexo retry issue=151")
+    assert isinstance(parsed_retry, ParsedOperatorCommand)
+    assert parsed_retry.command == "retry"
+    assert parsed_retry.get_arg("issue") == "151"
+    assert parsed_retry.normalized_command == "/mergexo retry issue=151"
+
 
 def test_parse_operator_command_errors_and_non_commands() -> None:
     assert parse_operator_command("regular comment") is None
@@ -273,6 +279,14 @@ def test_parse_operator_command_errors_and_non_commands() -> None:
     assert isinstance(unknown_restart_arg, ParsedOperatorCommand)
     assert "Unknown restart arguments" in (unknown_restart_arg.parse_error or "")
 
+    bad_retry_issue = parse_operator_command("/mergexo retry issue=-1")
+    assert isinstance(bad_retry_issue, ParsedOperatorCommand)
+    assert "positive integer" in (bad_retry_issue.parse_error or "")
+
+    unknown_retry_arg = parse_operator_command("/mergexo retry foo=bar")
+    assert isinstance(unknown_retry_arg, ParsedOperatorCommand)
+    assert "Unknown retry arguments" in (unknown_retry_arg.parse_error or "")
+
     unknown_unblock_arg = parse_operator_command("/mergexo unblock foo=bar")
     assert isinstance(unknown_unblock_arg, ParsedOperatorCommand)
     assert "Unknown unblock arguments" in (unknown_unblock_arg.parse_error or "")
@@ -281,4 +295,5 @@ def test_parse_operator_command_errors_and_non_commands() -> None:
 def test_operator_command_help_text_contains_anchor() -> None:
     text = operator_commands_help()
     assert "/mergexo unblock" in text
+    assert "/mergexo retry" in text
     assert "README.md#github-operator-commands" in text

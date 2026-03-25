@@ -25,6 +25,7 @@ from mergexo.agent_adapter import (
     GitOpRequest,
     RoadmapDependencyArtifact,
     RoadmapAdjustmentResult,
+    RoadmapFeedbackTurn,
     RoadmapStartResult,
     ReviewReply,
 )
@@ -480,6 +481,7 @@ class FakeAgent:
         self.small_job_guidelines_paths: list[str | None] = []
         self.implementation_guidelines_paths: list[str | None] = []
         self.feedback_calls: list[tuple[AgentSession, FeedbackTurn, Path]] = []
+        self.roadmap_feedback_calls: list[tuple[AgentSession, RoadmapFeedbackTurn, Path]] = []
         self.bugfix_result = DirectStartResult(
             pr_title="Fix bug",
             pr_summary="Applies bugfix changes.",
@@ -609,6 +611,14 @@ class FakeAgent:
         self, *, session: AgentSession, turn: FeedbackTurn, cwd: Path
     ) -> FeedbackResult:
         self.feedback_calls.append((session, turn, cwd))
+        if self.feedback_results:
+            return self.feedback_results.pop(0)
+        return self.feedback_result
+
+    def respond_to_roadmap_feedback(
+        self, *, session: AgentSession, turn: RoadmapFeedbackTurn, cwd: Path
+    ) -> FeedbackResult:
+        self.roadmap_feedback_calls.append((session, turn, cwd))
         if self.feedback_results:
             return self.feedback_results.pop(0)
         return self.feedback_result
@@ -1247,6 +1257,12 @@ class FakeState:
         _ = repo_full_name
         return ()
 
+    def list_failed_issue_runs_without_pr(
+        self, *, repo_full_name: str | None = None
+    ) -> tuple[object, ...]:
+        _ = repo_full_name
+        return ()
+
     def list_legacy_running_issue_runs_without_pr(
         self, *, repo_full_name: str | None = None
     ) -> tuple[object, ...]:
@@ -1385,6 +1401,10 @@ class FakeState:
         return None
 
     def reset_blocked_pull_requests(self, **kwargs):  # type: ignore[no-untyped-def]
+        _ = kwargs
+        return 0
+
+    def retry_failed_issue_runs(self, **kwargs):  # type: ignore[no-untyped-def]
         _ = kwargs
         return 0
 
@@ -3353,7 +3373,9 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     assert state.saved_sessions == [(7, "codex", "thread-123")]
 
 
-def test_process_issue_rejects_unauthorized_author_before_side_effects(tmp_path: Path) -> None:
+def test_process_issue_rejects_unauthorized_author_before_repo_side_effects_and_reports_failure(
+    tmp_path: Path,
+) -> None:
     cfg = _config(tmp_path, allowed_users=("reviewer",))
     git = FakeGitManager(tmp_path / "checkouts")
     github = FakeGitHub(issues=[])
@@ -3369,7 +3391,10 @@ def test_process_issue_rejects_unauthorized_author_before_side_effects(tmp_path:
     assert git.prepare_calls == []
     assert git.branch_calls == []
     assert github.created_prs == []
-    assert github.comments == []
+    assert len(github.comments) == 1
+    assert github.comments[0][0] == 7
+    assert "MergeXO design flow failed while processing this issue." in github.comments[0][1]
+    assert "not allowed by repo.allowed_users" in github.comments[0][1]
 
 
 def test_process_issue_bugfix_flow_happy_path(tmp_path: Path) -> None:
@@ -3943,6 +3968,53 @@ def test_process_implementation_candidate_marks_codex_finished_on_agent_exceptio
         )
 
     assert len(agent.implementation_calls) == 1
+    assert any(
+        issue_number == 7
+        and "MergeXO implementation flow failed while processing this issue." in body
+        and "codex failed" in body
+        for issue_number, body in github.comments
+    )
+
+
+def test_process_implementation_candidate_logs_when_failure_comment_posting_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[_issue()])
+    agent = FakeAgent(fail=True)
+    state = FakeState()
+
+    checkout_path = git.ensure_checkout(0)
+    design_doc = checkout_path / "docs/design/7-add-worker-scheduler.md"
+    design_doc.parent.mkdir(parents=True, exist_ok=True)
+    design_doc.write_text("# Design\n\nImplement queue scheduler.", encoding="utf-8")
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    def fail_report(*, issue_number: int, flow: IssueFlow, exc: Exception) -> None:
+        _ = issue_number, flow, exc
+        raise RuntimeError("failed to post failure comment")
+
+    monkeypatch.setattr(orch, "_report_issue_processing_failure", fail_report)
+    configure_logging(verbose=True)
+
+    with pytest.raises(RuntimeError, match="codex failed"):
+        orch._process_implementation_candidate(
+            ImplementationCandidateState(
+                issue_number=7,
+                design_branch="agent/design/7-add-worker-scheduler",
+                design_pr_number=44,
+                design_pr_url="https://example/pr/44",
+            )
+        )
+
+    stderr = capsys.readouterr().err
+    assert "event=issue_processing_failure_comment_failed" in stderr
+    assert "flow=implementation" in stderr
+    assert "issue_number=7" in stderr
 
 
 def test_process_implementation_candidate_rejects_unauthorized_author(tmp_path: Path) -> None:
@@ -3966,7 +4038,12 @@ def test_process_implementation_candidate_rejects_unauthorized_author(tmp_path: 
     assert git.ensure_checkout_calls == []
     assert git.prepare_calls == []
     assert github.created_prs == []
-    assert github.comments == []
+    assert len(github.comments) == 1
+    assert github.comments[0][0] == 7
+    assert (
+        "MergeXO implementation flow failed while processing this issue." in github.comments[0][1]
+    )
+    assert "not allowed by repo.allowed_users" in github.comments[0][1]
     assert len(agent.implementation_calls) == 0
 
 
@@ -5148,6 +5225,14 @@ def test_enqueue_new_work_passes_existing_issue_comments_on_first_invocation(
             created_at="2026-02-23T00:00:01Z",
             updated_at="2026-02-23T00:00:01Z",
         ),
+        PullRequestIssueComment(
+            comment_id=7,
+            body="/mergexo retry",
+            user_login="reviewer",
+            html_url="https://example/issues/1#issuecomment-7",
+            created_at="2026-02-23T00:00:02Z",
+            updated_at="2026-02-23T00:00:02Z",
+        ),
     ]
     state = FakeState(allowed={1})
     orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=FakeAgent())
@@ -5183,17 +5268,18 @@ def test_enqueue_new_work_passes_existing_issue_comments_on_first_invocation(
     assert len(pool.submitted) == 1
     submitted_issue, submitted_flow, consumed_comment_id_max = pool.submitted[0]
     assert submitted_flow == "design_doc"
-    assert consumed_comment_id_max == 6
+    assert consumed_comment_id_max == 7
     assert "Issue body" in submitted_issue.body
     assert "Ordered issue comments at first invocation:" in submitted_issue.body
     assert "first comment" in submitted_issue.body
     assert "second comment" in submitted_issue.body
+    assert "/mergexo retry" not in submitted_issue.body
     assert submitted_issue.body.index("first comment") < submitted_issue.body.index(
         "second comment"
     )
 
     cursor = state.get_issue_comment_cursor(1)
-    assert cursor.pre_pr_last_consumed_comment_id == 6
+    assert cursor.pre_pr_last_consumed_comment_id == 7
 
 
 def test_enqueue_new_work_does_not_advance_cursor_when_issue_already_processed(
@@ -5540,6 +5626,87 @@ def test_reap_finished_marks_success_and_failure(tmp_path: Path) -> None:
     assert [w.issue_number for w in state.completed] == [1]
     assert state.failed[0][0] == 2
     assert orch._running == {}
+
+
+def test_reap_finished_reports_issue_failure_when_worker_did_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    bad: Future[WorkResult] = Future()
+    bad.set_exception(RuntimeError("boom"))
+    orch._running = {7: bad}
+    orch._running_issue_metadata = {
+        7: _RunningIssueMetadata(
+            run_id="run-7",
+            flow="small_job",
+            branch="agent/small/7-worker",
+            context_json='{"flow":"small_job"}',
+            source_issue_number=7,
+            consumed_comment_id_max=0,
+        )
+    }
+
+    reported: list[tuple[int, str, str]] = []
+
+    def fake_report(*, issue_number: int, flow: IssueFlow, exc: Exception) -> None:
+        reported.append((issue_number, flow, str(exc)))
+
+    monkeypatch.setattr(orch, "_report_issue_processing_failure", fake_report)
+
+    orch._reap_finished()
+
+    assert reported == [(7, "small_job", "boom")]
+    assert state.failed[0][0] == 7
+
+
+def test_reap_finished_logs_when_fallback_failure_comment_posting_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    bad: Future[WorkResult] = Future()
+    bad.set_exception(RuntimeError("boom"))
+    orch._running = {7: bad}
+    orch._running_issue_metadata = {
+        7: _RunningIssueMetadata(
+            run_id="run-7",
+            flow="small_job",
+            branch="agent/small/7-worker",
+            context_json='{"flow":"small_job"}',
+            source_issue_number=7,
+            consumed_comment_id_max=0,
+        )
+    }
+
+    def fail_report(*, issue_number: int, flow: IssueFlow, exc: Exception) -> None:
+        _ = issue_number, flow, exc
+        raise RuntimeError("failed to post failure comment")
+
+    monkeypatch.setattr(orch, "_report_issue_processing_failure", fail_report)
+    configure_logging(verbose=True)
+
+    orch._reap_finished()
+
+    assert state.failed[0][0] == 7
+    stderr = capsys.readouterr().err
+    assert "event=issue_processing_failure_comment_failed" in stderr
+    assert "flow=small_job" in stderr
+    assert "issue_number=7" in stderr
 
 
 def test_reap_finished_recoverable_pre_pr_failure_moves_to_followup_waiting(
@@ -7896,6 +8063,107 @@ def _feedback_commit_push_context(
         git_ops=(),
     )
     return orch, git, github, state, tracked, turn, result
+
+
+def _roadmap_feedback_commit_push_context(
+    tmp_path: Path,
+) -> tuple[
+    Phase1Orchestrator,
+    FakeGitManager,
+    FakeGitHub,
+    FakeState,
+    TrackedPullRequestState,
+    RoadmapFeedbackTurn,
+    FeedbackResult,
+    Path,
+]:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Roadmap PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    github.changed_files = (roadmap_doc_path, graph_path)
+    checkout = tmp_path / "roadmap-feedback-checkout"
+    (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / roadmap_doc_path).write_text("# Roadmap\n\nBody\n", encoding="utf-8")
+    (checkout / graph_path).write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=issue.number,
+        branch="agent/roadmap/7-add-worker-scheduler",
+        status="awaiting_feedback",
+        last_seen_head_sha="head-1",
+    )
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=issue,
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=github.changed_files,
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        roadmap_markdown="# Roadmap\n\nBody\n",
+        graph_json_text=json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        graph_version=1,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+    result = FeedbackResult(
+        session=AgentSession(adapter="codex", thread_id="thread-1"),
+        review_replies=(),
+        general_comment=None,
+        commit_message="docs: update roadmap",
+        git_ops=(),
+    )
+    git.current_head_sha_value = "head-1"
+    return orch, git, github, state, tracked, turn, result, checkout
 
 
 def _workflow_run(
@@ -12832,6 +13100,945 @@ def test_run_feedback_agent_with_git_ops_round_trip(tmp_path: Path) -> None:
     assert "fetch_origin: ok (ok)" in second_turn.issue_comments[0].body
 
 
+def test_run_feedback_agent_with_git_ops_uses_roadmap_feedback_agent(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    github.changed_files = (
+        "docs/roadmap/7-add-worker-scheduler.md",
+        "docs/roadmap/7-add-worker-scheduler.graph.json",
+    )
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = TrackedPullRequestState(
+        pr_number=101,
+        issue_number=issue.number,
+        branch="agent/roadmap/7-add-worker-scheduler",
+        status="awaiting_feedback",
+        last_seen_head_sha="headsha",
+    )
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=issue,
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=github.changed_files,
+        roadmap_doc_path="docs/roadmap/7-add-worker-scheduler.md",
+        graph_path="docs/roadmap/7-add-worker-scheduler.graph.json",
+        roadmap_markdown="# Roadmap",
+        graph_json_text='{"roadmap_issue_number":7,"version":1,"nodes":[{"node_id":"n1","kind":"small_job","title":"Ship","body_markdown":"Do it","depends_on":[]}]}',
+        graph_version=1,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+    agent.feedback_results = [
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-1"),
+            review_replies=(),
+            general_comment=None,
+            commit_message=None,
+            git_ops=(GitOpRequest(op="fetch_origin"),),
+        ),
+        FeedbackResult(
+            session=AgentSession(adapter="codex", thread_id="thread-2"),
+            review_replies=(ReviewReply(review_comment_id=11, body="Updated roadmap"),),
+            general_comment="Done",
+            commit_message="docs: apply roadmap feedback",
+            git_ops=(),
+        ),
+    ]
+
+    outcome = orch._run_feedback_agent_with_git_ops(
+        tracked=tracked,
+        session=AgentSession(adapter="codex", thread_id="thread-0"),
+        turn=turn,
+        checkout_path=tmp_path,
+        pull_request=github.pr_snapshot,
+    )
+
+    assert outcome is not None
+    result, _ = outcome
+    assert result.commit_message == "docs: apply roadmap feedback"
+    assert len(agent.feedback_calls) == 0
+    assert len(agent.roadmap_feedback_calls) == 2
+    second_turn = agent.roadmap_feedback_calls[1][1]
+    assert len(second_turn.issue_comments) == 1
+    assert "fetch_origin: ok (ok)" in second_turn.issue_comments[0].body
+
+
+def test_validate_roadmap_feedback_artifacts_rejects_non_initial_version(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    checkout = git.ensure_checkout(0)
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/7-add-worker-scheduler.md",
+        content="# Roadmap\n\nBody\n",
+    )
+    _write_checkout_file(
+        git.checkout_root,
+        "docs/roadmap/7-add-worker-scheduler.graph.json",
+        content=json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 2,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+    )
+    turn = orch._build_roadmap_feedback_turn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(
+            "docs/roadmap/7-add-worker-scheduler.md",
+            "docs/roadmap/7-add-worker-scheduler.graph.json",
+        ),
+        checkout_path=checkout,
+    )
+
+    error = orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout)
+
+    assert error is not None
+    assert "initial roadmap PR must keep graph version 1" in error
+
+
+def test_process_feedback_turn_uses_roadmap_feedback_turn_for_roadmap_pr(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    issue = _issue(labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    github.pr_snapshot = PullRequestSnapshot(
+        number=101,
+        title="Roadmap PR",
+        body="Body",
+        head_sha="head-1",
+        base_sha="base-1",
+        draft=False,
+        state="open",
+        merged=False,
+    )
+    github.review_comments = [_review_comment()]
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    github.changed_files = (roadmap_doc_path, graph_path)
+    _write_checkout_file(
+        git.checkout_root,
+        roadmap_doc_path,
+        content="# Roadmap\n\nBody\n",
+    )
+    _write_checkout_file(
+        git.checkout_root,
+        graph_path,
+        content=json.dumps(
+            {
+                "roadmap_issue_number": issue.number,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+    )
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    state.mark_completed(
+        issue.number,
+        "agent/roadmap/7-add-worker-scheduler",
+        101,
+        "https://example/pr/101",
+        repo_full_name=cfg.repo.full_name,
+    )
+    state.save_agent_session(
+        issue_number=issue.number,
+        adapter="codex",
+        thread_id="thread-123",
+        repo_full_name=cfg.repo.full_name,
+    )
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    tracked = _tracked_state_from_store(state)
+    orch._process_feedback_turn(tracked)
+
+    assert len(agent.feedback_calls) == 0
+    assert len(agent.roadmap_feedback_calls) == 1
+    turn = agent.roadmap_feedback_calls[0][1]
+    assert turn.roadmap_doc_path == roadmap_doc_path
+    assert turn.graph_path == graph_path
+    assert turn.graph_version == 1
+
+
+def test_resolve_roadmap_feedback_paths_prefers_state_and_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg, state=state, github=FakeGitHub([]), git_manager=git, agent=FakeAgent()
+    )
+    issue = _issue(labels=(cfg.repo.roadmap_label,))
+
+    class RoadmapStateLike:
+        roadmap_doc_path = "docs/roadmap/from-state.md"
+        graph_path = "docs/roadmap/from-state.graph.json"
+
+    monkeypatch.setattr(
+        state,
+        "get_roadmap_state",
+        lambda **_: RoadmapStateLike(),
+        raising=False,
+    )
+    assert orch._resolve_roadmap_feedback_paths(
+        issue=issue,
+        changed_files=(),
+        checkout_path=tmp_path,
+    ) == ("docs/roadmap/from-state.md", "docs/roadmap/from-state.graph.json")
+
+    monkeypatch.setattr(state, "get_roadmap_state", lambda **_: None, raising=False)
+    expected_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    expected_graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    assert orch._resolve_roadmap_feedback_paths(
+        issue=issue,
+        changed_files=(expected_doc_path,),
+        checkout_path=tmp_path,
+    ) == (expected_doc_path, expected_graph_path)
+
+    (tmp_path / expected_graph_path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / expected_graph_path).write_text("{}", encoding="utf-8")
+    assert orch._resolve_roadmap_feedback_paths(
+        issue=issue,
+        changed_files=(),
+        checkout_path=tmp_path,
+    ) == (expected_doc_path, expected_graph_path)
+
+    other_doc = f"{cfg.repo.roadmap_docs_dir}/alternate.md"
+    other_graph = f"{cfg.repo.roadmap_docs_dir}/alternate.graph.json"
+    assert orch._resolve_roadmap_feedback_paths(
+        issue=issue,
+        changed_files=(other_doc, other_graph),
+        checkout_path=tmp_path / "missing",
+    ) == (other_doc, other_graph)
+
+    other_issue = _issue(number=8, labels=(cfg.repo.roadmap_label,))
+    assert orch._resolve_roadmap_feedback_paths(
+        issue=other_issue,
+        changed_files=(),
+        checkout_path=tmp_path / "missing",
+    ) == (
+        f"{cfg.repo.roadmap_docs_dir}/8-add-worker-scheduler.md",
+        f"{cfg.repo.roadmap_docs_dir}/8-add-worker-scheduler.graph.json",
+    )
+
+
+def test_refresh_roadmap_feedback_turn_handles_unreadable_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg, state=FakeState(), github=github, git_manager=git, agent=FakeAgent()
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    _write_checkout_file(git.checkout_root, roadmap_doc_path, content="# Roadmap\n")
+    _write_checkout_file(git.checkout_root, graph_path, content='{"ok":true}')
+    original_read_text = Path.read_text
+
+    def fake_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == checkout / roadmap_doc_path:
+            raise OSError("markdown unreadable")
+        if self == checkout / graph_path:
+            raise UnicodeDecodeError("utf-8", b"x", 0, 1, "graph unreadable")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    turn = orch._refresh_roadmap_feedback_turn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        checkout_path=checkout,
+    )
+
+    assert "roadmap markdown unreadable" in turn.roadmap_markdown
+    assert "roadmap graph unreadable" in turn.graph_json_text
+    assert turn.graph_validation_error is not None
+    assert "graph file is unreadable" in turn.graph_validation_error
+
+
+def test_refresh_roadmap_feedback_turn_reports_invalid_graph(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([])
+    orch = Phase1Orchestrator(
+        cfg, state=FakeState(), github=github, git_manager=git, agent=FakeAgent()
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    _write_checkout_file(git.checkout_root, roadmap_doc_path, content="# Roadmap\n")
+    _write_checkout_file(git.checkout_root, graph_path, content="{not valid json")
+
+    turn = orch._refresh_roadmap_feedback_turn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=github.pr_snapshot,
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        checkout_path=checkout,
+    )
+
+    assert turn.graph_validation_error is not None
+    assert turn.graph_version is None
+
+
+def test_with_feedback_issue_comment_requires_checkout_path_for_roadmap_turn(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="Roadmap PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(),
+        roadmap_doc_path="docs/roadmap/7-add-worker-scheduler.md",
+        graph_path="docs/roadmap/7-add-worker-scheduler.graph.json",
+        roadmap_markdown="# Roadmap",
+        graph_json_text="{}",
+        graph_version=None,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+    with pytest.raises(RuntimeError, match="requires checkout_path"):
+        orch._with_feedback_issue_comment(
+            turn=turn,
+            pull_request=turn.pull_request,
+            comment=_issue_comment(),
+        )
+
+
+def test_validate_roadmap_feedback_artifacts_rejects_missing_markdown_and_empty_markdown(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="Roadmap PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        roadmap_markdown="",
+        graph_json_text="",
+        graph_version=None,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) == (
+        f"missing roadmap markdown file: {roadmap_doc_path}"
+    )
+
+    (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / roadmap_doc_path).write_text("   ", encoding="utf-8")
+    (checkout / graph_path).write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) == (
+        f"roadmap markdown is empty at {roadmap_doc_path}"
+    )
+
+
+def test_validate_roadmap_feedback_artifacts_rejects_unreadable_markdown_and_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / roadmap_doc_path).write_text("# Roadmap\n", encoding="utf-8")
+    (checkout / graph_path).write_text("{}", encoding="utf-8")
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="Roadmap PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        roadmap_markdown="",
+        graph_json_text="",
+        graph_version=None,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+    original_read_text = Path.read_text
+
+    def unreadable_markdown(self: Path, *args: object, **kwargs: object) -> str:
+        if self == checkout / roadmap_doc_path:
+            raise OSError("cannot read markdown")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable_markdown)
+    assert "roadmap markdown is unreadable" in cast(
+        str, orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout)
+    )
+
+    def unreadable_graph(self: Path, *args: object, **kwargs: object) -> str:
+        if self == checkout / graph_path:
+            raise OSError("cannot read graph")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable_graph)
+    assert "roadmap graph is unreadable" in cast(
+        str, orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout)
+    )
+
+
+def test_validate_roadmap_feedback_artifacts_rejects_missing_and_invalid_graph(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / roadmap_doc_path).write_text("# Roadmap\n", encoding="utf-8")
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="Roadmap PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        roadmap_markdown="",
+        graph_json_text="",
+        graph_version=None,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) == (
+        f"missing roadmap graph file: {graph_path}"
+    )
+
+    (checkout / graph_path).write_text("{not valid json", encoding="utf-8")
+    error = orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout)
+    assert error is not None
+    assert error.startswith("invalid roadmap graph:")
+
+
+def test_validate_roadmap_feedback_artifacts_rejects_requested_revision_version_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = FakeState()
+    orch = Phase1Orchestrator(
+        cfg, state=state, github=FakeGitHub([]), git_manager=git, agent=FakeAgent()
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / roadmap_doc_path).write_text("# Roadmap\n", encoding="utf-8")
+    (checkout / graph_path).write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 2,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class RoadmapStateLike:
+        adjustment_request_version = 3
+
+    monkeypatch.setattr(state, "get_roadmap_state", lambda **_: RoadmapStateLike(), raising=False)
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="Roadmap PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        roadmap_markdown="",
+        graph_json_text="",
+        graph_version=2,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+    error = orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout)
+
+    assert error is not None
+    assert "same-roadmap revision PR must keep the requested graph version unchanged" in error
+
+
+def test_validate_roadmap_feedback_artifacts_accepts_valid_same_version_pair(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / roadmap_doc_path).write_text("# Roadmap\n\nBody\n", encoding="utf-8")
+    (checkout / graph_path).write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="Roadmap PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        roadmap_markdown="",
+        graph_json_text="",
+        graph_version=1,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) is None
+
+
+def test_roadmap_feedback_turn_with_validation_failure_truncates_and_handles_empty_output(
+    tmp_path: Path,
+) -> None:
+    orch, _git, github, _state, _tracked, turn, _result, checkout = (
+        _roadmap_feedback_commit_push_context(tmp_path)
+    )
+
+    truncated_turn = orch._roadmap_feedback_turn_with_validation_failure(
+        turn=turn,
+        pull_request=github.pr_snapshot,
+        repair_round=1,
+        failure_detail="x" * 13000,
+        checkout_path=checkout,
+    )
+    assert isinstance(truncated_turn, RoadmapFeedbackTurn)
+    assert "... [truncated by MergeXO]" in truncated_turn.issue_comments[-1].body
+
+    empty_turn = orch._roadmap_feedback_turn_with_validation_failure(
+        turn=turn,
+        pull_request=github.pr_snapshot,
+        repair_round=2,
+        failure_detail="   ",
+        checkout_path=checkout,
+    )
+    assert "Validation error:\n<empty>" in empty_turn.issue_comments[-1].body
+
+
+def test_roadmap_feedback_turn_with_validation_failure_rejects_non_roadmap_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch, _git, github, _state, _tracked, turn, _result, checkout = (
+        _roadmap_feedback_commit_push_context(tmp_path)
+    )
+    monkeypatch.setattr(
+        orch,
+        "_with_feedback_issue_comment",
+        lambda **_: FeedbackTurn(
+            turn_key=turn.turn_key,
+            issue=turn.issue,
+            pull_request=github.pr_snapshot,
+            review_comments=(),
+            issue_comments=(),
+            changed_files=(),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="must preserve roadmap turn type"):
+        orch._roadmap_feedback_turn_with_validation_failure(
+            turn=turn,
+            pull_request=github.pr_snapshot,
+            repair_round=1,
+            failure_detail="graph version drifted",
+            checkout_path=checkout,
+        )
+
+
+def test_commit_push_feedback_roadmap_validation_retries_before_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        orch,
+        git,
+        github,
+        _state,
+        tracked,
+        turn,
+        result,
+        checkout,
+    ) = _roadmap_feedback_commit_push_context(tmp_path)
+    validation_calls = {"count": 0}
+
+    def fake_validate(*, turn: RoadmapFeedbackTurn, checkout_path: Path) -> str | None:
+        _ = turn, checkout_path
+        validation_calls["count"] += 1
+        if validation_calls["count"] == 1:
+            return "graph version drifted"
+        return None
+
+    def fake_run_feedback_agent_with_git_ops(
+        **kwargs: object,
+    ) -> tuple[FeedbackResult, PullRequestSnapshot]:
+        repair_turn = cast(RoadmapFeedbackTurn, kwargs["turn"])
+        assert "graph version drifted" in repair_turn.issue_comments[-1].body
+        return (
+            FeedbackResult(
+                session=AgentSession(adapter="codex", thread_id="thread-2"),
+                review_replies=(),
+                general_comment="Repaired roadmap artifacts.",
+                commit_message="docs: repair roadmap feedback",
+                git_ops=(),
+            ),
+            github.pr_snapshot,
+        )
+
+    monkeypatch.setattr(orch, "_validate_roadmap_feedback_artifacts", fake_validate)
+    monkeypatch.setattr(
+        orch, "_run_feedback_agent_with_git_ops", fake_run_feedback_agent_with_git_ops
+    )
+    monkeypatch.setattr(orch, "_run_required_tests_before_push", lambda **_: None)
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=checkout,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is not None
+    final_result, _ = outcome
+    assert final_result.commit_message == "docs: repair roadmap feedback"
+    assert validation_calls["count"] == 2
+    assert len(git.commit_calls) == 2
+
+
+def test_commit_push_feedback_roadmap_validation_blocks_after_repair_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        orch,
+        _git,
+        _github,
+        state,
+        tracked,
+        turn,
+        result,
+        checkout,
+    ) = _roadmap_feedback_commit_push_context(tmp_path)
+    repair_calls = {"count": 0}
+    monkeypatch.setattr(
+        orch,
+        "_validate_roadmap_feedback_artifacts",
+        lambda **_: "roadmap markdown and graph disagree",
+    )
+
+    def fake_run_feedback_agent_with_git_ops(
+        **kwargs: object,
+    ) -> tuple[FeedbackResult, PullRequestSnapshot]:
+        _ = kwargs
+        repair_calls["count"] += 1
+        return result, turn.pull_request
+
+    monkeypatch.setattr(
+        orch, "_run_feedback_agent_with_git_ops", fake_run_feedback_agent_with_git_ops
+    )
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=checkout,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert repair_calls["count"] == 3
+    assert state.status_updates[-1][2] == "blocked"
+    assert "roadmap feedback validation failed after automated repair attempts" in cast(
+        str, state.status_updates[-1][4]
+    )
+
+
+def test_commit_push_feedback_roadmap_validation_blocks_when_agent_reports_impossible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        orch,
+        _git,
+        github,
+        state,
+        tracked,
+        turn,
+        result,
+        checkout,
+    ) = _roadmap_feedback_commit_push_context(tmp_path)
+    monkeypatch.setattr(
+        orch,
+        "_validate_roadmap_feedback_artifacts",
+        lambda **_: "graph version drifted",
+    )
+    monkeypatch.setattr(
+        orch,
+        "_run_feedback_agent_with_git_ops",
+        lambda **_: (
+            FeedbackResult(
+                session=AgentSession(adapter="codex", thread_id="thread-2"),
+                review_replies=(),
+                general_comment="The roadmap comments are contradictory.",
+                commit_message=None,
+                git_ops=(),
+            ),
+            github.pr_snapshot,
+        ),
+    )
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=checkout,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+    assert state.status_updates[-1][2] == "blocked"
+    assert state.status_updates[-1][4] == "The roadmap comments are contradictory."
+
+
+def test_commit_push_feedback_roadmap_validation_returns_none_when_repair_round_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        orch,
+        _git,
+        _github,
+        _state,
+        tracked,
+        turn,
+        result,
+        checkout,
+    ) = _roadmap_feedback_commit_push_context(tmp_path)
+    monkeypatch.setattr(
+        orch,
+        "_validate_roadmap_feedback_artifacts",
+        lambda **_: "graph version drifted",
+    )
+    monkeypatch.setattr(orch, "_run_feedback_agent_with_git_ops", lambda **_: None)
+
+    outcome = orch._commit_push_feedback_with_required_tests(
+        tracked=tracked,
+        checkout_path=checkout,
+        turn=turn,
+        result=result,
+        pull_request=turn.pull_request,
+        turn_start_head="head-1",
+    )
+
+    assert outcome is None
+
+
 def test_run_feedback_agent_with_git_ops_marks_codex_finished_on_agent_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -13557,6 +14764,139 @@ def test_operator_unblock_without_pr_fails_on_operations_issue(tmp_path: Path) -
     assert "unblock pr=<number>" in github.posted_comments[0][1]
 
 
+def test_operator_retry_rearms_failed_issue_from_issue_thread(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_failed(151, "roadmap schema rejected", repo_full_name=cfg.repo.full_name)
+    github = OperatorGitHub(
+        {
+            151: [
+                _operator_issue_comment(
+                    comment_id=19,
+                    body="/mergexo retry",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:08:30Z",
+                    issue_number=151,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    command = state.get_operator_command("151:19:2026-02-22T12:08:30Z")
+    assert command is not None
+    assert command.command == "retry"
+    assert command.status == "applied"
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 151
+    assert "Re-armed failed issue #151 for retry" in github.posted_comments[0][1]
+
+    retry_run_id = state.claim_new_issue_run_start(
+        issue_number=151,
+        flow="roadmap",
+        branch="agent/roadmap/151-retry",
+        run_id="run-151-retry",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert retry_run_id == "run-151-retry"
+
+
+def test_operator_retry_requires_target_on_operations_issue(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=20,
+                    body="/mergexo retry",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:08:40Z",
+                    issue_number=77,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    command = state.get_operator_command("77:20:2026-02-22T12:08:40Z")
+    assert command is not None
+    assert command.command == "retry"
+    assert command.status == "failed"
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 77
+    assert "retry issue=<number>" in github.posted_comments[0][1]
+
+
+def test_operator_retry_targets_failed_issue_from_operations_issue(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        enable_github_operations=True,
+        operator_logins=("alice",),
+        operations_issue_number=77,
+    )
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    state.mark_failed(151, "roadmap schema rejected", repo_full_name=cfg.repo.full_name)
+    github = OperatorGitHub(
+        {
+            77: [
+                _operator_issue_comment(
+                    comment_id=21,
+                    body="/mergexo retry issue=151",
+                    user_login="alice",
+                    updated_at="2026-02-22T12:08:50Z",
+                    issue_number=77,
+                )
+            ]
+        }
+    )
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    orch._scan_operator_commands()
+
+    command = state.get_operator_command("77:21:2026-02-22T12:08:50Z")
+    assert command is not None
+    assert command.command == "retry"
+    assert command.status == "applied"
+    assert len(github.posted_comments) == 1
+    assert github.posted_comments[0][0] == 151
+    assert "status: `applied`" in github.posted_comments[0][1]
+
+
 def test_operator_commands_reject_unauthorized_and_parse_failures(tmp_path: Path) -> None:
     cfg = _config(
         tmp_path,
@@ -13749,6 +15089,30 @@ def test_apply_unblock_command_fails_when_target_not_blocked(tmp_path: Path) -> 
     assert status == "failed"
     assert pr_number == 999
     assert "not currently blocked" in detail
+
+
+def test_apply_retry_command_fails_when_target_not_failed(tmp_path: Path) -> None:
+    cfg = _config(tmp_path, enable_github_operations=True, operator_logins=("alice",))
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    github = OperatorGitHub({})
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=cast(GitHubGateway, github),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    parsed = parse_operator_command("/mergexo retry issue=999")
+    assert isinstance(parsed, ParsedOperatorCommand)
+    status, detail, issue_number = orch._apply_retry_issue_command(
+        source_issue_number=77,
+        source_pr_number=None,
+        parsed=parsed,
+    )
+    assert status == "failed"
+    assert issue_number == 999
+    assert "not currently a failed pre-PR issue run" in detail
 
 
 def test_operator_scan_skips_non_commands_bots_and_reconciles_existing(tmp_path: Path) -> None:
@@ -14057,6 +15421,20 @@ def test_operator_helper_functions_cover_fallbacks(monkeypatch: pytest.MonkeyPat
         _operator_source_comment_url(command=payload_command, repo_full_name="r/n") == "https://x"
     )
     assert _operator_reply_status_for_record(payload_command) == "rejected"
+    retry_record = OperatorCommandRecord(
+        command_key="k-retry",
+        issue_number=77,
+        pr_number=None,
+        comment_id=15,
+        author_login="alice",
+        command="retry",
+        args_json='{"args":{"issue":"151"}}',
+        status="applied",
+        result="ok",
+        created_at="t1",
+        updated_at="t2",
+    )
+    assert _operator_reply_issue_number(retry_record) == 151
     help_record = OperatorCommandRecord(
         command_key="k4",
         issue_number=77,
@@ -18235,6 +19613,12 @@ def test_process_issue_roadmap_validation_and_required_tests_paths(
     )
     with pytest.raises(RuntimeError, match="codex failed"):
         failing_orch._process_issue(issue, "roadmap")
+    assert any(
+        issue_number == 120
+        and "MergeXO roadmap flow failed while processing this issue." in body
+        and "codex failed" in body
+        for issue_number, body in github.comments
+    )
 
     mismatch_agent = FakeAgent()
     mismatch_orch = Phase1Orchestrator(
@@ -18292,6 +19676,32 @@ def test_process_issue_roadmap_validation_and_required_tests_paths(
         for issue_number, body in github.comments
         if issue_number == 120
     )
+
+
+def test_process_issue_logs_when_failure_comment_posting_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    issue = _issue(121, "Roadmap", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    state = StateStore(tmp_path / "state.db")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=git,
+        agent=FakeAgent(fail=True),
+    )
+
+    def fail_report(*, issue: Issue, flow: str, exc: Exception) -> None:
+        _ = issue, flow, exc
+        raise RuntimeError("failed to post failure comment")
+
+    monkeypatch.setattr(orch, "_report_issue_processing_failure", fail_report)
+
+    with pytest.raises(RuntimeError, match="codex failed"):
+        orch._process_issue(issue, "roadmap")
 
 
 def test_process_issue_roadmap_posts_size_recommendation(tmp_path: Path) -> None:
