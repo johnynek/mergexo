@@ -94,6 +94,7 @@ from mergexo.prompts import (
     build_roadmap_prompt,
     build_small_job_prompt,
 )
+from mergexo.roadmap_markdown import render_roadmap_markdown
 from mergexo.roadmap_parser import (
     RoadmapGraphValidationError,
     parse_roadmap_graph_json,
@@ -284,6 +285,13 @@ class _RoadmapAdjustmentContext:
     dependency_artifacts: tuple[RoadmapDependencyArtifact, ...]
     status_report: str
     basis_digest: str
+
+
+@dataclass(frozen=True)
+class _MaterializedRoadmapArtifacts:
+    canonical_graph_json: str
+    roadmap_markdown: str
+    graph_version: int
 
 
 class DirectFlowError(RuntimeError):
@@ -1550,8 +1558,6 @@ class Phase1Orchestrator:
         ready_node_ids: tuple[str, ...],
         request_reason: str | None,
     ) -> RoadmapRevisionDraftRecord:
-        if decision.updated_roadmap_markdown is None:
-            raise RuntimeError("revise decision missing updated roadmap markdown")
         if decision.updated_canonical_graph_json is None:
             raise RuntimeError("revise decision missing updated roadmap graph")
 
@@ -1567,7 +1573,7 @@ class Phase1Orchestrator:
             request_version=parsed.graph.version,
             summary=decision.summary,
             details=decision.details,
-            updated_roadmap_markdown=decision.updated_roadmap_markdown,
+            updated_roadmap_markdown=render_roadmap_markdown(parsed.graph),
             updated_canonical_graph_json=parsed.canonical_json,
             source_kind=source_kind,
             ready_node_ids_json=(
@@ -1618,15 +1624,12 @@ class Phase1Orchestrator:
         issue = self._github.get_issue(roadmap.roadmap_issue_number)
         self._git.create_or_reset_branch(checkout_path, branch)
 
-        roadmap_abs_path = checkout_path / roadmap.roadmap_doc_path
-        graph_abs_path = checkout_path / roadmap.graph_path
-        roadmap_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        graph_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        roadmap_abs_path.write_text(draft.updated_roadmap_markdown, encoding="utf-8")
-        graph_payload = json.loads(parsed.canonical_json)
-        graph_abs_path.write_text(
-            json.dumps(graph_payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        self._materialize_roadmap_artifacts(
+            checkout_path=checkout_path,
+            roadmap_doc_path=roadmap.roadmap_doc_path,
+            graph_path=roadmap.graph_path,
+            graph_json=parsed.canonical_json,
+            expected_issue_number=roadmap.roadmap_issue_number,
         )
 
         if self._git.list_staged_files(checkout_path):
@@ -6055,14 +6058,12 @@ class Phase1Orchestrator:
                 "Roadmap graph issue number did not match the source issue number"
             )
 
-        roadmap_abs_path = checkout_path / roadmap_relpath
-        graph_abs_path = checkout_path / graph_relpath
-        roadmap_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        roadmap_abs_path.write_text(generated.roadmap_markdown, encoding="utf-8")
-        graph_payload = json.loads(generated.canonical_graph_json)
-        graph_abs_path.write_text(
-            json.dumps(graph_payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        self._materialize_roadmap_artifacts(
+            checkout_path=checkout_path,
+            roadmap_doc_path=roadmap_relpath,
+            graph_path=graph_relpath,
+            graph_json=generated.canonical_graph_json,
+            expected_issue_number=issue.number,
         )
 
         self._git.commit_all(checkout_path, f"docs: add roadmap for issue #{issue.number}")
@@ -8733,22 +8734,54 @@ class Phase1Orchestrator:
             changed_files=changed_files,
         )
 
+    def _materialize_roadmap_artifacts(
+        self,
+        *,
+        checkout_path: Path,
+        roadmap_doc_path: str,
+        graph_path: str,
+        graph_json: str,
+        expected_issue_number: int,
+    ) -> _MaterializedRoadmapArtifacts:
+        parsed = parse_roadmap_graph_json(
+            graph_json,
+            expected_issue_number=expected_issue_number,
+        )
+        roadmap_markdown = render_roadmap_markdown(parsed.graph)
+        graph_text = (
+            json.dumps(
+                json.loads(parsed.canonical_json),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        roadmap_abs_path = checkout_path / roadmap_doc_path
+        graph_abs_path = checkout_path / graph_path
+        roadmap_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        graph_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_text_if_changed(roadmap_abs_path, roadmap_markdown)
+        self._write_text_if_changed(graph_abs_path, graph_text)
+        return _MaterializedRoadmapArtifacts(
+            canonical_graph_json=parsed.canonical_json,
+            roadmap_markdown=roadmap_markdown,
+            graph_version=parsed.graph.version,
+        )
+
+    def _write_text_if_changed(self, path: Path, content: str) -> None:
+        try:
+            if path.read_text(encoding="utf-8") == content:
+                return
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            pass
+        path.write_text(content, encoding="utf-8")
+
     def _validate_roadmap_feedback_artifacts(
         self,
         *,
         turn: RoadmapFeedbackTurn,
         checkout_path: Path,
     ) -> str | None:
-        roadmap_abs_path = checkout_path / turn.roadmap_doc_path
-        if not roadmap_abs_path.exists():
-            return f"missing roadmap markdown file: {turn.roadmap_doc_path}"
-        try:
-            roadmap_markdown = roadmap_abs_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            return f"roadmap markdown is unreadable at {turn.roadmap_doc_path}: {exc}"
-        if not roadmap_markdown.strip():
-            return f"roadmap markdown is empty at {turn.roadmap_doc_path}"
-
         graph_abs_path = checkout_path / turn.graph_path
         if not graph_abs_path.exists():
             return f"missing roadmap graph file: {turn.graph_path}"
@@ -8758,25 +8791,37 @@ class Phase1Orchestrator:
             return f"roadmap graph is unreadable at {turn.graph_path}: {exc}"
 
         try:
-            parsed = parse_roadmap_graph_json(graph_raw, expected_issue_number=turn.issue.number)
+            materialized = self._materialize_roadmap_artifacts(
+                checkout_path=checkout_path,
+                roadmap_doc_path=turn.roadmap_doc_path,
+                graph_path=turn.graph_path,
+                graph_json=graph_raw,
+                expected_issue_number=turn.issue.number,
+            )
         except RoadmapGraphValidationError as exc:
             return f"invalid roadmap graph: {exc}"
+        except (OSError, RuntimeError, ValueError) as exc:
+            return f"failed to regenerate roadmap markdown: {exc}"
+
+        roadmap_abs_path = checkout_path / turn.roadmap_doc_path
+        if not roadmap_abs_path.exists():
+            return f"missing generated roadmap markdown file: {turn.roadmap_doc_path}"
 
         roadmap_state = self._maybe_lookup_roadmap_state_for_feedback(
             issue_number=turn.issue.number
         )
         if roadmap_state is None:
-            if parsed.graph.version != 1:
+            if materialized.graph_version != 1:
                 return (
                     "initial roadmap PR must keep graph version 1 until the roadmap is merged: "
-                    f"got {parsed.graph.version}"
+                    f"got {materialized.graph_version}"
                 )
         else:
             expected_version = roadmap_state.adjustment_request_version
-            if expected_version is not None and parsed.graph.version != expected_version:
+            if expected_version is not None and materialized.graph_version != expected_version:
                 return (
                     "same-roadmap revision PR must keep the requested graph version unchanged: "
-                    f"expected {expected_version}, got {parsed.graph.version}"
+                    f"expected {expected_version}, got {materialized.graph_version}"
                 )
         return None
 
@@ -8805,8 +8850,8 @@ class Phase1Orchestrator:
                 f"- roadmap markdown path: `{turn.roadmap_doc_path}`\n"
                 f"- roadmap graph path: `{turn.graph_path}`\n"
                 f"- repair_round: {repair_round}\n"
-                "- Keep the roadmap markdown and graph in sync.\n"
-                "- Repair the roadmap artifacts so the graph is valid and the PR can be pushed.\n"
+                "- Edit the roadmap graph file, not the generated markdown file.\n"
+                "- Repair the graph so MergeXO can regenerate markdown and push the PR.\n"
                 "- If impossible, set commit_message to null and explain why in general_comment.\n\n"
                 "Validation error:\n"
                 f"{trimmed_output}"
@@ -9007,59 +9052,6 @@ class Phase1Orchestrator:
                 has_commit_message=current_result.commit_message is not None,
             )
 
-            if current_result.commit_message is not None:
-                try:
-                    self._git.commit_all(checkout_path, current_result.commit_message)
-                except RuntimeError as exc:
-                    if not _is_no_staged_changes_error(exc):
-                        raise
-                    local_head_after_noop = self._git.current_head_sha(checkout_path)
-                    if local_head_after_noop != turn_start_head and self._git.is_ancestor(
-                        checkout_path, turn_start_head, local_head_after_noop
-                    ):
-                        log_event(
-                            LOGGER,
-                            "feedback_agent_local_commit_detected",
-                            issue_number=tracked.issue_number,
-                            pr_number=tracked.pr_number,
-                            branch=tracked.branch,
-                            turn_start_head_sha=turn_start_head,
-                            local_head_before_sha=local_head_sha,
-                            local_head_after_sha=local_head_after_noop,
-                        )
-                    else:
-                        error = (
-                            "agent returned commit_message but no staged changes were found; "
-                            "feedback turn requires repo edits before posting replies"
-                        )
-                        self._mark_feedback_blocked(
-                            pr_number=tracked.pr_number,
-                            issue_number=tracked.issue_number,
-                            reason="commit_message_without_changes",
-                            error=error,
-                            last_seen_head_sha=current_pr.head_sha,
-                            comment_body=(
-                                "MergeXO feedback automation is blocked because the agent "
-                                "returned `commit_message` but no new staged changes or local "
-                                "commits were detected.\n\n"
-                                "Action: request concrete file edits (or explicit `git_ops`), "
-                                "then reset blocked feedback state."
-                            ),
-                        )
-                        return None
-            else:
-                # A git-op round can advance local HEAD (for example merge origin/main)
-                # without requiring additional file edits from the agent.
-                log_event(
-                    LOGGER,
-                    "feedback_git_op_local_commit_detected",
-                    issue_number=tracked.issue_number,
-                    pr_number=tracked.pr_number,
-                    branch=tracked.branch,
-                    turn_start_head_sha=turn_start_head,
-                    local_head_sha=local_head_sha,
-                )
-
             if isinstance(current_turn, RoadmapFeedbackTurn):
                 validation_error = self._validate_roadmap_feedback_artifacts(
                     turn=current_turn,
@@ -9147,6 +9139,59 @@ class Phase1Orchestrator:
                         )
                         return None
                     continue
+
+            if current_result.commit_message is not None:
+                try:
+                    self._git.commit_all(checkout_path, current_result.commit_message)
+                except RuntimeError as exc:
+                    if not _is_no_staged_changes_error(exc):
+                        raise
+                    local_head_after_noop = self._git.current_head_sha(checkout_path)
+                    if local_head_after_noop != turn_start_head and self._git.is_ancestor(
+                        checkout_path, turn_start_head, local_head_after_noop
+                    ):
+                        log_event(
+                            LOGGER,
+                            "feedback_agent_local_commit_detected",
+                            issue_number=tracked.issue_number,
+                            pr_number=tracked.pr_number,
+                            branch=tracked.branch,
+                            turn_start_head_sha=turn_start_head,
+                            local_head_before_sha=local_head_sha,
+                            local_head_after_sha=local_head_after_noop,
+                        )
+                    else:
+                        error = (
+                            "agent returned commit_message but no staged changes were found; "
+                            "feedback turn requires repo edits before posting replies"
+                        )
+                        self._mark_feedback_blocked(
+                            pr_number=tracked.pr_number,
+                            issue_number=tracked.issue_number,
+                            reason="commit_message_without_changes",
+                            error=error,
+                            last_seen_head_sha=current_pr.head_sha,
+                            comment_body=(
+                                "MergeXO feedback automation is blocked because the agent "
+                                "returned `commit_message` but no new staged changes or local "
+                                "commits were detected.\n\n"
+                                "Action: request concrete file edits (or explicit `git_ops`), "
+                                "then reset blocked feedback state."
+                            ),
+                        )
+                        return None
+            else:
+                # A git-op round can advance local HEAD (for example merge origin/main)
+                # without requiring additional file edits from the agent.
+                log_event(
+                    LOGGER,
+                    "feedback_git_op_local_commit_detected",
+                    issue_number=tracked.issue_number,
+                    pr_number=tracked.pr_number,
+                    branch=tracked.branch,
+                    turn_start_head_sha=turn_start_head,
+                    local_head_sha=local_head_sha,
+                )
 
             required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
             if required_tests_error is not None:

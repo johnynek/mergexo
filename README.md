@@ -6,7 +6,7 @@ The goal is agentic development with normal software rigor: decisions are captur
 
 MergeXO is a local-first Python orchestrator that watches labeled issues and routes each issue into one startup flow:
 
-- `roadmap`: open a roadmap PR with canonical DAG JSON, then keep the same roadmap updated as dependency work changes what should happen next
+- `roadmap`: open a roadmap PR with canonical DAG JSON plus generated markdown, then keep the same roadmap updated as dependency work changes what should happen next
 - `design_doc`: open a design-doc PR first, then implementation PR work after merge
 - `bugfix`: open a direct bugfix PR
 - `small_job`: open a direct scoped-change PR
@@ -99,7 +99,7 @@ This is the recommended first run because it gives you both orchestration and vi
 
 ## MergeXO Roadmaps
 
-Roadmaps are a feature-flagged flow for multi-step work. MergeXO stores the roadmap as canonical markdown plus versioned DAG JSON, then treats that roadmap as a living plan: before issuing each ready frontier, it evaluates whether the current roadmap still matches what completed dependency work taught us.
+Roadmaps are a feature-flagged flow for multi-step work. MergeXO stores the roadmap graph JSON as the source of truth, generates a deterministic markdown review view from that graph, and then treats the roadmap as a living plan: before issuing each ready frontier, it evaluates whether the current roadmap still matches what completed dependency work taught us.
 
 ### Quick Start
 
@@ -128,7 +128,7 @@ Then do this:
 
 1. Starting a roadmap
    - You open issue `#123` for a larger feature and add `agent:roadmap`.
-   - MergeXO opens a roadmap PR with a narrative plan and canonical graph JSON (`docs/roadmap/123-....graph.json`).
+   - MergeXO opens a roadmap PR with generated markdown plus canonical graph JSON (`docs/roadmap/123-....graph.json`).
    - You review and merge it to activate the plan.
 
 2. Watching the roadmap execute
@@ -138,9 +138,11 @@ Then do this:
 
 3. Steering the roadmap as reality changes
    - If a completed PR reveals a technical hurdle, MergeXO returns `revise`.
-   - **Auto-Revision:** It opens or reuses a **same-roadmap revision PR** (e.g., on branch `agent/roadmap/123-revision-v2`). This PR updates the canonical Markdown and JSON files in your repo.
+   - **Auto-Revision:** It opens or reuses a **same-roadmap revision PR** (e.g., on branch `agent/roadmap/123-revision-v2`). This PR updates the canonical graph JSON and the generated markdown view in your repo.
    - **Manual Steering:** You can force a revision at any time by adding `agent:roadmap-revise` to the roadmap issue. MergeXO will then ask the agent to propose a concrete update based on current progress.
    - The roadmap pauses fan-out until you review and merge this revision PR.
+
+If you want to preview or regenerate the markdown locally while reviewing, run `python roadmap_json_to_md.py path/to/roadmap.graph.json --output path/to/roadmap.md`.
 
 ### Visibility and Control
 
@@ -228,10 +230,10 @@ Assume one repo with labels:
 
 4. Roadmap flow issue (feature-flagged):
    - Set `runtime.enable_roadmaps = true` and apply `agent:roadmap` to issue `#123`.
-   - MergeXO opens `agent/roadmap/123-...` and creates both `docs/roadmap/123-...md` and `docs/roadmap/123-....graph.json`.
+   - MergeXO opens `agent/roadmap/123-...` and creates both the generated `docs/roadmap/123-...md` file and the source-of-truth `docs/roadmap/123-....graph.json`.
    - After merge, MergeXO activates the roadmap DAG, then runs an adjustment gate before each ready frontier using the current roadmap plus dependency artifacts from completed child work.
    - If the gate says `proceed`, MergeXO opens only the currently ready child issues and keeps parent-child links in issue bodies.
-   - If the gate says `revise`, or if a maintainer applies `agent:roadmap-revise`, MergeXO pauses fan-out and opens or reuses a same-roadmap revision PR against the canonical roadmap markdown and graph.
+   - If the gate says `revise`, or if a maintainer applies `agent:roadmap-revise`, MergeXO pauses fan-out and opens or reuses a same-roadmap revision PR against the canonical roadmap graph and regenerated markdown view.
    - Comment `/roadmap status` on the roadmap issue for a live status report. Apply `agent:roadmap-abandon` to abandon the roadmap entirely.
    - Child PRs should reference only their direct child issue; MergeXO closes the parent roadmap issue once all roadmap nodes reach terminal outcomes or the roadmap is abandoned.
 
@@ -507,7 +509,7 @@ Do not mix both shapes in one file.
 | `small_job_label` | no | `"agent:small-job"` | small-job flow trigger |
 | `ignore_label` | no | `"agent:ignore"` | human takeover label; preempts all automation while present |
 | `roadmap_label` | no | `"agent:roadmap"` | roadmap flow trigger; only active when `runtime.enable_roadmaps = true` |
-| `roadmap_docs_dir` | no | `"docs/roadmap"` | canonical markdown + `.graph.json` output directory for roadmap PRs |
+| `roadmap_docs_dir` | no | `"docs/roadmap"` | generated markdown + source-of-truth `.graph.json` output directory for roadmap PRs |
 | `roadmap_revision_label` | no | `"agent:roadmap-revise"` | manual same-roadmap revision request label |
 | `roadmap_abandon_label` | no | `"agent:roadmap-abandon"` | manual roadmap abandon label |
 | `roadmap_recommended_node_count` | no | `7` | sizing recommendation for roadmap graphs; must be `>= 1` |

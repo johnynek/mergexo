@@ -46,6 +46,7 @@ from mergexo.prompts import (
     build_roadmap_prompt,
     build_small_job_prompt,
 )
+from mergexo.roadmap_markdown import render_roadmap_markdown
 from mergexo.roadmap_parser import parse_roadmap_graph_object
 from mergexo.shell import CommandError, DurableLaunch, RunningCommand, run
 
@@ -152,11 +153,10 @@ _ROADMAP_GRAPH_SCHEMA: dict[str, object] = {
 _ROADMAP_OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["title", "summary", "roadmap_markdown", "graph_json"],
+    "required": ["title", "summary", "graph_json"],
     "properties": {
         "title": {"type": "string", "minLength": 1},
         "summary": {"type": "string", "minLength": 1},
-        "roadmap_markdown": {"type": "string", "minLength": 1},
         "graph_json": _ROADMAP_GRAPH_SCHEMA,
     },
 }
@@ -168,7 +168,6 @@ _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA: dict[str, object] = {
         "action",
         "summary",
         "details",
-        "updated_roadmap_markdown",
         "updated_graph_json",
     ],
     "properties": {
@@ -178,7 +177,6 @@ _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA: dict[str, object] = {
         },
         "summary": {"type": "string", "minLength": 1},
         "details": {"type": "string", "minLength": 1},
-        "updated_roadmap_markdown": _NONEMPTY_NULLABLE_STRING_SCHEMA,
         "updated_graph_json": {
             "anyOf": [
                 {"type": "null"},
@@ -949,13 +947,13 @@ class CodexAdapter(AgentAdapter):
 
         title = _require_str(payload, "title")
         summary = _require_str(payload, "summary")
-        roadmap_markdown = _require_str(payload, "roadmap_markdown")
         graph_obj = payload.get("graph_json")
         if graph_obj is None:
             raise RuntimeError("Codex response missing required graph_json object")
         parsed_graph = parse_roadmap_graph_object(
             graph_obj, expected_issue_number=expected_issue_number
         )
+        roadmap_markdown = render_roadmap_markdown(parsed_graph.graph)
         return (
             GeneratedRoadmap(
                 title=title,
@@ -1138,12 +1136,10 @@ class CodexAdapter(AgentAdapter):
         action = _require_str(payload, "action")
         if action not in {"proceed", "revise", "abandon"}:
             raise RuntimeError("action must be one of: proceed, revise, abandon")
-        updated_roadmap_markdown = _optional_output_text(payload.get("updated_roadmap_markdown"))
         updated_graph_json_payload = payload.get("updated_graph_json")
+        updated_roadmap_markdown: str | None = None
         updated_canonical_graph_json: str | None = None
         if action == "revise":
-            if updated_roadmap_markdown is None:
-                raise RuntimeError("revise action requires non-null updated_roadmap_markdown")
             updated_graph_json = _as_object_dict(updated_graph_json_payload)
             if updated_graph_json is None:
                 raise RuntimeError("revise action requires non-null updated_graph_json object")
@@ -1156,11 +1152,12 @@ class CodexAdapter(AgentAdapter):
                     "revise action must bump roadmap graph version by exactly 1: "
                     f"expected {expected_version}, got {parsed_graph.graph.version}"
                 )
+            updated_roadmap_markdown = render_roadmap_markdown(parsed_graph.graph)
             updated_canonical_graph_json = parsed_graph.canonical_json
         else:
-            if updated_roadmap_markdown is not None or updated_graph_json_payload is not None:
+            if updated_graph_json_payload is not None:
                 raise RuntimeError(
-                    "proceed and abandon actions must set updated roadmap payload fields to null"
+                    "proceed and abandon actions must set updated_graph_json to null"
                 )
         return RoadmapAdjustmentResult(
             action=cast(RoadmapAdjustmentAction, action),
