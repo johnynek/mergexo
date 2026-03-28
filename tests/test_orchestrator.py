@@ -761,6 +761,7 @@ class FakeState:
         self._action_tokens: dict[str, ActionTokenState] = {}
         self._poll_cursors: dict[tuple[str, int], GitHubCommentPollCursorState] = {}
         self._issue_comment_cursors: dict[int, tuple[int, int]] = {}
+        self._issue_github_state_by_issue: dict[int, str | None] = {}
         self._takeover_active_issue_numbers: set[int] = set()
         self._takeover_comment_floors_by_pr: dict[int, tuple[int, int]] = {}
         self._next_github_call_id = 1
@@ -1196,6 +1197,18 @@ class FakeState:
                     "updated_at": "now",
                 },
             )(),
+        )
+
+    def set_issue_github_state(
+        self,
+        *,
+        issue_number: int,
+        github_state: str | None,
+        repo_full_name: str | None = None,
+    ) -> None:
+        _ = repo_full_name
+        self._issue_github_state_by_issue[issue_number] = (
+            github_state.strip().lower() if github_state is not None else None
         )
 
     def list_active_issue_takeovers(self, *, repo_full_name: str | None = None) -> tuple[int, ...]:
@@ -1875,6 +1888,7 @@ def _issue(
     title: str = "Add worker scheduler",
     labels: tuple[str, ...] = ("agent:design",),
     author_login: str = "issue-author",
+    state: str = "open",
 ) -> Issue:
     return Issue(
         number=number,
@@ -1883,6 +1897,7 @@ def _issue(
         html_url=f"https://example/issues/{number}",
         labels=labels,
         author_login=author_login,
+        state=state,
     )
 
 
@@ -4658,6 +4673,41 @@ def test_cleanup_persisted_codex_processes_resolves_launch_without_pid(
     assert killed == [(321, 654, 5.0)]
 
 
+def test_issue_snapshot_for_poll_rejects_non_positive_issue_numbers(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        orch._issue_snapshot_for_poll(issue_number=0)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        orch._issue_snapshot_for_poll(issue_number="7")  # type: ignore[arg-type]
+
+
+def test_issue_snapshot_for_poll_uses_cache_and_updates_state(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(state="closed")])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    snapshot = orch._issue_snapshot_for_poll(issue_number=7)
+
+    assert snapshot.state == "closed"
+    assert state._issue_github_state_by_issue[7] == "closed"
+
+    github.issues = [_issue(state="open")]
+    cached_snapshot = orch._issue_snapshot_for_poll(issue_number=7)
+
+    assert cached_snapshot.state == "closed"
+    assert state._issue_github_state_by_issue[7] == "closed"
+
+
 def test_observe_agent_invocations_updates_run_meta_and_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7298,6 +7348,20 @@ def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
         )
         is None
     )  # type: ignore[dict-item]
+    assert (
+        _issue_from_json_dict(
+            {
+                "number": 7,
+                "title": "x",
+                "body": "y",
+                "html_url": "u",
+                "author_login": "a",
+                "state": 1,
+                "labels": [],
+            }
+        )
+        is None
+    )
     assert (
         _issue_from_json_dict(
             {

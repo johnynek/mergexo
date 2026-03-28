@@ -23,6 +23,7 @@ class Issue:
     html_url: str
     labels: tuple[str, ...]
     author_login: str = ""
+    state: str = "open"
 
 
 @dataclass(frozen=True)

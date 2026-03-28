@@ -23,6 +23,7 @@ from mergexo.service_runner import ServiceSignal
 
 
 def test_observability_tui_helper_functions() -> None:
+    assert tui._BRANCH_COLUMN_MAX_CHARS == 25
     assert tui._normalize_window("7D") == "7d"
     assert tui._normalize_window("bad") == "24h"
     assert tui._next_window("24h") == "7d"
@@ -83,6 +84,21 @@ def test_observability_tui_helper_functions() -> None:
     assert (
         tui._url_for_tracked_row(tracked_pr, 4) == "https://github.com/o/repo-a/tree/agent/design/7"
     )
+    assert (
+        tui._url_for_history_row(
+            merged_outcome := TerminalIssueOutcomeRow(
+                repo_full_name="o/repo-a",
+                issue_number=7,
+                pr_number=101,
+                status="merged",
+                branch="agent/design/7",
+                updated_at="2026-02-24T00:00:00.000Z",
+            ),
+            3,
+        )
+        == "https://github.com/o/repo-a/issues/7"
+    )
+    assert tui._url_for_history_row(merged_outcome, 4) == "https://github.com/o/repo-a/pull/101"
     assert tui._url_for_tracked_row(tracked_issue, 1) == "https://github.com/o/repo-a/issues/8"
     assert tui._url_for_tracked_row(tracked_issue, 2) is None
     assert tui._tracked_row_key(tracked_pr) == ("o/repo-a", 101, 7, "blocked")
@@ -93,6 +109,8 @@ def test_observability_tui_helper_functions() -> None:
     assert tui._render_context_snippet("abcdefghijklmnopqrstuvwxyz", max_chars=2) == ".."
     assert tui._render_context_snippet("abc", max_chars=0) == ""
     assert tui._render_context_snippet("   ", max_chars=10) == "-"
+    assert tui._render_branch_snippet(None) == "-"
+    assert tui._render_branch_snippet("abcdefghijklmnopqrstuvwxyz") == "abcdefghijklmnopqrstuv..."
 
     active_context = tui._active_row_context(active)
     assert "Issue: 7" in active_context
@@ -124,14 +142,6 @@ def test_observability_tui_helper_functions() -> None:
     assert tracked_issue_field_map["PR"].url is None
     assert tracked_issue_field_map["Last Seen Head SHA"].value == "-"
     assert tracked_issue_field_map["Last Seen Head SHA"].url is None
-    merged_outcome = TerminalIssueOutcomeRow(
-        repo_full_name="o/repo-a",
-        issue_number=7,
-        pr_number=101,
-        status="merged",
-        branch="agent/design/7",
-        updated_at="2026-02-24T00:00:00.000Z",
-    )
     closed_outcome = TerminalIssueOutcomeRow(
         repo_full_name="o/repo-a",
         issue_number=8,
@@ -186,6 +196,7 @@ def test_observability_tui_helper_functions() -> None:
     no_pr_history_field_map = {field.label: field for field in no_pr_history_fields}
     assert no_pr_history_field_map["PR"].value == "-"
     assert no_pr_history_field_map["PR"].url is None
+    assert tui._url_for_history_row(no_pr_outcome, 4) is None
     sort_stack: tuple[tui._TrackedSortKey, ...] = ()
     sort_stack = tui._next_tracked_sort_stack(sort_stack, 2)
     assert sort_stack == (tui._TrackedSortKey(column_index=2, descending=True),)
@@ -693,19 +704,33 @@ def test_observability_app_refresh_and_keybindings(
             active.move_cursor(row=0, column=2, animate=False)
             await _pilot.press("enter")
             await _pilot.pause()
+            assert opened_urls == []
+            assert shown_details[-1][0] == "Issue #7 Context"
+            await _pilot.press("o")
+            await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
             tracked.focus()
             await _pilot.pause()
             tracked.move_cursor(row=0, column=1, animate=False)
             await _pilot.press("enter")
             await _pilot.pause()
+            assert shown_details[-1][0] == "PR #101 Context"
+            assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
+            await _pilot.press("o")
+            await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
             tracked.move_cursor(row=0, column=2, animate=False)
             await _pilot.press("enter")
             await _pilot.pause()
+            assert shown_details[-1][0] == "PR #101 Context"
+            await _pilot.press("o")
+            await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/pull/101"
             tracked.move_cursor(row=0, column=4, animate=False)
             await _pilot.press("enter")
+            await _pilot.pause()
+            assert shown_details[-1][0] == "PR #101 Context"
+            await _pilot.press("o")
             await _pilot.pause()
             assert opened_urls[-1] == "https://github.com/o/repo-a/tree/agent/design/7"
             tracked.move_cursor(row=0, column=6, animate=False)
@@ -724,6 +749,9 @@ def test_observability_app_refresh_and_keybindings(
             assert shown_details[-1][0] == "Issue #7 Completed"
             assert "Repo URL: https://github.com/o/repo-a" in shown_details[-1][1]
             assert "PR URL: https://github.com/o/repo-a/pull/101" in shown_details[-1][1]
+            await _pilot.press("o")
+            await _pilot.pause()
+            assert opened_urls[-1] == "https://github.com/o/repo-a/issues/7"
             app.action_refresh()
             assert history.cursor_row == 1
             assert history.cursor_column == 3
@@ -1039,26 +1067,26 @@ def test_detail_modal_field_navigation_opens_urls(
             assert isinstance(app.screen, tui._DetailModal)
             table = app.query_one("#detail-fields-table", DataTable)
             table.move_cursor(row=4, column=1, animate=False)  # Status has no URL
-            await pilot.press("enter")
+            await pilot.press("o")
             await pilot.pause()
             assert opened == []
             table.move_cursor(row=0, column=1, animate=False)  # Repo
-            await pilot.press("enter")
+            await pilot.press("o")
             await pilot.pause()
             assert len(opened) == 1
             assert opened[-1] == "https://github.com/o/repo-a"
             table.move_cursor(row=2, column=1, animate=False)  # Issue
-            await pilot.press("enter")
+            await pilot.press("o")
             await pilot.pause()
             assert len(opened) == 2
             assert opened[-1] == "https://github.com/o/repo-a/issues/7"
             table.move_cursor(row=3, column=1, animate=False)  # PR
-            await pilot.press("enter")
+            await pilot.press("o")
             await pilot.pause()
             assert len(opened) == 3
             assert opened[-1] == "https://github.com/o/repo-a/pull/101"
             table.move_cursor(row=7, column=1, animate=False)  # SHA commit
-            await pilot.press("enter")
+            await pilot.press("o")
             await pilot.pause()
             assert len(opened) == 4
             assert opened[-1] == "https://github.com/o/repo-a/commit/abc123"
@@ -1433,16 +1461,69 @@ def test_detail_modal_close_action_calls_dismiss(monkeypatch: pytest.MonkeyPatch
     assert dismissed == [None]
 
 
-def test_detail_modal_activate_without_fields_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detail_field_table_enter_closes_modal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        tui,
+        "load_overview",
+        lambda *args, **kwargs: OverviewStats(
+            active_agents=0,
+            blocked_prs=0,
+            tracked_prs=0,
+            failures=0,
+            mean_runtime_seconds=0.0,
+            stddev_runtime_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(tui, "load_active_agents", lambda *args, **kwargs: ())
+    monkeypatch.setattr(tui, "load_tracked_and_blocked", lambda *args, **kwargs: ())
+    monkeypatch.setattr(
+        tui,
+        "load_metrics",
+        lambda *args, **kwargs: MetricsStats(
+            overall=RuntimeMetric(
+                repo_full_name="__all__",
+                terminal_count=0,
+                failed_count=0,
+                failure_rate=0.0,
+                mean_runtime_seconds=0.0,
+                stddev_runtime_seconds=0.0,
+            ),
+            per_repo=(),
+        ),
+    )
+    monkeypatch.setattr(tui, "load_terminal_issue_outcomes", lambda *args, **kwargs: ())
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+
+    async def run_app() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._show_detail_context(
+                title="Context",
+                body="Body",
+                fields=(tui._DetailField("Repo", "o/repo-a", "https://github.com/o/repo-a"),),
+            )
+            await pilot.pause()
+            assert isinstance(app.screen, tui._DetailModal)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not isinstance(app.screen, tui._DetailModal)
+
+    asyncio.run(run_app())
+
+
+def test_detail_modal_selected_url_without_fields_is_none() -> None:
     modal = tui._DetailModal(title="Context", body="Body")
-    closed: list[bool] = []
-    monkeypatch.setattr(modal, "action_close", lambda: closed.append(True))
-
-    modal.action_activate()
-    assert closed == [True]
+    assert modal.selected_url() is None
 
 
-def test_detail_modal_activate_out_of_range_row_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detail_modal_selected_url_out_of_range_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
     modal = tui._DetailModal(
         title="Context",
         body="Body",
@@ -1451,23 +1532,10 @@ def test_detail_modal_activate_out_of_range_row_noop(monkeypatch: pytest.MonkeyP
     fake_table = SimpleNamespace(cursor_row=-1)
     monkeypatch.setattr(modal, "query_one", lambda *args, **kwargs: fake_table)
 
-    modal.action_activate()
+    assert modal.selected_url() is None
 
 
-def test_detail_modal_cell_selected_event_filter(monkeypatch: pytest.MonkeyPatch) -> None:
-    modal = tui._DetailModal(title="Context", body="Body")
-    calls: list[str] = []
-    monkeypatch.setattr(modal, "action_activate", lambda: calls.append("activate"))
-
-    modal.on_data_table_cell_selected(SimpleNamespace(data_table=SimpleNamespace(id="other")))
-    assert calls == []
-    modal.on_data_table_cell_selected(
-        SimpleNamespace(data_table=SimpleNamespace(id="detail-fields-table"))
-    )
-    assert calls == ["activate"]
-
-
-def test_detail_modal_activate_falls_back_to_module_open(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detail_modal_open_url_falls_back_to_module_open(monkeypatch: pytest.MonkeyPatch) -> None:
     modal = tui._DetailModal(
         title="Context",
         body="Body",
@@ -1482,7 +1550,7 @@ def test_detail_modal_activate_falls_back_to_module_open(monkeypatch: pytest.Mon
         pass
 
     monkeypatch.setattr(type(modal), "app", property(lambda self: NonObservabilityApp()))
-    modal.action_activate()
+    modal.action_open_url()
     assert opened == ["https://github.com/o/repo-a"]
 
 
@@ -1490,6 +1558,22 @@ def test_detail_data_table_ignores_non_target_ids(monkeypatch: pytest.MonkeyPatc
     table = tui._DetailDataTable(id="metrics-table")
     monkeypatch.setattr(DataTable, "action_select_cursor", lambda self: None)
     table.action_select_cursor()
+
+
+def test_detail_data_table_open_url_ignores_non_target_ids() -> None:
+    table = tui._DetailDataTable(id="metrics-table")
+    table.action_open_url()
+
+
+def test_detail_data_table_shows_horizontal_scroll_bindings() -> None:
+    table = tui._DetailDataTable(id="active-table")
+    bindings = {key: binding for key, binding in table._bindings if key in {"left", "right", "o"}}
+    assert bindings["left"].description == "Scroll Left"
+    assert bindings["left"].show is True
+    assert bindings["right"].description == "Scroll Right"
+    assert bindings["right"].show is True
+    assert bindings["o"].description == "Open URL"
+    assert bindings["o"].show is True
 
 
 def test_header_selected_ignores_non_tracked_table(tmp_path: Path) -> None:
@@ -1528,6 +1612,67 @@ def test_base_screen_falls_back_to_screen_when_stack_empty(tmp_path: Path) -> No
     assert app._base_screen().name == "fallback-screen"
 
 
+def test_action_open_url_noop_without_selected_url(tmp_path: Path) -> None:
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+    opened: list[str] = []
+    app._selected_url_from_focus = lambda: None  # type: ignore[method-assign]
+    app._open_external_url = lambda url: opened.append(url)  # type: ignore[method-assign]
+
+    app.action_open_url()
+    assert opened == []
+
+
+def test_selected_url_from_focus_noop_branches(tmp_path: Path) -> None:
+    class FocusApp(tui.ObservabilityApp):
+        def __init__(self, *, db_path: Path) -> None:
+            super().__init__(
+                db_path=db_path, refresh_seconds=60, default_window="24h", row_limit=20
+            )
+            self._forced_focus: object = Static(id="other")
+            self._forced_screen: object = Static(id="screen")
+
+        @property
+        def focused(self):  # type: ignore[override]
+            return self._forced_focus
+
+        @property
+        def screen(self):  # type: ignore[override]
+            return self._forced_screen
+
+    app = FocusApp(db_path=tmp_path / "state.db")
+
+    assert app._selected_url_from_focus() is None
+
+    app._forced_focus = tui._DetailDataTable(id="metrics-table")
+    assert app._selected_url_from_focus() is None
+
+    app._forced_focus = tui._DetailDataTable(id="active-table")
+    app._active_row_selection = lambda: None  # type: ignore[method-assign]
+    assert app._selected_url_from_focus() is None
+
+    app._forced_focus = tui._DetailDataTable(id="tracked-table")
+    app._tracked_row_selection = lambda: None  # type: ignore[method-assign]
+    assert app._selected_url_from_focus() is None
+
+    app._forced_focus = tui._DetailDataTable(id="history-table")
+    app._history_row_selection = lambda: None  # type: ignore[method-assign]
+    assert app._selected_url_from_focus() is None
+
+    app._forced_focus = tui._DetailDataTable(id="detail-fields-table")
+    app._forced_screen = Static(id="not-modal")
+    assert app._selected_url_from_focus() is None
+
+    modal = tui._DetailModal(title="Context", body="Body")
+    modal.selected_url = lambda: "https://example.com/detail"  # type: ignore[method-assign]
+    app._forced_screen = modal
+    assert app._selected_url_from_focus() == "https://example.com/detail"
+
+
 def test_tracked_sort_value_branches() -> None:
     row = TrackedOrBlockedRow(
         repo_full_name="O/Repo-A",
@@ -1562,3 +1707,96 @@ def test_tracked_sort_value_branches() -> None:
     assert tui._tracked_sort_value(row_without_pr, 6) == ""
     assert tui._tracked_sort_value(row, 7) == "2026-02-24T00:00:00.000Z"
     assert tui._tracked_sort_value(row, 999) == ""
+
+
+def test_branch_columns_use_fixed_width_and_truncated_cells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    long_branch = "agent/design/7-add-worker-scheduler"
+    monkeypatch.setattr(
+        tui,
+        "load_overview",
+        lambda *args, **kwargs: OverviewStats(
+            active_agents=1,
+            blocked_prs=1,
+            tracked_prs=1,
+            failures=0,
+            mean_runtime_seconds=10.0,
+            stddev_runtime_seconds=1.0,
+        ),
+    )
+    monkeypatch.setattr(
+        tui,
+        "load_active_agents",
+        lambda *args, **kwargs: (
+            ActiveAgentRow(
+                run_id="run-1",
+                repo_full_name="o/repo-a",
+                run_kind="issue_flow",
+                issue_number=7,
+                pr_number=101,
+                flow="design_doc",
+                branch=long_branch,
+                started_at="2026-02-24T00:00:00.000Z",
+                elapsed_seconds=12.0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        tui,
+        "load_tracked_and_blocked",
+        lambda *args, **kwargs: (
+            TrackedOrBlockedRow(
+                repo_full_name="o/repo-a",
+                pr_number=101,
+                issue_number=7,
+                status="blocked",
+                branch=long_branch,
+                last_seen_head_sha="head",
+                blocked_reason="boom",
+                pending_event_count=1,
+                updated_at="2026-02-24T00:00:00.000Z",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        tui,
+        "load_metrics",
+        lambda *args, **kwargs: MetricsStats(
+            overall=RuntimeMetric(
+                repo_full_name="__all__",
+                terminal_count=1,
+                failed_count=0,
+                failure_rate=0.0,
+                mean_runtime_seconds=5.0,
+                stddev_runtime_seconds=0.0,
+            ),
+            per_repo=(),
+        ),
+    )
+    monkeypatch.setattr(tui, "load_terminal_issue_outcomes", lambda *args, **kwargs: ())
+
+    app = tui.ObservabilityApp(
+        db_path=tmp_path / "state.db",
+        refresh_seconds=60,
+        default_window="24h",
+        row_limit=20,
+    )
+
+    async def run_app() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            active = app.query_one("#active-table", DataTable)
+            tracked = app.query_one("#tracked-table", DataTable)
+            expected = tui._render_branch_snippet(long_branch)
+            assert (
+                active.ordered_columns[tui._ACTIVE_COL_BRANCH].width == tui._BRANCH_COLUMN_MAX_CHARS
+            )
+            assert (
+                tracked.ordered_columns[tui._TRACKED_COL_BRANCH].width
+                == tui._BRANCH_COLUMN_MAX_CHARS
+            )
+            assert str(active.get_row_at(0)[tui._ACTIVE_COL_BRANCH]) == expected
+            assert str(tracked.get_row_at(0)[tui._TRACKED_COL_BRANCH]) == expected
+
+    asyncio.run(run_app())

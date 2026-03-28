@@ -257,7 +257,8 @@ Keybindings:
 - `f`: cycle repo filter
 - `w`: cycle window (`1h`, `24h`, `7d`, `30d`)
 - `tab`: cycle focused panel
-- `enter`: open GitHub URL when focused on `Issue`, `PR`, or `Branch`; otherwise open detail dialog
+- `enter`: open the detail pane for the selected row, with full branch names and full URLs for copy/paste
+- `o`: open the selected GitHub URL explicitly when focused on a URL-bearing field such as `Issue`, `PR`, `Branch`, or a URL row inside the detail pane
 - `q`: quit
 
 Metrics definitions:
