@@ -27,7 +27,6 @@ from mergexo.agent_adapter import (
     RoadmapDependencyReference,
     RoadmapAdjustmentResult,
     RoadmapFeedbackTurn,
-    RoadmapStartResult,
 )
 from mergexo.codex_adapter import CodexAdapter, CodexInvocationHooks
 from mergexo.config import AppConfig, RepoConfig
@@ -67,7 +66,6 @@ from mergexo.github_gateway import (
 from mergexo.models import (
     FlakyTestReport,
     GeneratedDesign,
-    GeneratedRoadmap,
     Issue,
     IssueFlow,
     OperatorCommandRecord,
@@ -701,8 +699,8 @@ class Phase1Orchestrator:
         graceful_shutdown_seconds = self._config.codex_for_repo(
             self._repo
         ).graceful_shutdown_seconds
-        for run in unfinished_runs:
-            meta = _run_meta_from_json(run.meta_json)
+        for unfinished_run in unfinished_runs:
+            meta = _run_meta_from_json(unfinished_run.meta_json)
             if meta.codex_active is not True:
                 continue
             resolved = self._resolve_persisted_codex_launch(meta)
@@ -717,9 +715,9 @@ class Phase1Orchestrator:
                 LOGGER,
                 "codex_startup_cleanup_kill",
                 repo_full_name=self._state_repo_full_name(),
-                run_id=run.run_id,
-                issue_number=run.issue_number,
-                pr_number=run.pr_number if run.pr_number is not None else "",
+                run_id=unfinished_run.run_id,
+                issue_number=unfinished_run.issue_number,
+                pr_number=unfinished_run.pr_number if unfinished_run.pr_number is not None else "",
                 pid=resolved.pid,
                 pgid=resolved.pgid if resolved.pgid is not None else "",
             )
@@ -858,12 +856,19 @@ class Phase1Orchestrator:
     def _issue_snapshot_for_poll(self, *, issue_number: int, issue: Issue | None = None) -> Issue:
         if issue is not None:
             self._poll_issue_cache[issue_number] = issue
-            return issue
-        cached = self._poll_issue_cache.get(issue_number)
-        if cached is not None:
-            return cached
-        snapshot = self._github.get_issue(issue_number)
-        self._poll_issue_cache[issue_number] = snapshot
+            snapshot = issue
+        else:
+            cached = self._poll_issue_cache.get(issue_number)
+            if cached is not None:
+                snapshot = cached
+            else:
+                snapshot = self._github.get_issue(issue_number)
+                self._poll_issue_cache[issue_number] = snapshot
+        self._state.set_issue_github_state(
+            issue_number=issue_number,
+            github_state=snapshot.state,
+            repo_full_name=self._state_repo_full_name(),
+        )
         return snapshot
 
     def _snapshot_takeover_comment_boundaries(
@@ -1389,7 +1394,7 @@ class Phase1Orchestrator:
                 )
                 marker = f"<!-- mergexo-action:{token} -->"
                 try:
-                    created = self._create_roadmap_child_issue_with_outbox(
+                    self._create_roadmap_child_issue_with_outbox(
                         claim=claim,
                         issue_body=append_action_token(
                             body=_render_roadmap_child_issue_body(
@@ -7183,6 +7188,7 @@ class Phase1Orchestrator:
             html_url=issue.html_url,
             labels=issue.labels,
             author_login=issue.author_login,
+            state=issue.state,
         )
 
     def _serialize_pre_pr_context_for_issue(
@@ -7282,6 +7288,7 @@ class Phase1Orchestrator:
             html_url=issue.html_url,
             labels=issue.labels,
             author_login=issue.author_login,
+            state=issue.state,
         )
 
     def _issue_with_required_tests_reminder(
@@ -7310,6 +7317,7 @@ class Phase1Orchestrator:
             html_url=issue.html_url,
             labels=issue.labels,
             author_login=issue.author_login,
+            state=issue.state,
         )
 
     def _issue_with_required_tests_failure(
@@ -7353,6 +7361,7 @@ class Phase1Orchestrator:
             html_url=base_issue.html_url,
             labels=base_issue.labels,
             author_login=base_issue.author_login,
+            state=base_issue.state,
         )
 
     def _issue_with_push_merge_conflict(
@@ -7394,6 +7403,7 @@ class Phase1Orchestrator:
             html_url=base_issue.html_url,
             labels=base_issue.labels,
             author_login=base_issue.author_login,
+            state=base_issue.state,
         )
 
     def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> str:
@@ -10186,6 +10196,7 @@ def _issue_to_json_dict(issue: Issue) -> dict[str, object]:
         "html_url": issue.html_url,
         "labels": list(issue.labels),
         "author_login": issue.author_login,
+        "state": issue.state,
     }
 
 
@@ -10201,6 +10212,7 @@ def _issue_from_json_dict(raw: object) -> Issue | None:
     html_url = payload.get("html_url")
     labels_raw = payload.get("labels")
     author_login = payload.get("author_login")
+    state = payload.get("state", "open")
     if not isinstance(number, int):
         return None
     if not isinstance(title, str):
@@ -10210,6 +10222,8 @@ def _issue_from_json_dict(raw: object) -> Issue | None:
     if not isinstance(html_url, str):
         return None
     if not isinstance(author_login, str):
+        return None
+    if not isinstance(state, str):
         return None
     if not isinstance(labels_raw, list):
         return None
@@ -10225,6 +10239,7 @@ def _issue_from_json_dict(raw: object) -> Issue | None:
         html_url=html_url,
         labels=tuple(labels),
         author_login=author_login,
+        state=state,
     )
 
 

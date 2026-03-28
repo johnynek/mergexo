@@ -207,6 +207,7 @@ def test_state_store_transitions_and_feedback_tracking(tmp_path: Path) -> None:
     assert run_record.pr_number == 9
     assert run_record.pr_url == "https://example/pr/9"
     assert run_record.error is None
+    assert run_record.github_state is None
     assert store.get_issue_run_record(999) is None
 
     store.save_agent_session(issue_number=42, adapter="codex", thread_id="thread-1")
@@ -353,6 +354,7 @@ def test_state_store_observability_schema_and_agent_run_lifecycle(tmp_path: Path
         assert "last_failure_class" in issue_run_columns
         assert "retry_count" in issue_run_columns
         assert "next_retry_at" in issue_run_columns
+        assert "github_state" in issue_run_columns
         assert "state_applied" in outbox_columns
         assert "result_json" in outbox_columns
         assert "head_sha" in pr_flake_columns
@@ -1047,6 +1049,33 @@ def test_state_store_migrates_issue_runs_retry_columns(tmp_path: Path) -> None:
     assert "last_failure_class" in columns
     assert "retry_count" in columns
     assert "next_retry_at" in columns
+    assert "github_state" in columns
+
+
+def test_set_issue_github_state_is_nullable(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_awaiting_issue_followup(
+        issue_number=12,
+        flow="small_job",
+        branch="agent/small/12",
+        context_json="{}",
+        waiting_reason="waiting",
+    )
+    run_record = store.get_issue_run_record(12)
+    assert run_record is not None
+    assert run_record.github_state is None
+
+    store.set_issue_github_state(issue_number=12, github_state="CLOSED")
+    run_record = store.get_issue_run_record(12)
+    assert run_record is not None
+    assert run_record.github_state == "closed"
+
+    store.set_issue_github_state(issue_number=12, github_state=None)
+    run_record = store.get_issue_run_record(12)
+    assert run_record is not None
+    assert run_record.github_state is None
 
 
 def test_state_store_migrates_roadmap_nodes_claim_token_column(tmp_path: Path) -> None:
@@ -5768,6 +5797,19 @@ def test_get_issue_run_state_validates_row_types(tmp_path: Path) -> None:
         )
         conn.commit()
     with pytest.raises(RuntimeError, match="Invalid error value"):
+        store.get_issue_run_record(1, repo_full_name=repo)
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE issue_runs
+            SET error = NULL, github_state = ?
+            WHERE repo_full_name = ? AND issue_number = ?
+            """,
+            (sqlite3.Binary(b"\x06"), repo, 1),
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="Invalid github_state value"):
         store.get_issue_run_record(1, repo_full_name=repo)
 
 

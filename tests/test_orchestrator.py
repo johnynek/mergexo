@@ -761,6 +761,7 @@ class FakeState:
         self._action_tokens: dict[str, ActionTokenState] = {}
         self._poll_cursors: dict[tuple[str, int], GitHubCommentPollCursorState] = {}
         self._issue_comment_cursors: dict[int, tuple[int, int]] = {}
+        self._issue_github_state_by_issue: dict[int, str | None] = {}
         self._takeover_active_issue_numbers: set[int] = set()
         self._takeover_comment_floors_by_pr: dict[int, tuple[int, int]] = {}
         self._next_github_call_id = 1
@@ -1196,6 +1197,18 @@ class FakeState:
                     "updated_at": "now",
                 },
             )(),
+        )
+
+    def set_issue_github_state(
+        self,
+        *,
+        issue_number: int,
+        github_state: str | None,
+        repo_full_name: str | None = None,
+    ) -> None:
+        _ = repo_full_name
+        self._issue_github_state_by_issue[issue_number] = (
+            github_state.strip().lower() if github_state is not None else None
         )
 
     def list_active_issue_takeovers(self, *, repo_full_name: str | None = None) -> tuple[int, ...]:
@@ -7298,6 +7311,20 @@ def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
         )
         is None
     )  # type: ignore[dict-item]
+    assert (
+        _issue_from_json_dict(
+            {
+                "number": 7,
+                "title": "x",
+                "body": "y",
+                "html_url": "u",
+                "author_login": "a",
+                "state": 1,
+                "labels": [],
+            }
+        )
+        is None
+    )
     assert (
         _issue_from_json_dict(
             {

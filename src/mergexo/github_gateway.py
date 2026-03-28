@@ -83,6 +83,7 @@ class GitHubGateway:
                     html_url=issue.html_url,
                     labels=tuple(merged_labels),
                     author_login=existing.author_login or issue.author_login,
+                    state=existing.state or issue.state,
                 )
 
         issues = [deduped[number] for number in sorted(deduped)]
@@ -113,6 +114,7 @@ class GitHubGateway:
             title = _as_string(item_obj.get("title"))
             body = _as_string(item_obj.get("body"))
             html_url = _as_string(item_obj.get("html_url"))
+            state = _normalize_optional_lower_str(item_obj.get("state")) or "open"
             user_obj = _as_object_dict(item_obj.get("user"))
             labels_obj = item_obj.get("labels")
             label_names: list[str] = []
@@ -132,6 +134,7 @@ class GitHubGateway:
                     html_url=html_url,
                     labels=tuple(label_names),
                     author_login=_as_login(user_obj.get("login") if user_obj else None),
+                    state=state,
                 )
             )
         log_event(
@@ -213,6 +216,7 @@ class GitHubGateway:
             html_url=_as_string(issue_obj.get("html_url")),
             labels=tuple(label_names),
             author_login=_as_login(user_obj.get("login") if user_obj else None),
+            state=_normalize_optional_lower_str(issue_obj.get("state")) or "open",
         )
         log_event(
             LOGGER,
@@ -311,6 +315,7 @@ class GitHubGateway:
         title = _as_string(payload_obj.get("title"))
         body = _as_string(payload_obj.get("body"))
         html_url = _as_string(payload_obj.get("html_url"))
+        state = _normalize_optional_lower_str(payload_obj.get("state")) or "open"
         user_obj = _as_object_dict(payload_obj.get("user"))
         labels_obj = payload_obj.get("labels")
         label_names: list[str] = []
@@ -335,6 +340,7 @@ class GitHubGateway:
             html_url=html_url,
             labels=tuple(label_names),
             author_login=_as_login(user_obj.get("login") if user_obj else None),
+            state=state,
         )
 
     def get_pull_request(self, pr_number: int) -> PullRequestSnapshot:

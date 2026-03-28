@@ -245,6 +245,7 @@ class IssueRunRecord:
     pr_number: int | None
     pr_url: str | None
     error: str | None
+    github_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -479,6 +480,7 @@ class StateStore:
                     pr_number INTEGER,
                     pr_url TEXT,
                     error TEXT,
+                    github_state TEXT NULL,
                     last_failure_class TEXT NULL,
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     next_retry_at TEXT NULL,
@@ -515,6 +517,13 @@ class StateStore:
                     """
                     ALTER TABLE issue_runs
                     ADD COLUMN next_retry_at TEXT NULL
+                    """
+                )
+            if "github_state" not in issue_run_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE issue_runs
+                    ADD COLUMN github_state TEXT NULL
                     """
                 )
             conn.execute(
@@ -5144,7 +5153,7 @@ class StateStore:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT status, branch, pr_number, pr_url, error
+                SELECT status, branch, pr_number, pr_url, error, github_state
                 FROM issue_runs
                 WHERE repo_full_name = ? AND issue_number = ?
                 """,
@@ -5152,7 +5161,7 @@ class StateStore:
             ).fetchone()
         if row is None:
             return None
-        status, branch, pr_number, pr_url, error = row
+        status, branch, pr_number, pr_url, error, github_state = row
         if not isinstance(status, str):
             raise RuntimeError("Invalid status value stored in issue_runs")
         if branch is not None and not isinstance(branch, str):
@@ -5163,6 +5172,8 @@ class StateStore:
             raise RuntimeError("Invalid pr_url value stored in issue_runs")
         if error is not None and not isinstance(error, str):
             raise RuntimeError("Invalid error value stored in issue_runs")
+        if github_state is not None and not isinstance(github_state, str):
+            raise RuntimeError("Invalid github_state value stored in issue_runs")
         return IssueRunRecord(
             repo_full_name=repo_key,
             issue_number=issue_number,
@@ -5171,7 +5182,29 @@ class StateStore:
             pr_number=pr_number,
             pr_url=pr_url,
             error=error,
+            github_state=github_state,
         )
+
+    def set_issue_github_state(
+        self,
+        *,
+        issue_number: int,
+        github_state: str | None,
+        repo_full_name: str | None = None,
+    ) -> None:
+        repo_key = _normalize_repo_full_name(repo_full_name)
+        normalized_state = github_state
+        if normalized_state is not None:
+            normalized_state = normalized_state.strip().lower() or None
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE issue_runs
+                SET github_state = ?
+                WHERE repo_full_name = ? AND issue_number = ?
+                """,
+                (normalized_state, repo_key, issue_number),
+            )
 
     def get_roadmap_state(
         self, *, roadmap_issue_number: int, repo_full_name: str | None = None
