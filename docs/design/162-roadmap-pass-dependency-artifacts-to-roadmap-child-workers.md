@@ -139,26 +139,26 @@ This same rule answers the issue-body question for issue #151: downstream nodes 
 
 ## Size And Truncation Rules
 
-The contract should be deterministic and bounded by serializer rules, not by ad hoc prompt trimming.
+The contract should be deterministic and bounded by serializer rules, not by ad hoc prompt trimming. The raw canonical JSON payload must stay under `16000` characters before base64 encoding.
+
+Serialization should apply these rules in order:
 
 1. Include only direct dependencies.
 2. Sort dependencies by `node_id`.
 3. Sort `artifact_paths` and `changed_files` lexically after selecting the primary path.
-4. Keep at most:
-   - `10` `artifact_paths`
-   - `25` `changed_files`
-   - `3` `review_notes`
-   - `3` `issue_notes`
-5. Truncate note and body excerpts to fixed character caps:
-   - `400` chars for each review or issue note
-   - `800` chars for each body excerpt
-6. Keep the raw canonical JSON payload under `16000` characters before base64 encoding.
-7. On overflow, drop data in this order:
-   - body excerpts
-   - extra changed files beyond `10`
-   - extra notes beyond `1`
-   - supporting artifact paths beyond `3`
-8. Never drop identity fields, milestone fields, issue or PR links, git refs, or the `primary` artifact path.
+4. Apply initial collection limits:
+   - keep at most `10` `artifact_paths`
+   - keep at most `25` `changed_files`
+   - keep at most `3` `review_notes`
+   - keep at most `3` `issue_notes`
+   - truncate each review or issue note to `400` characters
+   - truncate each body excerpt to `800` characters
+5. If the payload still exceeds `16000` characters after the initial limits, reduce data in this order until it fits:
+   - drop `child_issue_body_excerpt` and `pr_body_excerpt`
+   - reduce `changed_files` to at most `10`
+   - reduce `review_notes` and `issue_notes` to at most `1` each
+   - reduce supporting `artifact_paths` to at most `3`
+6. Never drop identity fields, milestone fields, issue or PR links, git refs, or the `primary` artifact path.
 
 The visible issue-body summary should be smaller than the hidden payload, for example no more than `5` files and `2` notes per dependency. Prompts should render from the parsed canonical payload so retries remain stable.
 
