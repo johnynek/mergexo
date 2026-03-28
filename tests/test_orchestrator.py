@@ -1888,6 +1888,7 @@ def _issue(
     title: str = "Add worker scheduler",
     labels: tuple[str, ...] = ("agent:design",),
     author_login: str = "issue-author",
+    state: str = "open",
 ) -> Issue:
     return Issue(
         number=number,
@@ -1896,6 +1897,7 @@ def _issue(
         html_url=f"https://example/issues/{number}",
         labels=labels,
         author_login=author_login,
+        state=state,
     )
 
 
@@ -4669,6 +4671,41 @@ def test_cleanup_persisted_codex_processes_resolves_launch_without_pid(
     orch._cleanup_persisted_codex_processes()
 
     assert killed == [(321, 654, 5.0)]
+
+
+def test_issue_snapshot_for_poll_rejects_non_positive_issue_numbers(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue()])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        orch._issue_snapshot_for_poll(issue_number=0)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        orch._issue_snapshot_for_poll(issue_number="7")  # type: ignore[arg-type]
+
+
+def test_issue_snapshot_for_poll_uses_cache_and_updates_state(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub([_issue(state="closed")])
+    agent = FakeAgent()
+    state = FakeState()
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+
+    snapshot = orch._issue_snapshot_for_poll(issue_number=7)
+
+    assert snapshot.state == "closed"
+    assert state._issue_github_state_by_issue[7] == "closed"
+
+    github.issues = [_issue(state="open")]
+    cached_snapshot = orch._issue_snapshot_for_poll(issue_number=7)
+
+    assert cached_snapshot.state == "closed"
+    assert state._issue_github_state_by_issue[7] == "closed"
 
 
 def test_observe_agent_invocations_updates_run_meta_and_progress(

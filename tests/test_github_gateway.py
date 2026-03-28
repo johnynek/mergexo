@@ -409,6 +409,16 @@ def test_get_issue_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
         gateway.get_issue(1)
 
 
+def test_get_issue_rejects_non_positive_number() -> None:
+    gateway = GitHubGateway("o", "r")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        gateway.get_issue(0)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        gateway.get_issue("7")  # type: ignore[arg-type]
+
+
 def test_create_pull_request_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway = GitHubGateway("o", "r")
     monkeypatch.setattr(GitHubGateway, "_api_json", lambda self, method, path, payload=None: [])

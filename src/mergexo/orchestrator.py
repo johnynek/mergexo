@@ -854,14 +854,14 @@ class Phase1Orchestrator:
         return ignore_label_active
 
     def _issue_snapshot_for_poll(self, *, issue_number: int, issue: Issue | None = None) -> Issue:
+        if not isinstance(issue_number, int) or issue_number <= 0:
+            raise ValueError("issue_number must be a positive integer")
         if issue is not None:
             self._poll_issue_cache[issue_number] = issue
             snapshot = issue
         else:
-            cached = self._poll_issue_cache.get(issue_number)
-            if cached is not None:
-                snapshot = cached
-            else:
+            snapshot = self._poll_issue_cache.get(issue_number)
+            if snapshot is None:
                 snapshot = self._github.get_issue(issue_number)
                 self._poll_issue_cache[issue_number] = snapshot
         self._state.set_issue_github_state(

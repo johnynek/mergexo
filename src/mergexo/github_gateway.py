@@ -306,6 +306,8 @@ class GitHubGateway:
         return selected
 
     def get_issue(self, issue_number: int) -> Issue:
+        if not isinstance(issue_number, int) or issue_number <= 0:
+            raise ValueError("issue_number must be a positive integer")
         path = f"/repos/{self.owner}/{self.name}/issues/{issue_number}"
         payload = self._api_json("GET", path)
         payload_obj = _as_object_dict(payload)
