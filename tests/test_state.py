@@ -2695,6 +2695,15 @@ def test_list_implementation_candidates_reads_merged_design_runs(tmp_path: Path)
     assert candidate.design_pr_url == "https://example/pr/101"
 
 
+def test_list_implementation_candidates_ignores_merged_reference_doc_runs(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.mark_completed(8, "agent/reference/8-foo", 101, "https://example/pr/101")
+    store.mark_pr_status(pr_number=101, issue_number=8, status="merged", last_seen_head_sha="head1")
+
+    assert store.list_implementation_candidates() == ()
+
+
 def test_list_implementation_candidates_includes_retryable_failed_implementation_rows(
     tmp_path: Path,
 ) -> None:
@@ -3715,6 +3724,7 @@ def test_parse_enum_helpers_validate_types_and_values() -> None:
 
     with pytest.raises(RuntimeError, match="Invalid flow value"):
         _parse_pre_pr_followup_flow(1)
+    assert _parse_pre_pr_followup_flow("reference_doc") == "reference_doc"
     with pytest.raises(RuntimeError, match="Unknown flow value"):
         _parse_pre_pr_followup_flow("other")
 
@@ -3993,6 +4003,7 @@ def test_roadmap_state_helper_parsers_validate_shapes() -> None:
     assert _parse_roadmap_status("active") == "active"
     assert _parse_roadmap_adjustment_state("idle") == "idle"
     assert _parse_roadmap_node_status("pending") == "pending"
+    assert _parse_roadmap_node_kind("reference_doc") == "reference_doc"
     assert _parse_roadmap_node_kind("small_job") == "small_job"
     state = _parse_roadmap_state_row(
         (

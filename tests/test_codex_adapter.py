@@ -631,6 +631,12 @@ def test_start_roadmap_from_issue_happy_path(
         assert graph_schema["required"] == ["roadmap_issue_number", "version", "nodes"]
         node_schema = graph_schema["properties"]["nodes"]["items"]
         assert node_schema["additionalProperties"] is False
+        assert node_schema["properties"]["kind"]["enum"] == [
+            "reference_doc",
+            "design_doc",
+            "small_job",
+            "roadmap",
+        ]
         assert node_schema["required"] == [
             "node_id",
             "kind",
@@ -862,6 +868,12 @@ def test_evaluate_roadmap_adjustment_happy_path(
         assert updated_graph_schema["required"] == ["roadmap_issue_number", "version", "nodes"]
         node_schema = updated_graph_schema["properties"]["nodes"]["items"]
         assert node_schema["additionalProperties"] is False
+        assert node_schema["properties"]["kind"]["enum"] == [
+            "reference_doc",
+            "design_doc",
+            "small_job",
+            "roadmap",
+        ]
         assert node_schema["required"] == [
             "node_id",
             "kind",

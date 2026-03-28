@@ -28,6 +28,7 @@ from mergexo.agent_adapter import (
 )
 from mergexo.config import CodexConfig
 from mergexo.models import (
+    ROADMAP_NODE_KINDS,
     FlakyTestReport,
     GeneratedDesign,
     GeneratedRoadmap,
@@ -124,7 +125,7 @@ _ROADMAP_NODE_SCHEMA: dict[str, object] = {
     "required": ["node_id", "kind", "title", "body_markdown", "depends_on"],
     "properties": {
         "node_id": {"type": "string", "minLength": 1},
-        "kind": {"type": "string", "enum": ["design_doc", "small_job", "roadmap"]},
+        "kind": {"type": "string", "enum": list(ROADMAP_NODE_KINDS)},
         "title": {"type": "string", "minLength": 1},
         "body_markdown": {"type": "string", "minLength": 1},
         "depends_on": {

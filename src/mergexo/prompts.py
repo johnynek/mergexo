@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from mergexo.agent_adapter import FeedbackTurn, RoadmapDependencyArtifact, RoadmapFeedbackTurn
-from mergexo.models import Issue
+from mergexo.models import ROADMAP_NODE_KINDS, Issue
 
 
 def _coding_guidelines_task_lines(*, coding_guidelines_path: str | None) -> str:
@@ -19,6 +19,10 @@ def _implementation_checks_line(*, coding_guidelines_path: str | None) -> str:
     if coding_guidelines_path:
         return f"  - Re-run formatting and CI-required checks from {coding_guidelines_path}."
     return "  - Re-run formatting and tests expected by this repo and target 100% test coverage."
+
+
+def _roadmap_node_kinds_text() -> str:
+    return ", ".join(f"`{kind}`" for kind in ROADMAP_NODE_KINDS)
 
 
 def _truncate_prompt_text(value: str, *, max_chars: int) -> str:
@@ -376,12 +380,15 @@ Output requirements:
 - `roadmap_markdown` and `graph_json` must describe the same plan.
 - Each roadmap node should represent one concrete child issue with reviewable scope, a clear completion outcome, and text that can plausibly become that child issue's title/body.
 - Keep the graph acyclic with internal `node_id` references only.
-- Allowed node kinds: `design_doc`, `small_job`, `roadmap`.
+- Allowed node kinds: {_roadmap_node_kinds_text()}.
 - Prefer:
-  - `design_doc` when downstream work should wait for a reviewed design artifact.
+  - `reference_doc` for reviewed durable docs that downstream nodes should consult without starting an implementation lane from that same child issue.
+  - `design_doc` only when the roadmap intentionally wants the existing design-to-implementation lane from the same child issue.
   - `small_job` for bounded implementation work that should directly produce a PR.
   - `roadmap` only when a subtree is large enough to deserve its own nested roadmap.
 - Milestone semantics for dependency planning:
+  - `reference_doc.planned`: the reference-doc PR has merged.
+  - `reference_doc.implemented`: same as `reference_doc.planned`; this kind is terminal when the artifact merges.
   - `design_doc.planned`: the design PR has merged.
   - `design_doc.implemented`: implementation from that design has merged.
   - `small_job.planned`: the child issue has been created and labeled.
@@ -417,7 +424,7 @@ Required output fields:
   - `nodes`: non-empty array of node objects.
 - Each item in `graph_json.nodes` must be an object with exactly:
   - `node_id`: non-empty string. Use a short stable internal identifier.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string for the child issue title.
   - `body_markdown`: non-empty string for the child issue body.
   - `depends_on`: array of dependency objects, using `[]` when there are no dependencies.
@@ -498,7 +505,7 @@ Payload rules:
   - `nodes`: non-empty array of node objects.
 - Each item in `updated_graph_json.nodes` must be an object with exactly:
   - `node_id`: non-empty string.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string.
   - `body_markdown`: non-empty string.
   - `depends_on`: array of dependency objects, using `[]` when there are no dependencies.
@@ -506,12 +513,13 @@ Payload rules:
   - `node_id`: string referencing another node in this same graph.
   - `requires`: one of `planned`, `implemented`.
 - The revised graph must stay acyclic and use only internal `node_id` references.
-- Allowed node kinds remain `design_doc`, `small_job`, and `roadmap`.
+- Allowed node kinds remain {_roadmap_node_kinds_text()}.
 - Include an explicit `depends_on` array on every revised node, using `[]` when there are no dependencies.
 - Include an explicit `requires` on every revised dependency object.
 - The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
 - Treat retained `node_id`s as stable work identities.
-- If you keep an existing `node_id`, preserve its `kind`, `title`, `body_markdown`, and `depends_on` exactly.
+- If you keep an existing `node_id`, preserve its `title`, `body_markdown`, and `depends_on` exactly.
+- Preserve `kind` too, except you may change an unstarted node between `design_doc` and `reference_doc` when correcting artifact-only doc semantics.
 - If pending work needs to change materially, retire the old pending node and add replacement work under a new `node_id`.
 - Do not remove any node whose work has already started. Treat nodes with child issues, completed work, blocked work, abandoned work, or other in-flight progress as started.
 - Do not churn `node_id`s for unchanged work. If the work is unchanged, keep the same `node_id`.
@@ -597,7 +605,7 @@ Payload rules:
   - `nodes`: non-empty array of node objects.
 - Each item in `updated_graph_json.nodes` must be an object with exactly:
   - `node_id`: non-empty string.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string.
   - `body_markdown`: non-empty string.
   - `depends_on`: array of dependency objects, using `[]` when there are no dependencies.
@@ -605,12 +613,13 @@ Payload rules:
   - `node_id`: string referencing another node in this same graph.
   - `requires`: one of `planned`, `implemented`.
 - The revised graph must stay acyclic and use only internal `node_id` references.
-- Allowed node kinds remain `design_doc`, `small_job`, and `roadmap`.
+- Allowed node kinds remain {_roadmap_node_kinds_text()}.
 - Include an explicit `depends_on` array on every revised node, using `[]` when there are no dependencies.
 - Include an explicit `requires` on every revised dependency object.
 - The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
 - Treat retained `node_id`s as stable work identities.
-- If you keep an existing `node_id`, preserve its `kind`, `title`, `body_markdown`, and `depends_on` exactly.
+- If you keep an existing `node_id`, preserve its `title`, `body_markdown`, and `depends_on` exactly.
+- Preserve `kind` too, except you may change an unstarted node between `design_doc` and `reference_doc` when correcting artifact-only doc semantics.
 - If pending work needs to change materially, retire the old pending node and add replacement work under a new `node_id`.
 - Do not remove any node whose work has already started. Treat nodes with child issues, completed work, blocked work, abandoned work, or other in-flight progress as started.
 - Do not churn `node_id`s for unchanged work. If the work is unchanged, keep the same `node_id`.
@@ -867,7 +876,7 @@ Roadmap graph contract:
 - `nodes` must be a non-empty array of node objects.
 - Each node object must contain exactly:
   - `node_id`: non-empty string.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string.
   - `body_markdown`: non-empty string.
   - `depends_on`: array, using `[]` when there are no dependencies.

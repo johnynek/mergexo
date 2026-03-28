@@ -2750,6 +2750,43 @@ def test_flow_helpers() -> None:
         )
         == "roadmap"
     )
+    assert (
+        _resolve_issue_flow(
+            issue=Issue(
+                number=7,
+                title="Add worker scheduler",
+                body="<!-- mergexo-roadmap-node-kind:reference_doc -->\n\nBody",
+                html_url="https://example/issues/7",
+                labels=("agent:design",),
+                author_login="issue-author",
+            ),
+            design_label=cfg.trigger_label,
+            roadmap_label=cfg.roadmap_label,
+            bugfix_label=cfg.bugfix_label,
+            small_job_label=cfg.small_job_label,
+            ignore_label=cfg.ignore_label,
+        )
+        == "reference_doc"
+    )
+    assert (
+        _resolve_issue_flow(
+            issue=Issue(
+                number=8,
+                title="Add worker scheduler",
+                body="Roadmap node kind: reference_doc\n\nBody",
+                html_url="https://example/issues/8",
+                labels=("agent:design",),
+                author_login="issue-author",
+            ),
+            design_label=cfg.trigger_label,
+            roadmap_label=cfg.roadmap_label,
+            bugfix_label=cfg.bugfix_label,
+            small_job_label=cfg.small_job_label,
+            ignore_label=cfg.ignore_label,
+        )
+        == "reference_doc"
+    )
+    assert _issue_branch(flow="reference_doc", issue_number=7, slug="x") == "agent/reference/7-x"
     assert _issue_branch(flow="design_doc", issue_number=7, slug="x") == "agent/design/7-x"
     assert _issue_branch(flow="roadmap", issue_number=7, slug="x") == "agent/roadmap/7-x"
     assert (
@@ -2797,6 +2834,7 @@ def test_flow_helpers() -> None:
     assert _design_branch_slug("agent/design/   ") is None
     assert _parse_superseding_roadmap_parent("Supersedes roadmap #41") == 41
     assert _parse_superseding_roadmap_parent("no parent") is None
+    assert _roadmap_child_label_for_kind(kind="reference_doc", repo=cfg) == cfg.trigger_label
     assert _roadmap_child_label_for_kind(kind="design_doc", repo=cfg) == cfg.trigger_label
     assert _roadmap_child_label_for_kind(kind="small_job", repo=cfg) == cfg.small_job_label
     assert _roadmap_child_label_for_kind(kind="roadmap", repo=cfg) == cfg.roadmap_label
@@ -2805,14 +2843,17 @@ def test_flow_helpers() -> None:
     child_body = _render_roadmap_child_issue_body(
         roadmap_issue_number=7,
         node_id="n1",
+        kind="reference_doc",
         dependencies_json='[{"node_id":"n0","requires":"planned"}]',
         body_markdown="Body",
     )
+    assert "<!-- mergexo-roadmap-node-kind:reference_doc -->" in child_body
     assert "Parent roadmap: #7" in child_body
     assert "n0 (planned)" in child_body
     invalid_child_body = _render_roadmap_child_issue_body(
         roadmap_issue_number=7,
         node_id="n2",
+        kind="small_job",
         dependencies_json="{",
         body_markdown="Body",
     )
@@ -2820,6 +2861,7 @@ def test_flow_helpers() -> None:
     mixed_child_body = _render_roadmap_child_issue_body(
         roadmap_issue_number=7,
         node_id="n3",
+        kind="design_doc",
         dependencies_json='[1, {"node_id":"n1","requires":"implemented"}]',
         body_markdown="Body",
     )
@@ -3202,6 +3244,7 @@ def test_flow_helpers() -> None:
     )
     assert "issue_run=missing" in missing_issue_run_markers
     assert _pre_pr_flow_label("roadmap") == "roadmap"
+    assert _flow_trigger_label(flow="reference_doc", repo=cfg) == cfg.trigger_label
     assert _flow_trigger_label(flow="roadmap", repo=cfg) == cfg.roadmap_label
     roadmap_recovery = _recovery_pr_payload_for_issue(
         issue=_issue(8, "Plan"), branch="agent/roadmap/8-plan"
@@ -3385,6 +3428,30 @@ def test_process_issue_happy_path(tmp_path: Path) -> None:
     assert f"# {agent.generated.title}" in contents
     assert "touch_paths" in contents
     assert branch.startswith("agent/design/7-")
+    assert state.saved_sessions == [(7, "codex", "thread-123")]
+
+
+def test_process_issue_reference_doc_happy_path(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    github = FakeGitHub(issues=[])
+    agent = FakeAgent()
+    state = FakeState()
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    result = orch._process_issue(_issue(), "reference_doc")
+
+    assert result.issue_number == 7
+    assert result.pr_number == 101
+    assert github.created_prs
+    assert "Closes #7" in github.created_prs[0][3]
+    assert github.comments == [
+        (7, "MergeXO assigned an agent and started reference document work for issue #7."),
+        (7, "Opened reference doc PR: https://example/pr/101"),
+    ]
+    generated_path = git.branch_calls[0][0] / f"docs/design/7-{_slugify('Add worker scheduler')}.md"
+    assert generated_path.exists()
+    assert result.branch.startswith("agent/reference/7-")
     assert state.saved_sessions == [(7, "codex", "thread-123")]
 
 
@@ -6157,9 +6224,13 @@ def test_recover_missing_pr_branch_tolerates_issue_comment_failure(tmp_path: Pat
     assert row[3] == "https://example/pr/101"
 
 
-def test_recovery_payload_covers_impl_and_bugfix_branches() -> None:
+def test_recovery_payload_covers_reference_impl_and_bugfix_branches() -> None:
     issue = _issue(number=11, title="Handle edge case")
 
+    reference_title, reference_body, reference_flow = _recovery_pr_payload_for_issue(
+        issue=issue,
+        branch="agent/reference/11-handle-edge-case",
+    )
     design_title, design_body, design_flow = _recovery_pr_payload_for_issue(
         issue=issue,
         branch="agent/design/11-handle-edge-case",
@@ -6172,6 +6243,12 @@ def test_recovery_payload_covers_impl_and_bugfix_branches() -> None:
         issue=issue,
         branch="agent/bugfix/11-handle-edge-case",
     )
+
+    assert reference_flow == "reference"
+    assert reference_title.startswith("Reference doc for #11:")
+    assert "Recovered reference doc PR from a previously pushed branch." in reference_body
+    assert "Closes #11" in reference_body
+    assert "Source issue:" not in reference_body
 
     assert design_flow == "design"
     assert design_title.startswith("Design doc for #11:")
@@ -6192,6 +6269,7 @@ def test_recovery_payload_covers_impl_and_bugfix_branches() -> None:
     assert "Source issue:" not in bug_body
 
     assert _flow_label_from_branch("agent/design/11-handle-edge-case") == "design"
+    assert _flow_label_from_branch("agent/reference/11-handle-edge-case") == "reference"
     assert _flow_label_from_branch("agent/impl/11-handle-edge-case") == "implementation"
     assert _flow_label_from_branch("agent/bugfix/11-handle-edge-case") == "bugfix"
 
@@ -7335,7 +7413,19 @@ def test_decode_pre_pr_context_invalid_json_falls_back_to_live_issue(tmp_path: P
 def test_pre_pr_helper_functions_cover_fallback_paths() -> None:
     issue = _issue(labels=("triage",))
     assert _pre_pr_flow_label("design_doc") == "design"
+    assert _pre_pr_flow_label("reference_doc") == "reference-doc"
     assert _pre_pr_flow_label("small_job") == "small-job"
+    assert (
+        _infer_pre_pr_flow_from_issue_and_error(
+            issue=issue,
+            error="reference-doc flow blocked: waiting on clarification",
+            design_label="agent:design",
+            roadmap_label="agent:roadmap",
+            bugfix_label="agent:bugfix",
+            small_job_label="agent:small-job",
+        )
+        == "reference_doc"
+    )
     assert _issue_to_json_dict(issue)["number"] == 7
     assert _issue_from_json_dict({1: "bad"}) is None  # type: ignore[arg-type]
     assert _issue_from_json_dict({"number": "7"}) is None  # type: ignore[dict-item]
@@ -15795,6 +15885,85 @@ def test_activate_and_advance_roadmap_nodes_creates_children_in_dependency_order
     assert completed.status == "completed"
 
 
+def test_activate_and_advance_reference_doc_nodes_do_not_create_implementation_candidates(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    roadmap_issue = _issue(52, "Reference Plan", labels=(cfg.repo.roadmap_label,))
+    github = FakeGitHub([roadmap_issue])
+    git = FakeGitManager(tmp_path / "checkouts")
+    agent = FakeAgent()
+    state = StateStore(tmp_path / "state.db")
+    repo = cfg.repo.full_name
+    store_checkout = git.ensure_checkout(0)
+    docs_dir = store_checkout / "docs/roadmap"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "52-reference-plan.md").write_text("# Plan", encoding="utf-8")
+    (docs_dir / "52-reference-plan.graph.json").write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 52,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "review_design",
+                        "kind": "reference_doc",
+                        "title": "Review design",
+                        "body_markdown": "Write the shared reference doc",
+                        "depends_on": [],
+                    },
+                    {
+                        "node_id": "impl",
+                        "kind": "small_job",
+                        "title": "Implement",
+                        "body_markdown": "Ship code",
+                        "depends_on": [{"node_id": "review_design", "requires": "planned"}],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state.mark_completed(
+        52,
+        "agent/roadmap/52-reference-plan",
+        520,
+        "https://example/pr/520",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(pr_number=520, issue_number=52, status="merged", repo_full_name=repo)
+
+    orch = Phase1Orchestrator(cfg, state=state, github=github, git_manager=git, agent=agent)
+    orch._activate_merged_roadmaps()
+    orch._advance_roadmap_nodes()
+
+    assert len(github.created_issues) == 1
+    _title1, body1, labels1 = github.created_issues[0]
+    assert labels1 == (cfg.repo.trigger_label,)
+    assert "<!-- mergexo-roadmap-node-kind:reference_doc -->" in body1
+    child_reference = github.issues[-1]
+    state.mark_completed(
+        child_reference.number,
+        f"agent/reference/{child_reference.number}-review-design",
+        521,
+        "https://example/pr/521",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(
+        pr_number=521,
+        issue_number=child_reference.number,
+        status="merged",
+        repo_full_name=repo,
+    )
+
+    assert state.list_implementation_candidates(repo_full_name=repo) == ()
+
+    orch._advance_roadmap_nodes()
+    assert len(github.created_issues) == 2
+    _title2, _body2, labels2 = github.created_issues[1]
+    assert labels2 == (cfg.repo.small_job_label,)
+
+
 def test_advance_roadmap_nodes_completion_finalizes_after_issue_close(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_roadmaps=True)
     repo = cfg.repo.full_name
@@ -16715,6 +16884,61 @@ def test_roadmap_node_milestones_and_sync_blocking_paths(tmp_path: Path) -> None
         if node.node_id == "design"
     )
     assert updated_design.status == "blocked"
+
+
+def test_reference_doc_roadmap_node_milestones_collapse_planned_and_implemented(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, enable_roadmaps=True)
+    repo = cfg.repo.full_name
+    state = StateStore(tmp_path / "state.db")
+    state.upsert_roadmap_graph(
+        roadmap_issue_number=97,
+        roadmap_pr_number=907,
+        roadmap_doc_path="docs/roadmap/97.md",
+        graph_path="docs/roadmap/97.graph.json",
+        graph_checksum="sum97",
+        nodes=(
+            RoadmapNodeGraphInput(
+                node_id="review_design",
+                kind="reference_doc",
+                title="Review design",
+                body_markdown="Doc",
+                dependencies=(),
+            ),
+        ),
+        repo_full_name=repo,
+    )
+    claim = state.claim_ready_roadmap_nodes(repo_full_name=repo)[0]
+    state.mark_roadmap_node_issue_created(
+        roadmap_issue_number=97,
+        node_id=claim.node_id,
+        claim_token=claim.claim_token,
+        child_issue_number=971,
+        child_issue_url="https://example/issues/971",
+        repo_full_name=repo,
+    )
+    state.mark_failed(971, "waiting", repo_full_name=repo)
+
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=FakeGitHub([_issue(97, "Plan", labels=(cfg.repo.roadmap_label,))]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+    node = state.list_roadmap_nodes(roadmap_issue_number=97, repo_full_name=repo)[0]
+    assert orch._roadmap_node_milestones(node=node) == (False, False, True)
+
+    state.mark_completed(
+        971,
+        "agent/reference/971-review-design",
+        972,
+        "https://example/pr/972",
+        repo_full_name=repo,
+    )
+    state.mark_pr_status(pr_number=972, issue_number=971, status="merged", repo_full_name=repo)
+    assert orch._roadmap_node_milestones(node=node) == (True, True, False)
 
 
 def test_handle_roadmap_control_labels_revision_and_abandon_paths(tmp_path: Path) -> None:

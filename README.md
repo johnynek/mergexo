@@ -142,6 +142,13 @@ Then do this:
    - **Manual Steering:** You can force a revision at any time by adding `agent:roadmap-revise` to the roadmap issue. MergeXO will then ask the agent to propose a concrete update based on current progress.
    - The roadmap pauses fan-out until you review and merge this revision PR.
 
+### Roadmap Node Kinds
+
+- `reference_doc`: reviewed doc-only artifact. The child PR merges a durable reference doc and stops there. Use `planned` dependencies when downstream nodes only need that merged artifact.
+- `design_doc`: reviewed design doc that can later continue into implementation from the same child issue. Use `planned` when downstream work only needs the merged design; use `implemented` when it depends on the shipped implementation outcome.
+- `small_job`: direct implementation lane. `planned` means the child issue exists; `implemented` means the child PR merged.
+- `roadmap`: nested roadmap lane. `planned` means the child roadmap PR merged and activated; `implemented` means that child roadmap completed.
+
 ### Visibility and Control
 
 The roadmap issue is your durable command center:
@@ -613,5 +620,7 @@ usage: mergexo feedback blocked reset [-h] (--pr PR | --all) [--yes] [--dry-run]
 ## Label and PR Body Rules
 
 - `bugfix` and `small_job` PR bodies include `Fixes #<issue_number>`.
+- `reference_doc` PR bodies include `Closes #<issue_number>`.
 - `design_doc` PR bodies include `Refs #<issue_number>`.
+- Roadmap-created `reference_doc` child issues reuse the design trigger label; MergeXO distinguishes them from `design_doc` with an internal issue-body marker.
 - If multiple flow labels are present, precedence is `ignore` > `bugfix` > `small_job` > `design_doc`.

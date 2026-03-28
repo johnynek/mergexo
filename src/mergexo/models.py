@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-IssueFlow = Literal["design_doc", "bugfix", "small_job", "roadmap"]
-RoadmapNodeKind = Literal["design_doc", "small_job", "roadmap"]
+IssueFlow = Literal["reference_doc", "design_doc", "bugfix", "small_job", "roadmap"]
+RoadmapNodeKind = Literal["reference_doc", "design_doc", "small_job", "roadmap"]
 RoadmapDependencyRequirement = Literal["planned", "implemented"]
 OperatorCommandName = Literal["unblock", "retry", "restart", "help", "invalid"]
 OperatorCommandStatus = Literal["applied", "rejected", "failed"]
@@ -13,6 +13,14 @@ OperatorReplyStatus = Literal["applied", "rejected", "failed", "help"]
 RestartMode = Literal["git_checkout", "pypi"]
 RuntimeOperationStatus = Literal["pending", "running", "failed", "completed"]
 PrActionsFeedbackPolicy = Literal["never", "first_fail", "all_complete"]
+
+
+ROADMAP_NODE_KINDS: tuple[RoadmapNodeKind, ...] = (
+    "reference_doc",
+    "design_doc",
+    "small_job",
+    "roadmap",
+)
 
 
 @dataclass(frozen=True)

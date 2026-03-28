@@ -321,6 +321,19 @@ def test_resolve_durable_launch_returns_none_when_process_scan_fails(
     assert resolve_durable_launch(durable_launch) is None
 
 
+def test_resolve_durable_launch_returns_none_when_process_scan_raises_os_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    durable_launch = DurableLaunch(token="launch-token", metadata_path=tmp_path / "launch.json")
+    monkeypatch.setattr(
+        shell.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("ps missing")),
+    )
+
+    assert resolve_durable_launch(durable_launch) is None
+
+
 def test_resolve_durable_launch_returns_none_on_windows(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

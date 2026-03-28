@@ -302,7 +302,7 @@ def test_build_roadmap_feedback_prompt_contains_graph_contract() -> None:
     )
     assert "`nodes` must be a non-empty array of node objects" in prompt
     assert "Each node object must contain exactly" in prompt
-    assert "`kind`: one of `design_doc`, `small_job`, `roadmap`." in prompt
+    assert "`kind`: one of `reference_doc`, `design_doc`, `small_job`, `roadmap`." in prompt
     assert "Each dependency object in `depends_on` must contain exactly" in prompt
     assert "`requires`: one of `planned`, `implemented`." in prompt
     assert "Do not add extra keys outside this schema." in prompt
@@ -417,7 +417,10 @@ def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
     assert "Each item in `updated_graph_json.nodes` must be an object with exactly" in prompt
     assert "bump the graph `version` from 3 to 4" in prompt
     assert "Treat retained `node_id`s as stable work identities" in prompt
-    assert "preserve its `kind`, `title`, `body_markdown`, and `depends_on` exactly" in prompt
+    assert (
+        "Preserve `kind` too, except you may change an unstarted node between `design_doc` and `reference_doc`"
+        in prompt
+    )
     assert "Do not remove any node whose work has already started" in prompt
     assert "Do not churn `node_id`s for unchanged work" in prompt
     assert "ready frontier node_ids" in prompt
@@ -462,6 +465,10 @@ def test_build_requested_roadmap_revision_prompt_contains_request_contract() -> 
     assert "`roadmap_issue_number`: integer. Keep this set to 23." in prompt
     assert "`version`: integer. Bump the graph version from 5 to 6." in prompt
     assert "Treat retained `node_id`s as stable work identities" in prompt
+    assert (
+        "Preserve `kind` too, except you may change an unstarted node between `design_doc` and `reference_doc`"
+        in prompt
+    )
     assert "Do not remove any node whose work has already started" in prompt
     assert "Do not churn `node_id`s for unchanged work" in prompt
     assert "operator requested roadmap revision" in prompt
@@ -564,6 +571,7 @@ def test_build_roadmap_prompt_requires_graph_contract() -> None:
     assert "roadmap agent" in prompt
     assert "graph_json" in prompt
     assert "docs/roadmap/42-<slug>.graph.json" in prompt
+    assert "reference_doc" in prompt
     assert "design_doc" in prompt
     assert "small_job" in prompt
     assert "roadmap" in prompt
@@ -574,6 +582,7 @@ def test_build_roadmap_prompt_requires_graph_contract() -> None:
     assert (
         "`roadmap_markdown`: non-empty string containing the full roadmap markdown body" in prompt
     )
+    assert "reference_doc.planned" in prompt
     assert "design_doc.planned" in prompt
     assert "small_job.implemented" in prompt
     assert "roadmap.planned" in prompt

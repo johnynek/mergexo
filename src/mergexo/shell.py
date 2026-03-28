@@ -161,12 +161,15 @@ def _resolved_launch_from_payload(
 def _find_launch_by_token(launch_token: str) -> ResolvedLaunch | None:
     if os.name == "nt":
         return None
-    proc = subprocess.run(
-        ["ps", "ax", "-o", "pid=", "-o", "command="],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["ps", "ax", "-o", "pid=", "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
     if proc.returncode != 0:
         return None
     for line in proc.stdout.splitlines():
