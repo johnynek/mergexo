@@ -6,6 +6,7 @@ import json
 from typing import cast
 
 from mergexo.models import (
+    ROADMAP_NODE_KINDS,
     RoadmapDependency,
     RoadmapDependencyRequirement,
     RoadmapNode,
@@ -70,10 +71,10 @@ def parse_roadmap_graph_object(
         node_ids.add(node_id)
 
         kind_value = _require_non_empty_str(node_obj.get("kind"), field=f"{node_id}.kind")
-        if kind_value not in {"design_doc", "small_job", "roadmap"}:
+        if kind_value not in ROADMAP_NODE_KINDS:
             raise RoadmapGraphValidationError(
                 f"Invalid node kind for {node_id}: {kind_value!r}. "
-                "Expected one of: design_doc, small_job, roadmap"
+                "Expected one of: " + ", ".join(ROADMAP_NODE_KINDS)
             )
         kind = cast(RoadmapNodeKind, kind_value)
 

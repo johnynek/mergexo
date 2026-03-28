@@ -87,6 +87,20 @@ def test_parse_roadmap_graph_defaults_dependency_requires_to_implemented() -> No
     assert impl.depends_on[0].requires == "implemented"
 
 
+def test_parse_roadmap_graph_accepts_reference_doc_kind() -> None:
+    payload = _valid_graph_payload()
+    nodes = payload["nodes"]
+    assert isinstance(nodes, list)
+    design_node = nodes[0]
+    assert isinstance(design_node, dict)
+    design_node["kind"] = "reference_doc"
+
+    parsed = parse_roadmap_graph_object(payload)
+
+    design = next(node for node in parsed.graph.nodes if node.node_id == "design")
+    assert design.kind == "reference_doc"
+
+
 def test_parse_roadmap_graph_rejects_invalid_top_level_shapes() -> None:
     with pytest.raises(RoadmapGraphValidationError, match="Invalid roadmap graph JSON"):
         parse_roadmap_graph_json("{")

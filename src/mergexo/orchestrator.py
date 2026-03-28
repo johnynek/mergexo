@@ -153,11 +153,15 @@ _GITHUB_AUTH_FAILURE_POLL_THRESHOLD = 3
 _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "flow blocked:",
     "required pre-push tests failed before pushing design branch",
+    "required pre-push tests failed before pushing reference branch",
     "required pre-push tests did not pass after automated repair attempts",
     "new_issue_comments_pending",
 )
 _PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(
-    r"(bugfix|small-job|roadmap|implementation) flow blocked:"
+    r"(reference-doc|bugfix|small-job|roadmap|implementation) flow blocked:"
+)
+_ROADMAP_NODE_KIND_MARKER_PATTERN = re.compile(
+    r"<!--\s*mergexo-roadmap-node-kind:(reference_doc|design_doc|small_job|roadmap)\s*-->"
 )
 _COMMENT_CURSOR_EPOCH = "1970-01-01T00:00:00Z"
 _SURFACE_PR_REVIEW_COMMENTS: GitHubCommentSurface = "pr_review_comments"
@@ -190,7 +194,9 @@ _FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS = 4
 _FEEDBACK_TRANSIENT_GIT_INITIAL_DELAY_SECONDS = 5
 _FEEDBACK_TRANSIENT_GIT_MAX_DELAY_SECONDS = 60
 
-PrePrFlow = Literal["design_doc", "bugfix", "small_job", "roadmap", "implementation"]
+PrePrFlow = Literal[
+    "reference_doc", "design_doc", "bugfix", "small_job", "roadmap", "implementation"
+]
 
 
 @dataclass(frozen=True)
@@ -1400,6 +1406,7 @@ class Phase1Orchestrator:
                             body=_render_roadmap_child_issue_body(
                                 roadmap_issue_number=claim.roadmap_issue_number,
                                 node_id=claim.node_id,
+                                kind=claim.kind,
                                 dependencies_json=claim.dependencies_json,
                                 body_markdown=claim.body_markdown,
                             ),
@@ -2469,6 +2476,20 @@ class Phase1Orchestrator:
                 "awaiting_issue_followup",
             }
             return True, implemented, blocked
+        if node.kind == "reference_doc":
+            # reference_doc is doc-only, so both dependency milestones arrive when the
+            # reviewed reference artifact merges.
+            merged_reference_doc = (
+                issue_state is not None
+                and issue_state[0] == "merged"
+                and (issue_state[1] or "").startswith("agent/reference/")
+            )
+            blocked = issue_state is not None and issue_state[0] in {
+                "failed",
+                "blocked",
+                "awaiting_issue_followup",
+            }
+            return merged_reference_doc, merged_reference_doc, blocked
         if node.kind == "design_doc":
             planned = (
                 issue_state is not None
@@ -5806,6 +5827,13 @@ class Phase1Orchestrator:
                     branch=branch,
                     pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
                 )
+            if flow == "reference_doc":
+                return self._process_reference_doc_issue(
+                    issue=issue,
+                    checkout_path=lease.path,
+                    branch=branch,
+                    pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+                )
             if flow == "roadmap":
                 return self._process_roadmap_issue(
                     issue=issue,
@@ -5869,13 +5897,71 @@ class Phase1Orchestrator:
         branch: str,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
+        return self._process_document_issue(
+            issue=issue,
+            checkout_path=checkout_path,
+            branch=branch,
+            flow="design_doc",
+            pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+        )
+
+    def _process_reference_doc_issue(
+        self,
+        *,
+        issue: Issue,
+        checkout_path: Path,
+        branch: str,
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
+        return self._process_document_issue(
+            issue=issue,
+            checkout_path=checkout_path,
+            branch=branch,
+            flow="reference_doc",
+            pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+        )
+
+    def _process_document_issue(
+        self,
+        *,
+        issue: Issue,
+        checkout_path: Path,
+        branch: str,
+        flow: Literal["design_doc", "reference_doc"],
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
         self._git.create_or_reset_branch(checkout_path, branch)
 
         slug = _slugify(issue.title)
-        design_relpath = f"{self._repo.design_docs_dir}/{issue.number}-{slug}.md"
+        doc_relpath = f"{self._repo.design_docs_dir}/{issue.number}-{slug}.md"
+        is_reference_doc = flow == "reference_doc"
+        flow_label = "reference-doc" if is_reference_doc else "design"
+        turn_started_event = (
+            "reference_doc_turn_started" if is_reference_doc else "design_turn_started"
+        )
+        turn_completed_event = (
+            "reference_doc_turn_completed" if is_reference_doc else "design_turn_completed"
+        )
+        opened_pr_comment = "Opened reference doc PR" if is_reference_doc else "Opened design PR"
+        pr_title_prefix = "Reference doc" if is_reference_doc else "Design doc"
+        pr_body = (
+            f"Reference doc.\n\nCloses #{issue.number}"
+            if is_reference_doc
+            else f"Design doc.\n\nRefs #{issue.number}"
+        )
+        commit_message = (
+            f"docs: add reference doc for issue #{issue.number}"
+            if is_reference_doc
+            else f"docs: add design for issue #{issue.number}"
+        )
+        required_tests_error_message = (
+            "required pre-push tests failed before pushing reference branch"
+            if is_reference_doc
+            else "required pre-push tests failed before pushing design branch"
+        )
         log_event(
             LOGGER,
-            "design_turn_started",
+            turn_started_event,
             issue_number=issue.number,
             branch=branch,
         )
@@ -5883,7 +5969,7 @@ class Phase1Orchestrator:
         design_prompt = build_design_prompt(
             issue=issue,
             repo_full_name=self._state_repo_full_name(),
-            design_doc_path=design_relpath,
+            design_doc_path=doc_relpath,
             default_branch=self._repo.default_branch,
         )
         durable_launch = self._durable_codex_launch(run_id)
@@ -5900,7 +5986,7 @@ class Phase1Orchestrator:
                 start_result = self._agent.start_design_from_issue(
                     issue=issue,
                     repo_full_name=self._state_repo_full_name(),
-                    design_doc_path=design_relpath,
+                    design_doc_path=doc_relpath,
                     default_branch=self._repo.default_branch,
                     cwd=checkout_path,
                 )
@@ -5910,14 +5996,17 @@ class Phase1Orchestrator:
                 exc=exc,
                 checkout_path=checkout_path,
                 initial_head_sha=initial_head_sha,
-                blocked_message="design_doc flow blocked: codex invocation timed out after local changes were made",
+                blocked_message=(
+                    f"{flow_label} flow blocked: codex invocation timed out after local changes "
+                    "were made"
+                ),
             )
             raise
         self._mark_codex_invocation_finished(
             run_id=run_id,
             session_id=start_result.session.thread_id if start_result.session else None,
         )
-        log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
+        log_event(LOGGER, turn_completed_event, issue_number=issue.number)
         generated = start_result.design
         if start_result.session:
             self._state.save_agent_session(
@@ -5927,14 +6016,14 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
             )
 
-        design_abs_path = checkout_path / design_relpath
-        design_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        design_abs_path.write_text(
+        doc_abs_path = checkout_path / doc_relpath
+        doc_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_abs_path.write_text(
             _render_design_doc(issue=issue, design=generated),
             encoding="utf-8",
         )
 
-        self._git.commit_all(checkout_path, f"docs: add design for issue #{issue.number}")
+        self._git.commit_all(checkout_path, commit_message)
         required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
         if required_tests_error is not None:
             required_tests_command = self._repo.required_tests or "<unset>"
@@ -5942,17 +6031,15 @@ class Phase1Orchestrator:
             self._github.post_issue_comment(
                 issue_number=issue.number,
                 body=(
-                    "MergeXO design flow could not push because the required pre-push test "
+                    f"MergeXO {flow_label} flow could not push because the required pre-push test "
                     f"`{required_tests_command}` failed.\n"
                     f"Failure summary: {error_summary}"
                 ),
             )
-            raise DirectFlowValidationError(
-                "required pre-push tests failed before pushing design branch"
-            )
+            raise DirectFlowValidationError(required_tests_error_message)
         self._push_pre_pr_branch(
             issue=issue,
-            flow_label="design",
+            flow_label=flow_label,
             checkout_path=checkout_path,
             branch=branch,
         )
@@ -5964,15 +6051,15 @@ class Phase1Orchestrator:
         pr = self._create_pull_request_with_outbox(
             issue_number=issue.number,
             run_id=run_id,
-            title=f"Design doc for #{issue.number}: {generated.title}",
+            title=f"{pr_title_prefix} for #{issue.number}: {generated.title}",
             head=branch,
             base=self._repo.default_branch,
-            body=(f"Design doc.\n\nRefs #{issue.number}"),
+            body=pr_body,
         )
 
         self._github.post_issue_comment(
             issue_number=issue.number,
-            body=f"Opened design PR: {pr.html_url}",
+            body=f"{opened_pr_comment}: {pr.html_url}",
         )
 
         log_event(
@@ -5981,7 +6068,7 @@ class Phase1Orchestrator:
             issue_number=issue.number,
             pr_number=pr.number,
             branch=branch,
-            flow="design_doc",
+            flow=flow,
         )
         return WorkResult(
             issue_number=issue.number,
@@ -10336,6 +10423,8 @@ def _infer_pre_pr_flow_from_issue_and_error(
     if error_match is None:
         return None
     matched = error_match.group(1)
+    if matched == "reference-doc":
+        return "reference_doc"
     if matched == "small-job":
         return "small_job"
     return cast(PrePrFlow, matched)
@@ -10420,8 +10509,25 @@ def _parse_superseding_roadmap_parent(body: str) -> int | None:
     return int(match.group(1))
 
 
+def _roadmap_node_kind_marker(*, kind: str) -> str:
+    return f"<!-- mergexo-roadmap-node-kind:{kind} -->"
+
+
+def _parse_roadmap_node_kind_marker(body: str) -> str | None:
+    match = _ROADMAP_NODE_KIND_MARKER_PATTERN.search(body)
+    if match is not None:
+        return match.group(1)
+    legacy_match = re.search(
+        r"(?im)^\s*Roadmap node kind:\s*(reference_doc|design_doc|small_job|roadmap)\s*$",
+        body,
+    )
+    if legacy_match is None:
+        return None
+    return legacy_match.group(1)
+
+
 def _roadmap_child_label_for_kind(*, kind: str, repo: RepoConfig) -> str:
-    if kind == "design_doc":
+    if kind in {"reference_doc", "design_doc"}:
         return repo.trigger_label
     if kind == "small_job":
         return repo.small_job_label
@@ -10434,6 +10540,7 @@ def _render_roadmap_child_issue_body(
     *,
     roadmap_issue_number: int,
     node_id: str,
+    kind: str,
     dependencies_json: str,
     body_markdown: str,
 ) -> str:
@@ -10452,6 +10559,7 @@ def _render_roadmap_child_issue_body(
                 dependencies.append(f"- {dep_node_id} ({requires})")
     dependency_lines = "\n".join(dependencies) if dependencies else "- none"
     return (
+        f"{_roadmap_node_kind_marker(kind=kind)}\n\n"
         f"Parent roadmap: #{roadmap_issue_number}\n"
         f"Roadmap node: {node_id}\n\n"
         "Dependency context:\n"
@@ -10701,6 +10809,8 @@ def _render_roadmap_status_report(
 
 
 def _pre_pr_flow_label(flow: PrePrFlow) -> str:
+    if flow == "reference_doc":
+        return "reference-doc"
     if flow == "design_doc":
         return "design"
     if flow == "small_job":
@@ -10801,12 +10911,14 @@ def _resolve_issue_flow(
     if small_job_label in issue_labels:
         return "small_job"
     if design_label in issue_labels:
+        if _parse_roadmap_node_kind_marker(issue.body) == "reference_doc":
+            return "reference_doc"
         return "design_doc"
     return None
 
 
 def _flow_trigger_label(*, flow: IssueFlow, repo: RepoConfig) -> str:
-    if flow == "design_doc":
+    if flow in {"reference_doc", "design_doc"}:
         return repo.trigger_label
     if flow == "roadmap":
         return repo.roadmap_label
@@ -10816,6 +10928,8 @@ def _flow_trigger_label(*, flow: IssueFlow, repo: RepoConfig) -> str:
 
 
 def _issue_branch(*, flow: IssueFlow, issue_number: int, slug: str) -> str:
+    if flow == "reference_doc":
+        return f"agent/reference/{issue_number}-{slug}"
     if flow == "design_doc":
         return f"agent/design/{issue_number}-{slug}"
     if flow == "roadmap":
@@ -10847,7 +10961,9 @@ def _default_commit_message(*, flow: IssueFlow, issue_number: int) -> str:
 def _render_issue_start_comment(
     *, issue_number: int, flow: IssueFlow | Literal["implementation"]
 ) -> str:
-    if flow == "design_doc":
+    if flow == "reference_doc":
+        action = "reference document work"
+    elif flow == "design_doc":
         action = "design work"
     elif flow == "roadmap":
         action = "roadmap planning work"
@@ -10894,6 +11010,14 @@ def _is_no_staged_changes_error_text(error: str) -> bool:
 
 def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, str, str]:
     flow = _flow_label_from_branch(branch)
+    if flow == "reference":
+        return (
+            f"Reference doc for #{issue.number}: {issue.title}",
+            (
+                f"Recovered reference doc PR from a previously pushed branch.\n\nCloses #{issue.number}"
+            ),
+            flow,
+        )
     if flow == "design":
         return (
             f"Design doc for #{issue.number}: {issue.title}",
@@ -10929,6 +11053,8 @@ def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, s
 
 
 def _flow_label_from_branch(branch: str) -> str:
+    if branch.startswith("agent/reference/"):
+        return "reference"
     if branch.startswith("agent/design/"):
         return "design"
     if branch.startswith("agent/roadmap/"):

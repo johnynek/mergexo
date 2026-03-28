@@ -44,7 +44,9 @@ _TRANSIENT_RETRY_MAX_DELAY_SECONDS = 300
 _STALE_RUNNING_RETRY_ERROR = "stale_running_issue_without_active_run"
 _ROADMAP_ADJUSTMENT_STALE_AFTER = timedelta(minutes=30)
 _ROADMAP_NODE_CLAIM_STALE_AFTER = timedelta(minutes=30)
-PrePrFollowupFlow = Literal["design_doc", "bugfix", "small_job", "roadmap", "implementation"]
+PrePrFollowupFlow = Literal[
+    "reference_doc", "design_doc", "bugfix", "small_job", "roadmap", "implementation"
+]
 AgentRunKind = Literal["issue_flow", "implementation_flow", "pre_pr_followup", "feedback_turn"]
 AgentRunTerminalStatus = Literal[
     "completed",
@@ -7687,7 +7689,14 @@ def _parse_restart_mode(value: object) -> RestartMode:
 def _parse_pre_pr_followup_flow(value: object) -> PrePrFollowupFlow:
     if not isinstance(value, str):
         raise RuntimeError("Invalid flow value stored in pre_pr_followup_state")
-    if value not in {"design_doc", "bugfix", "small_job", "roadmap", "implementation"}:
+    if value not in {
+        "reference_doc",
+        "design_doc",
+        "bugfix",
+        "small_job",
+        "roadmap",
+        "implementation",
+    }:
         raise RuntimeError(f"Unknown flow value stored in pre_pr_followup_state: {value}")
     return cast(PrePrFollowupFlow, value)
 
@@ -7819,7 +7828,7 @@ def _parse_roadmap_node_status(value: object) -> RoadmapNodeStatus:
 def _parse_roadmap_node_kind(value: object) -> RoadmapNodeKind:
     if not isinstance(value, str):
         raise RuntimeError("Invalid kind value stored in roadmap_nodes")
-    if value not in {"design_doc", "small_job", "roadmap"}:
+    if value not in {"reference_doc", "design_doc", "small_job", "roadmap"}:
         raise RuntimeError(f"Unknown kind value stored in roadmap_nodes: {value}")
     return cast(RoadmapNodeKind, value)
 
