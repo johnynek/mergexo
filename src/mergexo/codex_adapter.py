@@ -1050,35 +1050,12 @@ class CodexAdapter(AgentAdapter):
         cwd: Path,
         invocation_mode: str = "respond_to_review",
     ) -> tuple[dict[str, object], str | None]:
-        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
-            tmp_path = Path(tmp)
-            schema_path = tmp_path / "schema.json"
-            output_path = tmp_path / "last_message.txt"
-            schema_path.write_text(json.dumps(_FEEDBACK_OUTPUT_SCHEMA), encoding="utf-8")
-
-            cmd = [
-                "codex",
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-            ]
-            self._append_common_options(cmd)
-            cmd.append("-")
-
-            raw_events = self._run_codex_command(
-                cmd=cmd,
-                cwd=cwd,
-                prompt=prompt,
-                invocation_mode=invocation_mode,
-            )
-            raw = output_path.read_text(encoding="utf-8").strip()
-            payload = _parse_json_payload(raw)
-
-        return payload, _extract_thread_id(raw_events)
+        return self._run_codex_exec_turn(
+            prompt=prompt,
+            cwd=cwd,
+            schema=_FEEDBACK_OUTPUT_SCHEMA,
+            invocation_mode=invocation_mode,
+        )
 
     def _run_direct_turn_resume(
         self,
@@ -1113,7 +1090,15 @@ class CodexAdapter(AgentAdapter):
             raw_events
         ) or session.thread_id
 
-    def _run_pre_pr_review_turn(self, *, prompt: str, cwd: Path) -> PrePrReviewResult:
+    def _run_codex_exec_turn(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+        schema: dict[str, object],
+        invocation_mode: str,
+    ) -> tuple[dict[str, object], str | None]:
+        """Run a schema-backed `codex exec` turn and return the parsed payload and thread ID."""
         if not self._config.enabled:
             raise RuntimeError("Codex is disabled in config")
 
@@ -1121,42 +1106,7 @@ class CodexAdapter(AgentAdapter):
             tmp_path = Path(tmp)
             schema_path = tmp_path / "schema.json"
             output_path = tmp_path / "last_message.txt"
-            schema_path.write_text(json.dumps(_PRE_PR_REVIEW_OUTPUT_SCHEMA), encoding="utf-8")
-
-            cmd = [
-                "codex",
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-            ]
-            self._append_common_options(cmd)
-            cmd.append("-")
-
-            self._run_codex_command(
-                cmd=cmd,
-                cwd=cwd,
-                prompt=prompt,
-                invocation_mode="pre_pr_review",
-            )
-
-            raw = output_path.read_text(encoding="utf-8").strip()
-            payload = _parse_json_payload(raw)
-
-        return _parse_pre_pr_review_result_payload(payload)
-
-    def _run_design_turn(self, *, prompt: str, cwd: Path) -> tuple[GeneratedDesign, str | None]:
-        if not self._config.enabled:
-            raise RuntimeError("Codex is disabled in config")
-
-        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
-            tmp_path = Path(tmp)
-            schema_path = tmp_path / "schema.json"
-            output_path = tmp_path / "last_message.txt"
-            schema_path.write_text(json.dumps(_DESIGN_OUTPUT_SCHEMA), encoding="utf-8")
+            schema_path.write_text(json.dumps(schema), encoding="utf-8")
 
             cmd = [
                 "codex",
@@ -1175,12 +1125,29 @@ class CodexAdapter(AgentAdapter):
                 cmd=cmd,
                 cwd=cwd,
                 prompt=prompt,
-                invocation_mode="writing_doc",
+                invocation_mode=invocation_mode,
             )
-
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
 
+        return payload, _extract_thread_id(raw_events)
+
+    def _run_pre_pr_review_turn(self, *, prompt: str, cwd: Path) -> PrePrReviewResult:
+        payload, _thread_id = self._run_codex_exec_turn(
+            prompt=prompt,
+            cwd=cwd,
+            schema=_PRE_PR_REVIEW_OUTPUT_SCHEMA,
+            invocation_mode="pre_pr_review",
+        )
+        return _parse_pre_pr_review_result_payload(payload)
+
+    def _run_design_turn(self, *, prompt: str, cwd: Path) -> tuple[GeneratedDesign, str | None]:
+        payload, thread_id = self._run_codex_exec_turn(
+            prompt=prompt,
+            cwd=cwd,
+            schema=_DESIGN_OUTPUT_SCHEMA,
+            invocation_mode="writing_doc",
+        )
         title = _require_str(payload, "title")
         summary = _require_str(payload, "summary")
         design_doc_markdown = _require_str(payload, "design_doc_markdown")
@@ -1193,42 +1160,18 @@ class CodexAdapter(AgentAdapter):
                 design_doc_markdown=design_doc_markdown,
                 touch_paths=tuple(touch_paths),
             ),
-            _extract_thread_id(raw_events),
+            thread_id,
         )
 
     def _run_roadmap_turn(
         self, *, prompt: str, expected_issue_number: int, cwd: Path
     ) -> tuple[GeneratedRoadmap, str | None]:
-        if not self._config.enabled:
-            raise RuntimeError("Codex is disabled in config")
-
-        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
-            tmp_path = Path(tmp)
-            schema_path = tmp_path / "schema.json"
-            output_path = tmp_path / "last_message.txt"
-            schema_path.write_text(json.dumps(_ROADMAP_OUTPUT_SCHEMA), encoding="utf-8")
-
-            cmd = [
-                "codex",
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-            ]
-            self._append_common_options(cmd)
-            cmd.append("-")
-            raw_events = self._run_codex_command(
-                cmd=cmd,
-                cwd=cwd,
-                prompt=prompt,
-                invocation_mode="roadmap",
-            )
-            raw = output_path.read_text(encoding="utf-8").strip()
-            payload = _parse_json_payload(raw)
-
+        payload, thread_id = self._run_codex_exec_turn(
+            prompt=prompt,
+            cwd=cwd,
+            schema=_ROADMAP_OUTPUT_SCHEMA,
+            invocation_mode="roadmap",
+        )
         title = _require_str(payload, "title")
         summary = _require_str(payload, "summary")
         graph_obj = payload.get("graph_json")
@@ -1248,7 +1191,7 @@ class CodexAdapter(AgentAdapter):
                 graph_nodes=parsed_graph.graph.nodes,
                 canonical_graph_json=parsed_graph.canonical_json,
             ),
-            _extract_thread_id(raw_events),
+            thread_id,
         )
 
     def _start_direct_turn(
@@ -1326,39 +1269,13 @@ class CodexAdapter(AgentAdapter):
         cwd: Path,
         invocation_mode: str,
     ) -> tuple[DirectStartResult, str | None]:
-        if not self._config.enabled:
-            raise RuntimeError("Codex is disabled in config")
-
-        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
-            tmp_path = Path(tmp)
-            schema_path = tmp_path / "schema.json"
-            output_path = tmp_path / "last_message.txt"
-            schema_path.write_text(json.dumps(_DIRECT_OUTPUT_SCHEMA), encoding="utf-8")
-
-            cmd = [
-                "codex",
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-            ]
-            self._append_common_options(cmd)
-            cmd.append("-")
-
-            raw_events = self._run_codex_command(
-                cmd=cmd,
-                cwd=cwd,
-                prompt=prompt,
-                invocation_mode=invocation_mode,
-            )
-
-            raw = output_path.read_text(encoding="utf-8").strip()
-            payload = _parse_json_payload(raw)
-
-        return (_parse_direct_result_payload(payload), _extract_thread_id(raw_events))
+        payload, thread_id = self._run_codex_exec_turn(
+            prompt=prompt,
+            cwd=cwd,
+            schema=_DIRECT_OUTPUT_SCHEMA,
+            invocation_mode=invocation_mode,
+        )
+        return (_parse_direct_result_payload(payload), thread_id)
 
     def _run_roadmap_adjustment_turn(
         self,
@@ -1368,40 +1285,12 @@ class CodexAdapter(AgentAdapter):
         expected_issue_number: int,
         current_graph_version: int,
     ) -> RoadmapAdjustmentResult:
-        if not self._config.enabled:
-            raise RuntimeError("Codex is disabled in config")
-
-        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
-            tmp_path = Path(tmp)
-            schema_path = tmp_path / "schema.json"
-            output_path = tmp_path / "last_message.txt"
-            schema_path.write_text(
-                json.dumps(_ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA),
-                encoding="utf-8",
-            )
-
-            cmd = [
-                "codex",
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-            ]
-            self._append_common_options(cmd)
-            cmd.append("-")
-            self._run_codex_command(
-                cmd=cmd,
-                cwd=cwd,
-                prompt=prompt,
-                invocation_mode="roadmap",
-            )
-
-            raw = output_path.read_text(encoding="utf-8").strip()
-            payload = _parse_json_payload(raw)
-
+        payload, _thread_id = self._run_codex_exec_turn(
+            prompt=prompt,
+            cwd=cwd,
+            schema=_ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA,
+            invocation_mode="roadmap",
+        )
         action = _require_str(payload, "action")
         if action not in {"proceed", "revise", "abandon"}:
             raise RuntimeError("action must be one of: proceed, revise, abandon")
