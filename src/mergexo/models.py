@@ -50,6 +50,7 @@ class PullRequestSnapshot:
     draft: bool
     state: str
     merged: bool
+    merge_commit_sha: str | None = None
 
 
 @dataclass(frozen=True)

@@ -162,6 +162,8 @@ The roadmap issue is your durable command center:
 Roadmaps are now a continuous control loop, not a one-time plan that fans out unchanged.
 
 - Before issuing each ready frontier, MergeXO evaluates the current roadmap against concrete dependency artifacts from already-completed child work.
+- Each new roadmap child issue also carries a durable direct-dependency handoff snapshot in its issue body. Workers get those same direct dependency artifacts in their prompt, including stable issue/PR links, git provenance, and exact artifact paths for docs and nested roadmaps.
+- The handoff is direct-only by design. If a downstream node truly needs another upstream artifact, model that as an explicit roadmap edge instead of expecting workers to walk the graph or git history.
 - The adjustment result is one of `proceed`, `revise`, or `abandon`.
 - `proceed` issues the ready child issues now.
 - `revise` creates or reuses a same-roadmap revision PR instead of opening a replacement roadmap issue in the normal revision path.

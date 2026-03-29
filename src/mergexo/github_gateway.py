@@ -366,6 +366,7 @@ class GitHubGateway:
             draft=_as_bool(payload_obj.get("draft")),
             state=_as_string(payload_obj.get("state")),
             merged=_as_bool(payload_obj.get("merged")),
+            merge_commit_sha=_as_optional_str(payload_obj.get("merge_commit_sha")),
         )
         log_event(
             LOGGER,

@@ -481,6 +481,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
                 "draft": False,
                 "state": "open",
                 "merged": False,
+                "merge_commit_sha": "merge-9",
             }
         if path.endswith("/pulls/9/files?per_page=100"):
             return ["skip", {"filename": "src/a.py"}, {"filename": "README.md"}]
@@ -539,6 +540,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert pr.head_sha == "headsha"
     assert pr.state == "open"
     assert pr.merged is False
+    assert pr.merge_commit_sha == "merge-9"
     assert files == ("src/a.py", "README.md")
     assert review_comments[0].comment_id == 11
     assert review_comments[0].user_login == "reviewer"
