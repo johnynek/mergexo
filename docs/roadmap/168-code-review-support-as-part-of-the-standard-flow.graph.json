@@ -1,0 +1,101 @@
+{
+  "nodes": [
+    {
+      "body_markdown": "## Summary\nAdd the repo-level configuration and path-resolution plumbing needed to turn standard-flow review on selectively and to locate repo-supplied review guidance. Do not wire the review execution loop yet.\n\n## Scope\n- Extend `RepoConfig` and config parsing for the review settings defined by the accepted design.\n- Support both keyed `[repo.<id>]` and legacy `[repo]` config shapes.\n- Add helper(s) that resolve the configured review-guidance path in a checkout and degrade cleanly when the file is absent.\n- Keep existing flows unchanged when review is not enabled.\n\n## Likely touch paths\n- `src/mergexo/config.py`\n- `src/mergexo/orchestrator.py`\n- `tests/test_config.py`\n\n## Acceptance criteria\n- Valid review config loads correctly in both repo config shapes.\n- Invalid types or invalid combinations fail with precise config errors.\n- Missing review-guidance files are detectable without breaking unrelated flows.\n- Tests cover defaults, overrides, legacy compatibility, and path resolution.",
+      "depends_on": [
+        {
+          "node_id": "review_design",
+          "requires": "planned"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_config",
+      "title": "Add repo configuration for optional pre-PR review"
+    },
+    {
+      "body_markdown": "## Summary\nWrite a durable design/reference doc for optional code-review support on MergeXO's code-producing flows. This artifact should settle architecture questions before implementation work starts.\n\n## Scope\n- Cover `bugfix`, `small_job`, and `implementation` flows explicitly, and state whether design-doc or roadmap PRs stay on the existing human-review path.\n- Define the repo configuration surface for enabling review, locating repo-supplied review guidance, and bounding any review/repair rounds.\n- Define the structured reviewer output contract and the author-repair handoff contract.\n- Define how the author session remains usable for later PR feedback after pre-PR review completes.\n- Define sequencing around required tests, push/PR creation, blocked outcomes, and rollout defaults.\n\n## Likely touch paths\n- `docs/design/168-code-review-support-as-part-of-the-standard-flow.md`\n\n## Acceptance criteria\n- The design names the concrete artifacts, prompts, and adapter/orchestrator responsibilities.\n- The design explains how reviewer findings are passed back to the author agent for action without losing later feedback-loop continuity.\n- The design states the opt-in/default-off behavior and the expected test plan for each implementation slice.",
+      "depends_on": [],
+      "kind": "reference_doc",
+      "node_id": "review_design",
+      "title": "Write the reviewed design for standard-flow code review support"
+    },
+    {
+      "body_markdown": "## Summary\nAdd the operator-facing docs and example artifacts for the new review capability so repositories have a clear way to configure it and supply repo-specific review guidance.\n\n## Scope\n- Update `README.md` with the standard-flow review lifecycle, config knobs, and how reviewer findings are handed back to the author agent before PR creation.\n- Update `mergexo.toml.example` with the new review-related repo settings.\n- Add a concrete example review-guidance document under `docs/` that MergeXO itself can use as a repository-supplied reviewer brief.\n- Keep the docs aligned to shipped behavior, not aspirational behavior.\n\n## Likely touch paths\n- `README.md`\n- `mergexo.toml.example`\n- `docs/`\n\n## Acceptance criteria\n- The docs explain that review is optional and how to enable it per repo.\n- The docs identify where review guidance lives in-repo and how it influences the reviewer prompt.\n- The docs explain the author-repair handoff and any important limits or failure modes operators should expect.",
+      "depends_on": [
+        {
+          "node_id": "review_config",
+          "requires": "implemented"
+        },
+        {
+          "node_id": "review_design",
+          "requires": "planned"
+        },
+        {
+          "node_id": "review_flow",
+          "requires": "implemented"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_docs",
+      "title": "Document review guidance and operator configuration"
+    },
+    {
+      "body_markdown": "## Summary\nIntegrate optional review into the standard code-producing flows so MergeXO can run authoring, review, and author repair before opening a PR.\n\n## Scope\n- Apply the review loop to `bugfix`, `small_job`, and `implementation` flows.\n- After the initial author turn, run the reviewer, and when findings are returned, run bounded author-repair rounds before PR creation.\n- Re-run required-tests checks after each repair commit and only open the PR when the configured review gate is satisfied.\n- Preserve the saved author session for the later human PR-feedback loop.\n- Post clear issue comments and logs when review blocks, round limits are exceeded, or review is skipped because the feature is disabled.\n\n## Likely touch paths\n- `src/mergexo/orchestrator.py`\n- `src/mergexo/state.py`\n- `tests/test_orchestrator.py`\n- `tests/test_state.py`\n\n## Acceptance criteria\n- When review is disabled, the existing flows behave exactly as before.\n- When review is enabled and the reviewer returns no findings, PR creation proceeds normally.\n- When findings are returned, author repair runs before PR creation and required tests are rechecked.\n- When review cannot be cleared safely, no PR is opened and the issue gets a clear blocking comment.\n- Tests cover success, findings-triggered repair, round-limit or blocked outcomes, and later feedback-loop session continuity.",
+      "depends_on": [
+        {
+          "node_id": "review_config",
+          "requires": "implemented"
+        },
+        {
+          "node_id": "review_design",
+          "requires": "planned"
+        },
+        {
+          "node_id": "review_repair",
+          "requires": "implemented"
+        },
+        {
+          "node_id": "review_reviewer",
+          "requires": "implemented"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_flow",
+      "title": "Wire the pre-PR review loop into standard code flows"
+    },
+    {
+      "body_markdown": "## Summary\nTeach MergeXO to hand structured reviewer findings back to the author agent before PR creation so the author can make targeted fixes in the same workstream.\n\n## Scope\n- Add a dedicated prompt/adapter path for a pre-PR author-repair turn that consumes reviewer findings.\n- Reuse the direct-turn output contract so repaired author turns still return PR metadata, commit intent, and blocked reasons consistently.\n- Preserve author-session continuity when resume works, and define/test the fallback behavior when a fresh thread is required.\n- Keep this job limited to the author-side repair contract; the orchestrator loop that calls it lands separately.\n\n## Likely touch paths\n- `src/mergexo/agent_adapter.py`\n- `src/mergexo/codex_adapter.py`\n- `src/mergexo/prompts.py`\n- `tests/test_models_and_prompts.py`\n- `tests/test_codex_adapter.py`\n\n## Acceptance criteria\n- Structured reviewer findings can be injected into an author follow-up turn without dropping required direct-turn fields.\n- Resume and fresh-thread fallback behavior are both covered by tests.\n- Blocked or ambiguous repair outcomes stay explicit in the returned contract.",
+      "depends_on": [
+        {
+          "node_id": "review_design",
+          "requires": "planned"
+        },
+        {
+          "node_id": "review_reviewer",
+          "requires": "implemented"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_repair",
+      "title": "Resume the author agent from reviewer findings"
+    },
+    {
+      "body_markdown": "## Summary\nAdd the dedicated review-agent invocation used to inspect locally authored code changes before PR creation. The output must be structured so the orchestrator can decide whether to continue, request author repairs, or block.\n\n## Scope\n- Add the review result dataclasses and any schema helpers needed for structured findings.\n- Add a prompt builder that gives the reviewer the issue context, changed-file context, coding guidelines, and repo review guidance when configured.\n- Add the Codex adapter entrypoint and strict output validation for the reviewer turn.\n- Keep this job focused on the review-agent contract; author remediation and orchestration land separately.\n\n## Likely touch paths\n- `src/mergexo/agent_adapter.py`\n- `src/mergexo/codex_adapter.py`\n- `src/mergexo/prompts.py`\n- `tests/test_models_and_prompts.py`\n- `tests/test_codex_adapter.py`\n\n## Acceptance criteria\n- The reviewer output is structured and machine-consumable, with clear empty-findings and findings-present cases.\n- The prompt includes repo review guidance when available and stays usable when that file is absent.\n- Invalid reviewer payloads are rejected by tests instead of flowing into orchestration.",
+      "depends_on": [
+        {
+          "node_id": "review_config",
+          "requires": "implemented"
+        },
+        {
+          "node_id": "review_design",
+          "requires": "planned"
+        }
+      ],
+      "kind": "small_job",
+      "node_id": "review_reviewer",
+      "title": "Implement the reviewer prompt and structured findings contract"
+    }
+  ],
+  "roadmap_issue_number": 168,
+  "version": 1
+}
