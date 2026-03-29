@@ -131,6 +131,8 @@ from mergexo.orchestrator import (
     _truncate_feedback_text,
 )
 from mergexo.observability import configure_logging
+from mergexo.roadmap_markdown import render_roadmap_markdown
+from mergexo.prompts import parse_roadmap_child_dependency_handoff_marker
 from mergexo.prompts import parse_roadmap_child_dependency_handoff_marker
 from mergexo.roadmap_parser import parse_roadmap_graph_json
 from mergexo.shell import (
@@ -13735,7 +13737,7 @@ def test_with_feedback_issue_comment_requires_checkout_path_for_roadmap_turn(
         )
 
 
-def test_validate_roadmap_feedback_artifacts_rejects_missing_markdown_and_empty_markdown(
+def test_validate_roadmap_feedback_artifacts_regenerates_missing_and_empty_markdown(
     tmp_path: Path,
 ) -> None:
     cfg = _config(tmp_path)
@@ -13777,11 +13779,10 @@ def test_validate_roadmap_feedback_artifacts_rejects_missing_markdown_and_empty_
     )
 
     assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) == (
-        f"missing roadmap markdown file: {roadmap_doc_path}"
+        f"missing roadmap graph file: {graph_path}"
     )
 
-    (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
-    (checkout / roadmap_doc_path).write_text("   ", encoding="utf-8")
+    (checkout / graph_path).parent.mkdir(parents=True, exist_ok=True)
     (checkout / graph_path).write_text(
         json.dumps(
             {
@@ -13800,12 +13801,21 @@ def test_validate_roadmap_feedback_artifacts_rejects_missing_markdown_and_empty_
         ),
         encoding="utf-8",
     )
-    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) == (
-        f"roadmap markdown is empty at {roadmap_doc_path}"
+    parsed = parse_roadmap_graph_json(
+        (checkout / graph_path).read_text(encoding="utf-8"),
+        expected_issue_number=7,
     )
+    expected_markdown = render_roadmap_markdown(parsed.graph)
+
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) is None
+    assert (checkout / roadmap_doc_path).read_text(encoding="utf-8") == expected_markdown
+
+    (checkout / roadmap_doc_path).write_text("   ", encoding="utf-8")
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) is None
+    assert (checkout / roadmap_doc_path).read_text(encoding="utf-8") == expected_markdown
 
 
-def test_validate_roadmap_feedback_artifacts_rejects_unreadable_markdown_and_graph(
+def test_validate_roadmap_feedback_artifacts_tolerates_unreadable_markdown_but_rejects_unreadable_graph(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = _config(tmp_path)
@@ -13822,7 +13832,24 @@ def test_validate_roadmap_feedback_artifacts_rejects_unreadable_markdown_and_gra
     graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
     (checkout / roadmap_doc_path).parent.mkdir(parents=True, exist_ok=True)
     (checkout / roadmap_doc_path).write_text("# Roadmap\n", encoding="utf-8")
-    (checkout / graph_path).write_text("{}", encoding="utf-8")
+    (checkout / graph_path).write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     turn = RoadmapFeedbackTurn(
         turn_key="turn-key",
         issue=_issue(labels=(cfg.repo.roadmap_label,)),
@@ -13856,9 +13883,7 @@ def test_validate_roadmap_feedback_artifacts_rejects_unreadable_markdown_and_gra
         return original_read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", unreadable_markdown)
-    assert "roadmap markdown is unreadable" in cast(
-        str, orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout)
-    )
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) is None
 
     def unreadable_graph(self: Path, *args: object, **kwargs: object) -> str:
         if self == checkout / graph_path:
@@ -14055,6 +14080,97 @@ def test_validate_roadmap_feedback_artifacts_accepts_valid_same_version_pair(
     )
 
     assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) is None
+    parsed = parse_roadmap_graph_json(
+        (checkout / graph_path).read_text(encoding="utf-8"),
+        expected_issue_number=7,
+    )
+    assert (checkout / roadmap_doc_path).read_text(encoding="utf-8") == render_roadmap_markdown(
+        parsed.graph
+    )
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) is None
+
+
+def test_validate_roadmap_feedback_artifacts_reports_generation_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    git = FakeGitManager(tmp_path / "checkouts")
+    orch = Phase1Orchestrator(
+        cfg,
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=git,
+        agent=FakeAgent(),
+    )
+    checkout = git.ensure_checkout(0)
+    roadmap_doc_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.md"
+    graph_path = f"{cfg.repo.roadmap_docs_dir}/7-add-worker-scheduler.graph.json"
+    (checkout / graph_path).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / graph_path).write_text(
+        json.dumps(
+            {
+                "roadmap_issue_number": 7,
+                "version": 1,
+                "nodes": [
+                    {
+                        "node_id": "n1",
+                        "kind": "small_job",
+                        "title": "Ship",
+                        "body_markdown": "Do it",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    turn = RoadmapFeedbackTurn(
+        turn_key="turn-key",
+        issue=_issue(labels=(cfg.repo.roadmap_label,)),
+        pull_request=PullRequestSnapshot(
+            number=101,
+            title="Roadmap PR",
+            body="Body",
+            head_sha="head-1",
+            base_sha="base-1",
+            draft=False,
+            state="open",
+            merged=False,
+        ),
+        review_comments=(),
+        issue_comments=(),
+        changed_files=(roadmap_doc_path, graph_path),
+        roadmap_doc_path=roadmap_doc_path,
+        graph_path=graph_path,
+        roadmap_markdown="",
+        graph_json_text="",
+        graph_version=1,
+        roadmap_markdown_missing=False,
+        graph_missing=False,
+        graph_validation_error=None,
+    )
+
+    original_write_text = Path.write_text
+
+    def fail_markdown_write(self: Path, *args: object, **kwargs: object) -> int:
+        if self == checkout / roadmap_doc_path:
+            raise OSError("disk full")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_markdown_write)
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) == (
+        "failed to regenerate roadmap markdown: disk full"
+    )
+
+    class FakeMaterialized:
+        graph_version = 1
+
+    monkeypatch.setattr(orch, "_materialize_roadmap_artifacts", lambda **_: FakeMaterialized())
+    monkeypatch.setattr(Path, "write_text", original_write_text)
+    (checkout / roadmap_doc_path).unlink(missing_ok=True)
+    assert orch._validate_roadmap_feedback_artifacts(turn=turn, checkout_path=checkout) == (
+        f"missing generated roadmap markdown file: {roadmap_doc_path}"
+    )
 
 
 def test_roadmap_feedback_turn_with_validation_failure_truncates_and_handles_empty_output(
@@ -14170,7 +14286,7 @@ def test_commit_push_feedback_roadmap_validation_retries_before_push(
     final_result, _ = outcome
     assert final_result.commit_message == "docs: repair roadmap feedback"
     assert validation_calls["count"] == 2
-    assert len(git.commit_calls) == 2
+    assert len(git.commit_calls) == 1
 
 
 def test_commit_push_feedback_roadmap_validation_blocks_after_repair_limit(
@@ -14190,7 +14306,7 @@ def test_commit_push_feedback_roadmap_validation_blocks_after_repair_limit(
     monkeypatch.setattr(
         orch,
         "_validate_roadmap_feedback_artifacts",
-        lambda **_: "roadmap markdown and graph disagree",
+        lambda **_: "failed to regenerate roadmap markdown: boom",
     )
 
     def fake_run_feedback_agent_with_git_ops(
@@ -18619,9 +18735,9 @@ def test_run_roadmap_adjustment_gate_revise_and_abandon_paths(tmp_path: Path) ->
             "Refs #1003",
         )
     ]
-    assert (revise_checkout / "docs/roadmap/1003.md").read_text(
-        encoding="utf-8"
-    ) == "# Revised roadmap"
+    revised_markdown = (revise_checkout / "docs/roadmap/1003.md").read_text(encoding="utf-8")
+    assert "Generated from roadmap graph JSON." in revised_markdown
+    assert "### `n2`" in revised_markdown
     assert '"version": 2' in (revise_checkout / "docs/roadmap/1003.graph.json").read_text(
         encoding="utf-8"
     )
@@ -18813,7 +18929,7 @@ def test_run_roadmap_adjustment_gate_handles_failed_revision_pending_transition(
     assert "failed to persist same-roadmap revision draft" in refreshed.last_error
 
 
-def test_open_or_update_roadmap_revision_pr_rejects_missing_payloads(tmp_path: Path) -> None:
+def test_open_or_update_roadmap_revision_pr_rejects_missing_graph_payload(tmp_path: Path) -> None:
     cfg = _config(tmp_path, enable_roadmaps=True)
     repo = cfg.repo.full_name
     state = StateStore(tmp_path / "state.db")
@@ -18845,22 +18961,6 @@ def test_open_or_update_roadmap_revision_pr_rejects_missing_payloads(tmp_path: P
     )
     roadmap = state.get_roadmap_state(roadmap_issue_number=1007, repo_full_name=repo)
     assert roadmap is not None
-
-    with pytest.raises(RuntimeError, match="missing updated roadmap markdown"):
-        orch._open_or_update_roadmap_revision_pr(
-            roadmap=roadmap,
-            decision=RoadmapAdjustmentResult(
-                action="revise",
-                summary="Need revision",
-                details="Missing markdown payload.",
-                updated_roadmap_markdown=None,
-                updated_canonical_graph_json=(
-                    '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
-                    '"node_id":"n2","title":"Two"}],"roadmap_issue_number":1007,"version":2}'
-                ),
-            ),
-            checkout_path=checkout,
-        )
 
     with pytest.raises(RuntimeError, match="missing updated roadmap graph"):
         orch._open_or_update_roadmap_revision_pr(
@@ -21103,6 +21203,24 @@ def test_roadmap_revision_draft_helpers_reject_version_mismatches(tmp_path: Path
     )
     roadmap = state.get_roadmap_state(roadmap_issue_number=10111, repo_full_name=repo)
     assert roadmap is not None
+
+    derived = orch._roadmap_revision_draft_from_decision(
+        roadmap=roadmap,
+        decision=RoadmapAdjustmentResult(
+            action="revise",
+            summary="Need revision",
+            details="Derive markdown from graph only.",
+            updated_roadmap_markdown=None,
+            updated_canonical_graph_json=(
+                '{"nodes":[{"body_markdown":"Two","depends_on":[],"kind":"small_job",'
+                '"node_id":"n2","title":"Two"}],"roadmap_issue_number":10111,"version":2}'
+            ),
+        ),
+        source_kind="adjustment",
+        ready_node_ids=(),
+        request_reason=None,
+    )
+    assert "Generated from roadmap graph JSON." in derived.updated_roadmap_markdown
 
     with pytest.raises(RuntimeError, match="must bump roadmap graph version by exactly 1"):
         orch._roadmap_revision_draft_from_decision(

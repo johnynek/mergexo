@@ -939,14 +939,12 @@ Task:
 - Author the initial roadmap PR for issue #{issue.number}.
 - Base branch is: {default_branch}
 {coding_guidelines_lines}
-- Create both roadmap artifacts:
-  - narrative markdown
-  - canonical machine-readable graph JSON
+- Author the roadmap graph JSON.
+- MergeXO will generate the review markdown from that graph before opening the PR.
 
 Output requirements:
 - This turn is for roadmap authoring, not repository code implementation.
 - Produce a practical execution plan that decomposes the issue into child work MergeXO can issue incrementally.
-- `roadmap_markdown` and `graph_json` must describe the same plan.
 - Each roadmap node should represent one concrete child issue with reviewable scope, a clear completion outcome, and text that can plausibly become that child issue's title/body.
 - Keep the graph acyclic with internal `node_id` references only.
 {roadmap_contract_text}
@@ -961,11 +959,9 @@ Output requirements:
 - Include an explicit `depends_on` array on every node, using `[]` when there are no dependencies.
 - Choose short, unique, stable `node_id` values that will still make sense if the roadmap is revised later.
 - Recommended node count is around {recommended_node_count}; larger DAGs are allowed but should include decomposition notes.
-- A useful `roadmap_markdown` usually includes:
-  - a short overview of the overall strategy,
-  - dependency or sequencing notes for the DAG,
-  - a node-by-node breakdown keyed by `node_id` so reviewers can compare the markdown against the graph,
-  - decomposition notes when the roadmap is intentionally larger than the recommended size.
+- The generated markdown is a deterministic review view derived from `graph_json`.
+- Use `python roadmap_json_to_md.py {graph_path}` locally if you want to preview that generated markdown before you return.
+- Do not return roadmap markdown in this turn.
 
 Response format:
 - Return JSON only.
@@ -973,10 +969,9 @@ Response format:
 - Do not include markdown code fences in the JSON fields.
 
 Required output fields:
-- Always include `title`, `summary`, `roadmap_markdown`, and `graph_json`.
+- Always include `title`, `summary`, and `graph_json`.
 - `title`: non-empty string for the roadmap PR title.
 - `summary`: non-empty string for the roadmap PR summary.
-- `roadmap_markdown`: non-empty string containing the full roadmap markdown body for the target file.
 - `graph_json` as a JSON object, not a string, with exactly:
   - `roadmap_issue_number`: integer. Set this to {issue.number}.
   - `version`: integer. For the initial roadmap, set this to `1`.
@@ -993,7 +988,7 @@ Required output fields:
 - Do not add extra keys outside this schema.
 
 Target file paths:
-- roadmap markdown: {markdown_path}
+- generated roadmap markdown: {markdown_path}
 - roadmap graph: {graph_path}
 
 Issue title:
@@ -1053,14 +1048,12 @@ Required output fields:
 - `action`: one of `proceed`, `revise`, `abandon`
 - `summary`: short rationale
 - `details`: full rationale, referencing the ready frontier and the current roadmap state
-- `updated_roadmap_markdown`: string or null
 - `updated_graph_json`: object or null
-- Always include all five top-level keys. Do not omit nullable keys; use null when a field does not apply.
+- Always include all four top-level keys. Do not omit nullable keys; use null when a field does not apply.
 
 Payload rules:
-- When `action = "revise"`, set both `updated_roadmap_markdown` and `updated_graph_json`.
-- When `action` is `proceed` or `abandon`, set both `updated_roadmap_markdown` and `updated_graph_json` to null.
-- `updated_roadmap_markdown` must be the full revised markdown body for `{roadmap_doc_path}`.
+- When `action = "revise"`, set `updated_graph_json`.
+- When `action` is `proceed` or `abandon`, set `updated_graph_json` to null.
 - `updated_graph_json` must be a JSON object, not a string, with exactly:
   - `roadmap_issue_number`: integer. Keep this set to {issue.number}.
   - `version`: integer. Bump the graph version from {graph_version} to {graph_version + 1}.
@@ -1085,7 +1078,8 @@ Payload rules:
 - If pending work needs to change materially, retire the old pending node and add replacement work under a new `node_id`.
 - Do not remove any node whose work has already started. Treat nodes with child issues, completed work, blocked work, abandoned work, or other in-flight progress as started.
 - Do not churn `node_id`s for unchanged work. If the work is unchanged, keep the same `node_id`.
-- Keep the revised graph internally consistent with the revised markdown narrative.
+- MergeXO will derive `{roadmap_doc_path}` from the revised graph.
+- Use `python roadmap_json_to_md.py {graph_path}` locally if you want to preview the generated markdown for the revised graph.
 
 Current roadmap metadata:
 - roadmap markdown path: {roadmap_doc_path}
@@ -1156,14 +1150,12 @@ Required output fields:
 - `action`: one of `revise`, `abandon`
 - `summary`: short rationale
 - `details`: full rationale for the requested revision
-- `updated_roadmap_markdown`: string or null
 - `updated_graph_json`: object or null
-- Always include all five top-level keys. Do not omit nullable keys; use null when a field does not apply.
+- Always include all four top-level keys. Do not omit nullable keys; use null when a field does not apply.
 
 Payload rules:
-- When `action = "revise"`, set both `updated_roadmap_markdown` and `updated_graph_json`.
-- When `action = "abandon"`, set both `updated_roadmap_markdown` and `updated_graph_json` to null.
-- `updated_roadmap_markdown` must be the full revised markdown body for `{roadmap_doc_path}`.
+- When `action = "revise"`, set `updated_graph_json`.
+- When `action = "abandon"`, set `updated_graph_json` to null.
 - `updated_graph_json` must be a JSON object, not a string, with exactly:
   - `roadmap_issue_number`: integer. Keep this set to {issue.number}.
   - `version`: integer. Bump the graph version from {graph_version} to {graph_version + 1}.
@@ -1188,7 +1180,8 @@ Payload rules:
 - If pending work needs to change materially, retire the old pending node and add replacement work under a new `node_id`.
 - Do not remove any node whose work has already started. Treat nodes with child issues, completed work, blocked work, abandoned work, or other in-flight progress as started.
 - Do not churn `node_id`s for unchanged work. If the work is unchanged, keep the same `node_id`.
-- Keep the revised graph internally consistent with the revised markdown narrative.
+- MergeXO will derive `{roadmap_doc_path}` from the revised graph.
+- Use `python roadmap_json_to_md.py {graph_path}` locally if you want to preview the generated markdown for the revised graph.
 
 Revision request reason:
 {request_reason}
@@ -1423,21 +1416,22 @@ Return JSON only with this object shape:
 {_feedback_output_contract_lines(allow_escalation=False)}
 
 Roadmap review rules:
-- Primary objective: resolve roadmap review feedback by editing the roadmap markdown and roadmap graph in this PR, then provide commit_message.
-- Treat `{turn.roadmap_doc_path}` and `{turn.graph_path}` as a paired artifact set. Keep them in sync.
-- If you change roadmap strategy, sequencing, node scope, node titles, node bodies, or dependencies in one artifact, update the other artifact in the same turn.
+- Primary objective: resolve roadmap review feedback by editing `{turn.graph_path}` in this PR, then provide commit_message.
+- `{turn.roadmap_doc_path}` is generated from `{turn.graph_path}`.
+- Do not hand-edit `{turn.roadmap_doc_path}`.
+- If you want to preview the generated markdown locally, run `python roadmap_json_to_md.py {turn.graph_path}` or `python roadmap_json_to_md.py {turn.graph_path} --output {turn.roadmap_doc_path}`.
+- MergeXO will regenerate `{turn.roadmap_doc_path}` before validation and push.
 - Do not return `escalation` for this task. This PR itself is the place to fix roadmap review feedback.
 - Prefer concrete file edits over explanatory-only replies when a roadmap comment can be addressed directly.
-- Before finalizing, re-read both roadmap artifacts even if the comment mentions only one of them.
+- Before finalizing, re-read the roadmap graph and the generated markdown view even if the comment mentions only one artifact.
 {roadmap_contract_text}
 
 Roadmap markdown expectations:
-- The markdown should remain the full roadmap narrative body for `{turn.roadmap_doc_path}`.
-- Keep it aligned with the machine graph.
-- A useful roadmap markdown includes a short overview, sequencing notes, and a node-by-node breakdown keyed by `node_id`.
+- The markdown file is a generated review view for `{turn.graph_path}`.
+- Humans should edit the graph file and regenerate the markdown, not hand-maintain two sources of truth.
 
 Roadmap graph contract:
-- The graph file must be valid JSON and must describe the same plan as the markdown.
+- The graph file must be valid JSON so MergeXO can regenerate the markdown review view.
 - `roadmap_issue_number` must be the integer issue number `{turn.issue.number}`.
 {graph_version_line}
 - `nodes` must be a non-empty array of node objects.
@@ -1462,7 +1456,7 @@ Review workflow rules:
 - Synthetic MergeXO reminders may appear in issue_comments with negative IDs; never use those in review_replies.
 - Use general_comment for PR issue-thread responses when a thread-level reply is needed.
 - If CI failure context from GitHub Actions is present, reproduce those failures locally before finalizing.
-- Repair the roadmap artifacts and any required tests until local required pre-push checks pass before returning commit_message.
+- Repair the roadmap graph and any required tests until local required pre-push checks pass before returning commit_message.
 - A non-null commit_message is the ready-to-push signal.
 - If blocked, set commit_message to null and explain the blocker concretely in general_comment.
 - Set flaky_test_report only when the failure is an unrelated flaky CI test and you are confident.
@@ -1474,6 +1468,6 @@ Review workflow rules:
 - Never rewrite git history. Do not run: `git rebase`, `git commit --amend`, `git reset`, `git push --force`, `git push --force-with-lease`.
 - Keep history append-only: only add new commits on top of the current PR head.
 - If you provide commit_message, you MUST have edited repository files for this turn.
-- Do not claim you updated roadmap artifacts unless you actually edited them in this turn.
+- Do not claim you updated the roadmap graph unless you actually edited it in this turn.
 - Use null or empty values only when no action is needed or genuinely blocked.
 """.strip()

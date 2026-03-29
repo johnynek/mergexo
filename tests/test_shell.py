@@ -328,7 +328,7 @@ def test_resolve_durable_launch_returns_none_when_process_scan_raises_os_error(
     monkeypatch.setattr(
         shell.subprocess,
         "run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("ps missing")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("ps unavailable")),
     )
 
     assert resolve_durable_launch(durable_launch) is None

@@ -404,7 +404,11 @@ def test_build_roadmap_feedback_prompt_contains_graph_contract() -> None:
     assert "roadmap-feedback agent" in prompt
     assert "docs/roadmap/22-roadmap.md" in prompt
     assert "docs/roadmap/22-roadmap.graph.json" in prompt
-    assert "Keep them in sync" in prompt
+    assert "Do not hand-edit `docs/roadmap/22-roadmap.md`" in prompt
+    assert (
+        "MergeXO will regenerate `docs/roadmap/22-roadmap.md` before validation and push" in prompt
+    )
+    assert "python roadmap_json_to_md.py docs/roadmap/22-roadmap.graph.json" in prompt
     assert "Do not return `escalation` for this task" in prompt
     assert (
         "Always include `git_ops`, `review_replies`, `general_comment`, `commit_message`, and `flaky_test_report`."
@@ -523,9 +527,8 @@ def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
     assert '`action = "proceed"`' in prompt
     assert '`action = "revise"`' in prompt
     assert '`action = "abandon"`' in prompt
-    assert "`updated_roadmap_markdown`" in prompt
     assert "`updated_graph_json`" in prompt
-    assert "Always include all five top-level keys." in prompt
+    assert "Always include all four top-level keys." in prompt
     assert "`updated_graph_json` must be a JSON object, not a string, with exactly" in prompt
     assert "`roadmap_issue_number`: integer. Keep this set to 22." in prompt
     assert "`version`: integer. Bump the graph version from 3 to 4." in prompt
@@ -538,6 +541,8 @@ def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
     )
     assert "Do not remove any node whose work has already started" in prompt
     assert "Do not churn `node_id`s for unchanged work" in prompt
+    assert "MergeXO will derive `docs/roadmap/22-roadmap.md` from the revised graph" in prompt
+    assert "python roadmap_json_to_md.py docs/roadmap/22-roadmap.graph.json" in prompt
     assert "ready frontier node_ids" in prompt
     assert '["n2","n3"]' in prompt
     assert '"dependency_node_id":"n1"' in prompt
@@ -576,7 +581,7 @@ def test_build_requested_roadmap_revision_prompt_contains_request_contract() -> 
     assert 'Do not return `action = "proceed"`' in prompt
     assert "`action`: one of `revise`, `abandon`" in prompt
     assert "`action`: one of `proceed`, `revise`, `abandon`" not in prompt
-    assert "Always include all five top-level keys." in prompt
+    assert "Always include all four top-level keys." in prompt
     assert "`updated_graph_json` must be a JSON object, not a string, with exactly" in prompt
     assert "`roadmap_issue_number`: integer. Keep this set to 23." in prompt
     assert "`version`: integer. Bump the graph version from 5 to 6." in prompt
@@ -587,6 +592,8 @@ def test_build_requested_roadmap_revision_prompt_contains_request_contract() -> 
     )
     assert "Do not remove any node whose work has already started" in prompt
     assert "Do not churn `node_id`s for unchanged work" in prompt
+    assert "MergeXO will derive `docs/roadmap/23-roadmap.md` from the revised graph" in prompt
+    assert "python roadmap_json_to_md.py docs/roadmap/23-roadmap.graph.json" in prompt
     assert "operator requested roadmap revision" in prompt
     assert "docs/roadmap/23-roadmap.md" in prompt
     assert "bump the graph `version` from 5 to 6" in prompt
@@ -694,14 +701,16 @@ def test_build_roadmap_prompt_requires_graph_contract() -> None:
     assert "roadmap" in prompt
     assert "This turn is for roadmap authoring, not repository code implementation" in prompt
     assert "Produce a practical execution plan" in prompt
-    assert "`roadmap_markdown` and `graph_json` must describe the same plan" in prompt
-    assert "Always include `title`, `summary`, `roadmap_markdown`, and `graph_json`." in prompt
     assert (
-        "`roadmap_markdown`: non-empty string containing the full roadmap markdown body" in prompt
+        "MergeXO will generate the review markdown from that graph before opening the PR" in prompt
     )
+    assert (
+        "The generated markdown is a deterministic review view derived from `graph_json`" in prompt
+    )
+    assert "python roadmap_json_to_md.py docs/roadmap/42-<slug>.graph.json" in prompt
+    assert "Always include `title`, `summary`, and `graph_json`." in prompt
     assert "Per-kind handoff guidance:" in prompt
     assert "Choose short, unique, stable `node_id` values" in prompt
-    assert "node-by-node breakdown keyed by `node_id`" in prompt
     assert "Recommended node count is around 7" in prompt
     assert "`graph_json` as a JSON object, not a string, with exactly" in prompt
     assert "`roadmap_issue_number`: integer. Set this to 42." in prompt
