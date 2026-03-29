@@ -38,6 +38,13 @@ def _is_checkout_overwrite_error(detail: str) -> bool:
     return "would be overwritten by checkout" in normalized
 
 
+def _is_not_git_repository_error(detail: str) -> bool:
+    normalized = detail.strip().lower()
+    if not normalized:
+        return False
+    return "not a git repository" in normalized
+
+
 @dataclass(frozen=True)
 class RepoLayout:
     mirror_path: Path
@@ -62,30 +69,39 @@ class GitRepoManager:
         checkout_path = self.slot_path(slot)
         remote_url = self.repo.effective_remote_url
         if not checkout_path.exists():
+            self._clone_checkout(slot, checkout_path, remote_url)
+            return checkout_path
+
+        if not self._is_valid_checkout_path(checkout_path):
             log_event(
                 LOGGER,
-                "git_checkout_cloned",
+                "git_checkout_recreated_missing_metadata",
                 slot=slot,
                 checkout_path=str(checkout_path),
             )
-            run(
-                [
-                    "git",
-                    "clone",
-                    "--reference-if-able",
-                    str(self.layout.mirror_path),
-                    remote_url,
-                    str(checkout_path),
-                ]
-            )
-        else:
-            log_event(
-                LOGGER,
-                "git_checkout_remote_set",
-                slot=slot,
-                checkout_path=str(checkout_path),
-            )
+            shutil.rmtree(checkout_path)
+            self._clone_checkout(slot, checkout_path, remote_url)
+            return checkout_path
+
+        log_event(
+            LOGGER,
+            "git_checkout_remote_set",
+            slot=slot,
+            checkout_path=str(checkout_path),
+        )
+        try:
             run(["git", "-C", str(checkout_path), "remote", "set-url", "origin", remote_url])
+        except CommandError as exc:
+            if not _is_not_git_repository_error(str(exc)):
+                raise
+            log_event(
+                LOGGER,
+                "git_checkout_recreated_after_remote_set_failure",
+                slot=slot,
+                checkout_path=str(checkout_path),
+            )
+            shutil.rmtree(checkout_path)
+            self._clone_checkout(slot, checkout_path, remote_url)
         return checkout_path
 
     def slot_path(self, slot: int) -> Path:
@@ -143,6 +159,27 @@ class GitRepoManager:
             checkout_path=str(recovered_path),
         )
         return recovered_path
+
+    def _clone_checkout(self, slot: int, checkout_path: Path, remote_url: str) -> None:
+        log_event(
+            LOGGER,
+            "git_checkout_cloned",
+            slot=slot,
+            checkout_path=str(checkout_path),
+        )
+        run(
+            [
+                "git",
+                "clone",
+                "--reference-if-able",
+                str(self.layout.mirror_path),
+                remote_url,
+                str(checkout_path),
+            ]
+        )
+
+    def _is_valid_checkout_path(self, checkout_path: Path) -> bool:
+        return (checkout_path / ".git").exists()
 
     def _force_clean_checkout(self, checkout_path: Path) -> None:
         run(["git", "-C", str(checkout_path), "reset", "--hard"])
