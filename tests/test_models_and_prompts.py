@@ -105,6 +105,41 @@ def _roadmap_child_handoff(
     )
 
 
+def _assert_roadmap_authoring_contract(prompt: str, *, include_per_kind_guidance: bool) -> None:
+    assert "Roadmap dependency handoff contract:" in prompt
+    assert (
+        "Downstream workers receive direct dependency artifacts and satisfied dependency "
+        "states only, not the transitive closure of the roadmap graph." in prompt
+    )
+    assert (
+        "The same direct dependency handoff appears in both the child issue body and the "
+        "worker prompt." in prompt
+    )
+    assert (
+        "If a downstream worker needs another upstream artifact or satisfied upstream state, "
+        "add an explicit direct dependency edge to that node." in prompt
+    )
+    assert (
+        "Choose `planned` or `implemented` based on the earliest milestone at which MergeXO "
+        "can truthfully hand the downstream worker the concrete direct artifact or "
+        "satisfied state it needs." in prompt
+    )
+    assert (
+        "`review_config` and `review_contract` should each depend directly on "
+        "`review_design` with `requires = planned`" in prompt
+    )
+    if include_per_kind_guidance:
+        assert (
+            "`reference_doc`: downstream workers receive the merged doc artifact with its "
+            "exact path and provenance." in prompt
+        )
+        assert (
+            "`design_doc`: `planned` hands off the merged design artifact path and design PR "
+            "provenance; `implemented` waits for the shipped implementation outcome from "
+            "that same child issue." in prompt
+        )
+
+
 def test_model_dataclasses_and_version() -> None:
     issue = Issue(number=1, title="t", body="b", html_url="u", labels=("x",))
     pr = PullRequest(number=2, html_url="pr")
@@ -355,6 +390,7 @@ def test_build_roadmap_feedback_prompt_contains_graph_contract() -> None:
 
     prompt = build_roadmap_feedback_prompt(turn=turn)
 
+    _assert_roadmap_authoring_contract(prompt, include_per_kind_guidance=False)
     assert "roadmap-feedback agent" in prompt
     assert "docs/roadmap/22-roadmap.md" in prompt
     assert "docs/roadmap/22-roadmap.graph.json" in prompt
@@ -472,6 +508,7 @@ def test_build_roadmap_adjustment_prompt_contains_decision_contract() -> None:
         canonical_graph_json='{"roadmap_issue_number":22}',
     )
 
+    _assert_roadmap_authoring_contract(prompt, include_per_kind_guidance=True)
     assert "roadmap-adjustment agent" in prompt
     assert '`action = "proceed"`' in prompt
     assert '`action = "revise"`' in prompt
@@ -524,6 +561,7 @@ def test_build_requested_roadmap_revision_prompt_contains_request_contract() -> 
         canonical_graph_json='{"roadmap_issue_number":23}',
     )
 
+    _assert_roadmap_authoring_contract(prompt, include_per_kind_guidance=True)
     assert "roadmap-revision agent" in prompt
     assert 'Do not return `action = "proceed"`' in prompt
     assert "`action`: one of `revise`, `abandon`" in prompt
@@ -636,6 +674,7 @@ def test_build_roadmap_prompt_requires_graph_contract() -> None:
         coding_guidelines_path="docs/python_style.md",
     )
 
+    _assert_roadmap_authoring_contract(prompt, include_per_kind_guidance=True)
     assert "roadmap agent" in prompt
     assert "graph_json" in prompt
     assert "docs/roadmap/42-<slug>.graph.json" in prompt
@@ -650,11 +689,7 @@ def test_build_roadmap_prompt_requires_graph_contract() -> None:
     assert (
         "`roadmap_markdown`: non-empty string containing the full roadmap markdown body" in prompt
     )
-    assert "reference_doc.planned" in prompt
-    assert "design_doc.planned" in prompt
-    assert "small_job.implemented" in prompt
-    assert "roadmap.planned" in prompt
-    assert "Use `planned` only when downstream work can safely begin" in prompt
+    assert "Per-kind handoff guidance:" in prompt
     assert "Choose short, unique, stable `node_id` values" in prompt
     assert "node-by-node breakdown keyed by `node_id`" in prompt
     assert "Recommended node count is around 7" in prompt

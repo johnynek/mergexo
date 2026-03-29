@@ -657,6 +657,48 @@ def _feedback_output_contract_lines(*, allow_escalation: bool) -> str:
     ).strip()
 
 
+def _roadmap_authoring_contract_text(*, concise: bool) -> str:
+    core_lines = (
+        "Roadmap dependency handoff contract:",
+        "- Treat each dependency as both a sequencing constraint and a direct worker-input declaration.",
+        "- A roadmap edge exists when the downstream worker must receive that upstream artifact, or rely directly on that upstream satisfied state, in its child issue body and worker prompt.",
+        "- Downstream workers receive direct dependency artifacts and satisfied dependency states only, not the transitive closure of the roadmap graph.",
+        "- The same direct dependency handoff appears in both the child issue body and the worker prompt.",
+        "- For doc-like dependencies, MergeXO hands off exact artifact paths on the default branch plus stable GitHub and git provenance when available.",
+        "- For state-oriented dependencies such as `small_job.planned` or `roadmap.implemented`, MergeXO tells the worker the exact satisfied state it may rely on directly together with the available provenance for that state.",
+        "- Workers should not be expected to walk the roadmap graph, infer artifact locations from node ids, search the repository heuristically, or reconstruct intent from git history.",
+        "- If a downstream worker needs another upstream artifact or satisfied upstream state, add an explicit direct dependency edge to that node.",
+        "- Choose `planned` or `implemented` based on the earliest milestone at which MergeXO can truthfully hand the downstream worker the concrete direct artifact or satisfied state it needs.",
+    )
+    direct_edge_lines = (
+        "Direct-edge reminders:",
+        "- Ask what concrete upstream artifact or satisfied state the downstream worker must have on its first turn.",
+        "- Add a direct edge to every upstream node whose artifact or satisfied state must appear in that worker handoff.",
+        "- If a worker needs two upstream inputs, add two direct edges instead of relying on one dependency to transitively carry another node's artifact or satisfied state.",
+        "- Do not rely on transitive dependencies, git-history reconstruction, or heuristic repo search to supply missing inputs.",
+        "- Do not choose `planned` merely to preserve ordering if the needed artifact or satisfied state is not available yet.",
+    )
+    per_kind_lines = (
+        "Per-kind handoff guidance:",
+        "- `reference_doc`: downstream workers receive the merged doc artifact with its exact path and provenance. Usually use `planned` when the merged document itself is the needed input.",
+        "- `design_doc`: `planned` hands off the merged design artifact path and design PR provenance; `implemented` waits for the shipped implementation outcome from that same child issue.",
+        "- `small_job`: `planned` means the child issue and its issue text exist; merged code, changed files, and implementation behavior are not available until `implemented`.",
+        "- `roadmap`: `planned` hands off the child roadmap markdown and graph artifact paths plus activation provenance; `implemented` means the child roadmap has completed.",
+    )
+    example_lines = (
+        "Motivating example:",
+        "- Treat `review_design` as a `reference_doc`.",
+        "- `review_config` and `review_contract` should each depend directly on `review_design` with `requires = planned` so their workers receive the exact reviewed design artifact and constraints.",
+        "- If a later node needs both the reviewed design artifact and merged output from `review_config`, add direct edges to both nodes instead of expecting `review_design` to arrive transitively through `review_config`.",
+    )
+    sections: tuple[tuple[str, ...], ...]
+    if concise:
+        sections = (core_lines, direct_edge_lines, example_lines)
+    else:
+        sections = (core_lines, direct_edge_lines, per_kind_lines, example_lines)
+    return "\n".join("\n".join(section) for section in sections)
+
+
 def build_design_prompt(
     *,
     issue: Issue,
@@ -886,6 +928,7 @@ def build_roadmap_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=False)
     dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     markdown_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.md"
     graph_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.graph.json"
@@ -906,26 +949,16 @@ Output requirements:
 - `roadmap_markdown` and `graph_json` must describe the same plan.
 - Each roadmap node should represent one concrete child issue with reviewable scope, a clear completion outcome, and text that can plausibly become that child issue's title/body.
 - Keep the graph acyclic with internal `node_id` references only.
+{roadmap_contract_text}
 - Allowed node kinds: {_roadmap_node_kinds_text()}.
 - Prefer:
   - `reference_doc` for reviewed durable docs that downstream nodes should consult without starting an implementation lane from that same child issue.
   - `design_doc` only when the roadmap intentionally wants the existing design-to-implementation lane from the same child issue.
   - `small_job` for bounded implementation work that should directly produce a PR.
   - `roadmap` only when a subtree is large enough to deserve its own nested roadmap.
-- Milestone semantics for dependency planning:
-  - `reference_doc.planned`: the reference-doc PR has merged.
-  - `reference_doc.implemented`: same as `reference_doc.planned`; this kind is terminal when the artifact merges.
-  - `design_doc.planned`: the design PR has merged.
-  - `design_doc.implemented`: implementation from that design has merged.
-  - `small_job.planned`: the child issue has been created and labeled.
-  - `small_job.implemented`: the child PR has merged.
-  - `roadmap.planned`: the child roadmap PR has merged and its graph is activated.
-  - `roadmap.implemented`: the child roadmap has completed.
 - Dependency `requires` must be `planned` or `implemented`.
 - Include an explicit `requires` on every dependency object.
 - Include an explicit `depends_on` array on every node, using `[]` when there are no dependencies.
-- Use `implemented` when downstream work truly depends on the completed outcome.
-- Use `planned` only when downstream work can safely begin once the upstream plan/design/activation milestone exists.
 - Choose short, unique, stable `node_id` values that will still make sense if the roadmap is revised later.
 - Recommended node count is around {recommended_node_count}; larger DAGs are allowed but should include decomposition notes.
 - A useful `roadmap_markdown` usually includes:
@@ -992,6 +1025,7 @@ def build_roadmap_adjustment_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=False)
     ready_frontier_json = json.dumps(list(ready_node_ids), separators=(",", ":"))
     dependency_artifacts_json = _roadmap_dependency_artifacts_json(dependency_artifacts)
     return f"""
@@ -1007,6 +1041,8 @@ Decision rules:
 - Return `action = "revise"` when the roadmap should change before issuing more child work.
 - Return `action = "abandon"` only when continuing the roadmap is no longer viable.
 - Prefer `proceed` unless the current roadmap is materially wrong.
+
+{roadmap_contract_text}
 
 Response format:
 - Return JSON only.
@@ -1095,6 +1131,7 @@ def build_requested_roadmap_revision_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=False)
     return f"""
 You are the roadmap-revision agent for repository {repo_full_name}.
 
@@ -1107,6 +1144,8 @@ Decision rules:
 - Return `action = "revise"` when you can author a revised roadmap safely.
 - Return `action = "abandon"` only when the roadmap should be abandoned instead of revised.
 - Do not return `action = "proceed"` for this task.
+
+{roadmap_contract_text}
 
 Response format:
 - Return JSON only.
@@ -1329,6 +1368,7 @@ def build_roadmap_feedback_prompt(*, turn: RoadmapFeedbackTurn) -> str:
         if turn.graph_version is not None
         else "- Current graph version in this PR could not be validated. Fix the graph and preserve the intended PR version if it is evident from review context."
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=True)
 
     return f"""
 You are the roadmap-feedback agent for roadmap issue #{turn.issue.number}.
@@ -1389,6 +1429,7 @@ Roadmap review rules:
 - Do not return `escalation` for this task. This PR itself is the place to fix roadmap review feedback.
 - Prefer concrete file edits over explanatory-only replies when a roadmap comment can be addressed directly.
 - Before finalizing, re-read both roadmap artifacts even if the comment mentions only one of them.
+{roadmap_contract_text}
 
 Roadmap markdown expectations:
 - The markdown should remain the full roadmap narrative body for `{turn.roadmap_doc_path}`.
