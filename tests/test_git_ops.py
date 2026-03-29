@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 
 from mergexo.config import RepoConfig, RuntimeConfig
-from mergexo.git_ops import GitRepoManager, _is_non_fast_forward_push_error
+from mergexo.git_ops import (
+    GitRepoManager,
+    _is_non_fast_forward_push_error,
+    _is_not_git_repository_error,
+)
 from mergexo.observability import configure_logging
 from mergexo.shell import CommandError
 
@@ -64,6 +68,7 @@ def test_ensure_checkout_existing_slot_sets_remote(
     manager = GitRepoManager(runtime, repo)
     slot_path = manager.slot_path(0)
     slot_path.mkdir(parents=True)
+    (slot_path / ".git").mkdir()
 
     calls: list[list[str]] = []
 
@@ -77,6 +82,105 @@ def test_ensure_checkout_existing_slot_sets_remote(
     out = manager.ensure_checkout(0)
 
     assert out == slot_path
+    assert calls == [
+        ["git", "-C", str(slot_path), "remote", "set-url", "origin", repo.effective_remote_url]
+    ]
+
+
+def test_ensure_checkout_existing_non_git_slot_recreates_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    slot_path = manager.slot_path(0)
+    slot_path.mkdir(parents=True)
+    (slot_path / "core").mkdir()
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    out = manager.ensure_checkout(0)
+
+    assert out == slot_path
+    assert calls == [
+        [
+            "git",
+            "clone",
+            "--reference-if-able",
+            str(manager.layout.mirror_path),
+            repo.effective_remote_url,
+            str(slot_path),
+        ]
+    ]
+
+
+def test_ensure_checkout_recreates_slot_when_remote_set_url_reports_not_git_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    slot_path = manager.slot_path(0)
+    slot_path.mkdir(parents=True)
+    (slot_path / ".git").mkdir()
+    (slot_path / "stale.txt").write_text("stale", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        if cmd[:5] == ["git", "-C", str(slot_path), "remote", "set-url"]:
+            raise CommandError(
+                "fatal: not a git repository (or any of the parent directories): .git"
+            )
+        return ""
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    out = manager.ensure_checkout(0)
+
+    assert out == slot_path
+    assert not (slot_path / "stale.txt").exists()
+    assert calls == [
+        ["git", "-C", str(slot_path), "remote", "set-url", "origin", repo.effective_remote_url],
+        [
+            "git",
+            "clone",
+            "--reference-if-able",
+            str(manager.layout.mirror_path),
+            repo.effective_remote_url,
+            str(slot_path),
+        ],
+    ]
+
+
+def test_ensure_checkout_re_raises_unexpected_remote_set_url_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime, repo = _config(tmp_path, worker_count=1)
+    manager = GitRepoManager(runtime, repo)
+    slot_path = manager.slot_path(0)
+    slot_path.mkdir(parents=True)
+    (slot_path / ".git").mkdir()
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> str:
+        _ = kwargs
+        calls.append(cmd)
+        raise CommandError("permission denied")
+
+    monkeypatch.setattr("mergexo.git_ops.run", fake_run)
+
+    with pytest.raises(CommandError, match="permission denied"):
+        manager.ensure_checkout(0)
+
     assert calls == [
         ["git", "-C", str(slot_path), "remote", "set-url", "origin", repo.effective_remote_url]
     ]
@@ -108,6 +212,13 @@ def test_prepare_branch_push_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
     assert ["git", "-C", str(checkout), "checkout", "-B", "feature"] in calls
     assert ["git", "-C", str(checkout), "push", "-u", "origin", "feature"] in calls
+
+
+def test_is_not_git_repository_error_requires_non_empty_matching_message() -> None:
+    assert _is_not_git_repository_error("") is False
+    assert _is_not_git_repository_error(
+        "fatal: not a git repository (or any of the parent directories): .git"
+    )
 
 
 @pytest.mark.parametrize(
