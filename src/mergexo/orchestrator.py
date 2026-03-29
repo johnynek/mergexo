@@ -23,11 +23,13 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    RoadmapChildDependencyArtifact,
+    RoadmapChildDependencyArtifactPath,
+    RoadmapChildDependencyHandoff,
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
     RoadmapAdjustmentResult,
     RoadmapFeedbackTurn,
-    RoadmapStartResult,
 )
 from mergexo.codex_adapter import CodexAdapter, CodexInvocationHooks
 from mergexo.config import AppConfig, RepoConfig
@@ -67,7 +69,6 @@ from mergexo.github_gateway import (
 from mergexo.models import (
     FlakyTestReport,
     GeneratedDesign,
-    GeneratedRoadmap,
     Issue,
     IssueFlow,
     OperatorCommandRecord,
@@ -93,6 +94,8 @@ from mergexo.prompts import (
     build_roadmap_feedback_prompt,
     build_roadmap_prompt,
     build_small_job_prompt,
+    render_roadmap_child_dependency_handoff_summary,
+    render_roadmap_child_dependency_handoff_marker,
 )
 from mergexo.roadmap_markdown import render_roadmap_markdown
 from mergexo.roadmap_parser import (
@@ -156,11 +159,15 @@ _GITHUB_AUTH_FAILURE_POLL_THRESHOLD = 3
 _RECOVERABLE_PRE_PR_ERROR_SIGNATURES: tuple[str, ...] = (
     "flow blocked:",
     "required pre-push tests failed before pushing design branch",
+    "required pre-push tests failed before pushing reference branch",
     "required pre-push tests did not pass after automated repair attempts",
     "new_issue_comments_pending",
 )
 _PRE_PR_BLOCKED_FLOW_PATTERN = re.compile(
-    r"(bugfix|small-job|roadmap|implementation) flow blocked:"
+    r"(reference-doc|bugfix|small-job|roadmap|implementation) flow blocked:"
+)
+_ROADMAP_NODE_KIND_MARKER_PATTERN = re.compile(
+    r"<!--\s*mergexo-roadmap-node-kind:(reference_doc|design_doc|small_job|roadmap)\s*-->"
 )
 _COMMENT_CURSOR_EPOCH = "1970-01-01T00:00:00Z"
 _SURFACE_PR_REVIEW_COMMENTS: GitHubCommentSurface = "pr_review_comments"
@@ -193,7 +200,9 @@ _FEEDBACK_TRANSIENT_GIT_MAX_ATTEMPTS = 4
 _FEEDBACK_TRANSIENT_GIT_INITIAL_DELAY_SECONDS = 5
 _FEEDBACK_TRANSIENT_GIT_MAX_DELAY_SECONDS = 60
 
-PrePrFlow = Literal["design_doc", "bugfix", "small_job", "roadmap", "implementation"]
+PrePrFlow = Literal[
+    "reference_doc", "design_doc", "bugfix", "small_job", "roadmap", "implementation"
+]
 
 
 @dataclass(frozen=True)
@@ -207,6 +216,24 @@ class _FeedbackFuture:
     issue_number: int
     run_id: str
     future: Future[str]
+
+
+@dataclass(frozen=True)
+class _RoadmapDependencyProvenance:
+    dependency_node: RoadmapNodeRecord
+    frontier_references: tuple[RoadmapDependencyReference, ...]
+    child_issue: Issue | None
+    issue_comments: tuple[PullRequestIssueComment, ...]
+    issue_run: IssueRunRecord | None
+    satisfying_pr_number: int | None
+    satisfying_pr_url: str | None
+    satisfying_pr_snapshot: PullRequestSnapshot | None
+    satisfying_changed_files: tuple[str, ...]
+    satisfying_review_summaries: tuple[PullRequestIssueComment, ...]
+    artifact_pr_snapshot: PullRequestSnapshot | None
+    artifact_changed_files: tuple[str, ...]
+    artifact_review_summaries: tuple[PullRequestIssueComment, ...]
+    child_roadmap: RoadmapStateRecord | None
 
 
 @dataclass(frozen=True)
@@ -709,8 +736,8 @@ class Phase1Orchestrator:
         graceful_shutdown_seconds = self._config.codex_for_repo(
             self._repo
         ).graceful_shutdown_seconds
-        for run in unfinished_runs:
-            meta = _run_meta_from_json(run.meta_json)
+        for unfinished_run in unfinished_runs:
+            meta = _run_meta_from_json(unfinished_run.meta_json)
             if meta.codex_active is not True:
                 continue
             resolved = self._resolve_persisted_codex_launch(meta)
@@ -725,9 +752,9 @@ class Phase1Orchestrator:
                 LOGGER,
                 "codex_startup_cleanup_kill",
                 repo_full_name=self._state_repo_full_name(),
-                run_id=run.run_id,
-                issue_number=run.issue_number,
-                pr_number=run.pr_number if run.pr_number is not None else "",
+                run_id=unfinished_run.run_id,
+                issue_number=unfinished_run.issue_number,
+                pr_number=unfinished_run.pr_number if unfinished_run.pr_number is not None else "",
                 pid=resolved.pid,
                 pgid=resolved.pgid if resolved.pgid is not None else "",
             )
@@ -864,14 +891,21 @@ class Phase1Orchestrator:
         return ignore_label_active
 
     def _issue_snapshot_for_poll(self, *, issue_number: int, issue: Issue | None = None) -> Issue:
+        if not isinstance(issue_number, int) or issue_number <= 0:
+            raise ValueError("issue_number must be a positive integer")
         if issue is not None:
             self._poll_issue_cache[issue_number] = issue
-            return issue
-        cached = self._poll_issue_cache.get(issue_number)
-        if cached is not None:
-            return cached
-        snapshot = self._github.get_issue(issue_number)
-        self._poll_issue_cache[issue_number] = snapshot
+            snapshot = issue
+        else:
+            snapshot = self._poll_issue_cache.get(issue_number)
+            if snapshot is None:
+                snapshot = self._github.get_issue(issue_number)
+                self._poll_issue_cache[issue_number] = snapshot
+        self._state.set_issue_github_state(
+            issue_number=issue_number,
+            github_state=snapshot.state,
+            repo_full_name=self._state_repo_full_name(),
+        )
         return snapshot
 
     def _snapshot_takeover_comment_boundaries(
@@ -1397,13 +1431,20 @@ class Phase1Orchestrator:
                 )
                 marker = f"<!-- mergexo-action:{token} -->"
                 try:
-                    created = self._create_roadmap_child_issue_with_outbox(
+                    dependency_handoff = self._build_roadmap_child_dependency_handoff(
+                        roadmap_issue_number=claim.roadmap_issue_number,
+                        node_id=claim.node_id,
+                        kind=claim.kind,
+                        dependencies_json=claim.dependencies_json,
+                    )
+                    self._create_roadmap_child_issue_with_outbox(
                         claim=claim,
                         issue_body=append_action_token(
                             body=_render_roadmap_child_issue_body(
                                 roadmap_issue_number=claim.roadmap_issue_number,
                                 node_id=claim.node_id,
-                                dependencies_json=claim.dependencies_json,
+                                kind=claim.kind,
+                                dependency_handoff=dependency_handoff,
                                 body_markdown=claim.body_markdown,
                             ),
                             token=token,
@@ -1411,7 +1452,14 @@ class Phase1Orchestrator:
                         marker=marker,
                         labels=(label,),
                     )
-                except Exception:
+                except Exception as exc:
+                    self._state.set_roadmap_last_error(
+                        roadmap_issue_number=claim.roadmap_issue_number,
+                        error=(
+                            f"failed to prepare roadmap child issue for node {claim.node_id}: {exc}"
+                        ),
+                        repo_full_name=self._state_repo_full_name(),
+                    )
                     self._state.release_roadmap_node_claim(
                         roadmap_issue_number=claim.roadmap_issue_number,
                         node_id=claim.node_id,
@@ -1875,19 +1923,67 @@ class Phase1Orchestrator:
             roadmap_issue_number=roadmap_issue_number,
             repo_full_name=self._state_repo_full_name(),
         )
-        nodes_by_id = {node.node_id: node for node in nodes}
         dependency_refs = _ready_frontier_dependency_references(
-            nodes_by_id=nodes_by_id,
+            nodes_by_id={node.node_id: node for node in nodes},
             ready_node_ids=ready_node_ids,
         )
-        artifacts: list[RoadmapDependencyArtifact] = []
+        provenance = self._collect_roadmap_dependency_provenance(
+            roadmap_issue_number=roadmap_issue_number,
+            dependency_refs=dependency_refs,
+            strict_missing_dependencies=False,
+        )
+        return tuple(self._project_roadmap_dependency_artifact(item) for item in provenance)
+
+    def _build_roadmap_child_dependency_handoff(
+        self,
+        *,
+        roadmap_issue_number: int,
+        node_id: str,
+        kind: str,
+        dependencies_json: str,
+    ) -> RoadmapChildDependencyHandoff:
+        dependency_refs = _node_dependency_references(
+            node_id=node_id,
+            dependencies_json=dependencies_json,
+        )
+        provenance = self._collect_roadmap_dependency_provenance(
+            roadmap_issue_number=roadmap_issue_number,
+            dependency_refs=dependency_refs,
+            strict_missing_dependencies=True,
+        )
+        return RoadmapChildDependencyHandoff(
+            schema_version=1,
+            roadmap_issue_number=roadmap_issue_number,
+            node_id=node_id,
+            node_kind=cast(Literal["reference_doc", "design_doc", "small_job", "roadmap"], kind),
+            dependencies=tuple(
+                self._project_roadmap_child_dependency_artifact(item) for item in provenance
+            ),
+        )
+
+    def _collect_roadmap_dependency_provenance(
+        self,
+        *,
+        roadmap_issue_number: int,
+        dependency_refs: dict[str, tuple[RoadmapDependencyReference, ...]],
+        strict_missing_dependencies: bool,
+    ) -> tuple[_RoadmapDependencyProvenance, ...]:
+        nodes = self._state.list_roadmap_nodes(
+            roadmap_issue_number=roadmap_issue_number,
+            repo_full_name=self._state_repo_full_name(),
+        )
+        nodes_by_id = {node.node_id: node for node in nodes}
+        missing_dependency_node_ids: list[str] = []
+        provenance: list[_RoadmapDependencyProvenance] = []
         for dependency_node_id in sorted(dependency_refs):
             dependency_node = nodes_by_id.get(dependency_node_id)
             if dependency_node is None:
+                missing_dependency_node_ids.append(dependency_node_id)
                 continue
             child_issue = None
             issue_comments: tuple[PullRequestIssueComment, ...] = ()
             issue_run = None
+            child_roadmap = None
             if dependency_node.child_issue_number is not None:
                 child_issue = self._issue_snapshot_for_poll(
                     issue_number=dependency_node.child_issue_number
@@ -1899,52 +1995,359 @@ class Phase1Orchestrator:
                     dependency_node.child_issue_number,
                     repo_full_name=self._state_repo_full_name(),
                 )
-            pr_number = issue_run.pr_number if issue_run is not None else None
-            pr_url = issue_run.pr_url if issue_run is not None else None
-            pr_snapshot = (
-                self._github.get_pull_request(pr_number) if pr_number is not None else None
+                if dependency_node.kind == "roadmap":
+                    child_roadmap = self._state.get_roadmap_state(
+                        roadmap_issue_number=dependency_node.child_issue_number,
+                        repo_full_name=self._state_repo_full_name(),
+                    )
+            satisfying_pr_number = issue_run.pr_number if issue_run is not None else None
+            satisfying_pr_url = issue_run.pr_url if issue_run is not None else None
+            if (
+                satisfying_pr_number is None
+                and child_roadmap is not None
+                and child_roadmap.roadmap_pr_number is not None
+            ):
+                satisfying_pr_number = child_roadmap.roadmap_pr_number
+            if satisfying_pr_number is not None and satisfying_pr_url is None:
+                satisfying_pr_url = _pull_request_url(
+                    repo_full_name=self._state_repo_full_name(),
+                    pr_number=satisfying_pr_number,
+                )
+            satisfying_pr_snapshot = (
+                self._github.get_pull_request(satisfying_pr_number)
+                if satisfying_pr_number is not None
+                else None
             )
-            changed_files = (
-                _roadmap_dependency_changed_files(self._github.list_pull_request_files(pr_number))
-                if pr_number is not None
+            satisfying_changed_files = (
+                _roadmap_dependency_changed_files(
+                    self._github.list_pull_request_files(satisfying_pr_number)
+                )
+                if satisfying_pr_number is not None
                 else ()
             )
-            review_summaries = (
+            satisfying_review_summaries = (
                 _key_roadmap_dependency_comments(
-                    tuple(self._github.list_pull_request_review_summaries(pr_number))
+                    tuple(self._github.list_pull_request_review_summaries(satisfying_pr_number))
                 )
-                if pr_number is not None
+                if satisfying_pr_number is not None
                 else ()
             )
-            artifacts.append(
-                RoadmapDependencyArtifact(
-                    dependency_node_id=dependency_node.node_id,
-                    dependency_kind=dependency_node.kind,
-                    dependency_title=dependency_node.title,
+            (
+                artifact_pr_snapshot,
+                artifact_changed_files,
+                artifact_review_summaries,
+            ) = self._roadmap_dependency_artifact_source(
+                dependency_node=dependency_node,
+                child_issue=child_issue,
+                issue_run=issue_run,
+                satisfying_pr_snapshot=satisfying_pr_snapshot,
+                satisfying_changed_files=satisfying_changed_files,
+                satisfying_review_summaries=satisfying_review_summaries,
+            )
+            provenance.append(
+                _RoadmapDependencyProvenance(
+                    dependency_node=dependency_node,
                     frontier_references=dependency_refs[dependency_node_id],
-                    child_issue_number=dependency_node.child_issue_number,
-                    child_issue_url=dependency_node.child_issue_url,
-                    child_issue_title=child_issue.title if child_issue is not None else None,
-                    child_issue_body=child_issue.body if child_issue is not None else None,
-                    issue_run_status=issue_run.status if issue_run is not None else None,
-                    issue_run_branch=issue_run.branch if issue_run is not None else None,
-                    issue_run_error=issue_run.error if issue_run is not None else None,
-                    resolution_markers=_roadmap_dependency_resolution_markers(
-                        node=dependency_node,
-                        issue_run=issue_run,
-                    ),
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    pr_title=pr_snapshot.title if pr_snapshot is not None else None,
-                    pr_body=pr_snapshot.body if pr_snapshot is not None else None,
-                    pr_state=pr_snapshot.state if pr_snapshot is not None else None,
-                    pr_merged=pr_snapshot.merged if pr_snapshot is not None else None,
-                    changed_files=changed_files,
-                    review_summaries=review_summaries,
+                    child_issue=child_issue,
                     issue_comments=issue_comments,
+                    issue_run=issue_run,
+                    satisfying_pr_number=satisfying_pr_number,
+                    satisfying_pr_url=satisfying_pr_url,
+                    satisfying_pr_snapshot=satisfying_pr_snapshot,
+                    satisfying_changed_files=satisfying_changed_files,
+                    satisfying_review_summaries=satisfying_review_summaries,
+                    artifact_pr_snapshot=artifact_pr_snapshot,
+                    artifact_changed_files=artifact_changed_files,
+                    artifact_review_summaries=artifact_review_summaries,
+                    child_roadmap=child_roadmap,
                 )
             )
-        return tuple(artifacts)
+        if strict_missing_dependencies and missing_dependency_node_ids:
+            raise RuntimeError(
+                "roadmap dependency handoff is missing dependency nodes: "
+                + ", ".join(sorted(missing_dependency_node_ids))
+            )
+        return tuple(provenance)
+
+    def _roadmap_dependency_artifact_source(
+        self,
+        *,
+        dependency_node: RoadmapNodeRecord,
+        child_issue: Issue | None,
+        issue_run: IssueRunRecord | None,
+        satisfying_pr_snapshot: PullRequestSnapshot | None,
+        satisfying_changed_files: tuple[str, ...],
+        satisfying_review_summaries: tuple[PullRequestIssueComment, ...],
+    ) -> tuple[
+        PullRequestSnapshot | None,
+        tuple[str, ...],
+        tuple[PullRequestIssueComment, ...],
+    ]:
+        if dependency_node.kind != "design_doc":
+            return (
+                satisfying_pr_snapshot,
+                satisfying_changed_files,
+                satisfying_review_summaries,
+            )
+        if (
+            issue_run is None
+            or issue_run.branch is None
+            or not issue_run.branch.startswith("agent/impl/")
+        ):
+            return (
+                satisfying_pr_snapshot,
+                satisfying_changed_files,
+                satisfying_review_summaries,
+            )
+        if dependency_node.child_issue_number is None:
+            return (
+                satisfying_pr_snapshot,
+                satisfying_changed_files,
+                satisfying_review_summaries,
+            )
+        design_branch = (
+            f"agent/design/{dependency_node.child_issue_number}-"
+            f"{_slugify(child_issue.title if child_issue is not None else dependency_node.title)}"
+        )
+        design_pr = self._github.find_pull_request_by_head(
+            head=design_branch,
+            base=self._repo.default_branch,
+            state="all",
+        )
+        if design_pr is None:
+            return (
+                satisfying_pr_snapshot,
+                satisfying_changed_files,
+                satisfying_review_summaries,
+            )
+        return (
+            self._github.get_pull_request(design_pr.number),
+            _roadmap_dependency_changed_files(
+                self._github.list_pull_request_files(design_pr.number)
+            ),
+            _key_roadmap_dependency_comments(
+                tuple(self._github.list_pull_request_review_summaries(design_pr.number))
+            ),
+        )
+
+    def _project_roadmap_dependency_artifact(
+        self, provenance: _RoadmapDependencyProvenance
+    ) -> RoadmapDependencyArtifact:
+        pr_snapshot = provenance.satisfying_pr_snapshot
+        issue_run = provenance.issue_run
+        dependency_node = provenance.dependency_node
+        child_issue = provenance.child_issue
+        return RoadmapDependencyArtifact(
+            dependency_node_id=dependency_node.node_id,
+            dependency_kind=dependency_node.kind,
+            dependency_title=dependency_node.title,
+            frontier_references=provenance.frontier_references,
+            child_issue_number=dependency_node.child_issue_number,
+            child_issue_url=dependency_node.child_issue_url,
+            child_issue_title=child_issue.title if child_issue is not None else None,
+            child_issue_body=child_issue.body if child_issue is not None else None,
+            issue_run_status=issue_run.status if issue_run is not None else None,
+            issue_run_branch=issue_run.branch if issue_run is not None else None,
+            issue_run_error=issue_run.error if issue_run is not None else None,
+            resolution_markers=_roadmap_dependency_resolution_markers(
+                node=dependency_node,
+                issue_run=issue_run,
+            ),
+            pr_number=provenance.satisfying_pr_number,
+            pr_url=provenance.satisfying_pr_url,
+            pr_title=pr_snapshot.title if pr_snapshot is not None else None,
+            pr_body=pr_snapshot.body if pr_snapshot is not None else None,
+            pr_state=pr_snapshot.state if pr_snapshot is not None else None,
+            pr_merged=pr_snapshot.merged if pr_snapshot is not None else None,
+            changed_files=provenance.satisfying_changed_files,
+            review_summaries=provenance.satisfying_review_summaries,
+            issue_comments=provenance.issue_comments,
+        )
+
+    def _project_roadmap_child_dependency_artifact(
+        self, provenance: _RoadmapDependencyProvenance
+    ) -> RoadmapChildDependencyArtifact:
+        if len(provenance.frontier_references) != 1:
+            raise RuntimeError(
+                "roadmap child dependency handoff expects exactly one direct dependency reference"
+            )
+        dependency_ref = provenance.frontier_references[0]
+        review_summaries = (
+            provenance.artifact_review_summaries
+            if provenance.dependency_node.kind in {"reference_doc", "design_doc"}
+            else provenance.satisfying_review_summaries
+        )
+        issue_notes = [comment.body for comment in provenance.issue_comments]
+        if (
+            provenance.dependency_node.kind == "roadmap"
+            and provenance.child_roadmap is not None
+            and provenance.child_roadmap.status == "completed"
+        ):
+            issue_notes.insert(0, "Child roadmap reached completed status.")
+        return RoadmapChildDependencyArtifact(
+            node_id=provenance.dependency_node.node_id,
+            kind=provenance.dependency_node.kind,
+            title=provenance.dependency_node.title,
+            requires=dependency_ref.requires,
+            satisfied_by=dependency_ref.requires,
+            child_issue_number=provenance.dependency_node.child_issue_number,
+            child_issue_url=provenance.dependency_node.child_issue_url,
+            child_issue_title=(
+                provenance.child_issue.title if provenance.child_issue is not None else None
+            ),
+            pr_number=provenance.satisfying_pr_number,
+            pr_url=provenance.satisfying_pr_url,
+            pr_title=(
+                provenance.satisfying_pr_snapshot.title
+                if provenance.satisfying_pr_snapshot is not None
+                else None
+            ),
+            pr_merged=(
+                provenance.satisfying_pr_snapshot.merged
+                if provenance.satisfying_pr_snapshot is not None
+                else None
+            ),
+            branch=provenance.issue_run.branch if provenance.issue_run is not None else None,
+            head_sha=(
+                provenance.satisfying_pr_snapshot.head_sha
+                if provenance.satisfying_pr_snapshot is not None
+                else None
+            ),
+            merge_commit_sha=(
+                provenance.satisfying_pr_snapshot.merge_commit_sha
+                if provenance.satisfying_pr_snapshot is not None
+                else None
+            ),
+            artifact_paths=self._roadmap_child_dependency_artifact_paths(provenance),
+            changed_files=provenance.satisfying_changed_files,
+            review_notes=tuple(comment.body for comment in review_summaries),
+            issue_notes=tuple(issue_notes),
+            child_issue_body_excerpt=(
+                provenance.child_issue.body if provenance.child_issue is not None else None
+            ),
+            pr_body_excerpt=(
+                provenance.satisfying_pr_snapshot.body
+                if provenance.satisfying_pr_snapshot is not None
+                else None
+            ),
+        )
+
+    def _roadmap_child_dependency_artifact_paths(
+        self, provenance: _RoadmapDependencyProvenance
+    ) -> tuple[RoadmapChildDependencyArtifactPath, ...]:
+        dependency_node = provenance.dependency_node
+        if dependency_node.kind == "small_job":
+            return ()
+        if dependency_node.kind == "roadmap":
+            if provenance.child_roadmap is None:
+                raise RuntimeError(
+                    f"roadmap dependency {dependency_node.node_id} is missing child roadmap state"
+                )
+            return (
+                self._roadmap_dependency_artifact_path(
+                    path=provenance.child_roadmap.roadmap_doc_path,
+                    role="primary",
+                    snapshot=provenance.satisfying_pr_snapshot,
+                ),
+                self._roadmap_dependency_artifact_path(
+                    path=provenance.child_roadmap.graph_path,
+                    role="supporting",
+                    snapshot=provenance.satisfying_pr_snapshot,
+                ),
+            )
+        return self._roadmap_child_doc_artifact_paths(provenance)
+
+    def _roadmap_child_doc_artifact_paths(
+        self, provenance: _RoadmapDependencyProvenance
+    ) -> tuple[RoadmapChildDependencyArtifactPath, ...]:
+        design_docs_prefix = f"{self._repo.design_docs_dir}/"
+        doc_candidates = sorted(
+            {
+                path
+                for path in provenance.artifact_changed_files
+                if path.startswith(design_docs_prefix) and path.endswith(".md")
+            }
+        )
+        expected_path = None
+        if provenance.dependency_node.child_issue_number is not None:
+            expected_path = (
+                f"{self._repo.design_docs_dir}/{provenance.dependency_node.child_issue_number}-"
+                f"{_slugify(provenance.child_issue.title if provenance.child_issue is not None else provenance.dependency_node.title)}.md"
+            )
+        primary_path = None
+        supporting_paths: list[str] = []
+        if len(doc_candidates) == 1:
+            primary_path = doc_candidates[0]
+        elif len(doc_candidates) > 1:
+            if expected_path is not None and expected_path in doc_candidates:
+                primary_path = expected_path
+            else:
+                matching_issue_number_paths = [
+                    path
+                    for path in doc_candidates
+                    if provenance.dependency_node.child_issue_number is not None
+                    and path.startswith(
+                        f"{self._repo.design_docs_dir}/{provenance.dependency_node.child_issue_number}-"
+                    )
+                ]
+                if len(matching_issue_number_paths) == 1:
+                    primary_path = matching_issue_number_paths[0]
+            if primary_path is not None:
+                supporting_paths = [path for path in doc_candidates if path != primary_path]
+        if primary_path is None and expected_path is not None:
+            primary_path = expected_path
+            supporting_paths = list(doc_candidates)
+        if primary_path is None:
+            raise RuntimeError(
+                f"roadmap dependency {provenance.dependency_node.node_id} is missing a primary doc artifact path"
+            )
+        artifact_snapshot = provenance.artifact_pr_snapshot or provenance.satisfying_pr_snapshot
+        artifact_paths = [
+            self._roadmap_dependency_artifact_path(
+                path=primary_path,
+                role="primary",
+                snapshot=artifact_snapshot,
+            )
+        ]
+        artifact_paths.extend(
+            self._roadmap_dependency_artifact_path(
+                path=path,
+                role="supporting",
+                snapshot=artifact_snapshot,
+            )
+            for path in supporting_paths
+            if path != primary_path
+        )
+        return tuple(artifact_paths)
+
+    def _roadmap_dependency_artifact_path(
+        self,
+        *,
+        path: str,
+        role: Literal["primary", "supporting"],
+        snapshot: PullRequestSnapshot | None,
+    ) -> RoadmapChildDependencyArtifactPath:
+        pinned_ref = None
+        if snapshot is not None:
+            pinned_ref = snapshot.merge_commit_sha or snapshot.head_sha
+        return RoadmapChildDependencyArtifactPath(
+            path=path,
+            role=role,
+            default_branch_url=_repo_blob_url(
+                repo_full_name=self._state_repo_full_name(),
+                ref=self._repo.default_branch,
+                path=path,
+            ),
+            blob_url=(
+                _repo_blob_url(
+                    repo_full_name=self._state_repo_full_name(),
+                    ref=pinned_ref,
+                    path=path,
+                )
+                if pinned_ref is not None
+                else None
+            ),
+        )
 
     def _maybe_apply_pending_roadmap_revision(
         self, *, roadmap: RoadmapStateRecord, checkout_path: Path
@@ -2467,6 +2870,20 @@ class Phase1Orchestrator:
                 "awaiting_issue_followup",
             }
             return True, implemented, blocked
+        if node.kind == "reference_doc":
+            # reference_doc is doc-only, so both dependency milestones arrive when the
+            # reviewed reference artifact merges.
+            merged_reference_doc = (
+                issue_state is not None
+                and issue_state[0] == "merged"
+                and (issue_state[1] or "").startswith("agent/reference/")
+            )
+            blocked = issue_state is not None and issue_state[0] in {
+                "failed",
+                "blocked",
+                "awaiting_issue_followup",
+            }
+            return merged_reference_doc, merged_reference_doc, blocked
         if node.kind == "design_doc":
             planned = (
                 issue_state is not None
@@ -5804,6 +6221,13 @@ class Phase1Orchestrator:
                     branch=branch,
                     pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
                 )
+            if flow == "reference_doc":
+                return self._process_reference_doc_issue(
+                    issue=issue,
+                    checkout_path=lease.path,
+                    branch=branch,
+                    pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+                )
             if flow == "roadmap":
                 return self._process_roadmap_issue(
                     issue=issue,
@@ -5867,13 +6291,71 @@ class Phase1Orchestrator:
         branch: str,
         pre_pr_last_consumed_comment_id: int = 0,
     ) -> WorkResult:
+        return self._process_document_issue(
+            issue=issue,
+            checkout_path=checkout_path,
+            branch=branch,
+            flow="design_doc",
+            pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+        )
+
+    def _process_reference_doc_issue(
+        self,
+        *,
+        issue: Issue,
+        checkout_path: Path,
+        branch: str,
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
+        return self._process_document_issue(
+            issue=issue,
+            checkout_path=checkout_path,
+            branch=branch,
+            flow="reference_doc",
+            pre_pr_last_consumed_comment_id=pre_pr_last_consumed_comment_id,
+        )
+
+    def _process_document_issue(
+        self,
+        *,
+        issue: Issue,
+        checkout_path: Path,
+        branch: str,
+        flow: Literal["design_doc", "reference_doc"],
+        pre_pr_last_consumed_comment_id: int = 0,
+    ) -> WorkResult:
         self._git.create_or_reset_branch(checkout_path, branch)
 
         slug = _slugify(issue.title)
-        design_relpath = f"{self._repo.design_docs_dir}/{issue.number}-{slug}.md"
+        doc_relpath = f"{self._repo.design_docs_dir}/{issue.number}-{slug}.md"
+        is_reference_doc = flow == "reference_doc"
+        flow_label = "reference-doc" if is_reference_doc else "design"
+        turn_started_event = (
+            "reference_doc_turn_started" if is_reference_doc else "design_turn_started"
+        )
+        turn_completed_event = (
+            "reference_doc_turn_completed" if is_reference_doc else "design_turn_completed"
+        )
+        opened_pr_comment = "Opened reference doc PR" if is_reference_doc else "Opened design PR"
+        pr_title_prefix = "Reference doc" if is_reference_doc else "Design doc"
+        pr_body = (
+            f"Reference doc.\n\nCloses #{issue.number}"
+            if is_reference_doc
+            else f"Design doc.\n\nRefs #{issue.number}"
+        )
+        commit_message = (
+            f"docs: add reference doc for issue #{issue.number}"
+            if is_reference_doc
+            else f"docs: add design for issue #{issue.number}"
+        )
+        required_tests_error_message = (
+            "required pre-push tests failed before pushing reference branch"
+            if is_reference_doc
+            else "required pre-push tests failed before pushing design branch"
+        )
         log_event(
             LOGGER,
-            "design_turn_started",
+            turn_started_event,
             issue_number=issue.number,
             branch=branch,
         )
@@ -5881,7 +6363,7 @@ class Phase1Orchestrator:
         design_prompt = build_design_prompt(
             issue=issue,
             repo_full_name=self._state_repo_full_name(),
-            design_doc_path=design_relpath,
+            design_doc_path=doc_relpath,
             default_branch=self._repo.default_branch,
         )
         durable_launch = self._durable_codex_launch(run_id)
@@ -5898,7 +6380,7 @@ class Phase1Orchestrator:
                 start_result = self._agent.start_design_from_issue(
                     issue=issue,
                     repo_full_name=self._state_repo_full_name(),
-                    design_doc_path=design_relpath,
+                    design_doc_path=doc_relpath,
                     default_branch=self._repo.default_branch,
                     cwd=checkout_path,
                 )
@@ -5908,14 +6390,17 @@ class Phase1Orchestrator:
                 exc=exc,
                 checkout_path=checkout_path,
                 initial_head_sha=initial_head_sha,
-                blocked_message="design_doc flow blocked: codex invocation timed out after local changes were made",
+                blocked_message=(
+                    f"{flow_label} flow blocked: codex invocation timed out after local changes "
+                    "were made"
+                ),
             )
             raise
         self._mark_codex_invocation_finished(
             run_id=run_id,
             session_id=start_result.session.thread_id if start_result.session else None,
         )
-        log_event(LOGGER, "design_turn_completed", issue_number=issue.number)
+        log_event(LOGGER, turn_completed_event, issue_number=issue.number)
         generated = start_result.design
         if start_result.session:
             self._state.save_agent_session(
@@ -5925,14 +6410,14 @@ class Phase1Orchestrator:
                 repo_full_name=self._state_repo_full_name(),
             )
 
-        design_abs_path = checkout_path / design_relpath
-        design_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        design_abs_path.write_text(
+        doc_abs_path = checkout_path / doc_relpath
+        doc_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_abs_path.write_text(
             _render_design_doc(issue=issue, design=generated),
             encoding="utf-8",
         )
 
-        self._git.commit_all(checkout_path, f"docs: add design for issue #{issue.number}")
+        self._git.commit_all(checkout_path, commit_message)
         required_tests_error = self._run_required_tests_before_push(checkout_path=checkout_path)
         if required_tests_error is not None:
             required_tests_command = self._repo.required_tests or "<unset>"
@@ -5940,17 +6425,15 @@ class Phase1Orchestrator:
             self._github.post_issue_comment(
                 issue_number=issue.number,
                 body=(
-                    "MergeXO design flow could not push because the required pre-push test "
+                    f"MergeXO {flow_label} flow could not push because the required pre-push test "
                     f"`{required_tests_command}` failed.\n"
                     f"Failure summary: {error_summary}"
                 ),
             )
-            raise DirectFlowValidationError(
-                "required pre-push tests failed before pushing design branch"
-            )
+            raise DirectFlowValidationError(required_tests_error_message)
         self._push_pre_pr_branch(
             issue=issue,
-            flow_label="design",
+            flow_label=flow_label,
             checkout_path=checkout_path,
             branch=branch,
         )
@@ -5962,15 +6445,15 @@ class Phase1Orchestrator:
         pr = self._create_pull_request_with_outbox(
             issue_number=issue.number,
             run_id=run_id,
-            title=f"Design doc for #{issue.number}: {generated.title}",
+            title=f"{pr_title_prefix} for #{issue.number}: {generated.title}",
             head=branch,
             base=self._repo.default_branch,
-            body=(f"Design doc.\n\nRefs #{issue.number}"),
+            body=pr_body,
         )
 
         self._github.post_issue_comment(
             issue_number=issue.number,
-            body=f"Opened design PR: {pr.html_url}",
+            body=f"{opened_pr_comment}: {pr.html_url}",
         )
 
         log_event(
@@ -5979,7 +6462,7 @@ class Phase1Orchestrator:
             issue_number=issue.number,
             pr_number=pr.number,
             branch=branch,
-            flow="design_doc",
+            flow=flow,
         )
         return WorkResult(
             issue_number=issue.number,
@@ -7184,6 +7667,7 @@ class Phase1Orchestrator:
             html_url=issue.html_url,
             labels=issue.labels,
             author_login=issue.author_login,
+            state=issue.state,
         )
 
     def _serialize_pre_pr_context_for_issue(
@@ -7283,6 +7767,7 @@ class Phase1Orchestrator:
             html_url=issue.html_url,
             labels=issue.labels,
             author_login=issue.author_login,
+            state=issue.state,
         )
 
     def _issue_with_required_tests_reminder(
@@ -7311,6 +7796,7 @@ class Phase1Orchestrator:
             html_url=issue.html_url,
             labels=issue.labels,
             author_login=issue.author_login,
+            state=issue.state,
         )
 
     def _issue_with_required_tests_failure(
@@ -7354,6 +7840,7 @@ class Phase1Orchestrator:
             html_url=base_issue.html_url,
             labels=base_issue.labels,
             author_login=base_issue.author_login,
+            state=base_issue.state,
         )
 
     def _issue_with_push_merge_conflict(
@@ -7395,6 +7882,7 @@ class Phase1Orchestrator:
             html_url=base_issue.html_url,
             labels=base_issue.labels,
             author_login=base_issue.author_login,
+            state=base_issue.state,
         )
 
     def _process_feedback_turn(self, tracked: TrackedPullRequestState) -> str:
@@ -10235,6 +10723,7 @@ def _issue_to_json_dict(issue: Issue) -> dict[str, object]:
         "html_url": issue.html_url,
         "labels": list(issue.labels),
         "author_login": issue.author_login,
+        "state": issue.state,
     }
 
 
@@ -10250,6 +10739,7 @@ def _issue_from_json_dict(raw: object) -> Issue | None:
     html_url = payload.get("html_url")
     labels_raw = payload.get("labels")
     author_login = payload.get("author_login")
+    state = payload.get("state", "open")
     if not isinstance(number, int):
         return None
     if not isinstance(title, str):
@@ -10259,6 +10749,8 @@ def _issue_from_json_dict(raw: object) -> Issue | None:
     if not isinstance(html_url, str):
         return None
     if not isinstance(author_login, str):
+        return None
+    if not isinstance(state, str):
         return None
     if not isinstance(labels_raw, list):
         return None
@@ -10274,6 +10766,7 @@ def _issue_from_json_dict(raw: object) -> Issue | None:
         html_url=html_url,
         labels=tuple(labels),
         author_login=author_login,
+        state=state,
     )
 
 
@@ -10370,6 +10863,8 @@ def _infer_pre_pr_flow_from_issue_and_error(
     if error_match is None:
         return None
     matched = error_match.group(1)
+    if matched == "reference-doc":
+        return "reference_doc"
     if matched == "small-job":
         return "small_job"
     return cast(PrePrFlow, matched)
@@ -10454,8 +10949,25 @@ def _parse_superseding_roadmap_parent(body: str) -> int | None:
     return int(match.group(1))
 
 
+def _roadmap_node_kind_marker(*, kind: str) -> str:
+    return f"<!-- mergexo-roadmap-node-kind:{kind} -->"
+
+
+def _parse_roadmap_node_kind_marker(body: str) -> str | None:
+    match = _ROADMAP_NODE_KIND_MARKER_PATTERN.search(body)
+    if match is not None:
+        return match.group(1)
+    legacy_match = re.search(
+        r"(?im)^\s*Roadmap node kind:\s*(reference_doc|design_doc|small_job|roadmap)\s*$",
+        body,
+    )
+    if legacy_match is None:
+        return None
+    return legacy_match.group(1)
+
+
 def _roadmap_child_label_for_kind(*, kind: str, repo: RepoConfig) -> str:
-    if kind == "design_doc":
+    if kind in {"reference_doc", "design_doc"}:
         return repo.trigger_label
     if kind == "small_job":
         return repo.small_job_label
@@ -10468,30 +10980,54 @@ def _render_roadmap_child_issue_body(
     *,
     roadmap_issue_number: int,
     node_id: str,
-    dependencies_json: str,
+    kind: str,
+    dependency_handoff: RoadmapChildDependencyHandoff,
     body_markdown: str,
 ) -> str:
-    dependencies: list[str] = []
-    try:
-        payload = json.loads(dependencies_json)
-    except json.JSONDecodeError:
-        payload = []
-    if isinstance(payload, list):
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            dep_node_id = item.get("node_id")
-            requires = item.get("requires", "implemented")
-            if isinstance(dep_node_id, str) and isinstance(requires, str):
-                dependencies.append(f"- {dep_node_id} ({requires})")
-    dependency_lines = "\n".join(dependencies) if dependencies else "- none"
     return (
+        f"{_roadmap_node_kind_marker(kind=kind)}\n\n"
+        f"{render_roadmap_child_dependency_handoff_marker(dependency_handoff)}\n\n"
         f"Parent roadmap: #{roadmap_issue_number}\n"
         f"Roadmap node: {node_id}\n\n"
-        "Dependency context:\n"
-        f"{dependency_lines}\n\n"
+        f"{render_roadmap_child_dependency_handoff_summary(dependency_handoff)}\n\n"
         f"{body_markdown}"
     )
+
+
+def _node_dependency_references(
+    *, node_id: str, dependencies_json: str
+) -> dict[str, tuple[RoadmapDependencyReference, ...]]:
+    try:
+        payload = json.loads(dependencies_json)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid dependencies_json for roadmap node {node_id}") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Invalid dependencies_json for roadmap node {node_id}")
+    refs: dict[str, list[RoadmapDependencyReference]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Invalid dependencies_json for roadmap node {node_id}")
+        dependency_node_id = item.get("node_id")
+        requires = item.get("requires")
+        if not isinstance(dependency_node_id, str) or not isinstance(requires, str):
+            raise RuntimeError(f"Invalid dependencies_json for roadmap node {node_id}")
+        if requires not in {"planned", "implemented"}:
+            raise RuntimeError(f"Invalid dependencies_json for roadmap node {node_id}")
+        refs.setdefault(dependency_node_id, []).append(
+            RoadmapDependencyReference(
+                ready_node_id=node_id,
+                requires=cast(Literal["planned", "implemented"], requires),
+            )
+        )
+    return {
+        dependency_node_id: tuple(
+            sorted(
+                dependency_node_refs,
+                key=lambda reference: (reference.ready_node_id, reference.requires),
+            )
+        )
+        for dependency_node_id, dependency_node_refs in refs.items()
+    }
 
 
 def _ready_frontier_dependency_references(
@@ -10735,6 +11271,8 @@ def _render_roadmap_status_report(
 
 
 def _pre_pr_flow_label(flow: PrePrFlow) -> str:
+    if flow == "reference_doc":
+        return "reference-doc"
     if flow == "design_doc":
         return "design"
     if flow == "small_job":
@@ -10835,12 +11373,14 @@ def _resolve_issue_flow(
     if small_job_label in issue_labels:
         return "small_job"
     if design_label in issue_labels:
+        if _parse_roadmap_node_kind_marker(issue.body) == "reference_doc":
+            return "reference_doc"
         return "design_doc"
     return None
 
 
 def _flow_trigger_label(*, flow: IssueFlow, repo: RepoConfig) -> str:
-    if flow == "design_doc":
+    if flow in {"reference_doc", "design_doc"}:
         return repo.trigger_label
     if flow == "roadmap":
         return repo.roadmap_label
@@ -10850,6 +11390,8 @@ def _flow_trigger_label(*, flow: IssueFlow, repo: RepoConfig) -> str:
 
 
 def _issue_branch(*, flow: IssueFlow, issue_number: int, slug: str) -> str:
+    if flow == "reference_doc":
+        return f"agent/reference/{issue_number}-{slug}"
     if flow == "design_doc":
         return f"agent/design/{issue_number}-{slug}"
     if flow == "roadmap":
@@ -10881,7 +11423,9 @@ def _default_commit_message(*, flow: IssueFlow, issue_number: int) -> str:
 def _render_issue_start_comment(
     *, issue_number: int, flow: IssueFlow | Literal["implementation"]
 ) -> str:
-    if flow == "design_doc":
+    if flow == "reference_doc":
+        action = "reference document work"
+    elif flow == "design_doc":
         action = "design work"
     elif flow == "roadmap":
         action = "roadmap planning work"
@@ -10928,6 +11472,14 @@ def _is_no_staged_changes_error_text(error: str) -> bool:
 
 def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, str, str]:
     flow = _flow_label_from_branch(branch)
+    if flow == "reference":
+        return (
+            f"Reference doc for #{issue.number}: {issue.title}",
+            (
+                f"Recovered reference doc PR from a previously pushed branch.\n\nCloses #{issue.number}"
+            ),
+            flow,
+        )
     if flow == "design":
         return (
             f"Design doc for #{issue.number}: {issue.title}",
@@ -10963,6 +11515,8 @@ def _recovery_pr_payload_for_issue(*, issue: Issue, branch: str) -> tuple[str, s
 
 
 def _flow_label_from_branch(branch: str) -> str:
+    if branch.startswith("agent/reference/"):
+        return "reference"
     if branch.startswith("agent/design/"):
         return "design"
     if branch.startswith("agent/roadmap/"):
@@ -11150,7 +11704,11 @@ def _render_operator_command_result(
 
 
 def _design_doc_url(*, repo_full_name: str, default_branch: str, design_doc_path: str) -> str:
-    return f"https://github.com/{repo_full_name}/blob/{default_branch}/{design_doc_path}"
+    return _repo_blob_url(repo_full_name=repo_full_name, ref=default_branch, path=design_doc_path)
+
+
+def _repo_blob_url(*, repo_full_name: str, ref: str, path: str) -> str:
+    return f"https://github.com/{repo_full_name}/blob/{ref}/{path}"
 
 
 def _strip_leading_frontmatter(markdown: str) -> str:

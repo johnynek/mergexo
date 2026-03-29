@@ -39,6 +39,9 @@ _ACTIVE_COL_BRANCH = 5
 _TRACKED_COL_ISSUE = 1
 _TRACKED_COL_PR = 2
 _TRACKED_COL_BRANCH = 4
+_HISTORY_COL_ISSUE = 3
+_HISTORY_COL_PR = 4
+_BRANCH_COLUMN_MAX_CHARS = 25
 _BLOCKED_REASON_MAX_CHARS = 36
 _HISTORY_SCROLL_LOAD_THRESHOLD = 5
 _SERVICE_SIGNAL_DRAIN_SECONDS = 0.2
@@ -65,18 +68,27 @@ class _DetailField:
 
 
 class _DetailFieldTable(DataTable):
-    """Use DataTable Enter to activate the selected detail field."""
+    """Use DataTable Enter to close the detail modal."""
+
+    BINDINGS = [
+        Binding("o", "open_url", "Open URL"),
+    ]
 
     def action_select_cursor(self) -> None:
         screen = self.screen
         if isinstance(screen, _DetailModal):
-            screen.action_activate()
+            screen.action_close()
+
+    def action_open_url(self) -> None:
+        screen = self.screen
+        if isinstance(screen, _DetailModal):
+            screen.action_open_url()
 
 
 class _DetailModal(ModalScreen[None]):
     BINDINGS = [
         Binding("escape", "close", "Close"),
-        Binding("enter", "activate", "Open"),
+        Binding("enter", "close", "Close"),
         Binding("q", "close", "Close"),
     ]
     CSS = """
@@ -126,7 +138,7 @@ class _DetailModal(ModalScreen[None]):
                 with VerticalScroll(id="detail-body-scroll"):
                     yield Static(self._body, id="detail-body")
             hint = (
-                "Use arrows to select a field value; Enter opens link. Press Esc or q to close."
+                "Use arrows to inspect fields; press o to open the selected URL. Press Enter, Esc, or q to close."
                 if self._fields
                 else "Press Esc, Enter, or q to close."
             )
@@ -143,27 +155,24 @@ class _DetailModal(ModalScreen[None]):
             table.move_cursor(row=0, column=1, animate=False)
         table.focus()
 
-    def action_activate(self) -> None:
+    def selected_url(self) -> str | None:
         if not self._fields:
-            self.action_close()
-            return
+            return None
         table = self.query_one("#detail-fields-table", DataTable)
         row_index = table.cursor_row
         if row_index < 0 or row_index >= len(self._fields):
-            return
-        selected = self._fields[row_index]
-        if selected.url is None:
+            return None
+        return self._fields[row_index].url
+
+    def action_open_url(self) -> None:
+        selected_url = self.selected_url()
+        if selected_url is None:
             return
         app = self.app
         if isinstance(app, ObservabilityApp):
-            app._open_external_url(selected.url)
+            app._open_external_url(selected_url)
             return
-        _open_external_url(selected.url)
-
-    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
-        if event.data_table.id != "detail-fields-table":
-            return
-        self.action_activate()
+        _open_external_url(selected_url)
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -172,6 +181,12 @@ class _DetailModal(ModalScreen[None]):
 class _DetailDataTable(DataTable):
     """Use DataTable's native Enter key binding to drive app detail actions."""
 
+    BINDINGS = [
+        Binding("left", "cursor_left", "Scroll Left"),
+        Binding("right", "cursor_right", "Scroll Right"),
+        Binding("o", "open_url", "Open URL"),
+    ]
+
     def action_select_cursor(self) -> None:
         super().action_select_cursor()
         if self.id not in {"active-table", "tracked-table", "history-table"}:
@@ -179,6 +194,13 @@ class _DetailDataTable(DataTable):
         app = self.app
         if isinstance(app, ObservabilityApp):
             app.action_show_detail()
+
+    def action_open_url(self) -> None:
+        if self.id not in {"active-table", "tracked-table", "history-table"}:
+            return
+        app = self.app
+        if isinstance(app, ObservabilityApp):
+            app.action_open_url()
 
 
 class ObservabilityApp(App[None]):
@@ -189,6 +211,7 @@ class ObservabilityApp(App[None]):
         Binding("w", "cycle_window", "Window"),
         Binding("tab", "cycle_focus", "Focus"),
         Binding("enter", "show_detail", "Details"),
+        Binding("o", "open_url", "Open URL"),
     ]
     CSS = """
     Screen {
@@ -317,10 +340,6 @@ class ObservabilityApp(App[None]):
         if isinstance(focused, DataTable) and focused.id == "active-table":
             selected = self._active_row_selection()
             if selected is not None:
-                active_url = _url_for_active_row(selected, focused.cursor_column)
-                if active_url is not None:
-                    self._open_external_url(active_url)
-                    return
                 self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
                 self._show_detail_context(
                     title=f"Issue #{selected.issue_number} Context",
@@ -331,10 +350,6 @@ class ObservabilityApp(App[None]):
         elif isinstance(focused, DataTable) and focused.id == "tracked-table":
             selected = self._tracked_row_selection()
             if selected is not None:
-                tracked_url = _url_for_tracked_row(selected, focused.cursor_column)
-                if tracked_url is not None:
-                    self._open_external_url(tracked_url)
-                    return
                 if selected.pr_number is None:
                     self._detail_target = _DetailTarget(kind="issue", number=selected.issue_number)
                 else:
@@ -359,6 +374,12 @@ class ObservabilityApp(App[None]):
                     fields=_terminal_history_detail_fields(selected),
                 )
                 return
+
+    def action_open_url(self) -> None:
+        selected_url = self._selected_url_from_focus()
+        if selected_url is None:
+            return
+        self._open_external_url(selected_url)
 
     def _open_external_url(self, url: str) -> None:
         if _open_external_url(url):
@@ -393,6 +414,32 @@ class ObservabilityApp(App[None]):
 
     def _base_static(self, selector: str) -> Static:
         return self._base_screen().query_one(selector, Static)
+
+    def _selected_url_from_focus(self) -> str | None:
+        focused = self.focused
+        if not isinstance(focused, DataTable):
+            return None
+        if focused.id == "active-table":
+            selected = self._active_row_selection()
+            if selected is None:
+                return None
+            return _url_for_active_row(selected, focused.cursor_column)
+        if focused.id == "tracked-table":
+            selected = self._tracked_row_selection()
+            if selected is None:
+                return None
+            return _url_for_tracked_row(selected, focused.cursor_column)
+        if focused.id == "history-table":
+            selected = self._history_row_selection()
+            if selected is None:
+                return None
+            return _url_for_history_row(selected, focused.cursor_column)
+        if focused.id != "detail-fields-table":
+            return None
+        screen = self.screen
+        if not isinstance(screen, _DetailModal):
+            return None
+        return screen.selected_url()
 
     def refresh_data(self) -> None:
         overview = load_overview(self._db_path, self._repo_filter, self._window)
@@ -472,17 +519,16 @@ class ObservabilityApp(App[None]):
         tracked = self._base_table("#tracked-table")
         history = self._base_table("#history-table")
         metrics = self._base_table("#metrics-table")
-        active.add_columns("Repo", "Run", "Issue", "PR", "Flow", "Branch", "Started", "Elapsed")
-        tracked.add_columns(
-            "Repo",
-            "Issue",
-            "PR",
-            "Status",
-            "Branch",
-            "Pending",
-            "Blocked Reason",
-            "Updated",
-        )
+        for label in ("Repo", "Run", "Issue", "PR", "Flow"):
+            active.add_column(label)
+        active.add_column("Branch", width=_BRANCH_COLUMN_MAX_CHARS)
+        for label in ("Started", "Elapsed"):
+            active.add_column(label)
+        for label in ("Repo", "Issue", "PR", "Status"):
+            tracked.add_column(label)
+        tracked.add_column("Branch", width=_BRANCH_COLUMN_MAX_CHARS)
+        for label in ("Pending", "Blocked Reason", "Updated"):
+            tracked.add_column(label)
         history.add_columns("Time", "Outcome", "Repo", "Issue", "PR", "Status")
         metrics.add_columns("Repo", "Terminal", "Failed", "Failure Rate", "Mean", "StdDev")
 
@@ -499,7 +545,7 @@ class ObservabilityApp(App[None]):
                 str(row.issue_number),
                 str(row.pr_number) if row.pr_number is not None else "-",
                 row.flow or "-",
-                row.branch or "-",
+                _render_branch_snippet(row.branch),
                 row.started_at,
                 _render_seconds(row.elapsed_seconds),
             )
@@ -517,7 +563,7 @@ class ObservabilityApp(App[None]):
                 str(row.issue_number),
                 str(row.pr_number) if row.pr_number is not None else "",
                 row.status,
-                row.branch,
+                _render_branch_snippet(row.branch),
                 str(row.pending_event_count),
                 _render_context_snippet(row.blocked_reason, max_chars=_BLOCKED_REASON_MAX_CHARS),
                 row.updated_at,
@@ -758,7 +804,7 @@ def _summary_text(*, overview: OverviewStats, repo_filter: str | None, window: s
                 f"stddev={_render_seconds(overview.stddev_runtime_seconds)}",
             ]
         )
-        + "\nKeys: r refresh | f repo filter | w window | tab focus | enter open/details | q quit"
+        + "\nKeys: r refresh | f repo filter | w window | tab focus | enter details | o open url | q quit"
     )
 
 
@@ -793,6 +839,10 @@ def _render_seconds(value: float) -> str:
 
 def _render_ratio(value: float) -> str:
     return f"{value * 100.0:.1f}%"
+
+
+def _render_branch_snippet(value: str | None) -> str:
+    return _render_context_snippet(value, max_chars=_BRANCH_COLUMN_MAX_CHARS)
 
 
 def _tracked_row_key(row: TrackedOrBlockedRow) -> tuple[str, int | None, int, str]:
@@ -1014,6 +1064,14 @@ def _url_for_tracked_row(row: TrackedOrBlockedRow, column: int) -> str | None:
         return _issue_url(row.repo_full_name, row.issue_number)
     if column == _TRACKED_COL_BRANCH and row.branch and row.branch != "-":
         return _branch_url(row.repo_full_name, row.branch)
+    return None
+
+
+def _url_for_history_row(row: TerminalIssueOutcomeRow, column: int) -> str | None:
+    if column == _HISTORY_COL_ISSUE:
+        return _issue_url(row.repo_full_name, row.issue_number)
+    if column == _HISTORY_COL_PR and row.pr_number is not None:
+        return _pr_url(row.repo_full_name, row.pr_number)
     return None
 
 

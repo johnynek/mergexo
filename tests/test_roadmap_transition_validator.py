@@ -111,6 +111,38 @@ def test_validate_roadmap_graph_transition_allows_replacing_pending_work_with_ne
     assert transition.retired_node_ids == ("impl",)
 
 
+def test_validate_roadmap_graph_transition_allows_pending_design_doc_to_reference_doc_migration() -> (
+    None
+):
+    transition = validate_roadmap_graph_transition(
+        current_graph_version=2,
+        current_nodes=(
+            _existing_node(
+                node_id="design",
+                kind="design_doc",
+                title="Design",
+                body_markdown="Doc",
+            ),
+        ),
+        proposed_graph=RoadmapGraph(
+            roadmap_issue_number=55,
+            version=3,
+            nodes=(
+                _node(
+                    node_id="design",
+                    kind="reference_doc",
+                    title="Design",
+                    body_markdown="Doc",
+                ),
+            ),
+        ),
+    )
+
+    assert transition.retained_node_ids == ("design",)
+    assert transition.added_node_ids == ()
+    assert transition.retired_node_ids == ()
+
+
 def test_validate_roadmap_graph_transition_rejects_reintroducing_same_pending_work_with_new_node_id() -> (
     None
 ):
@@ -274,5 +306,36 @@ def test_validate_roadmap_graph_transition_rejects_mutating_protected_node_field
                 roadmap_issue_number=55,
                 version=5,
                 nodes=(proposed_node,),
+            ),
+        )
+
+
+def test_validate_roadmap_graph_transition_rejects_started_design_doc_to_reference_doc_migration() -> (
+    None
+):
+    with pytest.raises(RoadmapGraphTransitionError, match="cannot change roadmap node kind"):
+        validate_roadmap_graph_transition(
+            current_graph_version=4,
+            current_nodes=(
+                _existing_node(
+                    node_id="design",
+                    kind="design_doc",
+                    title="Design",
+                    body_markdown="Doc",
+                    status="issued",
+                    child_issue_number=101,
+                ),
+            ),
+            proposed_graph=RoadmapGraph(
+                roadmap_issue_number=55,
+                version=5,
+                nodes=(
+                    _node(
+                        node_id="design",
+                        kind="reference_doc",
+                        title="Design",
+                        body_markdown="Doc",
+                    ),
+                ),
             ),
         )

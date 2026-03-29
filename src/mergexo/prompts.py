@@ -1,9 +1,35 @@
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import re
+from typing import cast
 
-from mergexo.agent_adapter import FeedbackTurn, RoadmapDependencyArtifact, RoadmapFeedbackTurn
-from mergexo.models import Issue
+from mergexo.agent_adapter import (
+    FeedbackTurn,
+    RoadmapChildDependencyArtifact,
+    RoadmapChildDependencyArtifactPath,
+    RoadmapChildDependencyHandoff,
+    RoadmapDependencyArtifactPathRole,
+    RoadmapDependencyArtifact,
+    RoadmapFeedbackTurn,
+)
+from mergexo.models import (
+    ROADMAP_NODE_KINDS,
+    Issue,
+    RoadmapDependencyRequirement,
+    RoadmapNodeKind,
+)
+
+
+LOGGER = logging.getLogger("mergexo.prompts")
+_ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION = 1
+_ROADMAP_DEPENDENCY_HANDOFF_PAYLOAD_MAX_CHARS = 16000
+_ROADMAP_DEPENDENCY_HANDOFF_MARKER_PATTERN = re.compile(
+    r"<!--\s*mergexo-roadmap-dependency-handoff:v(?P<version>\d+):"
+    r"(?P<payload>[A-Za-z0-9_-]+)\s*-->"
+)
 
 
 def _coding_guidelines_task_lines(*, coding_guidelines_path: str | None) -> str:
@@ -19,6 +45,10 @@ def _implementation_checks_line(*, coding_guidelines_path: str | None) -> str:
     if coding_guidelines_path:
         return f"  - Re-run formatting and CI-required checks from {coding_guidelines_path}."
     return "  - Re-run formatting and tests expected by this repo and target 100% test coverage."
+
+
+def _roadmap_node_kinds_text() -> str:
+    return ", ".join(f"`{kind}`" for kind in ROADMAP_NODE_KINDS)
 
 
 def _truncate_prompt_text(value: str, *, max_chars: int) -> str:
@@ -91,6 +121,502 @@ def _roadmap_dependency_artifacts_json(
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
+def _normalize_roadmap_child_dependency_handoff(
+    handoff: RoadmapChildDependencyHandoff,
+    *,
+    include_body_excerpts: bool,
+    changed_files_limit: int,
+    notes_limit: int,
+    total_artifact_paths_limit: int,
+    supporting_artifact_paths_limit: int | None,
+) -> RoadmapChildDependencyHandoff:
+    normalized_dependencies: list[RoadmapChildDependencyArtifact] = []
+    for dependency in sorted(handoff.dependencies, key=lambda item: item.node_id):
+        primary_paths = sorted(
+            (path for path in dependency.artifact_paths if path.role == "primary"),
+            key=lambda path: path.path,
+        )
+        supporting_paths = sorted(
+            (path for path in dependency.artifact_paths if path.role != "primary"),
+            key=lambda path: path.path,
+        )
+        if supporting_artifact_paths_limit is not None:
+            supporting_paths = supporting_paths[:supporting_artifact_paths_limit]
+        max_supporting_paths = max(0, total_artifact_paths_limit - len(primary_paths))
+        supporting_paths = supporting_paths[:max_supporting_paths]
+        normalized_dependencies.append(
+            RoadmapChildDependencyArtifact(
+                node_id=dependency.node_id,
+                kind=dependency.kind,
+                title=dependency.title,
+                requires=dependency.requires,
+                satisfied_by=dependency.satisfied_by,
+                child_issue_number=dependency.child_issue_number,
+                child_issue_url=dependency.child_issue_url,
+                child_issue_title=dependency.child_issue_title,
+                pr_number=dependency.pr_number,
+                pr_url=dependency.pr_url,
+                pr_title=dependency.pr_title,
+                pr_merged=dependency.pr_merged,
+                branch=dependency.branch,
+                head_sha=dependency.head_sha,
+                merge_commit_sha=dependency.merge_commit_sha,
+                artifact_paths=tuple(primary_paths + supporting_paths),
+                changed_files=tuple(sorted(dependency.changed_files)[:changed_files_limit]),
+                review_notes=tuple(
+                    _truncate_prompt_text(note, max_chars=400)
+                    for note in dependency.review_notes[:notes_limit]
+                ),
+                issue_notes=tuple(
+                    _truncate_prompt_text(note, max_chars=400)
+                    for note in dependency.issue_notes[:notes_limit]
+                ),
+                child_issue_body_excerpt=(
+                    _truncate_prompt_text(dependency.child_issue_body_excerpt, max_chars=800)
+                    if include_body_excerpts and dependency.child_issue_body_excerpt is not None
+                    else None
+                ),
+                pr_body_excerpt=(
+                    _truncate_prompt_text(dependency.pr_body_excerpt, max_chars=800)
+                    if include_body_excerpts and dependency.pr_body_excerpt is not None
+                    else None
+                ),
+            )
+        )
+    return RoadmapChildDependencyHandoff(
+        schema_version=handoff.schema_version,
+        roadmap_issue_number=handoff.roadmap_issue_number,
+        node_id=handoff.node_id,
+        node_kind=handoff.node_kind,
+        dependencies=tuple(normalized_dependencies),
+    )
+
+
+def _roadmap_child_dependency_handoff_payload(
+    handoff: RoadmapChildDependencyHandoff,
+) -> dict[str, object]:
+    return {
+        "schema_version": handoff.schema_version,
+        "roadmap_issue_number": handoff.roadmap_issue_number,
+        "node_id": handoff.node_id,
+        "node_kind": handoff.node_kind,
+        "dependencies": [
+            {
+                "node_id": dependency.node_id,
+                "kind": dependency.kind,
+                "title": dependency.title,
+                "requires": dependency.requires,
+                "satisfied_by": dependency.satisfied_by,
+                "child_issue_number": dependency.child_issue_number,
+                "child_issue_url": dependency.child_issue_url,
+                "child_issue_title": dependency.child_issue_title,
+                "pr_number": dependency.pr_number,
+                "pr_url": dependency.pr_url,
+                "pr_title": dependency.pr_title,
+                "pr_merged": dependency.pr_merged,
+                "branch": dependency.branch,
+                "head_sha": dependency.head_sha,
+                "merge_commit_sha": dependency.merge_commit_sha,
+                "artifact_paths": [
+                    {
+                        "path": artifact_path.path,
+                        "role": artifact_path.role,
+                        "default_branch_url": artifact_path.default_branch_url,
+                        "blob_url": artifact_path.blob_url,
+                    }
+                    for artifact_path in dependency.artifact_paths
+                ],
+                "changed_files": list(dependency.changed_files),
+                "review_notes": list(dependency.review_notes),
+                "issue_notes": list(dependency.issue_notes),
+                "child_issue_body_excerpt": dependency.child_issue_body_excerpt,
+                "pr_body_excerpt": dependency.pr_body_excerpt,
+            }
+            for dependency in handoff.dependencies
+        ],
+    }
+
+
+def _serialize_roadmap_child_dependency_handoff(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    if handoff.schema_version != _ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported roadmap dependency handoff schema version: {handoff.schema_version}"
+        )
+    phases = (
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=True,
+            changed_files_limit=25,
+            notes_limit=3,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=25,
+            notes_limit=3,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=10,
+            notes_limit=3,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=10,
+            notes_limit=1,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=10,
+            notes_limit=1,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=3,
+        ),
+    )
+    for normalized in phases:
+        raw_payload = json.dumps(
+            _roadmap_child_dependency_handoff_payload(normalized),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(raw_payload) <= _ROADMAP_DEPENDENCY_HANDOFF_PAYLOAD_MAX_CHARS:
+            return raw_payload
+    raise RuntimeError("roadmap dependency handoff payload exceeds size limit")
+
+
+def render_roadmap_child_dependency_handoff_marker(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    raw_payload = _serialize_roadmap_child_dependency_handoff(handoff)
+    encoded = base64.urlsafe_b64encode(raw_payload.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"<!-- mergexo-roadmap-dependency-handoff:v{handoff.schema_version}:{encoded} -->"
+
+
+def _roadmap_child_dependency_handoff_from_payload(
+    payload: object,
+) -> RoadmapChildDependencyHandoff:
+    if not isinstance(payload, dict):
+        raise ValueError("roadmap dependency handoff payload must be an object")
+    payload_obj = cast(dict[str, object], payload)
+    schema_version = payload_obj.get("schema_version")
+    roadmap_issue_number = payload_obj.get("roadmap_issue_number")
+    node_id = payload_obj.get("node_id")
+    node_kind = payload_obj.get("node_kind")
+    dependencies_payload = payload_obj.get("dependencies")
+    if schema_version != _ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION:
+        raise ValueError("unsupported roadmap dependency handoff schema version")
+    if not isinstance(roadmap_issue_number, int):
+        raise ValueError("roadmap_issue_number must be an integer")
+    if not isinstance(node_id, str):
+        raise ValueError("node_id must be a string")
+    if not isinstance(node_kind, str):
+        raise ValueError("node_kind must be a string")
+    if not isinstance(dependencies_payload, list):
+        raise ValueError("dependencies must be a list")
+
+    dependencies: list[RoadmapChildDependencyArtifact] = []
+    for dependency_payload in dependencies_payload:
+        if not isinstance(dependency_payload, dict):
+            raise ValueError("dependency entry must be an object")
+        dependency_payload_obj = cast(dict[str, object], dependency_payload)
+        artifact_paths_payload = dependency_payload_obj.get("artifact_paths")
+        if not isinstance(artifact_paths_payload, list):
+            raise ValueError("artifact_paths must be a list")
+        artifact_paths: list[RoadmapChildDependencyArtifactPath] = []
+        for artifact_path_payload in artifact_paths_payload:
+            if not isinstance(artifact_path_payload, dict):
+                raise ValueError("artifact path entry must be an object")
+            artifact_path_payload_obj = cast(dict[str, object], artifact_path_payload)
+            path = artifact_path_payload_obj.get("path")
+            role = artifact_path_payload_obj.get("role")
+            default_branch_url = artifact_path_payload_obj.get("default_branch_url")
+            blob_url = artifact_path_payload_obj.get("blob_url")
+            if not isinstance(path, str):
+                raise ValueError("artifact path must be a string")
+            if not isinstance(role, str):
+                raise ValueError("artifact role must be a string")
+            if not isinstance(default_branch_url, str):
+                raise ValueError("default_branch_url must be a string")
+            if blob_url is not None and not isinstance(blob_url, str):
+                raise ValueError("blob_url must be a string or null")
+            if role not in {"primary", "supporting"}:
+                raise ValueError("artifact role must be primary or supporting")
+            artifact_paths.append(
+                RoadmapChildDependencyArtifactPath(
+                    path=path,
+                    role=cast(RoadmapDependencyArtifactPathRole, role),
+                    default_branch_url=default_branch_url,
+                    blob_url=blob_url,
+                )
+            )
+
+        changed_files = dependency_payload_obj.get("changed_files")
+        review_notes = dependency_payload_obj.get("review_notes")
+        issue_notes = dependency_payload_obj.get("issue_notes")
+        if not isinstance(changed_files, list) or not all(
+            isinstance(item, str) for item in changed_files
+        ):
+            raise ValueError("changed_files must be a string list")
+        if not isinstance(review_notes, list) or not all(
+            isinstance(item, str) for item in review_notes
+        ):
+            raise ValueError("review_notes must be a string list")
+        if not isinstance(issue_notes, list) or not all(
+            isinstance(item, str) for item in issue_notes
+        ):
+            raise ValueError("issue_notes must be a string list")
+        changed_files_list = cast(list[str], changed_files)
+        review_notes_list = cast(list[str], review_notes)
+        issue_notes_list = cast(list[str], issue_notes)
+
+        def optional_str(key: str) -> str | None:
+            value = dependency_payload_obj.get(key)
+            if value is None or isinstance(value, str):
+                return value
+            raise ValueError(f"{key} must be a string or null")
+
+        def optional_int(key: str) -> int | None:
+            value = dependency_payload_obj.get(key)
+            if value is None or isinstance(value, int):
+                return value
+            raise ValueError(f"{key} must be an integer or null")
+
+        def optional_bool(key: str) -> bool | None:
+            value = dependency_payload_obj.get(key)
+            if value is None or isinstance(value, bool):
+                return value
+            raise ValueError(f"{key} must be a boolean or null")
+
+        node_id_value = dependency_payload_obj.get("node_id")
+        kind = dependency_payload_obj.get("kind")
+        title = dependency_payload_obj.get("title")
+        requires = dependency_payload_obj.get("requires")
+        satisfied_by = dependency_payload_obj.get("satisfied_by")
+        if not isinstance(node_id_value, str):
+            raise ValueError("dependency node_id must be a string")
+        if not isinstance(kind, str):
+            raise ValueError("dependency kind must be a string")
+        if not isinstance(title, str):
+            raise ValueError("dependency title must be a string")
+        if not isinstance(requires, str):
+            raise ValueError("dependency requires must be a string")
+        if not isinstance(satisfied_by, str):
+            raise ValueError("dependency satisfied_by must be a string")
+        if kind not in {"reference_doc", "design_doc", "small_job", "roadmap"}:
+            raise ValueError("dependency kind is unsupported")
+        if requires not in {"planned", "implemented"}:
+            raise ValueError("dependency requires is unsupported")
+        if satisfied_by not in {"planned", "implemented"}:
+            raise ValueError("dependency satisfied_by is unsupported")
+        dependencies.append(
+            RoadmapChildDependencyArtifact(
+                node_id=node_id_value,
+                kind=cast(RoadmapNodeKind, kind),
+                title=title,
+                requires=cast(RoadmapDependencyRequirement, requires),
+                satisfied_by=cast(RoadmapDependencyRequirement, satisfied_by),
+                child_issue_number=optional_int("child_issue_number"),
+                child_issue_url=optional_str("child_issue_url"),
+                child_issue_title=optional_str("child_issue_title"),
+                pr_number=optional_int("pr_number"),
+                pr_url=optional_str("pr_url"),
+                pr_title=optional_str("pr_title"),
+                pr_merged=optional_bool("pr_merged"),
+                branch=optional_str("branch"),
+                head_sha=optional_str("head_sha"),
+                merge_commit_sha=optional_str("merge_commit_sha"),
+                artifact_paths=tuple(artifact_paths),
+                changed_files=tuple(changed_files_list),
+                review_notes=tuple(review_notes_list),
+                issue_notes=tuple(issue_notes_list),
+                child_issue_body_excerpt=optional_str("child_issue_body_excerpt"),
+                pr_body_excerpt=optional_str("pr_body_excerpt"),
+            )
+        )
+
+    return RoadmapChildDependencyHandoff(
+        schema_version=cast(int, schema_version),
+        roadmap_issue_number=roadmap_issue_number,
+        node_id=node_id,
+        node_kind=cast(RoadmapNodeKind, node_kind),
+        dependencies=tuple(dependencies),
+    )
+
+
+def parse_roadmap_child_dependency_handoff_marker(
+    issue_body: str,
+) -> RoadmapChildDependencyHandoff | None:
+    match = _ROADMAP_DEPENDENCY_HANDOFF_MARKER_PATTERN.search(issue_body)
+    if match is None:
+        return None
+    if int(match.group("version")) != _ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION:
+        LOGGER.warning("unsupported_roadmap_dependency_handoff_marker_version")
+        return None
+    payload = match.group("payload")
+    padded_payload = payload + ("=" * (-len(payload) % 4))
+    try:
+        raw_payload = base64.urlsafe_b64decode(padded_payload).decode("utf-8")
+        parsed_payload = json.loads(raw_payload)
+        return _roadmap_child_dependency_handoff_from_payload(parsed_payload)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        LOGGER.warning("failed_to_parse_roadmap_dependency_handoff_marker")
+        return None
+
+
+def _remove_roadmap_child_dependency_handoff_marker(issue_body: str) -> str:
+    without_marker = _ROADMAP_DEPENDENCY_HANDOFF_MARKER_PATTERN.sub("", issue_body, count=1)
+    without_marker = re.sub(r"\n{3,}", "\n\n", without_marker)
+    return without_marker.strip()
+
+
+def render_roadmap_child_dependency_handoff_summary(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    normalized = _normalize_roadmap_child_dependency_handoff(
+        handoff,
+        include_body_excerpts=False,
+        changed_files_limit=5,
+        notes_limit=2,
+        total_artifact_paths_limit=10,
+        supporting_artifact_paths_limit=3,
+    )
+    if not normalized.dependencies:
+        return "Dependency handoff:\n- none"
+    lines = [
+        "Dependency handoff:",
+        "- direct dependencies only; MergeXO resolved them ahead of time.",
+    ]
+    for dependency in normalized.dependencies:
+        lines.append(
+            f"- {dependency.node_id} [{dependency.kind}] "
+            f"requires={dependency.requires} satisfied_by={dependency.satisfied_by}"
+        )
+        if dependency.child_issue_number is not None:
+            lines.append(
+                "  child issue: "
+                f"#{dependency.child_issue_number}"
+                + (
+                    f" ({dependency.child_issue_url})"
+                    if dependency.child_issue_url is not None
+                    else ""
+                )
+            )
+        if dependency.pr_number is not None:
+            lines.append(
+                "  PR: "
+                f"#{dependency.pr_number}"
+                + (f" ({dependency.pr_url})" if dependency.pr_url is not None else "")
+            )
+        primary_paths = [path.path for path in dependency.artifact_paths if path.role == "primary"]
+        supporting_paths = [
+            path.path for path in dependency.artifact_paths if path.role == "supporting"
+        ]
+        if primary_paths:
+            lines.append(f"  primary artifact: {primary_paths[0]}")
+        if supporting_paths:
+            lines.append(f"  supporting artifacts: {', '.join(supporting_paths)}")
+        if dependency.changed_files:
+            lines.append(f"  changed files: {', '.join(dependency.changed_files)}")
+        if dependency.review_notes:
+            lines.append(f"  review notes: {' | '.join(dependency.review_notes)}")
+        if dependency.issue_notes:
+            lines.append(f"  issue notes: {' | '.join(dependency.issue_notes)}")
+    return "\n".join(lines)
+
+
+def _render_roadmap_child_dependency_handoff_prompt_section(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    normalized = _normalize_roadmap_child_dependency_handoff(
+        handoff,
+        include_body_excerpts=True,
+        changed_files_limit=25,
+        notes_limit=3,
+        total_artifact_paths_limit=10,
+        supporting_artifact_paths_limit=3,
+    )
+    lines = [
+        "Dependency Handoff:",
+        "- Direct dependencies only. MergeXO already resolved them; do not walk the roadmap graph or git history to discover more inputs.",
+        f"- Roadmap issue: #{normalized.roadmap_issue_number}",
+        f"- Current node: {normalized.node_id} [{normalized.node_kind}]",
+    ]
+    if not normalized.dependencies:
+        lines.append("- Dependency artifacts: none")
+        return "\n".join(lines)
+    for dependency in normalized.dependencies:
+        lines.append(
+            f"- {dependency.node_id} [{dependency.kind}] "
+            f"requires={dependency.requires} satisfied_by={dependency.satisfied_by}"
+        )
+        if dependency.child_issue_number is not None:
+            lines.append(
+                "  child issue: "
+                f"#{dependency.child_issue_number}"
+                + (
+                    f" ({dependency.child_issue_url})"
+                    if dependency.child_issue_url is not None
+                    else ""
+                )
+            )
+        if dependency.pr_number is not None:
+            lines.append(
+                "  satisfying PR: "
+                f"#{dependency.pr_number}"
+                + (f" ({dependency.pr_url})" if dependency.pr_url is not None else "")
+            )
+        if dependency.pr_title is not None:
+            lines.append(f"  PR title: {dependency.pr_title}")
+        if dependency.branch is not None or dependency.head_sha is not None:
+            lines.append(
+                "  git provenance: "
+                f"branch={dependency.branch or '-'} "
+                f"head_sha={dependency.head_sha or '-'} "
+                f"merge_commit_sha={dependency.merge_commit_sha or '-'}"
+            )
+        for artifact_path in dependency.artifact_paths:
+            label = "primary artifact" if artifact_path.role == "primary" else "supporting artifact"
+            lines.append(
+                f"  {label}: {artifact_path.path} "
+                f"(default branch: {artifact_path.default_branch_url}; "
+                f"pinned blob: {artifact_path.blob_url or 'unavailable'})"
+            )
+        if dependency.changed_files:
+            lines.append(f"  changed files: {', '.join(dependency.changed_files)}")
+        if dependency.review_notes:
+            lines.append(f"  review notes: {' | '.join(dependency.review_notes)}")
+        if dependency.issue_notes:
+            lines.append(f"  issue notes: {' | '.join(dependency.issue_notes)}")
+        if dependency.child_issue_body_excerpt is not None:
+            lines.append(f"  child issue excerpt: {dependency.child_issue_body_excerpt}")
+        if dependency.pr_body_excerpt is not None:
+            lines.append(f"  PR body excerpt: {dependency.pr_body_excerpt}")
+    return "\n".join(lines)
+
+
+def _worker_issue_context_sections(issue_body: str) -> tuple[str, str]:
+    handoff = parse_roadmap_child_dependency_handoff_marker(issue_body)
+    if handoff is None:
+        return "", issue_body
+    return (
+        _render_roadmap_child_dependency_handoff_prompt_section(handoff) + "\n\n",
+        _remove_roadmap_child_dependency_handoff_marker(issue_body),
+    )
+
+
 def _direct_output_contract_lines() -> str:
     return """
 Required output fields:
@@ -131,6 +657,48 @@ def _feedback_output_contract_lines(*, allow_escalation: bool) -> str:
     ).strip()
 
 
+def _roadmap_authoring_contract_text(*, concise: bool) -> str:
+    core_lines = (
+        "Roadmap dependency handoff contract:",
+        "- Treat each dependency as both a sequencing constraint and a direct worker-input declaration.",
+        "- A roadmap edge exists when the downstream worker must receive that upstream artifact, or rely directly on that upstream satisfied state, in its child issue body and worker prompt.",
+        "- Downstream workers receive direct dependency artifacts and satisfied dependency states only, not the transitive closure of the roadmap graph.",
+        "- The same direct dependency handoff appears in both the child issue body and the worker prompt.",
+        "- For doc-like dependencies, MergeXO hands off exact artifact paths on the default branch plus stable GitHub and git provenance when available.",
+        "- For state-oriented dependencies such as `small_job.planned` or `roadmap.implemented`, MergeXO tells the worker the exact satisfied state it may rely on directly together with the available provenance for that state.",
+        "- Workers should not be expected to walk the roadmap graph, infer artifact locations from node ids, search the repository heuristically, or reconstruct intent from git history.",
+        "- If a downstream worker needs another upstream artifact or satisfied upstream state, add an explicit direct dependency edge to that node.",
+        "- Choose `planned` or `implemented` based on the earliest milestone at which MergeXO can truthfully hand the downstream worker the concrete direct artifact or satisfied state it needs.",
+    )
+    direct_edge_lines = (
+        "Direct-edge reminders:",
+        "- Ask what concrete upstream artifact or satisfied state the downstream worker must have on its first turn.",
+        "- Add a direct edge to every upstream node whose artifact or satisfied state must appear in that worker handoff.",
+        "- If a worker needs two upstream inputs, add two direct edges instead of relying on one dependency to transitively carry another node's artifact or satisfied state.",
+        "- Do not rely on transitive dependencies, git-history reconstruction, or heuristic repo search to supply missing inputs.",
+        "- Do not choose `planned` merely to preserve ordering if the needed artifact or satisfied state is not available yet.",
+    )
+    per_kind_lines = (
+        "Per-kind handoff guidance:",
+        "- `reference_doc`: downstream workers receive the merged doc artifact with its exact path and provenance. Usually use `planned` when the merged document itself is the needed input.",
+        "- `design_doc`: `planned` hands off the merged design artifact path and design PR provenance; `implemented` waits for the shipped implementation outcome from that same child issue.",
+        "- `small_job`: `planned` means the child issue and its issue text exist; merged code, changed files, and implementation behavior are not available until `implemented`.",
+        "- `roadmap`: `planned` hands off the child roadmap markdown and graph artifact paths plus activation provenance; `implemented` means the child roadmap has completed.",
+    )
+    example_lines = (
+        "Motivating example:",
+        "- Treat `review_design` as a `reference_doc`.",
+        "- `review_config` and `review_contract` should each depend directly on `review_design` with `requires = planned` so their workers receive the exact reviewed design artifact and constraints.",
+        "- If a later node needs both the reviewed design artifact and merged output from `review_config`, add direct edges to both nodes instead of expecting `review_design` to arrive transitively through `review_config`.",
+    )
+    sections: tuple[tuple[str, ...], ...]
+    if concise:
+        sections = (core_lines, direct_edge_lines, example_lines)
+    else:
+        sections = (core_lines, direct_edge_lines, per_kind_lines, example_lines)
+    return "\n".join("\n".join(section) for section in sections)
+
+
 def build_design_prompt(
     *,
     issue: Issue,
@@ -138,6 +706,7 @@ def build_design_prompt(
     design_doc_path: str,
     default_branch: str,
 ) -> str:
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     return f"""
 You are the design-doc agent for repository {repo_full_name}.
 
@@ -176,8 +745,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 """.strip()
 
 
@@ -238,6 +807,7 @@ def build_small_job_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     return f"""
 You are the small-job agent for repository {repo_full_name}.
 
@@ -269,8 +839,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 """.strip()
 
 
@@ -291,6 +861,7 @@ def build_implementation_prompt(
     implementation_checks_line = _implementation_checks_line(
         coding_guidelines_path=coding_guidelines_path
     )
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     design_pr_line = (
         f"- Source design PR: #{design_pr_number} ({design_pr_url})"
         if design_pr_number is not None and design_pr_url
@@ -337,8 +908,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 
 Merged design doc markdown ({design_doc_path}):
 {design_doc_markdown}
@@ -357,6 +928,8 @@ def build_roadmap_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=False)
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     markdown_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.md"
     graph_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.graph.json"
     return f"""
@@ -374,23 +947,16 @@ Output requirements:
 - Produce a practical execution plan that decomposes the issue into child work MergeXO can issue incrementally.
 - Each roadmap node should represent one concrete child issue with reviewable scope, a clear completion outcome, and text that can plausibly become that child issue's title/body.
 - Keep the graph acyclic with internal `node_id` references only.
-- Allowed node kinds: `design_doc`, `small_job`, `roadmap`.
+{roadmap_contract_text}
+- Allowed node kinds: {_roadmap_node_kinds_text()}.
 - Prefer:
-  - `design_doc` when downstream work should wait for a reviewed design artifact.
+  - `reference_doc` for reviewed durable docs that downstream nodes should consult without starting an implementation lane from that same child issue.
+  - `design_doc` only when the roadmap intentionally wants the existing design-to-implementation lane from the same child issue.
   - `small_job` for bounded implementation work that should directly produce a PR.
   - `roadmap` only when a subtree is large enough to deserve its own nested roadmap.
-- Milestone semantics for dependency planning:
-  - `design_doc.planned`: the design PR has merged.
-  - `design_doc.implemented`: implementation from that design has merged.
-  - `small_job.planned`: the child issue has been created and labeled.
-  - `small_job.implemented`: the child PR has merged.
-  - `roadmap.planned`: the child roadmap PR has merged and its graph is activated.
-  - `roadmap.implemented`: the child roadmap has completed.
 - Dependency `requires` must be `planned` or `implemented`.
 - Include an explicit `requires` on every dependency object.
 - Include an explicit `depends_on` array on every node, using `[]` when there are no dependencies.
-- Use `implemented` when downstream work truly depends on the completed outcome.
-- Use `planned` only when downstream work can safely begin once the upstream plan/design/activation milestone exists.
 - Choose short, unique, stable `node_id` values that will still make sense if the roadmap is revised later.
 - Recommended node count is around {recommended_node_count}; larger DAGs are allowed but should include decomposition notes.
 - The generated markdown is a deterministic review view derived from `graph_json`.
@@ -412,7 +978,7 @@ Required output fields:
   - `nodes`: non-empty array of node objects.
 - Each item in `graph_json.nodes` must be an object with exactly:
   - `node_id`: non-empty string. Use a short stable internal identifier.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string for the child issue title.
   - `body_markdown`: non-empty string for the child issue body.
   - `depends_on`: array of dependency objects, using `[]` when there are no dependencies.
@@ -431,8 +997,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 """.strip()
 
 
@@ -454,6 +1020,7 @@ def build_roadmap_adjustment_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=False)
     ready_frontier_json = json.dumps(list(ready_node_ids), separators=(",", ":"))
     dependency_artifacts_json = _roadmap_dependency_artifacts_json(dependency_artifacts)
     return f"""
@@ -469,6 +1036,8 @@ Decision rules:
 - Return `action = "revise"` when the roadmap should change before issuing more child work.
 - Return `action = "abandon"` only when continuing the roadmap is no longer viable.
 - Prefer `proceed` unless the current roadmap is materially wrong.
+
+{roadmap_contract_text}
 
 Response format:
 - Return JSON only.
@@ -491,7 +1060,7 @@ Payload rules:
   - `nodes`: non-empty array of node objects.
 - Each item in `updated_graph_json.nodes` must be an object with exactly:
   - `node_id`: non-empty string.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string.
   - `body_markdown`: non-empty string.
   - `depends_on`: array of dependency objects, using `[]` when there are no dependencies.
@@ -499,12 +1068,13 @@ Payload rules:
   - `node_id`: string referencing another node in this same graph.
   - `requires`: one of `planned`, `implemented`.
 - The revised graph must stay acyclic and use only internal `node_id` references.
-- Allowed node kinds remain `design_doc`, `small_job`, and `roadmap`.
+- Allowed node kinds remain {_roadmap_node_kinds_text()}.
 - Include an explicit `depends_on` array on every revised node, using `[]` when there are no dependencies.
 - Include an explicit `requires` on every revised dependency object.
 - The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
 - Treat retained `node_id`s as stable work identities.
-- If you keep an existing `node_id`, preserve its `kind`, `title`, `body_markdown`, and `depends_on` exactly.
+- If you keep an existing `node_id`, preserve its `title`, `body_markdown`, and `depends_on` exactly.
+- Preserve `kind` too, except you may change an unstarted node between `design_doc` and `reference_doc` when correcting artifact-only doc semantics.
 - If pending work needs to change materially, retire the old pending node and add replacement work under a new `node_id`.
 - Do not remove any node whose work has already started. Treat nodes with child issues, completed work, blocked work, abandoned work, or other in-flight progress as started.
 - Do not churn `node_id`s for unchanged work. If the work is unchanged, keep the same `node_id`.
@@ -555,6 +1125,7 @@ def build_requested_roadmap_revision_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=False)
     return f"""
 You are the roadmap-revision agent for repository {repo_full_name}.
 
@@ -567,6 +1138,8 @@ Decision rules:
 - Return `action = "revise"` when you can author a revised roadmap safely.
 - Return `action = "abandon"` only when the roadmap should be abandoned instead of revised.
 - Do not return `action = "proceed"` for this task.
+
+{roadmap_contract_text}
 
 Response format:
 - Return JSON only.
@@ -589,7 +1162,7 @@ Payload rules:
   - `nodes`: non-empty array of node objects.
 - Each item in `updated_graph_json.nodes` must be an object with exactly:
   - `node_id`: non-empty string.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string.
   - `body_markdown`: non-empty string.
   - `depends_on`: array of dependency objects, using `[]` when there are no dependencies.
@@ -597,12 +1170,13 @@ Payload rules:
   - `node_id`: string referencing another node in this same graph.
   - `requires`: one of `planned`, `implemented`.
 - The revised graph must stay acyclic and use only internal `node_id` references.
-- Allowed node kinds remain `design_doc`, `small_job`, and `roadmap`.
+- Allowed node kinds remain {_roadmap_node_kinds_text()}.
 - Include an explicit `depends_on` array on every revised node, using `[]` when there are no dependencies.
 - Include an explicit `requires` on every revised dependency object.
 - The revised graph must keep `roadmap_issue_number = {issue.number}` and bump the graph `version` from {graph_version} to {graph_version + 1}.
 - Treat retained `node_id`s as stable work identities.
-- If you keep an existing `node_id`, preserve its `kind`, `title`, `body_markdown`, and `depends_on` exactly.
+- If you keep an existing `node_id`, preserve its `title`, `body_markdown`, and `depends_on` exactly.
+- Preserve `kind` too, except you may change an unstarted node between `design_doc` and `reference_doc` when correcting artifact-only doc semantics.
 - If pending work needs to change materially, retire the old pending node and add replacement work under a new `node_id`.
 - Do not remove any node whose work has already started. Treat nodes with child issues, completed work, blocked work, abandoned work, or other in-flight progress as started.
 - Do not churn `node_id`s for unchanged work. If the work is unchanged, keep the same `node_id`.
@@ -787,6 +1361,7 @@ def build_roadmap_feedback_prompt(*, turn: RoadmapFeedbackTurn) -> str:
         if turn.graph_version is not None
         else "- Current graph version in this PR could not be validated. Fix the graph and preserve the intended PR version if it is evident from review context."
     )
+    roadmap_contract_text = _roadmap_authoring_contract_text(concise=True)
 
     return f"""
 You are the roadmap-feedback agent for roadmap issue #{turn.issue.number}.
@@ -848,7 +1423,8 @@ Roadmap review rules:
 - MergeXO will regenerate `{turn.roadmap_doc_path}` before validation and push.
 - Do not return `escalation` for this task. This PR itself is the place to fix roadmap review feedback.
 - Prefer concrete file edits over explanatory-only replies when a roadmap comment can be addressed directly.
-- Before finalizing, re-read the roadmap graph and confirm the generated markdown view would match it.
+- Before finalizing, re-read the roadmap graph and the generated markdown view even if the comment mentions only one artifact.
+{roadmap_contract_text}
 
 Roadmap markdown expectations:
 - The markdown file is a generated review view for `{turn.graph_path}`.
@@ -861,7 +1437,7 @@ Roadmap graph contract:
 - `nodes` must be a non-empty array of node objects.
 - Each node object must contain exactly:
   - `node_id`: non-empty string.
-  - `kind`: one of `design_doc`, `small_job`, `roadmap`.
+  - `kind`: one of {_roadmap_node_kinds_text()}.
   - `title`: non-empty string.
   - `body_markdown`: non-empty string.
   - `depends_on`: array, using `[]` when there are no dependencies.

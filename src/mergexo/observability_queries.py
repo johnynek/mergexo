@@ -156,20 +156,24 @@ def load_overview(
                     LEFT JOIN issue_takeover_state AS t
                         ON t.repo_full_name = p.repo_full_name
                        AND t.issue_number = p.issue_number
-                    WHERE (
-                        p.status = 'blocked'
-                        OR (
-                            p.status = 'awaiting_feedback'
-                            AND COALESCE(t.ignore_active, 0) = 1
-                        )
-                    )
+                    LEFT JOIN issue_runs AS i
+                        ON i.repo_full_name = p.repo_full_name
+                       AND i.issue_number = p.issue_number
+                    WHERE p.status = 'blocked'
+                      AND COALESCE(t.ignore_active, 0) = 0
+                      AND COALESCE(LOWER(i.github_state), 'open') != 'closed'
                       {pr_repo_clause}
                 )
                 +
                 (
                     SELECT COUNT(*)
                     FROM issue_runs AS i
+                    LEFT JOIN issue_takeover_state AS t
+                        ON t.repo_full_name = i.repo_full_name
+                       AND t.issue_number = i.issue_number
                     WHERE i.status = 'awaiting_issue_followup'
+                      AND COALESCE(t.ignore_active, 0) = 0
+                      AND COALESCE(LOWER(i.github_state), 'open') != 'closed'
                       {issue_repo_clause}
                 )
             """,
@@ -183,8 +187,12 @@ def load_overview(
             LEFT JOIN issue_takeover_state AS t
                 ON t.repo_full_name = p.repo_full_name
                AND t.issue_number = p.issue_number
+            LEFT JOIN issue_runs AS i
+                ON i.repo_full_name = p.repo_full_name
+               AND i.issue_number = p.issue_number
             WHERE p.status = 'awaiting_feedback'
               AND COALESCE(t.ignore_active, 0) = 0
+              AND COALESCE(LOWER(i.github_state), 'open') != 'closed'
               {pr_repo_clause}
             """,
             pr_repo_params,
@@ -293,26 +301,91 @@ def load_tracked_and_blocked(
             params = (*pr_repo_params, *issue_repo_params)
         rows = conn.execute(
             f"""
-            WITH tracked_work AS (
+            WITH pr_observable_activity AS (
+                SELECT
+                    repo_full_name,
+                    pr_number,
+                    MAX(updated_at) AS observable_updated_at
+                FROM (
+                    SELECT
+                        repo_full_name,
+                        pr_number,
+                        updated_at
+                    FROM feedback_events
+
+                    UNION ALL
+
+                    SELECT
+                        repo_full_name,
+                        scope_number AS pr_number,
+                        observed_updated_at AS updated_at
+                    FROM action_tokens
+                    WHERE scope_kind = 'pr'
+                      AND status = 'observed'
+                      AND observed_updated_at IS NOT NULL
+
+                    UNION ALL
+
+                    SELECT
+                        repo_full_name,
+                        scope_number AS pr_number,
+                        last_updated_at AS updated_at
+                    FROM github_comment_poll_cursors
+                    WHERE surface IN (
+                        'pr_review_comments',
+                        'pr_issue_comments',
+                        'pr_review_summaries'
+                    )
+                      AND last_comment_id > 0
+                )
+                GROUP BY repo_full_name, pr_number
+            ),
+            issue_observable_activity AS (
+                SELECT
+                    repo_full_name,
+                    issue_number,
+                    MAX(updated_at) AS observable_updated_at
+                FROM (
+                    SELECT
+                        repo_full_name,
+                        scope_number AS issue_number,
+                        observed_updated_at AS updated_at
+                    FROM action_tokens
+                    WHERE scope_kind = 'issue'
+                      AND status = 'observed'
+                      AND observed_updated_at IS NOT NULL
+
+                    UNION ALL
+
+                    SELECT
+                        repo_full_name,
+                        scope_number AS issue_number,
+                        last_updated_at AS updated_at
+                    FROM github_comment_poll_cursors
+                    WHERE surface IN (
+                        'issue_pre_pr_followups',
+                        'issue_post_pr_redirects',
+                        'issue_operator_commands'
+                    )
+                      AND last_comment_id > 0
+                )
+                GROUP BY repo_full_name, issue_number
+            ),
+            tracked_work AS (
                 SELECT
                     p.repo_full_name AS repo_full_name,
                     p.pr_number AS pr_number,
                     p.issue_number AS issue_number,
-                    CASE
-                        WHEN p.status = 'awaiting_feedback' AND COALESCE(t.ignore_active, 0) = 1
-                        THEN 'blocked'
-                        ELSE p.status
-                    END AS status,
+                    p.status AS status,
                     COALESCE(p.branch, '-') AS branch,
                     p.last_seen_head_sha AS last_seen_head_sha,
                     CASE
                         WHEN p.status = 'blocked' THEN r.error
-                        WHEN p.status = 'awaiting_feedback' AND COALESCE(t.ignore_active, 0) = 1
-                        THEN 'ignored (takeover active)'
                         ELSE NULL
                     END AS blocked_reason,
                     COUNT(e.event_key) AS pending_event_count,
-                    p.updated_at AS updated_at
+                    COALESCE(o.observable_updated_at, '-') AS updated_at,
+                    COALESCE(o.observable_updated_at, '') AS sort_updated_at
                 FROM pr_feedback_state AS p
                 LEFT JOIN issue_runs AS r
                     ON r.repo_full_name = p.repo_full_name
@@ -324,7 +397,12 @@ def load_tracked_and_blocked(
                     ON e.repo_full_name = p.repo_full_name
                    AND e.pr_number = p.pr_number
                    AND e.processed_at IS NULL
+                LEFT JOIN pr_observable_activity AS o
+                    ON o.repo_full_name = p.repo_full_name
+                   AND o.pr_number = p.pr_number
                 WHERE p.status IN ('awaiting_feedback', 'blocked')
+                  AND COALESCE(t.ignore_active, 0) = 0
+                  AND COALESCE(LOWER(r.github_state), 'open') != 'closed'
                   {pr_repo_clause}
                 GROUP BY
                     p.repo_full_name,
@@ -333,9 +411,8 @@ def load_tracked_and_blocked(
                     p.status,
                     p.branch,
                     p.last_seen_head_sha,
-                    t.ignore_active,
                     r.error,
-                    p.updated_at
+                    o.observable_updated_at
 
                 UNION ALL
 
@@ -348,12 +425,21 @@ def load_tracked_and_blocked(
                     NULL AS last_seen_head_sha,
                     COALESCE(f.waiting_reason, i.error) AS blocked_reason,
                     0 AS pending_event_count,
-                    i.updated_at AS updated_at
+                    COALESCE(o.observable_updated_at, '-') AS updated_at,
+                    COALESCE(o.observable_updated_at, '') AS sort_updated_at
                 FROM issue_runs AS i
                 LEFT JOIN pre_pr_followup_state AS f
                     ON f.repo_full_name = i.repo_full_name
                    AND f.issue_number = i.issue_number
+                LEFT JOIN issue_takeover_state AS t
+                    ON t.repo_full_name = i.repo_full_name
+                   AND t.issue_number = i.issue_number
+                LEFT JOIN issue_observable_activity AS o
+                    ON o.repo_full_name = i.repo_full_name
+                   AND o.issue_number = i.issue_number
                 WHERE i.status = 'awaiting_issue_followup'
+                  AND COALESCE(t.ignore_active, 0) = 0
+                  AND COALESCE(LOWER(i.github_state), 'open') != 'closed'
                   {issue_repo_clause}
             )
             SELECT
@@ -368,7 +454,7 @@ def load_tracked_and_blocked(
                 updated_at
             FROM tracked_work
             ORDER BY
-                updated_at DESC,
+                sort_updated_at DESC,
                 repo_full_name ASC,
                 issue_number ASC,
                 COALESCE(pr_number, 0) ASC

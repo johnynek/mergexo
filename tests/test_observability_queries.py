@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import sqlite3
 
 import pytest
 
@@ -308,14 +307,18 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
         reverse=True,
     )
     blocked_row = next(row for row in tracked_rows if row.status == "blocked")
+    awaiting_feedback_row = next(row for row in tracked_rows if row.status == "awaiting_feedback")
     awaiting_issue_row = next(
         row for row in tracked_rows if row.status == "awaiting_issue_followup"
     )
     assert blocked_row.pending_event_count == 1
     assert blocked_row.blocked_reason == "rewrite"
+    assert blocked_row.updated_at == "2026-02-24T00:00:00Z"
+    assert awaiting_feedback_row.updated_at == "-"
     assert awaiting_issue_row.pr_number is None
     assert awaiting_issue_row.issue_number == 12
     assert awaiting_issue_row.blocked_reason == "waiting for reporter clarification"
+    assert awaiting_issue_row.updated_at == "-"
 
     issue_history = oq.load_issue_history(db_path, None, issue_number=2, limit=10)
     assert len(issue_history) == 1
@@ -380,7 +383,7 @@ def test_observability_queries_end_to_end(tmp_path: Path) -> None:
     assert oq.load_roadmap_blocker_ages(db_path, repo_filter="o/repo-b", limit=10) == ()
 
 
-def test_observability_queries_show_takeover_tracked_pr_as_blocked(tmp_path: Path) -> None:
+def test_observability_queries_hide_takeover_tracked_pr_from_top_ui(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
 
@@ -398,13 +401,59 @@ def test_observability_queries_show_takeover_tracked_pr_as_blocked(tmp_path: Pat
     assert [row.pr_number for row in tracked_state_rows] == [1818]
 
     tracked_rows = oq.load_tracked_and_blocked(db_path, repo_filter="o/repo-a", limit=20)
-    assert len(tracked_rows) == 1
-    assert tracked_rows[0].pr_number == 1818
-    assert tracked_rows[0].status == "blocked"
-    assert tracked_rows[0].blocked_reason == "ignored (takeover active)"
+    assert tracked_rows == ()
 
     overview = oq.load_overview(db_path, repo_filter="o/repo-a", window="24h")
-    assert overview.blocked_prs == 1
+    assert overview.blocked_prs == 0
+    assert overview.tracked_prs == 0
+
+
+def test_observability_queries_hide_closed_or_ignored_issue_rows_from_top_ui(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+
+    store.mark_completed(
+        21, "agent/design/21", 2121, "https://example/pr/2121", repo_full_name="o/repo-a"
+    )
+    store.mark_awaiting_issue_followup(
+        issue_number=22,
+        flow="small_job",
+        branch="agent/small/22",
+        context_json='{"source":"issue_comment"}',
+        waiting_reason="waiting on reporter",
+        repo_full_name="o/repo-a",
+    )
+    store.mark_awaiting_issue_followup(
+        issue_number=23,
+        flow="small_job",
+        branch="agent/small/23",
+        context_json='{"source":"issue_comment"}',
+        waiting_reason="waiting on reporter",
+        repo_full_name="o/repo-a",
+    )
+    store.set_issue_takeover_active(
+        issue_number=22,
+        ignore_active=True,
+        repo_full_name="o/repo-a",
+    )
+    store.set_issue_github_state(
+        issue_number=21,
+        github_state="closed",
+        repo_full_name="o/repo-a",
+    )
+    store.set_issue_github_state(
+        issue_number=23,
+        github_state="closed",
+        repo_full_name="o/repo-a",
+    )
+
+    tracked_rows = oq.load_tracked_and_blocked(db_path, repo_filter="o/repo-a", limit=20)
+    assert tracked_rows == ()
+
+    overview = oq.load_overview(db_path, repo_filter="o/repo-a", window="24h")
+    assert overview.blocked_prs == 0
     assert overview.tracked_prs == 0
 
 
@@ -567,36 +616,62 @@ def test_load_tracked_and_blocked_sorted_by_updated_desc(tmp_path: Path) -> None
     store = StateStore(db_path)
     _seed_state(store)
 
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute(
-            """
-            UPDATE pr_feedback_state
-            SET updated_at = '2026-02-24T00:00:02.000Z'
-            WHERE repo_full_name = 'o/repo-a' AND pr_number = 1010
-            """
-        )
-        conn.execute(
-            """
-            UPDATE issue_runs
-            SET updated_at = '2026-02-24T00:00:03.000Z'
-            WHERE repo_full_name = 'o/repo-b' AND issue_number = 12
-            """
-        )
-        conn.execute(
-            """
-            UPDATE pr_feedback_state
-            SET updated_at = '2026-02-24T00:00:01.000Z'
-            WHERE repo_full_name = 'o/repo-b' AND pr_number = 1111
-            """
-        )
-        conn.commit()
+    store.ingest_feedback_events(
+        (
+            FeedbackEventRecord(
+                event_key="1010:issue:2:2026-02-24T00:00:02Z",
+                pr_number=1010,
+                issue_number=10,
+                kind="issue",
+                comment_id=2,
+                updated_at="2026-02-24T00:00:02Z",
+            ),
+        ),
+        repo_full_name="o/repo-a",
+    )
+    store.record_action_token_observed(
+        token="tok-pr-1111",
+        scope_kind="pr",
+        scope_number=1111,
+        source="feedback_pr_issue_scan",
+        observed_comment_id=10,
+        observed_updated_at="2026-02-24T00:00:01Z",
+        repo_full_name="o/repo-b",
+    )
+    store.upsert_poll_cursor(
+        surface="issue_pre_pr_followups",
+        scope_number=12,
+        last_updated_at="2026-02-24T00:00:03Z",
+        last_comment_id=20,
+        bootstrap_complete=True,
+        repo_full_name="o/repo-b",
+    )
 
     rows = oq.load_tracked_and_blocked(db_path, limit=20)
     assert [row.updated_at for row in rows] == [
-        "2026-02-24T00:00:03.000Z",
-        "2026-02-24T00:00:02.000Z",
-        "2026-02-24T00:00:01.000Z",
+        "2026-02-24T00:00:03Z",
+        "2026-02-24T00:00:02Z",
+        "2026-02-24T00:00:01Z",
     ]
+
+
+def test_load_tracked_and_blocked_ignores_bootstrap_cursor_without_comments(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    _seed_state(store)
+
+    store.upsert_poll_cursor(
+        surface="pr_issue_comments",
+        scope_number=1111,
+        last_updated_at="2026-02-24T12:00:00Z",
+        last_comment_id=0,
+        bootstrap_complete=True,
+        repo_full_name="o/repo-b",
+    )
+
+    rows = oq.load_tracked_and_blocked(db_path, limit=20)
+    awaiting_feedback_row = next(row for row in rows if row.pr_number == 1111)
+    assert awaiting_feedback_row.updated_at == "-"
 
 
 def test_load_tracked_and_blocked_excludes_active_feedback_turn_prs(tmp_path: Path) -> None:

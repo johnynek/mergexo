@@ -83,6 +83,7 @@ def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.Monk
             "title": "Issue",
             "body": "Body",
             "html_url": "u",
+            "state": "OPEN",
             "user": {"login": "  Alice  "},
             "labels": [{"name": "x"}, 9],
         },
@@ -109,6 +110,7 @@ def test_list_open_issues_with_label_filters_and_parses(monkeypatch: pytest.Monk
     assert issues[0].number == 1
     assert issues[0].labels == ("x",)
     assert issues[0].author_login == "alice"
+    assert issues[0].state == "open"
 
 
 def test_list_open_issues_rejects_non_list(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -386,6 +388,7 @@ def test_get_issue_parses_object(monkeypatch: pytest.MonkeyPatch) -> None:
             "title": "Issue title",
             "body": "Issue body",
             "html_url": "https://example/issue/9",
+            "state": "CLOSED",
             "user": {"login": "Bob"},
             "labels": [{"name": "agent:design"}, "skip"],
         }
@@ -395,6 +398,7 @@ def test_get_issue_parses_object(monkeypatch: pytest.MonkeyPatch) -> None:
     assert issue.number == 9
     assert issue.labels == ("agent:design",)
     assert issue.author_login == "bob"
+    assert issue.state == "closed"
 
 
 def test_get_issue_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -403,6 +407,16 @@ def test_get_issue_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(RuntimeError, match="expected object for issue"):
         gateway.get_issue(1)
+
+
+def test_get_issue_rejects_non_positive_number() -> None:
+    gateway = GitHubGateway("o", "r")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        gateway.get_issue(0)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        gateway.get_issue("7")  # type: ignore[arg-type]
 
 
 def test_create_pull_request_rejects_non_object(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -467,6 +481,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
                 "draft": False,
                 "state": "open",
                 "merged": False,
+                "merge_commit_sha": "merge-9",
             }
         if path.endswith("/pulls/9/files?per_page=100"):
             return ["skip", {"filename": "src/a.py"}, {"filename": "README.md"}]
@@ -525,6 +540,7 @@ def test_pull_request_related_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     assert pr.head_sha == "headsha"
     assert pr.state == "open"
     assert pr.merged is False
+    assert pr.merge_commit_sha == "merge-9"
     assert files == ("src/a.py", "README.md")
     assert review_comments[0].comment_id == 11
     assert review_comments[0].user_login == "reviewer"

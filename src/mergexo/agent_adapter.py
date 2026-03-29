@@ -55,6 +55,7 @@ class ReviewReply:
 
 GitOpName = Literal["fetch_origin", "merge_origin_default_branch"]
 RoadmapAdjustmentAction = Literal["proceed", "revise", "abandon"]
+RoadmapDependencyArtifactPathRole = Literal["primary", "supporting"]
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,48 @@ class RoadmapDependencyArtifact:
     changed_files: tuple[str, ...]
     review_summaries: tuple[PullRequestIssueComment, ...]
     issue_comments: tuple[PullRequestIssueComment, ...]
+
+
+@dataclass(frozen=True)
+class RoadmapChildDependencyArtifactPath:
+    path: str
+    role: RoadmapDependencyArtifactPathRole
+    default_branch_url: str
+    blob_url: str | None
+
+
+@dataclass(frozen=True)
+class RoadmapChildDependencyArtifact:
+    node_id: str
+    kind: RoadmapNodeKind
+    title: str
+    requires: RoadmapDependencyRequirement
+    satisfied_by: RoadmapDependencyRequirement
+    child_issue_number: int | None
+    child_issue_url: str | None
+    child_issue_title: str | None
+    pr_number: int | None
+    pr_url: str | None
+    pr_title: str | None
+    pr_merged: bool | None
+    branch: str | None
+    head_sha: str | None
+    merge_commit_sha: str | None
+    artifact_paths: tuple[RoadmapChildDependencyArtifactPath, ...]
+    changed_files: tuple[str, ...]
+    review_notes: tuple[str, ...]
+    issue_notes: tuple[str, ...]
+    child_issue_body_excerpt: str | None
+    pr_body_excerpt: str | None
+
+
+@dataclass(frozen=True)
+class RoadmapChildDependencyHandoff:
+    schema_version: int
+    roadmap_issue_number: int
+    node_id: str
+    node_kind: RoadmapNodeKind
+    dependencies: tuple[RoadmapChildDependencyArtifact, ...]
 
 
 @dataclass(frozen=True)

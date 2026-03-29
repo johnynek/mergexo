@@ -69,9 +69,12 @@ def validate_roadmap_graph_transition(
 
         retained_node_ids.append(current_node.node_id)
         if proposed_node.kind != current_node.kind:
-            raise RoadmapGraphTransitionError(
-                f"cannot change roadmap node kind for existing node_id: {current_node.node_id}"
-            )
+            if protected or not _is_pending_doc_kind_migration(
+                current_kind=current_node.kind, proposed_kind=proposed_node.kind
+            ):
+                raise RoadmapGraphTransitionError(
+                    f"cannot change roadmap node kind for existing node_id: {current_node.node_id}"
+                )
         _validate_retained_node_identity(
             current_node=current_node,
             proposed_node=proposed_node,
@@ -104,6 +107,12 @@ def _dependency_pairs(
 
 
 _RoadmapNodeSignature: TypeAlias = tuple[RoadmapNodeKind, str, str, tuple[tuple[str, str], ...]]
+
+
+def _is_pending_doc_kind_migration(
+    *, current_kind: RoadmapNodeKind, proposed_kind: RoadmapNodeKind
+) -> bool:
+    return {current_kind, proposed_kind} == {"design_doc", "reference_doc"}
 
 
 def _node_work_started(node: ExistingRoadmapNodeState) -> bool:

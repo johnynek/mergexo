@@ -144,6 +144,21 @@ Then do this:
 
 If you want to preview or regenerate the markdown locally while reviewing, run `python roadmap_json_to_md.py path/to/roadmap.graph.json --output path/to/roadmap.md`.
 
+### Roadmap Node Kinds
+
+- `reference_doc`: reviewed doc-only artifact. The child PR merges a durable reference doc and stops there. Downstream workers receive the merged doc artifact with its exact path and provenance, so `planned` is usually the earliest truthful handoff milestone.
+- `design_doc`: reviewed design doc that can later continue into implementation from the same child issue. Use `planned` when downstream work only needs the merged design artifact path and design PR provenance; use `implemented` when it depends on the shipped implementation outcome from that same child issue.
+- `small_job`: direct implementation lane. `planned` means the child issue exists and only that issue text is available; `implemented` means the child PR merged, so merged code, changed files, and implementation behavior are available.
+- `roadmap`: nested roadmap lane. `planned` means the child roadmap PR merged and activated, so the child roadmap markdown/graph artifacts and activation provenance are available; `implemented` means that child roadmap completed.
+
+### Roadmap Authoring Contract
+
+- Treat every roadmap dependency as both a sequencing constraint and a declaration of what MergeXO will hand to the downstream worker.
+- Downstream workers receive direct dependency artifacts and satisfied dependency states only, not the transitive closure of the graph.
+- The same direct dependency handoff appears in both the child issue body and the worker prompt.
+- Choose `planned` or `implemented` based on the earliest milestone at which MergeXO can truthfully hand the needed direct artifact or satisfied state to the downstream worker.
+- If a node needs two upstream inputs, add two direct edges. Do not rely on one dependency to transitively carry another node's artifact or satisfied state, and do not expect workers to reconstruct missing inputs from node ids, git history, or heuristic repo search.
+
 ### Visibility and Control
 
 The roadmap issue is your durable command center:
@@ -157,6 +172,8 @@ The roadmap issue is your durable command center:
 Roadmaps are now a continuous control loop, not a one-time plan that fans out unchanged.
 
 - Before issuing each ready frontier, MergeXO evaluates the current roadmap against concrete dependency artifacts from already-completed child work.
+- Each new roadmap child issue also carries a durable direct-dependency handoff snapshot in its issue body. Workers get those same direct dependency artifacts in their prompt, including stable issue/PR links, git provenance, and exact artifact paths for docs and nested roadmaps.
+- The handoff is direct-only by design. If a downstream node truly needs another upstream artifact, model that as an explicit roadmap edge instead of expecting workers to walk the graph or git history.
 - The adjustment result is one of `proceed`, `revise`, or `abandon`.
 - `proceed` issues the ready child issues now.
 - `revise` creates or reuses a same-roadmap revision PR instead of opening a replacement roadmap issue in the normal revision path.
@@ -259,7 +276,8 @@ Keybindings:
 - `f`: cycle repo filter
 - `w`: cycle window (`1h`, `24h`, `7d`, `30d`)
 - `tab`: cycle focused panel
-- `enter`: open GitHub URL when focused on `Issue`, `PR`, or `Branch`; otherwise open detail dialog
+- `enter`: open the detail pane for the selected row, with full branch names and full URLs for copy/paste
+- `o`: open the selected GitHub URL explicitly when focused on a URL-bearing field such as `Issue`, `PR`, `Branch`, or a URL row inside the detail pane
 - `q`: quit
 
 Metrics definitions:
@@ -614,5 +632,7 @@ usage: mergexo feedback blocked reset [-h] (--pr PR | --all) [--yes] [--dry-run]
 ## Label and PR Body Rules
 
 - `bugfix` and `small_job` PR bodies include `Fixes #<issue_number>`.
+- `reference_doc` PR bodies include `Closes #<issue_number>`.
 - `design_doc` PR bodies include `Refs #<issue_number>`.
+- Roadmap-created `reference_doc` child issues reuse the design trigger label; MergeXO distinguishes them from `design_doc` with an internal issue-body marker.
 - If multiple flow labels are present, precedence is `ignore` > `bugfix` > `small_job` > `design_doc`.
