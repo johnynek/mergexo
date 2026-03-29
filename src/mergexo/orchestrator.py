@@ -276,6 +276,7 @@ class _CreatePullRequestOutboxPayload:
     head: str
     base: str
     body: str
+    draft: bool
 
 
 @dataclass(frozen=True)
@@ -3962,6 +3963,7 @@ class Phase1Orchestrator:
         head = payload_obj.get("head")
         base = payload_obj.get("base")
         body = payload_obj.get("body")
+        draft = payload_obj.get("draft", False)
         if not isinstance(issue_number, int):
             raise RuntimeError("create_pull_request outbox payload is missing issue_number")
         if not isinstance(title, str):
@@ -3972,12 +3974,15 @@ class Phase1Orchestrator:
             raise RuntimeError("create_pull_request outbox payload is missing base")
         if not isinstance(body, str):
             raise RuntimeError("create_pull_request outbox payload is missing body")
+        if not isinstance(draft, bool):
+            raise RuntimeError("create_pull_request outbox payload has invalid draft")
         return _CreatePullRequestOutboxPayload(
             issue_number=issue_number,
             title=title,
             head=head,
             base=base,
             body=body,
+            draft=draft,
         )
 
     def _pull_request_from_outbox_result(self, result_json: str | None) -> PullRequest | None:
@@ -4039,6 +4044,7 @@ class Phase1Orchestrator:
                         head=payload.head,
                         base=payload.base,
                         body=payload.body,
+                        draft=payload.draft,
                     )
                 except Exception:
                     recovered = self._find_existing_pull_request_for_branch(
@@ -4075,6 +4081,7 @@ class Phase1Orchestrator:
         head: str,
         base: str,
         body: str,
+        draft: bool = False,
     ) -> PullRequest:
         dedupe_key = self._create_pr_dedupe_key(
             issue_number=issue_number,
@@ -4092,6 +4099,7 @@ class Phase1Orchestrator:
                     "head": head,
                     "base": base,
                     "body": body,
+                    "draft": draft,
                 },
                 sort_keys=True,
             ),

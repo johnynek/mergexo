@@ -275,6 +275,7 @@ class FakeGitHub:
         self.issues = issues
         self.requested_labels: tuple[str, ...] | None = None
         self.created_prs: list[tuple[str, str, str, str]] = []
+        self.created_pr_drafts: list[bool] = []
         self.created_issues: list[tuple[str, str, tuple[str, ...] | None]] = []
         self.rerun_requests: list[int] = []
         self.comments: list[tuple[int, str]] = []
@@ -311,15 +312,23 @@ class FakeGitHub:
     def list_open_issues_with_label(self, label: str) -> list[Issue]:
         return [issue for issue in self.issues if label in issue.labels]
 
-    def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
+    def create_pull_request(
+        self,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+        draft: bool = False,
+    ) -> PullRequest:
         self.created_prs.append((title, head, base, body))
+        self.created_pr_drafts.append(draft)
         self.pr_snapshot = PullRequestSnapshot(
             number=101,
             title=title,
             body=body,
             head_sha="headsha",
             base_sha="basesha",
-            draft=False,
+            draft=draft,
             state="open",
             merged=False,
         )
@@ -2352,6 +2361,10 @@ def test_ensure_poll_setup_replays_in_progress_create_pr_calls_without_duplicate
             '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker","base":"main"}',
             "missing body",
         ),
+        (
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker","base":"main","body":"Design body","draft":"yes"}',
+            "invalid draft",
+        ),
     ],
 )
 def test_parse_create_pr_outbox_payload_validation(
@@ -2366,6 +2379,27 @@ def test_parse_create_pr_outbox_payload_validation(
     )
     with pytest.raises(RuntimeError, match=message):
         orch._parse_create_pr_outbox_payload(payload_json)
+
+
+def test_parse_create_pr_outbox_payload_defaults_draft_to_false_for_legacy_payloads(
+    tmp_path: Path,
+) -> None:
+    orch = Phase1Orchestrator(
+        _config(tmp_path),
+        state=FakeState(),
+        github=FakeGitHub([]),
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    payload = orch._parse_create_pr_outbox_payload(
+        (
+            '{"issue_number":7,"title":"Design doc","head":"agent/design/7-worker",'
+            '"base":"main","body":"Design body"}'
+        )
+    )
+
+    assert payload.draft is False
 
 
 def test_pull_request_from_outbox_result_validation_paths(tmp_path: Path) -> None:
@@ -2511,6 +2545,42 @@ def test_execute_create_pr_outbox_call_uses_succeeded_result_without_github_call
     assert github.created_prs == []
 
 
+@pytest.mark.parametrize("draft", [False, True])
+def test_create_pull_request_with_outbox_round_trips_draft_flag(
+    tmp_path: Path, draft: bool
+) -> None:
+    cfg = _config(tmp_path)
+    state = StateStore(tmp_path / f"state-{draft}.db")
+    github = FakeGitHub([_issue(7, "Design issue")])
+    orch = Phase1Orchestrator(
+        cfg,
+        state=state,
+        github=github,
+        git_manager=FakeGitManager(tmp_path / "checkouts"),
+        agent=FakeAgent(),
+    )
+
+    pr = orch._create_pull_request_with_outbox(
+        issue_number=7,
+        run_id="run-7",
+        title="Design doc",
+        head="agent/design/7-worker",
+        base="main",
+        body="Design body",
+        draft=draft,
+    )
+
+    assert pr.number == 101
+    assert github.created_prs == [("Design doc", "agent/design/7-worker", "main", "Design body")]
+    assert github.created_pr_drafts == [draft]
+    replayable = state.list_replayable_github_calls(
+        call_kind="create_pull_request",
+        repo_full_name=cfg.repo.full_name,
+    )
+    assert len(replayable) == 1
+    assert json.loads(replayable[0].payload_json)["draft"] is draft
+
+
 def test_execute_create_pr_outbox_call_repairs_succeeded_rows_missing_result_payload(
     tmp_path: Path,
 ) -> None:
@@ -2596,8 +2666,10 @@ def test_execute_create_pr_outbox_call_recovers_after_create_error(tmp_path: Pat
                 return PullRequest(number=212, html_url="https://example/pr/212")
             return None
 
-        def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
-            _ = title, head, base, body
+        def create_pull_request(
+            self, title: str, head: str, base: str, body: str, draft: bool = False
+        ) -> PullRequest:
+            _ = title, head, base, body, draft
             raise RuntimeError("create failed after side effects")
 
     github = RecoverAfterCreateErrorGitHub()
@@ -2642,8 +2714,10 @@ def test_replay_pending_create_pr_calls_reraises_github_polling_errors(tmp_path:
             _ = head, base, state
             return None
 
-        def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
-            _ = title, head, base, body
+        def create_pull_request(
+            self, title: str, head: str, base: str, body: str, draft: bool = False
+        ) -> PullRequest:
+            _ = title, head, base, body, draft
             raise GitHubPollingError("temporary outage")
 
     orch = Phase1Orchestrator(
