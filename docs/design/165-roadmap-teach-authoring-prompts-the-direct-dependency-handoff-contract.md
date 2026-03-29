@@ -16,7 +16,7 @@ _Issue: #165 (https://github.com/johnynek/mergexo/issues/165)_
 
 ## Summary
 
-Define the post-#159/#162 roadmap authoring contract so initial roadmap creation and same-roadmap revision prompts explicitly teach direct-only worker handoff, explicit edge modeling, and milestone choice based on the earliest truthful artifact handoff.
+Define the post-#159/#162 roadmap authoring contract so initial roadmap creation and same-roadmap revision prompts explicitly teach direct-only worker handoff, explicit edge modeling, and milestone choice based on the earliest truthful direct input handoff.
 
 ## Context
 
@@ -25,7 +25,7 @@ Issue #159 and PR #161 made roadmap node kinds truthful by separating `reference
 The remaining gap is on the authoring side. `src/mergexo/prompts.py` already teaches roadmap authors about node kinds and milestone ordering, but it still frames dependencies mostly as sequencing. It does not clearly tell the roadmap-authoring agent what a downstream worker will actually receive from a dependency edge.
 
 That mismatch matters because the runtime contract is now stronger than the authoring contract:
-- workers receive direct dependency artifacts only
+- workers receive direct dependency handoff only, including direct artifacts and satisfied-state signals from direct dependencies
 - the handoff is projected into both the child issue body and the worker prompt
 - doc-like dependencies include exact artifact paths and provenance
 - workers are not expected to reconstruct artifact locations from transitive graph structure or git history
@@ -36,7 +36,7 @@ When the authoring prompt omits that contract, an authored roadmap can still be 
 
 1. Define a single truthful author-facing contract for roadmap dependency modeling after #159 and #162.
 2. Update roadmap authoring and revision prompts so they explicitly promise the direct-only worker handoff behavior that already exists at runtime.
-3. Teach roadmap authors to add explicit direct edges whenever a downstream worker needs another upstream artifact.
+3. Teach roadmap authors to add explicit direct edges whenever a downstream worker needs another upstream artifact or satisfied state.
 4. Reframe `planned` versus `implemented` around the earliest milestone at which MergeXO can hand the needed input to the downstream worker truthfully.
 5. Keep the guidance short enough for routine prompt use while still being concrete enough to prevent the older dependency misunderstandings.
 
@@ -53,9 +53,9 @@ Make the roadmap authoring prompts explicitly treat dependencies as both sequenc
 
 The core authoring rule should be:
 
-A roadmap edge exists when the downstream worker must receive that upstream artifact directly in its child issue body and worker prompt.
+A roadmap edge exists when the downstream worker must receive that upstream artifact, or be able to rely directly on that upstream satisfied state, in its child issue body and worker prompt.
 
-That rule aligns the authoring mental model with the current runtime behavior. A dependency is no longer just "what should happen before this other thing." It is also "what MergeXO will hand to the downstream worker as direct input."
+That rule aligns the authoring mental model with the current runtime behavior. A dependency is no longer just "what should happen before this other thing." It is also "what MergeXO will hand to the downstream worker, or what satisfied upstream state MergeXO will explicitly tell the worker it may rely on, as direct input."
 
 This issue should be implemented as a prompt-contract update, not a runtime change. The runtime contract already exists in the child issue body marker, worker prompt rendering, and README execution docs. The missing work is to teach roadmap authors and revisers the same contract in the prompts that create or revise roadmap graphs.
 
@@ -69,39 +69,40 @@ The new contract should be carried by all roadmap-authoring surfaces that can cr
    This prompt can decide `proceed`, but when it decides `revise` it is authoring a same-roadmap revision. It needs the same dependency-modeling contract.
 3. `build_requested_roadmap_revision_prompt(...)`
    This prompt always authors or declines a same-roadmap revision and therefore also needs the same contract.
+4. `build_roadmap_feedback_prompt(...)`
+   This prompt edits roadmap artifacts during review feedback, so it must carry the same contract in shorter form. Otherwise review edits can reintroduce the older sequencing-only model after initial authoring.
 
-A short consistency reminder should also be considered for `build_roadmap_feedback_prompt(...)`. That prompt edits roadmap artifacts during review feedback, so it can otherwise regress dependency wording back to the older sequencing-only model. The shorter reminder can reuse the same helper text but does not need the full explanatory block if prompt size becomes a concern.
-
-The contract text should be produced from one shared helper in `src/mergexo/prompts.py` so the three required prompts cannot drift from one another.
+The contract text should be produced from one shared helper in `src/mergexo/prompts.py` so these prompts cannot drift from one another. The feedback prompt can use a shorter rendering, but it should still come from the same source text.
 
 ## Required Prompt Contract
 
 The shared prompt block should make these promises explicitly and in plain language:
 
-- Downstream workers receive direct dependency artifacts only, not the transitive closure of the roadmap graph.
+- Downstream workers receive direct dependency artifacts and satisfied dependency states only, not the transitive closure of the roadmap graph.
 - The direct dependency handoff appears in both the child issue body and the worker prompt.
 - For doc-like dependencies, MergeXO hands off exact artifact paths on the default branch plus stable GitHub and git provenance when available.
+- For state-oriented dependencies such as `small_job.planned` or `roadmap.implemented`, MergeXO tells the worker the exact satisfied state it may rely on directly, together with the available provenance for that state.
 - Workers should not be expected to walk the roadmap graph, infer artifact locations from node ids, search the repository heuristically, or reconstruct intent from git history.
-- If a downstream worker needs another upstream artifact, the roadmap author must model that as an explicit direct dependency edge.
+- If a downstream worker needs another upstream artifact or satisfied upstream state, the roadmap author must model that as an explicit direct dependency edge.
 
 This wording should be presented as a truthful statement about the current system, not as a suggestion or best effort. Issue #165 exists because the runtime already guarantees these behaviors.
 
 ## How Prompts Should Teach Edge Modeling
 
-The prompts should move from "dependencies express milestone ordering" to "dependencies express the direct artifacts the worker will receive when unblocked."
+The prompts should move from "dependencies express milestone ordering" to "dependencies express the direct artifacts or satisfied states the worker will receive or be able to rely on when unblocked."
 
 The authoring guidance should be:
 
-1. Ask what concrete upstream artifact or state the downstream worker must have on its first turn.
-2. Add a direct edge to every upstream node whose artifact must appear in that worker's handoff.
+1. Ask what concrete upstream artifact or satisfied state the downstream worker must have on its first turn.
+2. Add a direct edge to every upstream node whose artifact or satisfied state must appear in that worker's handoff.
 3. Choose `requires = planned` or `requires = implemented` based on the earliest milestone at which MergeXO can hand that required input over truthfully.
-4. If the worker needs two upstream artifacts, add two direct edges. Do not rely on one upstream node to transitively carry another node's artifact unless the roadmap intentionally created a new direct artifact that summarizes it.
+4. If the worker needs two upstream inputs, add two direct edges. Do not rely on one upstream node to transitively carry another node's artifact or satisfied state unless the roadmap intentionally created a new direct artifact that summarizes it.
 
 The prompts should also include concise anti-pattern guidance:
 
 - Do not rely on transitive dependencies to get artifacts into a worker prompt.
 - Do not assume the worker will walk git history or search for the right file.
-- Do not choose `planned` merely to preserve ordering if the needed artifact does not exist yet at that milestone.
+- Do not choose `planned` merely to preserve ordering if the needed artifact or satisfied state is not yet available at that milestone.
 
 ## Per-Kind Handoff Guidance
 
@@ -116,7 +117,7 @@ The recommended guidance is:
 - `small_job`
   For `planned`, the worker can rely only on the child issue existing and its issue text; merged code and changed files are not available yet. For `implemented`, the worker receives merged PR provenance and changed-file context.
 - `roadmap`
-  For `planned`, the worker receives the child roadmap markdown and graph artifact paths plus activation provenance. For `implemented`, the worker can assume the child roadmap completed rather than merely activated.
+  For `planned`, the worker receives the child roadmap markdown and graph artifact paths plus activation provenance. For `implemented`, the worker can rely on the child roadmap having completed rather than merely activated.
 
 These examples matter because the right edge and the right `requires` value depend on what the future worker will actually see.
 
@@ -126,18 +127,18 @@ The prompts should stop teaching `planned` and `implemented` as generic ordering
 
 The decision rule should be:
 
-Choose the earliest milestone at which MergeXO can truthfully hand the downstream worker the concrete direct input it needs.
+Choose the earliest milestone at which MergeXO can truthfully hand the downstream worker the concrete direct artifact or satisfied state it needs.
 
 That yields the following authoring guidance:
 
 - `reference_doc`
-  Usually use `planned` when downstream work needs the merged document artifact. `implemented` remains technically valid because `reference_doc` is terminal, but it should not be the default teaching because it hides the real artifact handoff rule.
+  Usually use `planned` when downstream work needs the merged document artifact. `implemented` remains technically valid because `reference_doc` is terminal, but it should not be the default teaching because it hides the real direct-input handoff rule.
 - `design_doc`
   Use `planned` when the merged design artifact is enough for downstream work. Use `implemented` only when the downstream node depends on the shipped implementation outcome from that same design issue.
 - `small_job`
-  Use `planned` only when the downstream node can begin once the upstream issue exists and no merged artifact is required. If the downstream node needs code, files, or behavior from the upstream job, use `implemented`.
+  Use `planned` only when the downstream node can begin once the upstream issue exists and that satisfied state is enough. If the downstream node needs code, files, or behavior from the upstream job, use `implemented`.
 - `roadmap`
-  Use `planned` when downstream work only needs the activated child roadmap artifacts. Use `implemented` when it depends on outputs that exist only after the nested roadmap completes.
+  Use `planned` when downstream work only needs the activated child roadmap artifacts and activation state. Use `implemented` when it depends on outputs that exist only after the nested roadmap completes.
 
 This reframing is the main behavior change for the authoring prompts. It turns `planned` into a truthful promise about what the worker will receive, not just a topological convenience.
 
@@ -167,7 +168,7 @@ The reason is scope and signal quality:
 The reinforcement for this issue should therefore be:
 
 - one shared prompt-contract helper in `src/mergexo/prompts.py`
-- prompt tests that assert the same direct-handoff language appears in every required roadmap authoring surface
+- prompt tests that assert the same direct-handoff language appears in the initial roadmap prompt, both same-roadmap revision prompts, and the roadmap feedback prompt
 - a README wording update so operator-facing docs and agent-facing prompts say the same thing
 
 If later roadmaps still show repeated under-modeled edges, a future issue can add non-blocking lint or review hints. That should not block this prompt-alignment change.
@@ -178,21 +179,20 @@ The architecture change is small but important: centralize the roadmap authoring
 
 Recommended structure inside `src/mergexo/prompts.py`:
 
-- add a helper that returns the shared direct-dependency handoff contract text
-- optionally add a second helper for the short per-kind handoff bullets so the initial prompt can include the fuller version while revision prompts use a shorter form if needed
+- add a helper that returns the shared direct-dependency handoff contract text and can render full or concise variants from the same source wording
 - call that helper from `build_roadmap_prompt(...)`, `build_roadmap_adjustment_prompt(...)`, and `build_requested_roadmap_revision_prompt(...)`
-- optionally call the shorter form from `build_roadmap_feedback_prompt(...)`
+- call the concise form from `build_roadmap_feedback_prompt(...)` so review edits stay aligned with the same dependency contract
 
 No changes to response schemas in `src/mergexo/codex_adapter.py` are expected, because this issue changes prompt content rather than JSON shape.
 
 ## Implementation Plan
 
-1. Add a shared roadmap-authoring contract helper to `src/mergexo/prompts.py` that states the direct-only handoff rule, the child-issue-body plus worker-prompt projection, the doc-path plus provenance promise, and the explicit-edge requirement.
+1. Add a shared roadmap-authoring contract helper to `src/mergexo/prompts.py` that states the direct-only handoff rule, the child-issue-body plus worker-prompt projection, the artifact-path or satisfied-state promise, and the explicit-edge requirement.
 2. Insert that helper into `build_roadmap_prompt(...)` before the existing node-kind and milestone guidance so the downstream worker model is established before the prompt asks the agent to choose dependencies.
-3. Insert the same contract into `build_roadmap_adjustment_prompt(...)` and `build_requested_roadmap_revision_prompt(...)` so same-roadmap revisions are authored against the same mental model as initial roadmaps.
+3. Insert the same contract into `build_roadmap_adjustment_prompt(...)`, `build_requested_roadmap_revision_prompt(...)`, and `build_roadmap_feedback_prompt(...)` so initial authoring, same-roadmap revisions, and roadmap review edits are all authored against the same mental model.
 4. Update the milestone guidance in those prompts so `planned` and `implemented` are taught as earliest truthful handoff milestones rather than generic sequencing markers.
 5. Add concise per-kind handoff bullets and anti-pattern bullets, with special emphasis on `reference_doc`, `design_doc`, and the direct-only rule.
-6. Add or update tests in `tests/test_models_and_prompts.py` so the initial roadmap prompt and both revision prompts assert the new contract text and issue #151 style guidance.
+6. Add or update tests in `tests/test_models_and_prompts.py` so the initial roadmap prompt, both revision prompts, and the roadmap feedback prompt assert the new contract text and issue #151 style guidance.
 7. Update `README.md` roadmap documentation so the operator-facing wording about roadmap authoring matches the prompt contract already used at runtime.
 
 ## Risks
@@ -204,11 +204,11 @@ No changes to response schemas in `src/mergexo/codex_adapter.py` are expected, b
 - Overcorrection toward `implemented`
   Authors may respond to the new contract by overusing `implemented` for safety. The milestone guidance must explicitly say to choose the earliest truthful handoff milestone, not the latest one.
 - Review-path regression
-  If roadmap review-feedback prompts keep the older sequencing-only framing, reviewers can accidentally reintroduce weak edges while editing the roadmap PR. A short reminder there is recommended even if it is not strictly required for the initial landing.
+  If roadmap review-feedback prompts are not updated in the same rollout, reviewers can accidentally reintroduce weak edges while editing the roadmap PR. This design therefore makes the feedback prompt update part of the required implementation rather than optional follow-up work.
 
 ## Rollout Notes
 
-- Land the prompt text changes, README update, and prompt tests in the same PR.
+- Land the prompt text changes, roadmap feedback prompt update, README update, and prompt tests in the same PR.
 - No runtime or state migration is required; this issue aligns agent-facing wording with behavior that already shipped in #164.
 - Existing already-issued child issues do not need backfill. The new contract affects future roadmap authoring turns and future same-roadmap revision turns.
 - Open roadmap work should adopt the new guidance the next time it is authored or revised. For issue #151 / PR #154 specifically, the next revision should keep `review_design` as a direct `reference_doc` dependency of both `review_config` and `review_contract`.
@@ -216,10 +216,10 @@ No changes to response schemas in `src/mergexo/codex_adapter.py` are expected, b
 ## Acceptance Criteria
 
 1. The design doc defines the authoritative roadmap authoring contract after #159 and #162.
-2. The design doc specifies the exact promises that roadmap authoring and same-roadmap revision prompts should make about worker handoff behavior.
-3. The design doc states explicitly that workers receive direct dependency artifacts only, not a transitive closure, and explains how roadmap authors should encode any additional required upstream inputs.
+2. The design doc specifies the exact promises that roadmap authoring, same-roadmap revision, and roadmap feedback prompts should make about worker handoff behavior.
+3. The design doc states explicitly that workers receive direct dependency handoff only, not a transitive closure, and explains how roadmap authors should encode any additional required upstream inputs.
 4. The design doc explains how prompt guidance for `reference_doc`, `design_doc`, `small_job`, and `roadmap` should change in light of the direct-handoff contract.
-5. The design doc explains `planned` versus `implemented` using the earliest truthful handoff rule rather than generic milestone ordering.
+5. The design doc explains `planned` versus `implemented` using the earliest truthful artifact-or-satisfied-state handoff rule rather than generic milestone ordering.
 6. The design doc uses issue #151 / PR #154 as a motivating example and states that `review_config` and `review_contract` should each depend directly on `review_design` with `requires = planned`.
 7. The design doc identifies likely implementation touch paths in `src/mergexo/prompts.py`, `tests/test_models_and_prompts.py`, and `README.md`.
 8. The design leaves schemas and runtime handoff behavior unchanged and scopes the implementation to prompt, test, and documentation alignment.
