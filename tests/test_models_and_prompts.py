@@ -138,6 +138,16 @@ def _assert_roadmap_authoring_contract(prompt: str, *, include_per_kind_guidance
             "provenance; `implemented` waits for the shipped implementation outcome from "
             "that same child issue." in prompt
         )
+        assert (
+            "`small_job`: `planned` means the child issue and its issue text exist; merged "
+            "code, changed files, and implementation behavior are not available until "
+            "`implemented`." in prompt
+        )
+        assert (
+            "`roadmap`: `planned` hands off the child roadmap markdown and graph artifact "
+            "paths plus activation provenance; `implemented` means the child roadmap has "
+            "completed." in prompt
+        )
 
 
 def test_model_dataclasses_and_version() -> None:
