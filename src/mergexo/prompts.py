@@ -8,6 +8,8 @@ from typing import cast
 
 from mergexo.agent_adapter import (
     FeedbackTurn,
+    PrePrReviewFlow,
+    PrePrReviewResult,
     RoadmapChildDependencyArtifact,
     RoadmapChildDependencyArtifactPath,
     RoadmapChildDependencyHandoff,
@@ -631,6 +633,27 @@ Required output fields:
 """.strip()
 
 
+def _pre_pr_review_output_contract_lines() -> str:
+    return """
+Required output fields:
+- Always include `outcome`, `summary`, `findings`, and `escalation_reason`.
+- `outcome`: one of `approved`, `changes_requested`, `escalate`.
+- `summary`: non-empty string.
+- `findings`: array. Use `[]` when the candidate is approved.
+- Each item in `findings` must be an object with exactly `finding_id`, `path`, `line`, `title`, and `details`.
+- `finding_id`: non-empty string, unique within the response.
+- `path`: non-empty repo-relative file path string.
+- `line`: integer >= 1 or null.
+- `title`: non-empty short actionable headline.
+- `details`: non-empty explanation of the defect and expected repair.
+- `escalation_reason`: non-empty string or null.
+- `approved` requires `findings = []` and `escalation_reason = null`.
+- `changes_requested` requires at least one finding and `escalation_reason = null`.
+- `escalate` requires a non-null `escalation_reason`; `findings` may be empty or non-empty.
+- Do not omit keys.
+""".strip()
+
+
 def _feedback_output_contract_lines(*, allow_escalation: bool) -> str:
     top_level_keys = (
         "`git_ops`, `review_replies`, `general_comment`, `commit_message`, "
@@ -697,6 +720,52 @@ def _roadmap_authoring_contract_text(*, concise: bool) -> str:
     else:
         sections = (core_lines, direct_edge_lines, per_kind_lines, example_lines)
     return "\n".join("\n".join(section) for section in sections)
+
+
+def _pre_pr_review_guidance_section(*, review_guidance: str | None) -> str:
+    normalized = review_guidance.strip() if review_guidance is not None else ""
+    if not normalized:
+        return "Repo review guidance:\n- None provided by the caller."
+    return f"Repo review guidance:\n{normalized}"
+
+
+def _implementation_pre_pr_context_section(
+    *,
+    design_doc_path: str | None,
+    design_doc_markdown: str | None,
+    design_pr_number: int | None,
+    design_pr_url: str | None,
+) -> str:
+    design_path = design_doc_path or "unavailable in local state"
+    design_pr_line = (
+        f"- Source design PR: #{design_pr_number} ({design_pr_url})"
+        if design_pr_number is not None and design_pr_url
+        else "- Source design PR: unavailable in local state"
+    )
+    design_markdown = design_doc_markdown if design_doc_markdown is not None else "Unavailable."
+    return (
+        "Implementation context:\n"
+        f"- Design doc path on base branch: {design_path}\n"
+        f"{design_pr_line}\n\n"
+        f"Merged design doc markdown ({design_path}):\n"
+        f"{design_markdown}"
+    )
+
+
+def _review_findings_json(review_result: PrePrReviewResult) -> str:
+    return json.dumps(
+        [
+            {
+                "finding_id": finding.finding_id,
+                "path": finding.path,
+                "line": finding.line,
+                "title": finding.title,
+                "details": finding.details,
+            }
+            for finding in review_result.findings
+        ],
+        indent=2,
+    )
 
 
 def build_design_prompt(
@@ -913,6 +982,172 @@ Issue URL:
 
 Merged design doc markdown ({design_doc_path}):
 {design_doc_markdown}
+""".strip()
+
+
+def build_pre_pr_review_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    flow_name: PrePrReviewFlow,
+    coding_guidelines_path: str | None,
+    review_guidance: str | None,
+    branch: str,
+    head_sha: str,
+    changed_files: tuple[str, ...],
+    diff_text: str,
+    design_doc_path: str | None,
+    design_doc_markdown: str | None,
+    design_pr_number: int | None,
+    design_pr_url: str | None,
+) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
+    changed_files_json = json.dumps(list(changed_files), indent=2)
+    rendered_diff = _truncate_prompt_text(diff_text.strip() or "<empty diff>", max_chars=20000)
+    implementation_context = (
+        "\n\n"
+        + _implementation_pre_pr_context_section(
+            design_doc_path=design_doc_path,
+            design_doc_markdown=design_doc_markdown,
+            design_pr_number=design_pr_number,
+            design_pr_url=design_pr_url,
+        )
+        if flow_name == "implementation"
+        else ""
+    )
+    return f"""
+You are the pre-PR reviewer for repository {repo_full_name}.
+
+Task:
+- Review the current local `{flow_name}` candidate for issue #{issue.number} before MergeXO opens a PR.
+- Base branch is: {default_branch}
+- Active flow: {flow_name}
+- Candidate branch: {branch}
+- Candidate head: {head_sha}
+{coding_guidelines_lines}
+- Review only approval-blocking problems in correctness, safety, missing tests, or contract violations.
+- Ignore non-blocking style nits or optional cleanup.
+
+Output requirements:
+- Return a machine-consumable reviewer result for `approved`, `changes_requested`, or `escalate`.
+- Only include findings that must be fixed before approval.
+- Use `escalate` when the candidate needs human judgment or broader product/architecture direction.
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+{_pre_pr_review_output_contract_lines()}
+
+Issue title:
+{issue.title}
+
+Issue URL:
+{issue.html_url}
+
+{dependency_handoff_section}Issue body:
+{issue_body}
+
+Changed files:
+{changed_files_json}
+
+Current local diff against {default_branch} (truncated if needed):
+```diff
+{rendered_diff}
+```
+
+{_pre_pr_review_guidance_section(review_guidance=review_guidance)}{implementation_context}
+""".strip()
+
+
+def build_pre_pr_author_repair_prompt(
+    *,
+    issue: Issue,
+    repo_full_name: str,
+    default_branch: str,
+    flow_name: PrePrReviewFlow,
+    coding_guidelines_path: str | None,
+    review_guidance: str | None,
+    branch: str,
+    head_sha: str,
+    review_result: PrePrReviewResult,
+    design_doc_path: str | None,
+    design_doc_markdown: str | None,
+    design_pr_number: int | None,
+    design_pr_url: str | None,
+) -> str:
+    coding_guidelines_lines = _coding_guidelines_task_lines(
+        coding_guidelines_path=coding_guidelines_path
+    )
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
+    implementation_context = (
+        "\n\n"
+        + _implementation_pre_pr_context_section(
+            design_doc_path=design_doc_path,
+            design_doc_markdown=design_doc_markdown,
+            design_pr_number=design_pr_number,
+            design_pr_url=design_pr_url,
+        )
+        if flow_name == "implementation"
+        else ""
+    )
+    escalation_reason = review_result.escalation_reason or "null"
+    return f"""
+You are the pre-PR author-repair agent for repository {repo_full_name}.
+
+Task:
+- Resume the active `{flow_name}` author work for issue #{issue.number} and repair the reviewer findings before MergeXO opens a PR.
+- Base branch is: {default_branch}
+- Active flow: {flow_name}
+- Current branch: {branch}
+- Current head: {head_sha}
+{coding_guidelines_lines}
+- Treat the reviewer summary and findings below as the approval-blocking worklist.
+- Keep the direct-turn output contract unchanged from the original author turn.
+
+Output requirements:
+- Implement the repairs needed to address the reviewer findings.
+- Return the same direct-turn JSON contract used by the original author flow.
+- If you cannot proceed safely, return a blocked_reason.
+- If roadmap assumptions are fundamentally invalid, set escalation with:
+  - kind = "roadmap_revision"
+  - summary
+  - details
+
+Response format:
+- Return JSON only.
+- The response must satisfy the provided schema.
+- Do not include markdown code fences in the JSON fields.
+
+{_direct_output_contract_lines()}
+
+Issue title:
+{issue.title}
+
+Issue URL:
+{issue.html_url}
+
+{dependency_handoff_section}Issue body:
+{issue_body}
+
+Reviewer outcome:
+{review_result.outcome}
+
+Reviewer summary:
+{review_result.summary}
+
+Reviewer escalation reason:
+{escalation_reason}
+
+Reviewer findings JSON:
+{_review_findings_json(review_result)}
+
+{_pre_pr_review_guidance_section(review_guidance=review_guidance)}{implementation_context}
 """.strip()
 
 

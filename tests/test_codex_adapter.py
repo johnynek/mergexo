@@ -7,10 +7,13 @@ import pytest
 
 from mergexo.agent_adapter import (
     AgentSession,
+    DirectStartResult,
     FeedbackTurn,
+    PrePrReviewResult,
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
     RoadmapFeedbackTurn,
+    ReviewFinding,
 )
 from mergexo.codex_adapter import (
     CodexAdapter,
@@ -18,6 +21,7 @@ from mergexo.codex_adapter import (
     _DESIGN_OUTPUT_SCHEMA,
     _DIRECT_OUTPUT_SCHEMA,
     _FEEDBACK_OUTPUT_SCHEMA,
+    _PRE_PR_REVIEW_OUTPUT_SCHEMA,
     _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA,
     _ROADMAP_OUTPUT_SCHEMA,
     _as_object_dict,
@@ -25,12 +29,15 @@ from mergexo.codex_adapter import (
     _extract_thread_id,
     _filter_resume_extra_args,
     _is_context_window_exhaustion_error,
+    _parse_direct_result_payload,
     _parse_flaky_test_report,
     _parse_git_ops,
     _optional_output_text,
     _parse_event_line,
     _parse_json_payload,
+    _parse_pre_pr_review_result_payload,
     _parse_roadmap_revision_escalation,
+    _parse_review_findings,
     _parse_review_replies,
     _require_str,
     _require_str_list,
@@ -133,10 +140,28 @@ def _roadmap_feedback_turn() -> RoadmapFeedbackTurn:
     )
 
 
+def _pre_pr_review_result() -> PrePrReviewResult:
+    return PrePrReviewResult(
+        outcome="changes_requested",
+        summary="Reviewer found one blocking issue.",
+        findings=(
+            ReviewFinding(
+                finding_id="R1",
+                path="src/mergexo/codex_adapter.py",
+                line=101,
+                title="Validate reviewer output",
+                details="Reject invalid outcome combinations.",
+            ),
+        ),
+        escalation_reason=None,
+    )
+
+
 def test_output_schemas_satisfy_strict_backend_contract() -> None:
     schemas = {
         "design": _DESIGN_OUTPUT_SCHEMA,
         "direct": _DIRECT_OUTPUT_SCHEMA,
+        "pre_pr_review": _PRE_PR_REVIEW_OUTPUT_SCHEMA,
         "roadmap": _ROADMAP_OUTPUT_SCHEMA,
         "roadmap_adjustment": _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA,
         "feedback": _FEEDBACK_OUTPUT_SCHEMA,
@@ -151,6 +176,12 @@ def test_output_schemas_satisfy_strict_backend_contract() -> None:
         "commit_message",
         "blocked_reason",
         "escalation",
+    ]
+    assert _PRE_PR_REVIEW_OUTPUT_SCHEMA["required"] == [
+        "outcome",
+        "summary",
+        "findings",
+        "escalation_reason",
     ]
     assert _ROADMAP_OUTPUT_SCHEMA["required"] == ["title", "summary", "graph_json"]
     assert _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA["required"] == [
@@ -1470,6 +1501,346 @@ def test_start_implementation_from_design_happy_path(
     assert result.session.thread_id == "thread-impl"
 
 
+def test_review_pre_pr_candidate_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert "pre-PR reviewer" in input_text
+        assert "docs/python_style.md" in input_text
+        assert "Prioritize correctness over style." in input_text
+        assert "Source design PR: #77 (https://example/pr/77)" in input_text
+        schema_idx = cmd.index("--output-schema")
+        schema = json.loads(Path(cmd[schema_idx + 1]).read_text(encoding="utf-8"))
+        assert schema["required"] == ["outcome", "summary", "findings", "escalation_reason"]
+        assert schema["properties"]["outcome"]["enum"] == [
+            "approved",
+            "changes_requested",
+            "escalate",
+        ]
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "outcome": "changes_requested",
+                    "summary": "One repair is required.",
+                    "findings": [
+                        {
+                            "finding_id": "R1",
+                            "path": "src/mergexo/codex_adapter.py",
+                            "line": 101,
+                            "title": "Validate reviewer output",
+                            "details": "Reject invalid payload combinations.",
+                        }
+                    ],
+                    "escalation_reason": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-review"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.review_pre_pr_candidate(
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="implementation",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance="Prioritize correctness over style.",
+        branch="agent/impl/1-review",
+        head_sha="abc123",
+        changed_files=("src/mergexo/codex_adapter.py",),
+        diff_text="diff --git a/src/mergexo/codex_adapter.py b/src/mergexo/codex_adapter.py",
+        design_doc_path="docs/design/1-issue.md",
+        design_doc_markdown="## Design\n\nReview the contract.",
+        design_pr_number=77,
+        design_pr_url="https://example/pr/77",
+        cwd=tmp_path,
+    )
+
+    assert result.outcome == "changes_requested"
+    assert result.summary == "One repair is required."
+    assert result.findings[0].finding_id == "R1"
+    assert result.findings[0].line == 101
+    assert result.escalation_reason is None
+
+
+def test_repair_from_pre_pr_review_resumes_saved_author_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, check
+        assert input_text is not None
+        assert cmd[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+        assert "pre-PR author-repair agent" in input_text
+        assert "Reviewer found one blocking issue." in input_text
+        assert '"finding_id": "R1"' in input_text
+        assert "Source design PR: #77 (https://example/pr/77)" in input_text
+        message_payload = json.dumps(
+            {
+                "pr_title": "Repair reviewer findings",
+                "pr_summary": "Addresses the reviewer contract issues.",
+                "commit_message": "fix: repair reviewer findings",
+                "blocked_reason": None,
+                "escalation": None,
+            }
+        )
+        return (
+            '{"type":"thread.started","thread_id":"thread-repaired"}\n'
+            + json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": message_payload},
+                }
+            )
+            + "\n"
+        )
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.repair_from_pre_pr_review(
+        session=AgentSession(adapter="codex", thread_id="thread-author"),
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="implementation",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance="Keep the repair focused.",
+        branch="agent/impl/1-review",
+        head_sha="abc123",
+        review_result=_pre_pr_review_result(),
+        design_doc_path="docs/design/1-issue.md",
+        design_doc_markdown="## Design\n\nReview the contract.",
+        design_pr_number=77,
+        design_pr_url="https://example/pr/77",
+        cwd=tmp_path,
+    )
+
+    assert result.pr_title == "Repair reviewer findings"
+    assert result.commit_message == "fix: repair reviewer findings"
+    assert result.blocked_reason is None
+    assert result.escalation is None
+    assert result.session is not None
+    assert result.session.thread_id == "thread-repaired"
+
+
+def test_repair_from_pre_pr_review_falls_back_to_fresh_thread_on_context_window_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, input_text, check
+        calls.append(cmd)
+        if cmd[:3] == ["codex", "exec", "resume"]:
+            raise CommandError(
+                "Command failed\n"
+                f"cmd: {' '.join(cmd)}\n"
+                "exit: 1\n"
+                'stdout:\n{"type":"error","message":"Codex ran out of room in the model\'s context window. Start a new thread."}\n'
+                "stderr:\n"
+            )
+
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "pr_title": "Repair reviewer findings",
+                    "pr_summary": "Addresses the reviewer contract issues.",
+                    "commit_message": "fix: continue reviewer repair in new thread",
+                    "blocked_reason": None,
+                    "escalation": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-fresh-repair"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.repair_from_pre_pr_review(
+        session=AgentSession(adapter="codex", thread_id="thread-author"),
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="small_job",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance=None,
+        branch="agent/small/1-review",
+        head_sha="abc123",
+        review_result=_pre_pr_review_result(),
+        design_doc_path=None,
+        design_doc_markdown=None,
+        design_pr_number=None,
+        design_pr_url=None,
+        cwd=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert calls[0][:3] == ["codex", "exec", "resume"]
+    assert calls[1][:2] == ["codex", "exec"]
+    assert result.session is not None
+    assert result.session.thread_id == "thread-fresh-repair"
+    assert result.commit_message == "fix: continue reviewer repair in new thread"
+
+
+def test_repair_from_pre_pr_review_uses_fresh_turn_when_author_session_lacks_thread_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter = CodexAdapter(_enabled_config())
+    monkeypatch.setattr(
+        adapter,
+        "_run_direct_turn",
+        lambda **_: (
+            DirectStartResult(
+                pr_title="Repair reviewer findings",
+                pr_summary="Summary",
+                commit_message="fix: repair from fresh author thread",
+                blocked_reason=None,
+                session=None,
+                escalation=None,
+            ),
+            "thread-fresh-no-session",
+        ),
+    )
+
+    result = adapter.repair_from_pre_pr_review(
+        session=AgentSession(adapter="codex", thread_id=None),
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="small_job",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance=None,
+        branch="agent/small/1-review",
+        head_sha="abc123",
+        review_result=_pre_pr_review_result(),
+        design_doc_path=None,
+        design_doc_markdown=None,
+        design_pr_number=None,
+        design_pr_url=None,
+        cwd=tmp_path,
+    )
+
+    assert result.session is not None
+    assert result.session.thread_id == "thread-fresh-no-session"
+    assert result.commit_message == "fix: repair from fresh author thread"
+
+
+def test_review_pre_pr_candidate_logs_fault_when_review_turn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    adapter = CodexAdapter(_enabled_config())
+    monkeypatch.setattr(
+        adapter,
+        "_run_pre_pr_review_turn",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("review failed")),
+    )
+    configure_logging(verbose=True)
+
+    with pytest.raises(RuntimeError, match="review failed"):
+        adapter.review_pre_pr_candidate(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            flow_name="small_job",
+            coding_guidelines_path="docs/python_style.md",
+            review_guidance=None,
+            branch="agent/small/1-review",
+            head_sha="abc123",
+            changed_files=("src/mergexo/codex_adapter.py",),
+            diff_text="diff --git a/src/mergexo/codex_adapter.py b/src/mergexo/codex_adapter.py",
+            design_doc_path=None,
+            design_doc_markdown=None,
+            design_pr_number=None,
+            design_pr_url=None,
+            cwd=tmp_path,
+        )
+
+    stderr = capsys.readouterr().err
+    assert "mode=pre_pr_review" in stderr
+    assert "status=fault" in stderr
+
+
+def test_repair_from_pre_pr_review_re_raises_non_context_error_and_logs_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        **_kwargs: object,
+    ) -> str:
+        _ = cmd, cwd, input_text, check
+        raise CommandError(
+            "Command failed\n"
+            "cmd: codex exec resume --json --skip-git-repo-check thread-author -\n"
+            "exit: 1\n"
+            'stdout:\n{"type":"error","message":"transient CLI failure"}\n'
+            "stderr:\n"
+        )
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+    configure_logging(verbose=True)
+
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(CommandError, match="transient CLI failure"):
+        adapter.repair_from_pre_pr_review(
+            session=AgentSession(adapter="codex", thread_id="thread-author"),
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            flow_name="small_job",
+            coding_guidelines_path="docs/python_style.md",
+            review_guidance=None,
+            branch="agent/small/1-review",
+            head_sha="abc123",
+            review_result=_pre_pr_review_result(),
+            design_doc_path=None,
+            design_doc_markdown=None,
+            design_pr_number=None,
+            design_pr_url=None,
+            cwd=tmp_path,
+        )
+
+    stderr = capsys.readouterr().err
+    assert "mode=pre_pr_author_repair" in stderr
+    assert "status=fault" in stderr
+
+
 def test_respond_to_feedback_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1719,6 +2090,17 @@ def test_run_feedback_turn_resume_requires_thread_id(tmp_path: Path) -> None:
         )
 
 
+def test_run_direct_turn_resume_requires_thread_id(tmp_path: Path) -> None:
+    adapter = CodexAdapter(_enabled_config())
+    with pytest.raises(RuntimeError, match="thread_id"):
+        adapter._run_direct_turn_resume(
+            session=AgentSession(adapter="codex", thread_id=None),
+            prompt="prompt",
+            cwd=tmp_path,
+            invocation_mode="pre_pr_author_repair",
+        )
+
+
 def test_respond_to_feedback_requires_thread_id(tmp_path: Path) -> None:
     adapter = CodexAdapter(_enabled_config())
     with pytest.raises(RuntimeError, match="thread_id"):
@@ -1774,6 +2156,30 @@ def test_start_design_from_issue_rejects_disabled(tmp_path: Path) -> None:
             repo_full_name="johnynek/mergexo",
             design_doc_path="docs/design/1-issue.md",
             default_branch="main",
+            cwd=tmp_path,
+        )
+
+
+def test_review_pre_pr_candidate_rejects_disabled(tmp_path: Path) -> None:
+    adapter = CodexAdapter(
+        CodexConfig(enabled=False, model=None, sandbox=None, profile=None, extra_args=())
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        adapter.review_pre_pr_candidate(
+            issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+            repo_full_name="johnynek/mergexo",
+            default_branch="main",
+            flow_name="small_job",
+            coding_guidelines_path="docs/python_style.md",
+            review_guidance=None,
+            branch="agent/small/1-review",
+            head_sha="abc123",
+            changed_files=("src/mergexo/codex_adapter.py",),
+            diff_text="diff --git a/src/mergexo/codex_adapter.py b/src/mergexo/codex_adapter.py",
+            design_doc_path=None,
+            design_doc_markdown=None,
+            design_pr_number=None,
+            design_pr_url=None,
             cwd=tmp_path,
         )
 
@@ -2024,6 +2430,240 @@ def test_parse_roadmap_revision_escalation_validation() -> None:
                 "kind": "roadmap_revision",
                 "summary": "x",
                 "details": " ",
+            }
+        )
+
+
+def test_parse_direct_result_payload_preserves_escalation() -> None:
+    result = _parse_direct_result_payload(
+        {
+            "pr_title": "Repair reviewer findings",
+            "pr_summary": "Summary",
+            "commit_message": "fix: repair",
+            "blocked_reason": None,
+            "escalation": {
+                "kind": "roadmap_revision",
+                "summary": "Assumption failed",
+                "details": "Need to change the plan.",
+            },
+        }
+    )
+
+    assert result.pr_title == "Repair reviewer findings"
+    assert result.escalation is not None
+    assert result.escalation.kind == "roadmap_revision"
+
+
+def test_parse_review_findings_validation() -> None:
+    findings = _parse_review_findings(
+        [
+            {
+                "finding_id": "R1",
+                "path": "src/mergexo/codex_adapter.py",
+                "line": 101,
+                "title": "Validate reviewer output",
+                "details": "Reject invalid outcome combinations.",
+            }
+        ]
+    )
+    assert findings[0].finding_id == "R1"
+
+    with pytest.raises(RuntimeError, match="must be a list"):
+        _parse_review_findings("bad")
+    with pytest.raises(RuntimeError, match="must be an object"):
+        _parse_review_findings(["bad"])
+    with pytest.raises(RuntimeError, match="finding_id must be a non-empty string"):
+        _parse_review_findings(
+            [
+                {
+                    "finding_id": " ",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "title": "One",
+                    "details": "First",
+                }
+            ]
+        )
+    with pytest.raises(RuntimeError, match="finding_id values must be unique"):
+        _parse_review_findings(
+            [
+                {
+                    "finding_id": "R1",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "title": "One",
+                    "details": "First",
+                },
+                {
+                    "finding_id": "R1",
+                    "path": "src/b.py",
+                    "line": 2,
+                    "title": "Two",
+                    "details": "Second",
+                },
+            ]
+        )
+    with pytest.raises(RuntimeError, match="path must be a non-empty string"):
+        _parse_review_findings(
+            [
+                {
+                    "finding_id": "R1",
+                    "path": " ",
+                    "line": 1,
+                    "title": "One",
+                    "details": "First",
+                }
+            ]
+        )
+    with pytest.raises(RuntimeError, match="line must be an integer >= 1 or null"):
+        _parse_review_findings(
+            [
+                {
+                    "finding_id": "R1",
+                    "path": "src/a.py",
+                    "line": 0,
+                    "title": "One",
+                    "details": "First",
+                }
+            ]
+        )
+    with pytest.raises(RuntimeError, match="title must be a non-empty string"):
+        _parse_review_findings(
+            [
+                {
+                    "finding_id": "R1",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "title": " ",
+                    "details": "First",
+                }
+            ]
+        )
+    with pytest.raises(RuntimeError, match="details must be a non-empty string"):
+        _parse_review_findings(
+            [
+                {
+                    "finding_id": "R1",
+                    "path": "src/a.py",
+                    "line": 1,
+                    "title": "One",
+                    "details": " ",
+                }
+            ]
+        )
+
+
+def test_parse_pre_pr_review_result_payload_validation() -> None:
+    approved = _parse_pre_pr_review_result_payload(
+        {
+            "outcome": "approved",
+            "summary": "Looks good.",
+            "findings": [],
+            "escalation_reason": None,
+        }
+    )
+    assert approved.outcome == "approved"
+
+    changes_requested = _parse_pre_pr_review_result_payload(
+        {
+            "outcome": "changes_requested",
+            "summary": "Needs a repair.",
+            "findings": [
+                {
+                    "finding_id": "R1",
+                    "path": "src/a.py",
+                    "line": 10,
+                    "title": "Fix this",
+                    "details": "Repair the invalid contract combination.",
+                }
+            ],
+            "escalation_reason": None,
+        }
+    )
+    assert changes_requested.outcome == "changes_requested"
+    assert changes_requested.findings[0].path == "src/a.py"
+
+    escalated = _parse_pre_pr_review_result_payload(
+        {
+            "outcome": "escalate",
+            "summary": "Needs human judgment.",
+            "findings": [],
+            "escalation_reason": "The candidate changes an ambiguous product contract.",
+        }
+    )
+    assert escalated.outcome == "escalate"
+    assert escalated.escalation_reason is not None
+
+    with pytest.raises(RuntimeError, match="outcome must be one of"):
+        _parse_pre_pr_review_result_payload(
+            {
+                "outcome": "maybe",
+                "summary": "Needs a repair.",
+                "findings": [],
+                "escalation_reason": None,
+            }
+        )
+    with pytest.raises(RuntimeError, match="approved outcome must not include findings"):
+        _parse_pre_pr_review_result_payload(
+            {
+                "outcome": "approved",
+                "summary": "Looks good.",
+                "findings": [
+                    {
+                        "finding_id": "R1",
+                        "path": "src/a.py",
+                        "line": 10,
+                        "title": "Fix this",
+                        "details": "Repair the invalid contract combination.",
+                    }
+                ],
+                "escalation_reason": None,
+            }
+        )
+    with pytest.raises(RuntimeError, match="approved outcome must set escalation_reason to null"):
+        _parse_pre_pr_review_result_payload(
+            {
+                "outcome": "approved",
+                "summary": "Looks good.",
+                "findings": [],
+                "escalation_reason": "Needs a human sign-off anyway.",
+            }
+        )
+    with pytest.raises(RuntimeError, match="requires at least one finding"):
+        _parse_pre_pr_review_result_payload(
+            {
+                "outcome": "changes_requested",
+                "summary": "Needs a repair.",
+                "findings": [],
+                "escalation_reason": None,
+            }
+        )
+    with pytest.raises(
+        RuntimeError, match="changes_requested outcome must set escalation_reason to null"
+    ):
+        _parse_pre_pr_review_result_payload(
+            {
+                "outcome": "changes_requested",
+                "summary": "Needs a repair.",
+                "findings": [
+                    {
+                        "finding_id": "R1",
+                        "path": "src/a.py",
+                        "line": 10,
+                        "title": "Fix this",
+                        "details": "Repair the invalid contract combination.",
+                    }
+                ],
+                "escalation_reason": "Also asking for human review.",
+            }
+        )
+    with pytest.raises(RuntimeError, match="requires a non-null escalation_reason"):
+        _parse_pre_pr_review_result_payload(
+            {
+                "outcome": "escalate",
+                "summary": "Needs human judgment.",
+                "findings": [],
+                "escalation_reason": None,
             }
         )
 

@@ -4,17 +4,20 @@ from pathlib import Path
 
 from mergexo.agent_adapter import (
     AgentAdapter,
-    DirectStartResult,
     AgentSession,
+    DirectStartResult,
     DesignStartResult,
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    PrePrReviewFlow,
+    PrePrReviewResult,
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
     RoadmapAdjustmentResult,
     RoadmapFeedbackTurn,
     RoadmapStartResult,
+    ReviewFinding,
     ReviewReply,
 )
 from mergexo.models import (
@@ -79,6 +82,101 @@ class DummyAdapter(AgentAdapter):
             general_comment="done",
             commit_message="commit",
             git_ops=(GitOpRequest(op="fetch_origin"),),
+        )
+
+    def review_pre_pr_candidate(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        flow_name: PrePrReviewFlow,
+        coding_guidelines_path: str | None,
+        review_guidance: str | None,
+        branch: str,
+        head_sha: str,
+        changed_files: tuple[str, ...],
+        diff_text: str,
+        design_doc_path: str | None,
+        design_doc_markdown: str | None,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> PrePrReviewResult:
+        _ = (
+            issue,
+            repo_full_name,
+            default_branch,
+            flow_name,
+            coding_guidelines_path,
+            review_guidance,
+            branch,
+            head_sha,
+            changed_files,
+            diff_text,
+            design_doc_path,
+            design_doc_markdown,
+            design_pr_number,
+            design_pr_url,
+            cwd,
+        )
+        return PrePrReviewResult(
+            outcome="changes_requested",
+            summary="Needs a small repair.",
+            findings=(
+                ReviewFinding(
+                    finding_id="R1",
+                    path="src/a.py",
+                    line=1,
+                    title="Fix me",
+                    details="Repair the pre-PR issue.",
+                ),
+            ),
+            escalation_reason=None,
+        )
+
+    def repair_from_pre_pr_review(
+        self,
+        *,
+        session: AgentSession,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        flow_name: PrePrReviewFlow,
+        coding_guidelines_path: str | None,
+        review_guidance: str | None,
+        branch: str,
+        head_sha: str,
+        review_result: PrePrReviewResult,
+        design_doc_path: str | None,
+        design_doc_markdown: str | None,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> DirectStartResult:
+        _ = (
+            session,
+            issue,
+            repo_full_name,
+            default_branch,
+            flow_name,
+            coding_guidelines_path,
+            review_guidance,
+            branch,
+            head_sha,
+            review_result,
+            design_doc_path,
+            design_doc_markdown,
+            design_pr_number,
+            design_pr_url,
+            cwd,
+        )
+        return DirectStartResult(
+            pr_title="Repair pre-PR findings",
+            pr_summary="Summary",
+            commit_message="fix: repair review findings",
+            blocked_reason=None,
+            session=AgentSession(adapter="dummy", thread_id="th"),
         )
 
     def start_roadmap_from_issue(

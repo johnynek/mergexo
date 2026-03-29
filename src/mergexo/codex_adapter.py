@@ -19,11 +19,15 @@ from mergexo.agent_adapter import (
     FeedbackResult,
     FeedbackTurn,
     GitOpRequest,
+    PrePrReviewFlow,
+    PrePrReviewOutcome,
+    PrePrReviewResult,
     RoadmapAdjustmentAction,
     RoadmapDependencyArtifact,
     RoadmapAdjustmentResult,
     RoadmapFeedbackTurn,
     RoadmapStartResult,
+    ReviewFinding,
     ReviewReply,
 )
 from mergexo.config import CodexConfig
@@ -41,6 +45,8 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_pre_pr_author_repair_prompt,
+    build_pre_pr_review_prompt,
     build_roadmap_feedback_prompt,
     build_requested_roadmap_revision_prompt,
     build_roadmap_adjustment_prompt,
@@ -197,6 +203,42 @@ _REVIEW_REPLY_SCHEMA: dict[str, object] = {
     },
 }
 
+_PRE_PR_REVIEW_FINDING_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["finding_id", "path", "line", "title", "details"],
+    "properties": {
+        "finding_id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "line": {
+            "anyOf": [
+                {"type": "null"},
+                {"type": "integer", "minimum": 1},
+            ]
+        },
+        "title": {"type": "string", "minLength": 1},
+        "details": {"type": "string", "minLength": 1},
+    },
+}
+
+_PRE_PR_REVIEW_OUTPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["outcome", "summary", "findings", "escalation_reason"],
+    "properties": {
+        "outcome": {
+            "type": "string",
+            "enum": ["approved", "changes_requested", "escalate"],
+        },
+        "summary": {"type": "string", "minLength": 1},
+        "findings": {
+            "type": "array",
+            "items": _PRE_PR_REVIEW_FINDING_SCHEMA,
+        },
+        "escalation_reason": _NONEMPTY_NULLABLE_STRING_SCHEMA,
+    },
+}
+
 _GIT_OP_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
@@ -336,6 +378,7 @@ def _validate_strict_output_schema(*, schema_name: str, schema: object, path: st
 for _schema_name, _schema in (
     ("design", _DESIGN_OUTPUT_SCHEMA),
     ("direct", _DIRECT_OUTPUT_SCHEMA),
+    ("pre_pr_review", _PRE_PR_REVIEW_OUTPUT_SCHEMA),
     ("roadmap", _ROADMAP_OUTPUT_SCHEMA),
     ("roadmap_adjustment", _ROADMAP_ADJUSTMENT_OUTPUT_SCHEMA),
     ("feedback", _FEEDBACK_OUTPUT_SCHEMA),
@@ -687,6 +730,178 @@ class CodexAdapter(AgentAdapter):
         )
         return result
 
+    def review_pre_pr_candidate(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        flow_name: PrePrReviewFlow,
+        coding_guidelines_path: str | None,
+        review_guidance: str | None,
+        branch: str,
+        head_sha: str,
+        changed_files: tuple[str, ...],
+        diff_text: str,
+        design_doc_path: str | None,
+        design_doc_markdown: str | None,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> PrePrReviewResult:
+        prompt = build_pre_pr_review_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            flow_name=flow_name,
+            coding_guidelines_path=coding_guidelines_path,
+            review_guidance=review_guidance,
+            branch=branch,
+            head_sha=head_sha,
+            changed_files=changed_files,
+            diff_text=diff_text,
+            design_doc_path=design_doc_path,
+            design_doc_markdown=design_doc_markdown,
+            design_pr_number=design_pr_number,
+            design_pr_url=design_pr_url,
+        )
+        started_at = time.monotonic()
+        log_event(
+            LOGGER,
+            "codex_invocation_started",
+            mode="pre_pr_review",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+        )
+        try:
+            result = self._run_pre_pr_review_turn(prompt=prompt, cwd=cwd)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "codex_invocation_finished",
+                mode="pre_pr_review",
+                repo_full_name=repo_full_name,
+                issue_number=issue.number,
+                status="fault",
+                duration_seconds=_elapsed_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log_event(
+            LOGGER,
+            "codex_invocation_finished",
+            mode="pre_pr_review",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+            status="success",
+            duration_seconds=_elapsed_seconds(started_at),
+            review_outcome=result.outcome,
+            finding_count=len(result.findings),
+        )
+        return result
+
+    def repair_from_pre_pr_review(
+        self,
+        *,
+        session: AgentSession,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        flow_name: PrePrReviewFlow,
+        coding_guidelines_path: str | None,
+        review_guidance: str | None,
+        branch: str,
+        head_sha: str,
+        review_result: PrePrReviewResult,
+        design_doc_path: str | None,
+        design_doc_markdown: str | None,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> DirectStartResult:
+        prompt = build_pre_pr_author_repair_prompt(
+            issue=issue,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+            flow_name=flow_name,
+            coding_guidelines_path=coding_guidelines_path,
+            review_guidance=review_guidance,
+            branch=branch,
+            head_sha=head_sha,
+            review_result=review_result,
+            design_doc_path=design_doc_path,
+            design_doc_markdown=design_doc_markdown,
+            design_pr_number=design_pr_number,
+            design_pr_url=design_pr_url,
+        )
+        started_at = time.monotonic()
+        log_event(
+            LOGGER,
+            "codex_invocation_started",
+            mode="pre_pr_author_repair",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+        )
+        try:
+            if session.thread_id is None:
+                result, thread_id = self._run_direct_turn(
+                    prompt=prompt,
+                    cwd=cwd,
+                    invocation_mode="pre_pr_author_repair",
+                )
+            else:
+                try:
+                    result, thread_id = self._run_direct_turn_resume(
+                        session=session,
+                        prompt=prompt,
+                        cwd=cwd,
+                        invocation_mode="pre_pr_author_repair",
+                    )
+                except CommandError as exc:
+                    if not _is_context_window_exhaustion_error(exc):
+                        raise
+                    log_event(
+                        LOGGER,
+                        "pre_pr_author_repair_restart_fresh_thread",
+                        issue_number=issue.number,
+                        thread_id=session.thread_id,
+                    )
+                    result, thread_id = self._run_direct_turn(
+                        prompt=prompt,
+                        cwd=cwd,
+                        invocation_mode="pre_pr_author_repair",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                "codex_invocation_finished",
+                mode="pre_pr_author_repair",
+                repo_full_name=repo_full_name,
+                issue_number=issue.number,
+                status="fault",
+                duration_seconds=_elapsed_seconds(started_at),
+                error_type=type(exc).__name__,
+            )
+            raise
+        log_event(
+            LOGGER,
+            "codex_invocation_finished",
+            mode="pre_pr_author_repair",
+            repo_full_name=repo_full_name,
+            issue_number=issue.number,
+            status="success",
+            duration_seconds=_elapsed_seconds(started_at),
+            blocked=result.blocked_reason is not None,
+        )
+        return DirectStartResult(
+            pr_title=result.pr_title,
+            pr_summary=result.pr_summary,
+            commit_message=result.commit_message,
+            blocked_reason=result.blocked_reason,
+            session=AgentSession(adapter="codex", thread_id=thread_id),
+            escalation=result.escalation,
+        )
+
     def _respond_to_review_turn(
         self,
         *,
@@ -865,6 +1080,74 @@ class CodexAdapter(AgentAdapter):
 
         return payload, _extract_thread_id(raw_events)
 
+    def _run_direct_turn_resume(
+        self,
+        *,
+        session: AgentSession,
+        prompt: str,
+        cwd: Path,
+        invocation_mode: str,
+    ) -> tuple[DirectStartResult, str | None]:
+        if session.thread_id is None:
+            raise RuntimeError("Cannot resume Codex direct turn without a thread_id")
+
+        cmd = [
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "--skip-git-repo-check",
+        ]
+        self._append_resume_options(cmd)
+        cmd.extend([session.thread_id, "-"])
+
+        raw_events = self._run_codex_command(
+            cmd=cmd,
+            cwd=cwd,
+            prompt=prompt,
+            invocation_mode=invocation_mode,
+        )
+        message = _extract_final_agent_message(raw_events)
+        payload = _parse_json_payload(message)
+        return _parse_direct_result_payload(payload), _extract_thread_id(
+            raw_events
+        ) or session.thread_id
+
+    def _run_pre_pr_review_turn(self, *, prompt: str, cwd: Path) -> PrePrReviewResult:
+        if not self._config.enabled:
+            raise RuntimeError("Codex is disabled in config")
+
+        with tempfile.TemporaryDirectory(prefix="mergexo_codex_") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "schema.json"
+            output_path = tmp_path / "last_message.txt"
+            schema_path.write_text(json.dumps(_PRE_PR_REVIEW_OUTPUT_SCHEMA), encoding="utf-8")
+
+            cmd = [
+                "codex",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+            ]
+            self._append_common_options(cmd)
+            cmd.append("-")
+
+            self._run_codex_command(
+                cmd=cmd,
+                cwd=cwd,
+                prompt=prompt,
+                invocation_mode="pre_pr_review",
+            )
+
+            raw = output_path.read_text(encoding="utf-8").strip()
+            payload = _parse_json_payload(raw)
+
+        return _parse_pre_pr_review_result_payload(payload)
+
     def _run_design_turn(self, *, prompt: str, cwd: Path) -> tuple[GeneratedDesign, str | None]:
         if not self._config.enabled:
             raise RuntimeError("Codex is disabled in config")
@@ -1033,6 +1316,7 @@ class CodexAdapter(AgentAdapter):
             commit_message=result.commit_message,
             blocked_reason=result.blocked_reason,
             session=AgentSession(adapter="codex", thread_id=thread_id),
+            escalation=result.escalation,
         )
 
     def _run_direct_turn(
@@ -1074,23 +1358,7 @@ class CodexAdapter(AgentAdapter):
             raw = output_path.read_text(encoding="utf-8").strip()
             payload = _parse_json_payload(raw)
 
-        pr_title = _require_str(payload, "pr_title")
-        pr_summary = _require_str(payload, "pr_summary")
-        commit_message = _optional_output_text(payload.get("commit_message"))
-        blocked_reason = _optional_output_text(payload.get("blocked_reason"))
-        escalation = _parse_roadmap_revision_escalation(payload.get("escalation"))
-
-        return (
-            DirectStartResult(
-                pr_title=pr_title,
-                pr_summary=pr_summary,
-                commit_message=commit_message,
-                blocked_reason=blocked_reason,
-                session=None,
-                escalation=escalation,
-            ),
-            _extract_thread_id(raw_events),
-        )
+        return (_parse_direct_result_payload(payload), _extract_thread_id(raw_events))
 
     def _run_roadmap_adjustment_turn(
         self,
@@ -1296,6 +1564,88 @@ def _parse_event_line(line: str) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _parse_direct_result_payload(payload: dict[str, object]) -> DirectStartResult:
+    return DirectStartResult(
+        pr_title=_require_str(payload, "pr_title"),
+        pr_summary=_require_str(payload, "pr_summary"),
+        commit_message=_optional_output_text(payload.get("commit_message")),
+        blocked_reason=_optional_output_text(payload.get("blocked_reason")),
+        session=None,
+        escalation=_parse_roadmap_revision_escalation(payload.get("escalation")),
+    )
+
+
+def _parse_review_findings(value: object) -> list[ReviewFinding]:
+    if not isinstance(value, list):
+        raise RuntimeError("Codex response field findings must be a list")
+
+    findings: list[ReviewFinding] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        item_obj = _as_object_dict(item)
+        if item_obj is None:
+            raise RuntimeError("Each findings entry must be an object")
+        finding_id = item_obj.get("finding_id")
+        path = item_obj.get("path")
+        line = item_obj.get("line")
+        title = item_obj.get("title")
+        details = item_obj.get("details")
+        if not isinstance(finding_id, str) or not finding_id.strip():
+            raise RuntimeError("finding_id must be a non-empty string")
+        normalized_finding_id = finding_id.strip()
+        if normalized_finding_id in seen_ids:
+            raise RuntimeError("finding_id values must be unique")
+        seen_ids.add(normalized_finding_id)
+        if not isinstance(path, str) or not path.strip():
+            raise RuntimeError("path must be a non-empty string")
+        if line is not None and (not isinstance(line, int) or line < 1):
+            raise RuntimeError("line must be an integer >= 1 or null")
+        if not isinstance(title, str) or not title.strip():
+            raise RuntimeError("title must be a non-empty string")
+        if not isinstance(details, str) or not details.strip():
+            raise RuntimeError("details must be a non-empty string")
+        findings.append(
+            ReviewFinding(
+                finding_id=normalized_finding_id,
+                path=path.strip(),
+                line=line,
+                title=title.strip(),
+                details=details.strip(),
+            )
+        )
+    return findings
+
+
+def _parse_pre_pr_review_result_payload(payload: dict[str, object]) -> PrePrReviewResult:
+    outcome = _require_str(payload, "outcome")
+    if outcome not in {"approved", "changes_requested", "escalate"}:
+        raise RuntimeError("outcome must be one of: approved, changes_requested, escalate")
+    summary = _require_str(payload, "summary")
+    findings = _parse_review_findings(payload.get("findings"))
+    escalation_reason = _optional_output_text(payload.get("escalation_reason"))
+
+    if outcome == "approved":
+        if findings:
+            raise RuntimeError("approved outcome must not include findings")
+        if escalation_reason is not None:
+            raise RuntimeError("approved outcome must set escalation_reason to null")
+    elif outcome == "changes_requested":
+        if not findings:
+            raise RuntimeError("changes_requested outcome requires at least one finding")
+        if escalation_reason is not None:
+            raise RuntimeError("changes_requested outcome must set escalation_reason to null")
+    else:
+        if escalation_reason is None:
+            raise RuntimeError("escalate outcome requires a non-null escalation_reason")
+
+    return PrePrReviewResult(
+        outcome=cast(PrePrReviewOutcome, outcome),
+        summary=summary,
+        findings=tuple(findings),
+        escalation_reason=escalation_reason,
+    )
 
 
 def _require_str(payload: dict[str, object], key: str) -> str:
