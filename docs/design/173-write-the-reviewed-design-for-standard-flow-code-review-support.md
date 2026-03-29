@@ -7,12 +7,14 @@ touch_paths:
   - src/mergexo/agent_adapter.py
   - src/mergexo/codex_adapter.py
   - src/mergexo/orchestrator.py
+  - src/mergexo/github_gateway.py
   - src/mergexo/state.py
   - README.md
   - mergexo.toml.example
   - tests/test_config.py
   - tests/test_models_and_prompts.py
   - tests/test_codex_adapter.py
+  - tests/test_github_gateway.py
   - tests/test_orchestrator.py
   - tests/test_state.py
 depends_on: []
@@ -44,7 +46,7 @@ Issue #173 asks for optional pre-PR review on code-producing flows only. The des
 1. Add an opt-in, default-off pre-PR review gate for `bugfix`, `small_job`, and `implementation`.
 2. Let repositories provide reviewer-specific guidance without making that file mandatory.
 3. Reuse the existing author session for author-repair turns and later PR feedback turns.
-4. Keep the runtime bounded and deterministic with explicit review and repair limits plus clear blocked outcomes.
+4. Keep the runtime bounded and deterministic with explicit review and repair limits plus clear escalation and hard-stop outcomes.
 5. Preserve current behavior exactly when review is disabled.
 
 ## Non-goals
@@ -72,7 +74,8 @@ Flows that stay on the existing human-review path:
 The core invariants are:
 - Review is repo-scoped and opt-in.
 - Review never overwrites the saved author session with a reviewer session.
-- A PR is created only after the exact local head to be pushed has both passed `required_tests` and cleared the reviewer gate.
+- Review disagreement escalates onto the PR; it does not suppress PR creation once MergeXO has a pushable candidate.
+- A PR is created only after the exact local head to be pushed has passed `required_tests`, and any unresolved review concern is carried into that PR explicitly.
 - Any post-review code mutation invalidates the earlier review approval and re-enters the gate.
 
 ## Configuration Surface
@@ -88,7 +91,7 @@ Semantics:
 - Default-off: if `pre_pr_review_flows` is absent or `[]`, all flows behave exactly as they do today.
 - Missing `pre_pr_review_guidance_path` is non-fatal. MergeXO logs the miss, omits the extra guidance from the prompt, and continues with the base review instructions.
 - `design_doc`, `reference_doc`, and `roadmap` flows ignore these keys because they do not enter the pre-PR review gate.
-- `pre_pr_review_max_repair_rounds = 0` means: review once and do not run author repair automatically.
+- `pre_pr_review_max_repair_rounds = 0` means: review once, then either approve immediately or escalate the current reviewer concerns into the PR without automatic repair.
 - When review keys are present, invalid flow names, duplicate values, negative limits, or wrong types should fail config loading with precise errors.
 
 ## Reviewer Contract
@@ -110,10 +113,10 @@ Prompt inputs should include:
 - for `implementation`, the merged design doc path and design provenance already available to the author flow
 
 Structured reviewer output:
-- `outcome`: `approved | changes_requested | blocked`
+- `outcome`: `approved | changes_requested | escalate`
 - `summary`: non-empty string
-- `findings`: array of blocking findings
-- `blocked_reason`: non-empty string or `null`
+- `findings`: array of approval-blocking findings
+- `escalation_reason`: non-empty string or `null`
 
 Each finding should include:
 - `finding_id`: stable within the response, for example `R1`
@@ -123,10 +126,10 @@ Each finding should include:
 - `details`: concrete explanation of the defect and expected repair
 
 Contract rules:
-- `approved` requires `findings = []` and `blocked_reason = null`.
-- `changes_requested` requires at least one finding and `blocked_reason = null`.
-- `blocked` requires `blocked_reason` and does not open a PR.
-- Findings are blocking findings only. Non-blocking style nits should not appear in this gate.
+- `approved` requires `findings = []` and `escalation_reason = null`.
+- `changes_requested` requires at least one finding and `escalation_reason = null`.
+- `escalate` requires `escalation_reason` and may still include findings.
+- Findings are approval-blocking findings only. Non-blocking style nits should not appear in this gate.
 
 ## Author Repair Contract
 
@@ -175,33 +178,48 @@ For an eligible flow with review enabled, the sequence is:
 1. Run the normal author turn for `bugfix`, `small_job`, or `implementation`.
 2. Commit the author's local edits and run `required_tests` using the existing repair loop.
 3. Once the local head is test-green, invoke the reviewer on that exact local head.
-4. If the reviewer returns `approved`, the candidate is eligible for push.
-5. If the reviewer returns `changes_requested`, resume the author session with the findings, commit the repair, rerun `required_tests`, and rerun the reviewer.
-6. If the reviewer returns `blocked`, or if the author returns `blocked_reason`, stop before push and PR creation and leave a clear source-issue comment.
-7. Only after review approval do push and PR creation run.
+4. If the reviewer returns `approved`, the candidate is eligible for a normal push and PR open.
+5. If the reviewer returns `changes_requested`, and repair rounds remain, resume the author session with the findings, commit the repair, rerun `required_tests`, and rerun the reviewer.
+6. If the reviewer returns `escalate`, or if repair rounds are exhausted with findings still open, push the current test-green head, open the PR in draft state, and post the reviewer concerns on the PR.
+7. If the author returns `blocked_reason`, or MergeXO cannot produce a pushable head at all, stop before PR creation and report the hard stop clearly.
 
 Two additional sequencing rules keep the gate truthful:
 - If required-tests repair changes the branch, the reviewer must run again on the repaired head.
 - If push-time conflict repair or automatic remote-race reconciliation changes the branch, `required_tests` and the reviewer must run again before the PR is opened.
 
-This means the reviewer approval applies to the exact head that is about to become the PR head, not an earlier local state.
+This means the review disposition applies to the exact head that is about to become the PR head, not an earlier local state.
 
-## Blocked Outcomes
+## Escalation Handoff
 
-Blocked outcomes should stay explicit and should not produce a PR.
+Reviewer disagreement should produce a handoff artifact, not a missing PR.
 
-Cases that block before PR creation:
-- reviewer returns `blocked`
+Escalation cases:
+- reviewer returns `escalate`
+- `pre_pr_review_max_repair_rounds` is exhausted while findings still remain
+- push-time mutation forces a rerun and the final rerun still does not clear review
+
+Behavior:
+- push the current test-green branch state
+- open the PR as draft by default so GitHub clearly shows that adjudication is still pending
+- post a tokenized PR issue comment that includes the reviewer summary, remaining findings, and explicit escalation reason
+- preserve the saved author session so the normal PR feedback loop, human review, or takeover flow can continue from the richest available context
+
+This makes the PR the place where the diff and the dissenting opinion coexist. A human or agent can then review, take over, or continue the repair from the GitHub UI without losing the current branch state.
+
+## Hard-stop Outcomes
+
+Review disagreement is not a hard stop. Hard stops are reserved for cases where MergeXO cannot safely produce a pushable candidate at all.
+
+Cases that still stop before PR creation:
 - author returns `blocked_reason` during initial authoring or repair
-- `pre_pr_review_max_repair_rounds` is exhausted while the reviewer still returns findings
 - required tests cannot be satisfied after the existing repair limit
-- push-time merge conflict or remote-race repair changes cannot be cleared safely
-- new source-issue comments arrive and the existing pre-PR ordering gate defers the run
+- push-time merge conflict or remote-race repair cannot produce a test-green head
+- new source-issue comments arrive and the existing pre-PR ordering gate defers the run before push
 
 Behavior:
 - post a clear source-issue comment describing why no PR was opened
 - reuse the existing recoverable pre-PR blocked and follow-up path when the failure is recoverable
-- do not synthesize a draft PR just to hold reviewer findings; the feature is specifically a pre-PR gate
+- reserve the no-PR path for operational or authoring hard stops, not reviewer dissent
 
 ## Adapter And Orchestrator Responsibilities
 
@@ -229,7 +247,10 @@ Behavior:
 - Run the author -> tests -> reviewer -> author-repair loop.
 - Preserve only the author session in durable state.
 - Rerun the gate whenever push-time mutations change the candidate head.
-- Emit clear blocked comments and keep disabled flows unchanged.
+- Open draft PRs plus escalation comments when review does not clear, and keep disabled flows unchanged.
+
+`src/mergexo/github_gateway.py`
+- Extend PR creation support to request draft PRs for escalated review outcomes.
 
 `src/mergexo/state.py`
 - Ideally remain unchanged structurally.
@@ -245,7 +266,7 @@ Behavior:
 2. Reviewer contract slice
 - Add reviewer dataclasses and a prompt builder in `src/mergexo/agent_adapter.py` and `src/mergexo/prompts.py`.
 - Add strict schema parsing in `src/mergexo/codex_adapter.py`.
-- Test in `tests/test_models_and_prompts.py` and `tests/test_codex_adapter.py` for prompt content, guidance inclusion, `approved` vs `changes_requested` vs `blocked`, and invalid payload rejection.
+- Test in `tests/test_models_and_prompts.py` and `tests/test_codex_adapter.py` for prompt content, guidance inclusion, `approved` vs `changes_requested` vs `escalate`, and invalid payload rejection.
 
 3. Author-repair slice
 - Add a dedicated author-repair adapter path that resumes the author session first and falls back to a fresh thread when needed.
@@ -255,14 +276,17 @@ Behavior:
 4. Flow-integration slice
 - Integrate the review gate into `bugfix`, `small_job`, and `implementation` orchestration only.
 - Ensure `required_tests`, push repair, and remote-race reconciliation rerun review when they change `HEAD`.
+- Add draft PR creation support plus a structured PR comment for escalated review outcomes.
 - Test in `tests/test_orchestrator.py` for:
   - disabled behavior unchanged
   - reviewer pass with normal PR creation
   - findings-triggered author repair
-  - exhausted repair rounds
-  - reviewer-blocked outcome
+  - exhausted repair rounds opening a draft PR with reviewer concerns
+  - explicit reviewer escalation opening a draft PR with reviewer concerns
   - push-time mutation forcing re-review
   - later PR feedback using the saved author session after pre-PR review
+
+- Test in `tests/test_github_gateway.py` for draft PR creation plumbing.
 
 5. Docs slice
 - Update `README.md` and `mergexo.toml.example` with the new config and lifecycle.
@@ -275,14 +299,14 @@ Behavior:
 2. `design_doc`, `reference_doc`, `roadmap`, and same-roadmap revision PRs stay on the existing human-review path and do not enter the automated pre-PR reviewer gate.
 3. The design names the concrete artifacts, prompt builders, and adapter/orchestrator responsibilities for reviewer turns and author-repair turns.
 4. Reviewer findings are passed back to the author as structured data without overwriting the saved author session used by later PR feedback.
-5. A PR is created only after the exact candidate head has passed `required_tests` and the reviewer has returned `approved`.
-6. When review cannot clear safely, no PR is opened and the source issue gets a clear blocked comment.
+5. A PR is created only after the exact candidate head has passed `required_tests`; an approved review opens a normal PR, while an escalated review opens a draft PR with the final reviewer concerns attached on the PR.
+6. Reviewer disagreement or exhausted repair rounds do not suppress PR creation; only hard-stop conditions that prevent a pushable candidate keep the PR from opening.
 7. The implementation plan calls out the expected tests for config, reviewer contract, author repair, and orchestration sequencing slices.
 
 ## Risks and Mitigations
 
 1. Reviewer false positives or prompt drift could slow delivery.
-Mitigation: default-off rollout, repo-supplied guidance, and a contract that only returns blocking findings.
+Mitigation: default-off rollout, repo-supplied guidance, and a contract that only returns approval-blocking findings.
 
 2. Reviewer or repair turns could break later PR feedback by overwriting the wrong session.
 Mitigation: never persist reviewer sessions in `agent_sessions`; always persist the newest author session immediately after author turns.
