@@ -147,9 +147,50 @@ def test_create_pull_request_and_comment(monkeypatch: pytest.MonkeyPatch) -> Non
     assert pr.number == 123
     assert pr.html_url == "https://example/pr/123"
     assert calls[0][0] == "POST"
+    assert calls[0][2] == {
+        "title": "t",
+        "head": "head",
+        "base": "main",
+        "body": "body",
+        "draft": False,
+    }
     assert calls[1][1].endswith("/issues/7/comments")
     assert calls[2][1].endswith("/pulls/7/comments")
     assert calls[2][2] == {"body": "reply", "in_reply_to": 55}
+
+
+def test_create_pull_request_can_request_draft_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = GitHubGateway("o", "r")
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_api(
+        self: GitHubGateway, method: str, path: str, payload: dict[str, object] | None = None
+    ) -> object:
+        _ = self
+        calls.append((method, path, payload))
+        return {"number": 124, "html_url": "https://example/pr/124"}
+
+    monkeypatch.setattr(GitHubGateway, "_api_json", fake_api)
+
+    pr = gateway.create_pull_request("t", "head", "main", "body", draft=True)
+
+    assert pr.number == 124
+    assert pr.html_url == "https://example/pr/124"
+    assert calls == [
+        (
+            "POST",
+            "/repos/o/r/pulls",
+            {
+                "title": "t",
+                "head": "head",
+                "base": "main",
+                "body": "body",
+                "draft": True,
+            },
+        )
+    ]
 
 
 def test_create_issue_parses_response_and_omits_labels_when_not_set(

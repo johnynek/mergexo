@@ -145,13 +145,26 @@ class GitHubGateway:
         )
         return issues
 
-    def create_pull_request(self, title: str, head: str, base: str, body: str) -> PullRequest:
+    def create_pull_request(
+        self,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+        draft: bool = False,
+    ) -> PullRequest:
         path = f"/repos/{self.owner}/{self.name}/pulls"
         try:
             payload = self._api_json(
                 "POST",
                 path,
-                payload={"title": title, "head": head, "base": base, "body": body},
+                payload={
+                    "title": title,
+                    "head": head,
+                    "base": base,
+                    "body": body,
+                    "draft": draft,
+                },
             )
             payload_obj = _as_object_dict(payload)
             if payload_obj is None:
@@ -165,6 +178,7 @@ class GitHubGateway:
                 repo_full_name=f"{self.owner}/{self.name}",
                 base=base,
                 head=head,
+                draft=draft,
                 error_type=type(exc).__name__,
             )
             raise
@@ -176,6 +190,7 @@ class GitHubGateway:
             pr_url=html_url,
             base=base,
             head=head,
+            draft=draft,
         )
         return PullRequest(number=number, html_url=html_url)
 
