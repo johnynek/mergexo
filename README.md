@@ -144,10 +144,18 @@ Then do this:
 
 ### Roadmap Node Kinds
 
-- `reference_doc`: reviewed doc-only artifact. The child PR merges a durable reference doc and stops there. Use `planned` dependencies when downstream nodes only need that merged artifact.
-- `design_doc`: reviewed design doc that can later continue into implementation from the same child issue. Use `planned` when downstream work only needs the merged design; use `implemented` when it depends on the shipped implementation outcome.
-- `small_job`: direct implementation lane. `planned` means the child issue exists; `implemented` means the child PR merged.
-- `roadmap`: nested roadmap lane. `planned` means the child roadmap PR merged and activated; `implemented` means that child roadmap completed.
+- `reference_doc`: reviewed doc-only artifact. The child PR merges a durable reference doc and stops there. Downstream workers receive the merged doc artifact with its exact path and provenance, so `planned` is usually the earliest truthful handoff milestone.
+- `design_doc`: reviewed design doc that can later continue into implementation from the same child issue. Use `planned` when downstream work only needs the merged design artifact path and design PR provenance; use `implemented` when it depends on the shipped implementation outcome from that same child issue.
+- `small_job`: direct implementation lane. `planned` means the child issue exists and only that issue text is available; `implemented` means the child PR merged, so merged code, changed files, and implementation behavior are available.
+- `roadmap`: nested roadmap lane. `planned` means the child roadmap PR merged and activated, so the child roadmap markdown/graph artifacts and activation provenance are available; `implemented` means that child roadmap completed.
+
+### Roadmap Authoring Contract
+
+- Treat every roadmap dependency as both a sequencing constraint and a declaration of what MergeXO will hand to the downstream worker.
+- Downstream workers receive direct dependency artifacts and satisfied dependency states only, not the transitive closure of the graph.
+- The same direct dependency handoff appears in both the child issue body and the worker prompt.
+- Choose `planned` or `implemented` based on the earliest milestone at which MergeXO can truthfully hand the needed direct artifact or satisfied state to the downstream worker.
+- If a node needs two upstream inputs, add two direct edges. Do not rely on one dependency to transitively carry another node's artifact or satisfied state, and do not expect workers to reconstruct missing inputs from node ids, git history, or heuristic repo search.
 
 ### Visibility and Control
 
