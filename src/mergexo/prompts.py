@@ -1,9 +1,35 @@
 from __future__ import annotations
 
+import base64
 import json
+import logging
+import re
+from typing import cast
 
-from mergexo.agent_adapter import FeedbackTurn, RoadmapDependencyArtifact, RoadmapFeedbackTurn
-from mergexo.models import ROADMAP_NODE_KINDS, Issue
+from mergexo.agent_adapter import (
+    FeedbackTurn,
+    RoadmapChildDependencyArtifact,
+    RoadmapChildDependencyArtifactPath,
+    RoadmapChildDependencyHandoff,
+    RoadmapDependencyArtifactPathRole,
+    RoadmapDependencyArtifact,
+    RoadmapFeedbackTurn,
+)
+from mergexo.models import (
+    ROADMAP_NODE_KINDS,
+    Issue,
+    RoadmapDependencyRequirement,
+    RoadmapNodeKind,
+)
+
+
+LOGGER = logging.getLogger("mergexo.prompts")
+_ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION = 1
+_ROADMAP_DEPENDENCY_HANDOFF_PAYLOAD_MAX_CHARS = 16000
+_ROADMAP_DEPENDENCY_HANDOFF_MARKER_PATTERN = re.compile(
+    r"<!--\s*mergexo-roadmap-dependency-handoff:v(?P<version>\d+):"
+    r"(?P<payload>[A-Za-z0-9_-]+)\s*-->"
+)
 
 
 def _coding_guidelines_task_lines(*, coding_guidelines_path: str | None) -> str:
@@ -95,6 +121,502 @@ def _roadmap_dependency_artifacts_json(
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
+def _normalize_roadmap_child_dependency_handoff(
+    handoff: RoadmapChildDependencyHandoff,
+    *,
+    include_body_excerpts: bool,
+    changed_files_limit: int,
+    notes_limit: int,
+    total_artifact_paths_limit: int,
+    supporting_artifact_paths_limit: int | None,
+) -> RoadmapChildDependencyHandoff:
+    normalized_dependencies: list[RoadmapChildDependencyArtifact] = []
+    for dependency in sorted(handoff.dependencies, key=lambda item: item.node_id):
+        primary_paths = sorted(
+            (path for path in dependency.artifact_paths if path.role == "primary"),
+            key=lambda path: path.path,
+        )
+        supporting_paths = sorted(
+            (path for path in dependency.artifact_paths if path.role != "primary"),
+            key=lambda path: path.path,
+        )
+        if supporting_artifact_paths_limit is not None:
+            supporting_paths = supporting_paths[:supporting_artifact_paths_limit]
+        max_supporting_paths = max(0, total_artifact_paths_limit - len(primary_paths))
+        supporting_paths = supporting_paths[:max_supporting_paths]
+        normalized_dependencies.append(
+            RoadmapChildDependencyArtifact(
+                node_id=dependency.node_id,
+                kind=dependency.kind,
+                title=dependency.title,
+                requires=dependency.requires,
+                satisfied_by=dependency.satisfied_by,
+                child_issue_number=dependency.child_issue_number,
+                child_issue_url=dependency.child_issue_url,
+                child_issue_title=dependency.child_issue_title,
+                pr_number=dependency.pr_number,
+                pr_url=dependency.pr_url,
+                pr_title=dependency.pr_title,
+                pr_merged=dependency.pr_merged,
+                branch=dependency.branch,
+                head_sha=dependency.head_sha,
+                merge_commit_sha=dependency.merge_commit_sha,
+                artifact_paths=tuple(primary_paths + supporting_paths),
+                changed_files=tuple(sorted(dependency.changed_files)[:changed_files_limit]),
+                review_notes=tuple(
+                    _truncate_prompt_text(note, max_chars=400)
+                    for note in dependency.review_notes[:notes_limit]
+                ),
+                issue_notes=tuple(
+                    _truncate_prompt_text(note, max_chars=400)
+                    for note in dependency.issue_notes[:notes_limit]
+                ),
+                child_issue_body_excerpt=(
+                    _truncate_prompt_text(dependency.child_issue_body_excerpt, max_chars=800)
+                    if include_body_excerpts and dependency.child_issue_body_excerpt is not None
+                    else None
+                ),
+                pr_body_excerpt=(
+                    _truncate_prompt_text(dependency.pr_body_excerpt, max_chars=800)
+                    if include_body_excerpts and dependency.pr_body_excerpt is not None
+                    else None
+                ),
+            )
+        )
+    return RoadmapChildDependencyHandoff(
+        schema_version=handoff.schema_version,
+        roadmap_issue_number=handoff.roadmap_issue_number,
+        node_id=handoff.node_id,
+        node_kind=handoff.node_kind,
+        dependencies=tuple(normalized_dependencies),
+    )
+
+
+def _roadmap_child_dependency_handoff_payload(
+    handoff: RoadmapChildDependencyHandoff,
+) -> dict[str, object]:
+    return {
+        "schema_version": handoff.schema_version,
+        "roadmap_issue_number": handoff.roadmap_issue_number,
+        "node_id": handoff.node_id,
+        "node_kind": handoff.node_kind,
+        "dependencies": [
+            {
+                "node_id": dependency.node_id,
+                "kind": dependency.kind,
+                "title": dependency.title,
+                "requires": dependency.requires,
+                "satisfied_by": dependency.satisfied_by,
+                "child_issue_number": dependency.child_issue_number,
+                "child_issue_url": dependency.child_issue_url,
+                "child_issue_title": dependency.child_issue_title,
+                "pr_number": dependency.pr_number,
+                "pr_url": dependency.pr_url,
+                "pr_title": dependency.pr_title,
+                "pr_merged": dependency.pr_merged,
+                "branch": dependency.branch,
+                "head_sha": dependency.head_sha,
+                "merge_commit_sha": dependency.merge_commit_sha,
+                "artifact_paths": [
+                    {
+                        "path": artifact_path.path,
+                        "role": artifact_path.role,
+                        "default_branch_url": artifact_path.default_branch_url,
+                        "blob_url": artifact_path.blob_url,
+                    }
+                    for artifact_path in dependency.artifact_paths
+                ],
+                "changed_files": list(dependency.changed_files),
+                "review_notes": list(dependency.review_notes),
+                "issue_notes": list(dependency.issue_notes),
+                "child_issue_body_excerpt": dependency.child_issue_body_excerpt,
+                "pr_body_excerpt": dependency.pr_body_excerpt,
+            }
+            for dependency in handoff.dependencies
+        ],
+    }
+
+
+def _serialize_roadmap_child_dependency_handoff(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    if handoff.schema_version != _ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported roadmap dependency handoff schema version: {handoff.schema_version}"
+        )
+    phases = (
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=True,
+            changed_files_limit=25,
+            notes_limit=3,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=25,
+            notes_limit=3,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=10,
+            notes_limit=3,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=10,
+            notes_limit=1,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=None,
+        ),
+        _normalize_roadmap_child_dependency_handoff(
+            handoff,
+            include_body_excerpts=False,
+            changed_files_limit=10,
+            notes_limit=1,
+            total_artifact_paths_limit=10,
+            supporting_artifact_paths_limit=3,
+        ),
+    )
+    for normalized in phases:
+        raw_payload = json.dumps(
+            _roadmap_child_dependency_handoff_payload(normalized),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(raw_payload) <= _ROADMAP_DEPENDENCY_HANDOFF_PAYLOAD_MAX_CHARS:
+            return raw_payload
+    raise RuntimeError("roadmap dependency handoff payload exceeds size limit")
+
+
+def render_roadmap_child_dependency_handoff_marker(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    raw_payload = _serialize_roadmap_child_dependency_handoff(handoff)
+    encoded = base64.urlsafe_b64encode(raw_payload.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"<!-- mergexo-roadmap-dependency-handoff:v{handoff.schema_version}:{encoded} -->"
+
+
+def _roadmap_child_dependency_handoff_from_payload(
+    payload: object,
+) -> RoadmapChildDependencyHandoff:
+    if not isinstance(payload, dict):
+        raise ValueError("roadmap dependency handoff payload must be an object")
+    payload_obj = cast(dict[str, object], payload)
+    schema_version = payload_obj.get("schema_version")
+    roadmap_issue_number = payload_obj.get("roadmap_issue_number")
+    node_id = payload_obj.get("node_id")
+    node_kind = payload_obj.get("node_kind")
+    dependencies_payload = payload_obj.get("dependencies")
+    if schema_version != _ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION:
+        raise ValueError("unsupported roadmap dependency handoff schema version")
+    if not isinstance(roadmap_issue_number, int):
+        raise ValueError("roadmap_issue_number must be an integer")
+    if not isinstance(node_id, str):
+        raise ValueError("node_id must be a string")
+    if not isinstance(node_kind, str):
+        raise ValueError("node_kind must be a string")
+    if not isinstance(dependencies_payload, list):
+        raise ValueError("dependencies must be a list")
+
+    dependencies: list[RoadmapChildDependencyArtifact] = []
+    for dependency_payload in dependencies_payload:
+        if not isinstance(dependency_payload, dict):
+            raise ValueError("dependency entry must be an object")
+        dependency_payload_obj = cast(dict[str, object], dependency_payload)
+        artifact_paths_payload = dependency_payload_obj.get("artifact_paths")
+        if not isinstance(artifact_paths_payload, list):
+            raise ValueError("artifact_paths must be a list")
+        artifact_paths: list[RoadmapChildDependencyArtifactPath] = []
+        for artifact_path_payload in artifact_paths_payload:
+            if not isinstance(artifact_path_payload, dict):
+                raise ValueError("artifact path entry must be an object")
+            artifact_path_payload_obj = cast(dict[str, object], artifact_path_payload)
+            path = artifact_path_payload_obj.get("path")
+            role = artifact_path_payload_obj.get("role")
+            default_branch_url = artifact_path_payload_obj.get("default_branch_url")
+            blob_url = artifact_path_payload_obj.get("blob_url")
+            if not isinstance(path, str):
+                raise ValueError("artifact path must be a string")
+            if not isinstance(role, str):
+                raise ValueError("artifact role must be a string")
+            if not isinstance(default_branch_url, str):
+                raise ValueError("default_branch_url must be a string")
+            if blob_url is not None and not isinstance(blob_url, str):
+                raise ValueError("blob_url must be a string or null")
+            if role not in {"primary", "supporting"}:
+                raise ValueError("artifact role must be primary or supporting")
+            artifact_paths.append(
+                RoadmapChildDependencyArtifactPath(
+                    path=path,
+                    role=cast(RoadmapDependencyArtifactPathRole, role),
+                    default_branch_url=default_branch_url,
+                    blob_url=blob_url,
+                )
+            )
+
+        changed_files = dependency_payload_obj.get("changed_files")
+        review_notes = dependency_payload_obj.get("review_notes")
+        issue_notes = dependency_payload_obj.get("issue_notes")
+        if not isinstance(changed_files, list) or not all(
+            isinstance(item, str) for item in changed_files
+        ):
+            raise ValueError("changed_files must be a string list")
+        if not isinstance(review_notes, list) or not all(
+            isinstance(item, str) for item in review_notes
+        ):
+            raise ValueError("review_notes must be a string list")
+        if not isinstance(issue_notes, list) or not all(
+            isinstance(item, str) for item in issue_notes
+        ):
+            raise ValueError("issue_notes must be a string list")
+        changed_files_list = cast(list[str], changed_files)
+        review_notes_list = cast(list[str], review_notes)
+        issue_notes_list = cast(list[str], issue_notes)
+
+        def optional_str(key: str) -> str | None:
+            value = dependency_payload_obj.get(key)
+            if value is None or isinstance(value, str):
+                return value
+            raise ValueError(f"{key} must be a string or null")
+
+        def optional_int(key: str) -> int | None:
+            value = dependency_payload_obj.get(key)
+            if value is None or isinstance(value, int):
+                return value
+            raise ValueError(f"{key} must be an integer or null")
+
+        def optional_bool(key: str) -> bool | None:
+            value = dependency_payload_obj.get(key)
+            if value is None or isinstance(value, bool):
+                return value
+            raise ValueError(f"{key} must be a boolean or null")
+
+        node_id_value = dependency_payload_obj.get("node_id")
+        kind = dependency_payload_obj.get("kind")
+        title = dependency_payload_obj.get("title")
+        requires = dependency_payload_obj.get("requires")
+        satisfied_by = dependency_payload_obj.get("satisfied_by")
+        if not isinstance(node_id_value, str):
+            raise ValueError("dependency node_id must be a string")
+        if not isinstance(kind, str):
+            raise ValueError("dependency kind must be a string")
+        if not isinstance(title, str):
+            raise ValueError("dependency title must be a string")
+        if not isinstance(requires, str):
+            raise ValueError("dependency requires must be a string")
+        if not isinstance(satisfied_by, str):
+            raise ValueError("dependency satisfied_by must be a string")
+        if kind not in {"reference_doc", "design_doc", "small_job", "roadmap"}:
+            raise ValueError("dependency kind is unsupported")
+        if requires not in {"planned", "implemented"}:
+            raise ValueError("dependency requires is unsupported")
+        if satisfied_by not in {"planned", "implemented"}:
+            raise ValueError("dependency satisfied_by is unsupported")
+        dependencies.append(
+            RoadmapChildDependencyArtifact(
+                node_id=node_id_value,
+                kind=cast(RoadmapNodeKind, kind),
+                title=title,
+                requires=cast(RoadmapDependencyRequirement, requires),
+                satisfied_by=cast(RoadmapDependencyRequirement, satisfied_by),
+                child_issue_number=optional_int("child_issue_number"),
+                child_issue_url=optional_str("child_issue_url"),
+                child_issue_title=optional_str("child_issue_title"),
+                pr_number=optional_int("pr_number"),
+                pr_url=optional_str("pr_url"),
+                pr_title=optional_str("pr_title"),
+                pr_merged=optional_bool("pr_merged"),
+                branch=optional_str("branch"),
+                head_sha=optional_str("head_sha"),
+                merge_commit_sha=optional_str("merge_commit_sha"),
+                artifact_paths=tuple(artifact_paths),
+                changed_files=tuple(changed_files_list),
+                review_notes=tuple(review_notes_list),
+                issue_notes=tuple(issue_notes_list),
+                child_issue_body_excerpt=optional_str("child_issue_body_excerpt"),
+                pr_body_excerpt=optional_str("pr_body_excerpt"),
+            )
+        )
+
+    return RoadmapChildDependencyHandoff(
+        schema_version=cast(int, schema_version),
+        roadmap_issue_number=roadmap_issue_number,
+        node_id=node_id,
+        node_kind=cast(RoadmapNodeKind, node_kind),
+        dependencies=tuple(dependencies),
+    )
+
+
+def parse_roadmap_child_dependency_handoff_marker(
+    issue_body: str,
+) -> RoadmapChildDependencyHandoff | None:
+    match = _ROADMAP_DEPENDENCY_HANDOFF_MARKER_PATTERN.search(issue_body)
+    if match is None:
+        return None
+    if int(match.group("version")) != _ROADMAP_DEPENDENCY_HANDOFF_SCHEMA_VERSION:
+        LOGGER.warning("unsupported_roadmap_dependency_handoff_marker_version")
+        return None
+    payload = match.group("payload")
+    padded_payload = payload + ("=" * (-len(payload) % 4))
+    try:
+        raw_payload = base64.urlsafe_b64decode(padded_payload).decode("utf-8")
+        parsed_payload = json.loads(raw_payload)
+        return _roadmap_child_dependency_handoff_from_payload(parsed_payload)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        LOGGER.warning("failed_to_parse_roadmap_dependency_handoff_marker")
+        return None
+
+
+def _remove_roadmap_child_dependency_handoff_marker(issue_body: str) -> str:
+    without_marker = _ROADMAP_DEPENDENCY_HANDOFF_MARKER_PATTERN.sub("", issue_body, count=1)
+    without_marker = re.sub(r"\n{3,}", "\n\n", without_marker)
+    return without_marker.strip()
+
+
+def render_roadmap_child_dependency_handoff_summary(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    normalized = _normalize_roadmap_child_dependency_handoff(
+        handoff,
+        include_body_excerpts=False,
+        changed_files_limit=5,
+        notes_limit=2,
+        total_artifact_paths_limit=10,
+        supporting_artifact_paths_limit=3,
+    )
+    if not normalized.dependencies:
+        return "Dependency handoff:\n- none"
+    lines = [
+        "Dependency handoff:",
+        "- direct dependencies only; MergeXO resolved them ahead of time.",
+    ]
+    for dependency in normalized.dependencies:
+        lines.append(
+            f"- {dependency.node_id} [{dependency.kind}] "
+            f"requires={dependency.requires} satisfied_by={dependency.satisfied_by}"
+        )
+        if dependency.child_issue_number is not None:
+            lines.append(
+                "  child issue: "
+                f"#{dependency.child_issue_number}"
+                + (
+                    f" ({dependency.child_issue_url})"
+                    if dependency.child_issue_url is not None
+                    else ""
+                )
+            )
+        if dependency.pr_number is not None:
+            lines.append(
+                "  PR: "
+                f"#{dependency.pr_number}"
+                + (f" ({dependency.pr_url})" if dependency.pr_url is not None else "")
+            )
+        primary_paths = [path.path for path in dependency.artifact_paths if path.role == "primary"]
+        supporting_paths = [
+            path.path for path in dependency.artifact_paths if path.role == "supporting"
+        ]
+        if primary_paths:
+            lines.append(f"  primary artifact: {primary_paths[0]}")
+        if supporting_paths:
+            lines.append(f"  supporting artifacts: {', '.join(supporting_paths)}")
+        if dependency.changed_files:
+            lines.append(f"  changed files: {', '.join(dependency.changed_files)}")
+        if dependency.review_notes:
+            lines.append(f"  review notes: {' | '.join(dependency.review_notes)}")
+        if dependency.issue_notes:
+            lines.append(f"  issue notes: {' | '.join(dependency.issue_notes)}")
+    return "\n".join(lines)
+
+
+def _render_roadmap_child_dependency_handoff_prompt_section(
+    handoff: RoadmapChildDependencyHandoff,
+) -> str:
+    normalized = _normalize_roadmap_child_dependency_handoff(
+        handoff,
+        include_body_excerpts=True,
+        changed_files_limit=25,
+        notes_limit=3,
+        total_artifact_paths_limit=10,
+        supporting_artifact_paths_limit=3,
+    )
+    lines = [
+        "Dependency Handoff:",
+        "- Direct dependencies only. MergeXO already resolved them; do not walk the roadmap graph or git history to discover more inputs.",
+        f"- Roadmap issue: #{normalized.roadmap_issue_number}",
+        f"- Current node: {normalized.node_id} [{normalized.node_kind}]",
+    ]
+    if not normalized.dependencies:
+        lines.append("- Dependency artifacts: none")
+        return "\n".join(lines)
+    for dependency in normalized.dependencies:
+        lines.append(
+            f"- {dependency.node_id} [{dependency.kind}] "
+            f"requires={dependency.requires} satisfied_by={dependency.satisfied_by}"
+        )
+        if dependency.child_issue_number is not None:
+            lines.append(
+                "  child issue: "
+                f"#{dependency.child_issue_number}"
+                + (
+                    f" ({dependency.child_issue_url})"
+                    if dependency.child_issue_url is not None
+                    else ""
+                )
+            )
+        if dependency.pr_number is not None:
+            lines.append(
+                "  satisfying PR: "
+                f"#{dependency.pr_number}"
+                + (f" ({dependency.pr_url})" if dependency.pr_url is not None else "")
+            )
+        if dependency.pr_title is not None:
+            lines.append(f"  PR title: {dependency.pr_title}")
+        if dependency.branch is not None or dependency.head_sha is not None:
+            lines.append(
+                "  git provenance: "
+                f"branch={dependency.branch or '-'} "
+                f"head_sha={dependency.head_sha or '-'} "
+                f"merge_commit_sha={dependency.merge_commit_sha or '-'}"
+            )
+        for artifact_path in dependency.artifact_paths:
+            label = "primary artifact" if artifact_path.role == "primary" else "supporting artifact"
+            lines.append(
+                f"  {label}: {artifact_path.path} "
+                f"(default branch: {artifact_path.default_branch_url}; "
+                f"pinned blob: {artifact_path.blob_url or 'unavailable'})"
+            )
+        if dependency.changed_files:
+            lines.append(f"  changed files: {', '.join(dependency.changed_files)}")
+        if dependency.review_notes:
+            lines.append(f"  review notes: {' | '.join(dependency.review_notes)}")
+        if dependency.issue_notes:
+            lines.append(f"  issue notes: {' | '.join(dependency.issue_notes)}")
+        if dependency.child_issue_body_excerpt is not None:
+            lines.append(f"  child issue excerpt: {dependency.child_issue_body_excerpt}")
+        if dependency.pr_body_excerpt is not None:
+            lines.append(f"  PR body excerpt: {dependency.pr_body_excerpt}")
+    return "\n".join(lines)
+
+
+def _worker_issue_context_sections(issue_body: str) -> tuple[str, str]:
+    handoff = parse_roadmap_child_dependency_handoff_marker(issue_body)
+    if handoff is None:
+        return "", issue_body
+    return (
+        _render_roadmap_child_dependency_handoff_prompt_section(handoff) + "\n\n",
+        _remove_roadmap_child_dependency_handoff_marker(issue_body),
+    )
+
+
 def _direct_output_contract_lines() -> str:
     return """
 Required output fields:
@@ -142,6 +664,7 @@ def build_design_prompt(
     design_doc_path: str,
     default_branch: str,
 ) -> str:
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     return f"""
 You are the design-doc agent for repository {repo_full_name}.
 
@@ -180,8 +703,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 """.strip()
 
 
@@ -242,6 +765,7 @@ def build_small_job_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     return f"""
 You are the small-job agent for repository {repo_full_name}.
 
@@ -273,8 +797,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 """.strip()
 
 
@@ -295,6 +819,7 @@ def build_implementation_prompt(
     implementation_checks_line = _implementation_checks_line(
         coding_guidelines_path=coding_guidelines_path
     )
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     design_pr_line = (
         f"- Source design PR: #{design_pr_number} ({design_pr_url})"
         if design_pr_number is not None and design_pr_url
@@ -341,8 +866,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 
 Merged design doc markdown ({design_doc_path}):
 {design_doc_markdown}
@@ -361,6 +886,7 @@ def build_roadmap_prompt(
     coding_guidelines_lines = _coding_guidelines_task_lines(
         coding_guidelines_path=coding_guidelines_path
     )
+    dependency_handoff_section, issue_body = _worker_issue_context_sections(issue.body)
     markdown_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.md"
     graph_path = f"{roadmap_docs_dir}/{issue.number}-<slug>.graph.json"
     return f"""
@@ -443,8 +969,8 @@ Issue title:
 Issue URL:
 {issue.html_url}
 
-Issue body:
-{issue.body}
+{dependency_handoff_section}Issue body:
+{issue_body}
 """.strip()
 
 
