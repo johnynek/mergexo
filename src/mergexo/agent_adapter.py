@@ -47,6 +47,27 @@ class DirectStartResult:
     escalation: RoadmapRevisionEscalation | None = None
 
 
+PrePrReviewFlow = Literal["bugfix", "small_job", "implementation"]
+PrePrReviewOutcome = Literal["approved", "changes_requested", "escalate"]
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    finding_id: str
+    path: str
+    line: int | None
+    title: str
+    details: str
+
+
+@dataclass(frozen=True)
+class PrePrReviewResult:
+    outcome: PrePrReviewOutcome
+    summary: str
+    findings: tuple[ReviewFinding, ...]
+    escalation_reason: str | None
+
+
 @dataclass(frozen=True)
 class ReviewReply:
     review_comment_id: int
@@ -288,6 +309,50 @@ class AgentAdapter(ABC):
         cwd: Path,
     ) -> DirectStartResult:
         """Start an implementation PR flow from a merged design doc."""
+
+    @abstractmethod
+    def review_pre_pr_candidate(
+        self,
+        *,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        flow_name: PrePrReviewFlow,
+        coding_guidelines_path: str | None,
+        review_guidance: str | None,
+        branch: str,
+        head_sha: str,
+        changed_files: tuple[str, ...],
+        diff_text: str,
+        design_doc_path: str | None,
+        design_doc_markdown: str | None,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> PrePrReviewResult:
+        """Review a pre-PR candidate on the current local head."""
+
+    @abstractmethod
+    def repair_from_pre_pr_review(
+        self,
+        *,
+        session: AgentSession,
+        issue: Issue,
+        repo_full_name: str,
+        default_branch: str,
+        flow_name: PrePrReviewFlow,
+        coding_guidelines_path: str | None,
+        review_guidance: str | None,
+        branch: str,
+        head_sha: str,
+        review_result: PrePrReviewResult,
+        design_doc_path: str | None,
+        design_doc_markdown: str | None,
+        design_pr_number: int | None,
+        design_pr_url: str | None,
+        cwd: Path,
+    ) -> DirectStartResult:
+        """Resume or restart the author turn to repair pre-PR review findings."""
 
     @abstractmethod
     def respond_to_feedback(

@@ -4,12 +4,14 @@ import pytest
 
 from mergexo.agent_adapter import (
     FeedbackTurn,
+    PrePrReviewResult,
     RoadmapChildDependencyArtifact,
     RoadmapChildDependencyArtifactPath,
     RoadmapChildDependencyHandoff,
     RoadmapDependencyArtifact,
     RoadmapDependencyReference,
     RoadmapFeedbackTurn,
+    ReviewFinding,
 )
 from mergexo import __version__
 from mergexo.models import (
@@ -38,6 +40,8 @@ from mergexo.prompts import (
     build_design_prompt,
     build_feedback_prompt,
     build_implementation_prompt,
+    build_pre_pr_author_repair_prompt,
+    build_pre_pr_review_prompt,
     build_requested_roadmap_revision_prompt,
     build_roadmap_adjustment_prompt,
     build_roadmap_feedback_prompt,
@@ -255,6 +259,19 @@ def test_model_dataclasses_and_version() -> None:
         summary="Intermittent timeout in shard 2.",
         relevant_log_excerpt="TimeoutError: queue did not drain",
     )
+    finding = ReviewFinding(
+        finding_id="R1",
+        path="src/core.py",
+        line=17,
+        title="Repair contract",
+        details="Preserve the existing direct-turn contract.",
+    )
+    pre_pr_review = PrePrReviewResult(
+        outcome="changes_requested",
+        summary="Needs one repair.",
+        findings=(finding,),
+        escalation_reason=None,
+    )
 
     assert __version__ == "0.1.0"
     assert issue.labels == ("x",)
@@ -272,6 +289,7 @@ def test_model_dataclasses_and_version() -> None:
     assert workflow_run.run_id == 11
     assert workflow_job.job_id == 21
     assert flaky_report.run_id == 777
+    assert pre_pr_review.findings[0].finding_id == "R1"
 
 
 def test_build_design_prompt_contains_required_contract() -> None:
@@ -671,6 +689,134 @@ def test_build_small_job_prompt_is_scoped() -> None:
         "Always include `pr_title`, `pr_summary`, `commit_message`, `blocked_reason`, and `escalation`."
         in prompt
     )
+
+
+def test_build_pre_pr_review_prompt_includes_guidance_and_design_context() -> None:
+    issue = Issue(
+        number=220,
+        title="Implement review contracts",
+        body="Wire the reviewer contract into the adapter.",
+        html_url="https://example/issue/220",
+        labels=("agent:implementation",),
+    )
+
+    prompt = build_pre_pr_review_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="implementation",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance="Prioritize correctness and missing tests over style.",
+        branch="agent/impl/220-review-contracts",
+        head_sha="abc123",
+        changed_files=("src/mergexo/codex_adapter.py", "tests/test_codex_adapter.py"),
+        diff_text="diff --git a/src/mergexo/codex_adapter.py b/src/mergexo/codex_adapter.py",
+        design_doc_path="docs/design/220-review-contracts.md",
+        design_doc_markdown="## Plan\n\nImplement reviewer contracts.",
+        design_pr_number=321,
+        design_pr_url="https://example/pr/321",
+    )
+
+    assert "pre-PR reviewer" in prompt
+    assert "docs/python_style.md" in prompt
+    assert "Prioritize correctness and missing tests over style." in prompt
+    assert "agent/impl/220-review-contracts" in prompt
+    assert "abc123" in prompt
+    assert '"src/mergexo/codex_adapter.py"' in prompt
+    assert "Current local diff against main" in prompt
+    assert "Always include `outcome`, `summary`, `findings`, and `escalation_reason`." in prompt
+    assert "`outcome`: one of `approved`, `changes_requested`, `escalate`." in prompt
+    assert "Source design PR: #321 (https://example/pr/321)" in prompt
+    assert "docs/design/220-review-contracts.md" in prompt
+    assert "## Plan" in prompt
+
+
+def test_build_pre_pr_review_prompt_without_guidance_remains_usable() -> None:
+    issue = Issue(
+        number=221,
+        title="Repair a small job",
+        body="Make a small focused repair.",
+        html_url="https://example/issue/221",
+        labels=("agent:small-job",),
+    )
+
+    prompt = build_pre_pr_review_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="small_job",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance=None,
+        branch="agent/small/221-repair",
+        head_sha="def456",
+        changed_files=("src/mergexo/prompts.py",),
+        diff_text="diff --git a/src/mergexo/prompts.py b/src/mergexo/prompts.py",
+        design_doc_path=None,
+        design_doc_markdown=None,
+        design_pr_number=None,
+        design_pr_url=None,
+    )
+
+    assert "Repo review guidance:" in prompt
+    assert "None provided by the caller." in prompt
+    assert "Implementation context:" not in prompt
+    assert "Source design PR:" not in prompt
+
+
+def test_build_pre_pr_author_repair_prompt_preserves_direct_turn_contract() -> None:
+    issue = Issue(
+        number=222,
+        title="Repair reviewer findings",
+        body="Address the reviewer findings before opening the PR.",
+        html_url="https://example/issue/222",
+        labels=("agent:implementation",),
+    )
+    review_result = PrePrReviewResult(
+        outcome="changes_requested",
+        summary="Two fixes remain before approval.",
+        findings=(
+            ReviewFinding(
+                finding_id="R1",
+                path="src/mergexo/codex_adapter.py",
+                line=101,
+                title="Validate reviewer outcome",
+                details="Reject invalid reviewer payload combinations.",
+            ),
+        ),
+        escalation_reason=None,
+    )
+
+    prompt = build_pre_pr_author_repair_prompt(
+        issue=issue,
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="implementation",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance="Do not broaden the scope past the contract work.",
+        branch="agent/impl/222-repair-review",
+        head_sha="fedcba",
+        review_result=review_result,
+        design_doc_path="docs/design/222-review.md",
+        design_doc_markdown="## Context\n\nRepair the review flow.",
+        design_pr_number=400,
+        design_pr_url="https://example/pr/400",
+    )
+
+    assert "pre-PR author-repair agent" in prompt
+    assert "docs/python_style.md" in prompt
+    assert "Do not broaden the scope past the contract work." in prompt
+    assert "agent/impl/222-repair-review" in prompt
+    assert "fedcba" in prompt
+    assert "Reviewer outcome:" in prompt
+    assert "changes_requested" in prompt
+    assert "Two fixes remain before approval." in prompt
+    assert '"finding_id": "R1"' in prompt
+    assert (
+        "Always include `pr_title`, `pr_summary`, `commit_message`, `blocked_reason`, and `escalation`."
+        in prompt
+    )
+    assert "Source design PR: #400 (https://example/pr/400)" in prompt
+    assert "docs/design/222-review.md" in prompt
 
 
 def test_build_roadmap_prompt_requires_graph_contract() -> None:
