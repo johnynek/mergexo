@@ -29,6 +29,7 @@ from mergexo.codex_adapter import (
     _extract_thread_id,
     _filter_resume_extra_args,
     _is_context_window_exhaustion_error,
+    _is_resume_session_unavailable_error,
     _parse_direct_result_payload,
     _parse_flaky_test_report,
     _parse_git_ops,
@@ -1711,6 +1712,136 @@ def test_repair_from_pre_pr_review_falls_back_to_fresh_thread_on_context_window_
     assert result.commit_message == "fix: continue reviewer repair in new thread"
 
 
+def test_repair_from_pre_pr_review_falls_back_to_fresh_thread_on_resume_command_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, input_text, check
+        calls.append(cmd)
+        if cmd[:3] == ["codex", "exec", "resume"]:
+            raise CommandError(
+                "Command failed\n"
+                "cmd: codex exec resume --json --skip-git-repo-check thread-author -\n"
+                "exit: 1\n"
+                'stdout:\n{"type":"error","message":"thread not found"}\n'
+                "stderr:\n"
+            )
+
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "pr_title": "Repair reviewer findings",
+                    "pr_summary": "Addresses the reviewer contract issues.",
+                    "commit_message": "fix: restart reviewer repair in new thread",
+                    "blocked_reason": None,
+                    "escalation": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-fresh-command-error"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.repair_from_pre_pr_review(
+        session=AgentSession(adapter="codex", thread_id="thread-author"),
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="small_job",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance=None,
+        branch="agent/small/1-review",
+        head_sha="abc123",
+        review_result=_pre_pr_review_result(),
+        design_doc_path=None,
+        design_doc_markdown=None,
+        design_pr_number=None,
+        design_pr_url=None,
+        cwd=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert calls[0][:3] == ["codex", "exec", "resume"]
+    assert calls[1][:2] == ["codex", "exec"]
+    assert result.session is not None
+    assert result.session.thread_id == "thread-fresh-command-error"
+    assert result.commit_message == "fix: restart reviewer repair in new thread"
+
+
+def test_repair_from_pre_pr_review_falls_back_to_fresh_thread_when_resume_emits_no_final_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+        check: bool = True,
+        **_kwargs: object,
+    ) -> str:
+        _ = cwd, input_text, check
+        calls.append(cmd)
+        if cmd[:3] == ["codex", "exec", "resume"]:
+            return '{"type":"thread.started","thread_id":"thread-author"}\n'
+
+        idx = cmd.index("--output-last-message")
+        Path(cmd[idx + 1]).write_text(
+            json.dumps(
+                {
+                    "pr_title": "Repair reviewer findings",
+                    "pr_summary": "Addresses the reviewer contract issues.",
+                    "commit_message": "fix: recover missing resume output with new thread",
+                    "blocked_reason": None,
+                    "escalation": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return '{"type":"thread.started","thread_id":"thread-fresh-missing-message"}\n'
+
+    monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
+
+    adapter = CodexAdapter(_enabled_config())
+    result = adapter.repair_from_pre_pr_review(
+        session=AgentSession(adapter="codex", thread_id="thread-author"),
+        issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
+        repo_full_name="johnynek/mergexo",
+        default_branch="main",
+        flow_name="small_job",
+        coding_guidelines_path="docs/python_style.md",
+        review_guidance=None,
+        branch="agent/small/1-review",
+        head_sha="abc123",
+        review_result=_pre_pr_review_result(),
+        design_doc_path=None,
+        design_doc_markdown=None,
+        design_pr_number=None,
+        design_pr_url=None,
+        cwd=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert calls[0][:3] == ["codex", "exec", "resume"]
+    assert calls[1][:2] == ["codex", "exec"]
+    assert result.session is not None
+    assert result.session.thread_id == "thread-fresh-missing-message"
+    assert result.commit_message == "fix: recover missing resume output with new thread"
+
+
 def test_repair_from_pre_pr_review_uses_fresh_turn_when_author_session_lacks_thread_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1791,7 +1922,7 @@ def test_review_pre_pr_candidate_logs_fault_when_review_turn_fails(
     assert "status=fault" in stderr
 
 
-def test_repair_from_pre_pr_review_re_raises_non_context_error_and_logs_fault(
+def test_repair_from_pre_pr_review_re_raises_non_resumability_runtime_error_and_logs_fault(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1804,20 +1935,24 @@ def test_repair_from_pre_pr_review_re_raises_non_context_error_and_logs_fault(
         check: bool = True,
         **_kwargs: object,
     ) -> str:
-        _ = cmd, cwd, input_text, check
-        raise CommandError(
-            "Command failed\n"
-            "cmd: codex exec resume --json --skip-git-repo-check thread-author -\n"
-            "exit: 1\n"
-            'stdout:\n{"type":"error","message":"transient CLI failure"}\n'
-            "stderr:\n"
+        _ = cwd, input_text, check
+        message_payload = "[]"
+        return (
+            '{"type":"thread.started","thread_id":"thread-author"}\n'
+            + json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": message_payload},
+                }
+            )
+            + "\n"
         )
 
     monkeypatch.setattr("mergexo.codex_adapter.run", fake_run)
     configure_logging(verbose=True)
 
     adapter = CodexAdapter(_enabled_config())
-    with pytest.raises(CommandError, match="transient CLI failure"):
+    with pytest.raises(RuntimeError, match="JSON object"):
         adapter.repair_from_pre_pr_review(
             session=AgentSession(adapter="codex", thread_id="thread-author"),
             issue=Issue(number=1, title="Issue", body="Body", html_url="url", labels=("x",)),
@@ -2321,6 +2456,32 @@ def test_is_context_window_exhaustion_error_detection() -> None:
         )
         is True
     )
+
+
+def test_is_resume_session_unavailable_error_detection() -> None:
+    assert (
+        _is_resume_session_unavailable_error(
+            CommandError(
+                "Command failed\n"
+                "cmd: codex exec resume --json --skip-git-repo-check thread-abc -\n"
+                "exit: 1\n"
+                'stdout:\n{"type":"error","message":"thread not found"}\n'
+                "stderr:\n"
+            )
+        )
+        is True
+    )
+    assert (
+        _is_resume_session_unavailable_error(
+            RuntimeError("Codex resume did not emit a final agent message")
+        )
+        is True
+    )
+    assert (
+        _is_resume_session_unavailable_error(RuntimeError("Codex response must be a JSON object"))
+        is False
+    )
+    assert _is_resume_session_unavailable_error(ValueError("not a resume failure")) is False
 
 
 def test_parse_git_ops_validation() -> None:

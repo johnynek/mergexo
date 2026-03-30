@@ -857,14 +857,15 @@ class CodexAdapter(AgentAdapter):
                         cwd=cwd,
                         invocation_mode="pre_pr_author_repair",
                     )
-                except CommandError as exc:
-                    if not _is_context_window_exhaustion_error(exc):
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_resume_session_unavailable_error(exc):
                         raise
                     log_event(
                         LOGGER,
                         "pre_pr_author_repair_restart_fresh_thread",
                         issue_number=issue.number,
                         thread_id=session.thread_id,
+                        error_type=type(exc).__name__,
                     )
                     result, thread_id = self._run_direct_turn(
                         prompt=prompt,
@@ -1699,6 +1700,14 @@ def _is_context_window_exhaustion_error(exc: Exception) -> bool:
     return "context window" in normalized and (
         "start a new thread" in normalized or "ran out of room" in normalized
     )
+
+
+def _is_resume_session_unavailable_error(exc: Exception) -> bool:
+    if isinstance(exc, CommandError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    return "did not emit a final agent message" in str(exc).lower()
 
 
 def _direct_invocation_mode(flow_name: str) -> str:
